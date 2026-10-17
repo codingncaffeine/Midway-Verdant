@@ -1,0 +1,52 @@
+name: CI
+
+# Every push to main or to the gate branch (tools/push.sh lands a batch on main only after this has run it
+# there) and every pull request: configure and build with warnings as errors on Linux and on Windows, run the
+# tests, and on Linux prove the content scan still refuses every kind of forbidden file.
+on:
+  push:
+    branches: [main, gate]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux:
+    name: Linux (GCC 14)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      SDL_VIDEODRIVER: dummy
+      SDL_AUDIODRIVER: dummy
+    steps:
+      - uses: actions/checkout@v7
+      - name: Toolchain
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq ninja-build gcc-14 g++-14
+      - name: Configure
+        run: CC=gcc-14 CXX=g++-14 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DMV_WERROR=ON
+      - name: Build
+        run: cmake --build build
+      - name: Tests
+        run: tools/ci-test.sh build
+      - name: Scan controls
+        run: tests/tools/scan-controls.sh
+
+  windows:
+    name: Windows (MSVC)
+    runs-on: windows-2025
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v7
+      - name: Configure
+        run: cmake -S . -B build -A x64 -DMV_WERROR=ON
+      - name: Build
+        run: cmake --build build --config Release
+      - name: Tests
+        shell: bash
+        run: tools/ci-test.sh build Release
