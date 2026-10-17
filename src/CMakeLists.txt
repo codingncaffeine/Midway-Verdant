@@ -68,9 +68,10 @@ if(NOT MSVC)
   set_source_files_properties(nv2a/shaders/glsl_compiler.cpp PROPERTIES COMPILE_OPTIONS "-Wno-shadow;-Wno-conversion")
 endif()
 
-# midway-verdant: the emulator. Headless until the window shell lands.
-add_executable(midway-verdant ui/main.cpp)
-target_link_libraries(midway-verdant PRIVATE mvcore)
+# midway-verdant: the emulator shell — the SDL3 window around the core (the core itself never sees SDL).
+include(${CMAKE_SOURCE_DIR}/cmake/SDL3.cmake)
+add_executable(midway-verdant ui/main.cpp ui/window.cpp)
+target_link_libraries(midway-verdant PRIVATE mvcore SDL3::SDL3)
 
 # mv-pbcap: the pushbuffer capture reader (summaries and dumps of what --capture wrote).
 add_executable(mv-pbcap tools/mv-pbcap.cpp)

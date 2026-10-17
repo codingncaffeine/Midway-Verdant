@@ -1,16 +1,20 @@
-// The headless runner: boots the machine from the user's dumps and reports what the boot chain did.
-// The window shell arrives with the first picture (Phase 3); until then this is the instrument.
+// The shell: boots the machine from the user's dumps, shows its scanout in a window when asked, and reports
+// what the boot chain did.
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <format>
+#include <functional>
 #include <string>
+#include <thread>
 
 #include "core/clock.h"
 #include "core/machine.h"
 #include "core/version.h"
 #include "debug/trace.h"
+#include "ui/window.h"
 
 namespace {
 
@@ -34,6 +38,7 @@ void print_usage() {
         "  --watch HEX,...    log every change of these physical RAM words (polled each tick) under the boot trace\n"
         "  --break-smbus AA:CC  log the CPU registers and stack (boot trace) when SMBus address AA gets command CC written\n"
         "  --reset-at S       press the front-panel reset S seconds into the run (a warm reboot)\n"
+        "  --window           show the console's scanout in a window (Escape or closing it ends the run)\n"
         "  --version, --help\n");
 }
 
@@ -60,6 +65,7 @@ int main(int argc, char** argv) {
     std::string until;
     std::FILE* trace_file = nullptr;
     std::string dump_ram;
+    bool want_window = false;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto need = [&](const char* what) -> const char* {
@@ -129,6 +135,8 @@ int main(int argc, char** argv) {
             }
             cfg.break_smbus_write = std::make_pair(static_cast<mv::u8>(std::strtoul(spec.substr(0, colon).c_str(), nullptr, 16)),
                                                    static_cast<mv::u8>(std::strtoul(spec.substr(colon + 1).c_str(), nullptr, 16)));
+        } else if (a == "--window") {
+            want_window = true;
         } else if (a == "--reset-at") {
             cfg.reset_at_seconds = std::atof(need("--reset-at"));
         } else if (a == "--rtc-time") {
@@ -159,7 +167,26 @@ int main(int argc, char** argv) {
     }
 
     const auto t0 = std::chrono::steady_clock::now();
-    const auto reason = machine.run(std::chrono::nanoseconds(static_cast<long long>(seconds * 1e9)), condition);
+    const auto duration = std::chrono::nanoseconds(static_cast<long long>(seconds * 1e9));
+    mv::Machine::StopReason reason = mv::Machine::StopReason::Duration;
+    if (want_window) {
+        mv::ui::ScanoutWindow window;
+        if (!window.open(error)) {
+            std::fprintf(stderr, "midway-verdant: %s\n", error.c_str());
+            return 1;
+        }
+        // The machine runs on its own io thread; this thread belongs to the window (SDL wants the main thread).
+        std::atomic<bool> stop{false};
+        std::thread io([&] {
+            reason = machine.run(duration, [&](mv::Machine& m) { return stop.load() || (condition && condition(m)); });
+            stop = true;
+        });
+        const unsigned frames = window.run(machine, stop);
+        io.join();
+        std::printf("window: %u frames presented\n", frames);
+    } else {
+        reason = machine.run(duration, condition);
+    }
     const double wall = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
 
     std::printf("stopped: %s after %.3f s host, %.3f ms guest\n", reason_name(reason), wall,

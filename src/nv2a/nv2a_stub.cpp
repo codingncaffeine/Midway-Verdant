@@ -39,6 +39,8 @@ void Nv2aStub::reset() {
     bound_ = {};
     bound_handles_ = {};
     sync_ = {};
+    crtc_ = {};
+    crtc_index_ = 0;
     pgraph_stalled_ = false;
     update_irq();
 }
@@ -275,6 +277,14 @@ u32 Nv2aStub::mmio_read(PhysAddr addr, unsigned size) {
         ++reads_;
         return vr ? 0x09u : 0x00u;
     }
+    if (size == 1 && off == kPrmcioCrtcIndex) {
+        ++reads_;
+        return crtc_index_;
+    }
+    if (size == 1 && off == kPrmcioCrtcData) {
+        ++reads_;
+        return crtc_[crtc_index_];
+    }
     u32 word;
     switch (key) {
         case kPtimerTime0: word = static_cast<u32>((ptimer_ticks() & 0x7FFFFFFu) << 5); break;
@@ -308,6 +318,14 @@ void Nv2aStub::mmio_write(PhysAddr addr, unsigned size, u32 value) {
     }
     ++writes_;
     trace::log(trace::Cat::Gpu, "write +{:06x} size {} <- {:08x}", off, size, value);
+    if (size == 1 && off == kPrmcioCrtcIndex) {
+        crtc_index_ = static_cast<u8>(value);
+        return;
+    }
+    if (size == 1 && off == kPrmcioCrtcData) {
+        crtc_[crtc_index_] = static_cast<u8>(value);
+        return;
+    }
     // The scanout blocks (PCRTC, PRAMDAC) go into the capture: a replay needs to know which surface is displayed.
     if (capture_ && ((key >= 0x600000 && key < 0x601000) || (key >= 0x680000 && key < 0x681000))) capture_->reg(key, word);
     switch (key) {

@@ -53,6 +53,7 @@ public:
                          kCache1DmaGet = 0x003244;
     static constexpr u32 kPramin = 0x700000, kUser = 0x800000;
     static constexpr u32 kPrmcioInputStatus1 = 0x6013DA;  // the VGA input status register: retrace bits
+    static constexpr u32 kPrmcioCrtcIndex = 0x6013D4, kPrmcioCrtcData = 0x6013D5;  // the CRTC register file
     static constexpr u32 kPmcIntrPfifo = 1u << 8, kPmcIntrPgraph = 1u << 12, kPmcIntrPtimer = 1u << 20, kPmcIntrPcrtc = 1u << 24;
 
     Nv2aStub(Bus& bus, Scheduler& sched, std::function<void(bool)> irq);
@@ -67,6 +68,16 @@ public:
     u64 vblanks() const { return vblanks_; }
     // The reset line: registers at power-on, no objects bound, the engine free; the frame timer keeps running.
     void reset();
+    // The mode the CRTC was programmed with (VGA-style registers through PRMCIO index/data, with NVIDIA's
+    // extended bits): the displayed width and height in pixels and the line pitch in bytes; zero until set.
+    u32 scanout_width() const { return (static_cast<u32>(crtc_[0x01]) + 1u) * 8u; }
+    u32 scanout_height() const {
+        return (static_cast<u32>(crtc_[0x12]) | ((crtc_[0x07] & 0x02u) << 7) | ((crtc_[0x07] & 0x40u) << 3) | ((crtc_[0x25] & 0x02u) << 9)) + 1u;
+    }
+    u32 scanout_pitch() const {
+        return 8u * (static_cast<u32>(crtc_[0x13]) | ((crtc_[0x19] & 0xE0u) << 3) | ((crtc_[0x25] & 0x20u) << 6));
+    }
+    bool scanout_programmed() const { return crtc_[0x13] != 0; }
     u32 framebuffer_start() const { return reg(kPcrtcStart); }
     const PushbufferWalker& pushbuffer() const { return walker_; }
     // Objects bound to the channel's eight subchannels (class numbers, 0 = none).
@@ -103,6 +114,8 @@ private:
     std::function<void(bool)> irq_;
     u32 mapped_at_{0};
     std::unordered_map<u32, u32> regs_;
+    std::array<u8, 256> crtc_{};
+    u8 crtc_index_{0};
     u64 reads_{0}, writes_{0}, vblanks_{0};
     bool irq_level_{false};
     TimerEvent vblank_;
