@@ -18,6 +18,7 @@ add_executable(mv_tests
   unit/eeprom_test.cpp
   unit/pushbuffer_test.cpp
   unit/capture_test.cpp
+  unit/kelvin_test.cpp
 )
 target_link_libraries(mv_tests PRIVATE mvcore gtest_main)
 include(GoogleTest)

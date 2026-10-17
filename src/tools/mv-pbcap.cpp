@@ -3,13 +3,21 @@
 // clears per frame, the RAM pages carried. The renderer's offline instrument.
 //   mv-pbcap summary FILE        the report
 //   mv-pbcap methods FILE        every method as "class method value", one per line (diffs against traces)
+//   mv-pbcap replay FILE [N]     run the Kelvin state machine over the capture (N frames, default all): draws, vertices,
+//                                primitives, texture and surface formats per frame, fetch errors
+#include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <map>
+#include <utility>
 #include <string>
 #include <vector>
 
 #include "nv2a/capture.h"
+#include "nv2a/pgraph/kelvin.h"
+#include "nv2a/pgraph/replay.h"
+#include <set>
 
 namespace {
 
@@ -131,15 +139,96 @@ int methods(const char* path) {
     return 0;
 }
 
+// The replay instrument: counts what each frame asks of a renderer.
+struct CountingSink : mv::pgraph::RenderSink {
+    const mv::pgraph::Replay* replay{nullptr};
+    struct FrameCount {
+        mv::u64 draws{0}, vertices{0}, indices{0}, clears{0}, errors{0};
+        std::map<mv::pgraph::Primitive, mv::u64> primitives;
+        std::set<mv::u32> surface_formats, texture_formats, stage_programs;
+        std::set<mv::u32> program_modes;
+        std::string first_error;
+    } frame;
+    void clear(const mv::pgraph::KelvinState& s, mv::u32) override {
+        ++frame.clears;
+        frame.surface_formats.insert(s.surface().format);
+    }
+    void draw(const mv::pgraph::KelvinState& s, const mv::pgraph::DrawBatch& batch) override {
+        ++frame.draws;
+        frame.surface_formats.insert(s.surface().format);
+        frame.program_modes.insert(s.transform_mode());
+        frame.stage_programs.insert(s.reg(mv::pgraph::mthd::kShaderStageProgram));
+        for (mv::u32 t = 0; t < 4; ++t)
+            if (s.texture(t).enabled() && s.shader_stage_program(t) != 0) frame.texture_formats.insert(s.texture(t).format);
+        mv::pgraph::FetchedVertices v;
+        if (!mv::pgraph::fetch_vertices(s, *replay, replay->memory(), batch, v)) {
+            ++frame.errors;
+            if (frame.first_error.empty()) frame.first_error = v.error;
+            return;
+        }
+        frame.vertices += v.count;
+        frame.indices += v.indices.empty() ? v.count : v.indices.size();
+        ++frame.primitives[v.primitive];
+    }
+};
+
+struct ReplayObserver : mv::pgraph::Replay::Observer {
+    CountingSink* sink{nullptr};
+    void frame_end(mv::u32 index, mv::u32 semaphore) override {
+        auto& f = sink->frame;
+        std::printf("frame %u: %llu draws, %llu vertices, %llu indices, %llu clears%s; semaphore %08x\n", index,
+                    static_cast<unsigned long long>(f.draws), static_cast<unsigned long long>(f.vertices),
+                    static_cast<unsigned long long>(f.indices), static_cast<unsigned long long>(f.clears),
+                    f.errors ? (" (" + std::to_string(f.errors) + " FETCH ERRORS: " + f.first_error + ")").c_str() : "", semaphore);
+        std::printf("   primitives:");
+        for (const auto& [p, n] : f.primitives) std::printf(" %s x%llu", mv::pgraph::primitive_name(p), static_cast<unsigned long long>(n));
+        std::printf("; transform modes:");
+        for (auto m : f.program_modes) std::printf(" %u", m);
+        std::printf("; surfaces:");
+        for (auto s : f.surface_formats) std::printf(" %08x", s);
+        std::printf("; stage programs:");
+        for (auto s : f.stage_programs) std::printf(" %05x", s);
+        std::printf("; textures:");
+        for (auto t : f.texture_formats) std::printf(" %08x", t);
+        std::printf("\n");
+        f = CountingSink::FrameCount{};
+    }
+};
+
+int replay(const char* path, mv::u32 frames) {
+    mv::pgraph::Replay r;
+    std::string error;
+    if (!r.open(path, error)) {
+        std::fprintf(stderr, "mv-pbcap: %s\n", error.c_str());
+        return 1;
+    }
+    mv::pgraph::Kelvin kelvin;
+    CountingSink sink;
+    sink.replay = &r;
+    kelvin.set_sink(&sink);
+    ReplayObserver observer;
+    observer.sink = &sink;
+    if (!r.run(kelvin, &observer, error, frames)) {
+        std::fprintf(stderr, "mv-pbcap: %s\n", error.c_str());
+        return 1;
+    }
+    std::printf("%u frames, %llu methods; scanout start %08x; final surface format %08x colour offset %08x pitch %08x clip %ux%u\n", r.frames(),
+                static_cast<unsigned long long>(r.methods()), r.scanout_start(), kelvin.state().surface().format,
+                kelvin.state().surface().color_offset, kelvin.state().surface().pitch, kelvin.state().surface().clip_width(),
+                kelvin.state().surface().clip_height());
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
     if (argc < 3) {
-        std::fprintf(stderr, "usage: mv-pbcap summary|methods FILE\n");
+        std::fprintf(stderr, "usage: mv-pbcap summary|methods|replay FILE [FRAMES]\n");
         return 2;
     }
     if (std::strcmp(argv[1], "summary") == 0) return summary(argv[2]);
     if (std::strcmp(argv[1], "methods") == 0) return methods(argv[2]);
+    if (std::strcmp(argv[1], "replay") == 0) return replay(argv[2], argc > 3 ? static_cast<mv::u32>(std::atoi(argv[3])) : 0u);
     std::fprintf(stderr, "mv-pbcap: unknown command %s\n", argv[1]);
     return 2;
 }
