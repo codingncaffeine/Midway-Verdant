@@ -23,6 +23,7 @@ void print_usage() {
         "  --eeprom FILE      a 256-byte EEPROM image; generated there from the kernel's key when missing\n"
         "  --hdd FILE         a raw hard-disk image (8 GiB retail layout); no drive without it\n"
         "  --hdd-unlocked     present the disk unlocked instead of locked with the EEPROM's key\n"
+        "  --smc-scratch N    the SMC scratch flags the kernel reads at boot (4 = short animation, 8 = dashboard)\n"
         "  --seconds N        run for N seconds of host time (default 5)\n"
         "  --until EVENT      stop early at a milestone: rom-hidden, bootloader, kernel\n"
         "  --trace LIST       comma-separated: post,pci,smbus,mmio,pio,irq,flash,cpu,boot,timer,gpu,all\n"
@@ -80,6 +81,8 @@ int main(int argc, char** argv) {
             cfg.hdd_image = need("--hdd");
         } else if (a == "--hdd-unlocked") {
             cfg.hdd_locked = false;
+        } else if (a == "--smc-scratch") {
+            cfg.smc_scratch = static_cast<mv::u8>(std::strtoul(need("--smc-scratch"), nullptr, 0));
         } else if (a == "--seconds") {
             seconds = std::atof(need("--seconds"));
         } else if (a == "--until") {
@@ -165,6 +168,10 @@ int main(int argc, char** argv) {
                 static_cast<unsigned long long>(machine.nv2a().writes()), static_cast<unsigned long long>(machine.nv2a().vblanks()),
                 static_cast<unsigned long long>(machine.apu().reads()), static_cast<unsigned long long>(machine.apu().writes()),
                 static_cast<unsigned long long>(machine.aci().reads()), static_cast<unsigned long long>(machine.aci().writes()));
+    std::printf("gpu fifo: %llu methods, %llu semaphore releases, %llu notifies%s\n",
+                static_cast<unsigned long long>(machine.nv2a().pushbuffer().methods_seen()),
+                static_cast<unsigned long long>(machine.nv2a().semaphore_releases()), static_cast<unsigned long long>(machine.nv2a().notifies()),
+                machine.nv2a().pushbuffer().errored() ? (" ERROR: " + machine.nv2a().pushbuffer().last_error()).c_str() : "");
     std::printf("ide: %llu commands, %llu sectors read, %llu written; hdd %s, unlock attempts %llu; dvd packets %llu\n",
                 static_cast<unsigned long long>(machine.ide().primary().commands()),
                 static_cast<unsigned long long>(machine.ide().primary().sectors_read()),
@@ -176,6 +183,8 @@ int main(int argc, char** argv) {
     if (machine.cpu()->read_regs(regs)) {
         std::printf("cpu: cs %04x eip %08x eflags %08x cr0 %08x cr3 %08x esp %08x tsc %llu\n", regs.cs, regs.eip, regs.eflags, regs.cr0,
                     regs.cr3, regs.esp, static_cast<unsigned long long>(regs.tsc));
+        std::printf("     eax %08x ebx %08x ecx %08x edx %08x esi %08x edi %08x ebp %08x\n", regs.eax, regs.ebx, regs.ecx, regs.edx, regs.esi,
+                    regs.edi, regs.ebp);
     }
     const auto unknown_mmio = machine.bus().unknown_mmio();
     const auto unknown_pio = machine.bus().unknown_pio();

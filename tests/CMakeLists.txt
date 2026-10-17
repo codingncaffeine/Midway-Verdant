@@ -16,6 +16,7 @@ add_executable(mv_tests
   unit/smbus_test.cpp
   unit/crypto_test.cpp
   unit/eeprom_test.cpp
+  unit/pushbuffer_test.cpp
 )
 target_link_libraries(mv_tests PRIVATE mvcore gtest_main)
 include(GoogleTest)

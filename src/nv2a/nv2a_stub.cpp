@@ -5,7 +5,8 @@
 namespace mv {
 
 Nv2aStub::Nv2aStub(Bus& bus, Scheduler& sched, std::function<void(bool)> irq)
-    : PciDevice("nv2a", 0x10DE, 0x02A0, 0x030000, 0xA1), bus_(bus), sched_(sched), irq_(std::move(irq)) {
+    : PciDevice("nv2a", 0x10DE, 0x02A0, 0x030000, 0xA1), bus_(bus), sched_(sched), irq_(std::move(irq)), walker_(bus) {
+    walker_.set_sink([this](const PushbufferMethod& m) { on_method(m); });
     define_bar(0, BarKind::Memory, kMmioSize);
     define_bar(1, BarKind::Memory, 128u * 1024 * 1024, true);
     define_bar(2, BarKind::Memory, 512u * 1024, true);
@@ -24,9 +25,20 @@ Nv2aStub::Nv2aStub(Bus& bus, Scheduler& sched, std::function<void(bool)> irq)
     schedule_vblank();
 }
 
+Cycles Nv2aStub::frame_period() const {
+    // 59.94 Hz: the NTSC field rate the encoder puts out.
+    return muldiv64(clk::kCpuHzNum * 1001, 1, clk::kCpuHzDen * 60000);
+}
+
+bool Nv2aStub::in_vertical_retrace() const {
+    // The vertical blanking interval: about 20 of 262.5 lines a field, at the start of each frame on our clock.
+    const Cycles frame = frame_period();
+    const Cycles phase = sched_.now() % frame;
+    return phase < frame * 20 / 262;
+}
+
 void Nv2aStub::schedule_vblank() {
-    // 59.94 Hz: the NTSC field rate the encoder puts out; one event per frame on the master clock.
-    const u64 frame = muldiv64(clk::kCpuHzNum * 1001, 1, clk::kCpuHzDen * 60000);
+    const u64 frame = frame_period();
     const Cycles now = sched_.now();
     sched_.schedule(vblank_, (now / frame + 1) * frame);
 }
@@ -35,6 +47,9 @@ void Nv2aStub::update_irq() {
     u32 intr = 0;
     if (regs_[kPcrtcIntr0] & regs_[kPcrtcIntrEn0] & 1u) intr |= kPmcIntrPcrtc;
     if (regs_[kPtimerIntr0] & regs_[kPtimerIntrEn0] & 1u) intr |= kPmcIntrPtimer;
+    if (regs_[kPfifoIntr0] & regs_[kPfifoIntrEn0]) intr |= kPmcIntrPfifo;
+    if (regs_[kPgraphIntr] & regs_[kPgraphIntrEn]) intr |= kPmcIntrPgraph;
+    if (regs_[kPvideoIntr] & regs_[kPvideoIntrEn]) intr |= 1u << 16;
     regs_[kPmcIntr0] = intr;
     const bool level = (regs_[kPmcIntrEn0] & 1u) && intr != 0;
     if (level != irq_level_) {
@@ -68,13 +83,133 @@ u32 Nv2aStub::reg(u32 offset) const {
     return it == regs_.end() ? 0 : it->second;
 }
 
+u32 Nv2aStub::lookup_handle(u32 handle) const {
+    // RAMHT: base and size from PFIFO_RAMHT; the hash folds the handle in slices of the table's index width
+    // and mixes in the channel (0 here). Entries are {handle, context} pairs.
+    const u32 ramht = reg(kPfifoRamht);
+    const u32 base = (ramht & 0x1F0u) << 8;
+    const u32 bits = ((ramht >> 16) & 3u) + 9;
+    u32 hash = 0;
+    u32 h = handle;
+    while (h) {
+        hash ^= h & ((1u << bits) - 1);
+        h >>= bits;
+    }
+    const u32 entry = base + hash * 8;
+    const u32 found = ramin32(entry);
+    if (found != handle) {
+        // Collisions are rare on the console; a linear scan of the table settles them.
+        const u32 size = 1u << (bits + 3);
+        for (u32 off = 0; off < size; off += 8) {
+            if (ramin32(base + off) == handle) return ramin32(base + off + 4);
+        }
+        return 0;
+    }
+    return ramin32(entry + 4);
+}
+
+PushbufferWalker::DmaObject Nv2aStub::dma_object(u32 instance) const {
+    PushbufferWalker::DmaObject d;
+    const u32 at = instance * 16;
+    const u32 dw0 = ramin32(at), dw1 = ramin32(at + 4), dw2 = ramin32(at + 8);
+    const u32 cls = dw0 & 0xFFu;
+    if (cls != 0x02 && cls != 0x03 && cls != 0x3D) return d;  // DMA object classes
+    d.base = (dw2 & 0xFFFFF000u) | ((dw0 >> 20) & 0xFFFu);
+    d.limit = dw1;
+    d.valid = true;
+    return d;
+}
+
+void Nv2aStub::on_method(const PushbufferMethod& m) {
+    if (m.method == 0) {
+        bound_handles_[m.subchannel] = m.value;
+        const u32 ctx = lookup_handle(m.value);
+        const u32 instance = ctx & 0xFFFFu;
+        bound_[m.subchannel] = ramin32(instance * 16) & 0xFFFFu;
+        trace::log(trace::Cat::Gpu, "fifo: subchannel {} <- object {:08x} (class {:04x}, instance {:04x})", m.subchannel, m.value,
+                   bound_[m.subchannel], instance);
+        return;
+    }
+    if (method_log_lines_ < 200000) {
+        ++method_log_lines_;
+        trace::log(trace::Cat::Gpu, "fifo: [{:04x}] {:04x} <- {:08x}", bound_[m.subchannel], m.method, m.value);
+    }
+    // The synchronisation methods every class shares, and Kelvin's semaphore: these are what the CPU waits on,
+    // so they are executed here while every drawing method is only logged (the real engine arrives in Phase 4).
+    SyncState& s = sync_[m.subchannel];
+    switch (m.method) {
+        case 0x0180:  // SET_CONTEXT_DMA_NOTIFIES
+            s.notifier_handle = m.value;
+            return;
+        case 0x0104: {  // NOTIFY: write the notifier (timestamp, info, status = done) when the next method completes
+            const auto dma = dma_object(lookup_handle(s.notifier_handle) & 0xFFFFu);
+            if (!dma.valid) {
+                trace::log(trace::Cat::Gpu, "notify with no notifier object (handle {:08x})", s.notifier_handle);
+                return;
+            }
+            u8 notifier[16]{};
+            const u64 t = ptimer_ticks();
+            for (int i = 0; i < 8; ++i) notifier[i] = static_cast<u8>(t >> (8 * i));
+            bus_.write_ram(dma.base, notifier, 16);
+            ++notifies_;
+            return;
+        }
+        case 0x01A4:  // SET_CONTEXT_DMA_SEMAPHORE
+            s.semaphore_handle = m.value;
+            return;
+        case 0x1D6C:  // SET_SEMAPHORE_OFFSET
+            s.semaphore_offset = m.value;
+            return;
+        case 0x1D70: {  // BACK_END_WRITE_SEMAPHORE_RELEASE
+            const auto dma = dma_object(lookup_handle(s.semaphore_handle) & 0xFFFFu);
+            if (!dma.valid || s.semaphore_offset + 4 > dma.limit + 1) {
+                trace::log(trace::Cat::Gpu, "semaphore release with no object (handle {:08x})", s.semaphore_handle);
+                return;
+            }
+            bus_.write_ram(dma.base + s.semaphore_offset, &m.value, 4);
+            ++semaphore_releases_;
+            trace::log(trace::Cat::Gpu, "semaphore release: {:08x} -> {:08x}", m.value, dma.base + s.semaphore_offset);
+            return;
+        }
+        default:
+            return;
+    }
+}
+
+void Nv2aStub::run_pusher() {
+    if (!(reg(kCache1DmaPush) & 1u)) return;
+    const u32 put = reg(kCache1DmaPut);
+    u32 get = reg(kCache1DmaGet);
+    if (get == put) return;
+    const auto dma = dma_object(reg(kCache1DmaInstance) & 0xFFFFu);
+    if (!dma.valid) {
+        trace::log(trace::Cat::Gpu, "pusher: no DMA object bound (instance {:04x})", reg(kCache1DmaInstance));
+        return;
+    }
+    get = walker_.run(dma, get, put);
+    regs_[kCache1DmaGet] = get;
+}
+
 u32 Nv2aStub::mmio_read(PhysAddr addr, unsigned size) {
     const u32 off = addr - mapped_at_;
     const u32 key = off & ~3u;
+    if (off == kPrmcioInputStatus1 && size == 1) {
+        // Bit 3: vertical retrace in progress; bit 0: display inactive (blanking).
+        const bool vr = in_vertical_retrace();
+        ++reads_;
+        return vr ? 0x09u : 0x00u;
+    }
     u32 word;
     switch (key) {
         case kPtimerTime0: word = static_cast<u32>((ptimer_ticks() & 0x7FFFFFFu) << 5); break;
         case kPtimerTime1: word = static_cast<u32>((ptimer_ticks() >> 27) & 0x1FFFFFFFu); break;
+        case kUser + 0x40: word = reg(kCache1DmaPut); break;
+        case kUser + 0x44: word = reg(kCache1DmaGet); break;
+        // The cache is always drained here: LOW_MARK (empty) set, HIGH_MARK (full) clear.
+        case kCache1Status: word = 0x10; break;
+        case kPfifoRunoutStatus: word = 0x10; break;  // runout buffer empty
+        // DMA pusher: access bit as written, state idle, buffer empty.
+        case kCache1DmaPush: word = (reg(key) & 1u) | 0x100u; break;
         default: word = reg(key); break;
     }
     const unsigned shift = 8u * (off & 3u);
@@ -104,17 +239,32 @@ void Nv2aStub::mmio_write(PhysAddr addr, unsigned size, u32 value) {
             return;
         case kPcrtcIntr0:
         case kPtimerIntr0:
-            regs_[key] &= ~word;  // write one to clear
+        case kPfifoIntr0:
+        case kPgraphIntr:
+        case kPvideoIntr:
+            regs_[key] &= ~word;  // interrupt status: write one to clear
             update_irq();
             return;
         case kPcrtcIntrEn0:
         case kPtimerIntrEn0:
+        case kPfifoIntrEn0:
+        case kPgraphIntrEn:
+        case kPvideoIntrEn:
         case kPmcIntrEn0:
             regs_[key] = word;
             update_irq();
             return;
         case kPmcIntr0:
             return;  // read-only aggregate
+        case kUser + 0x40:  // channel 0 DMA_PUT through the USER window
+        case kCache1DmaPut:
+            regs_[kCache1DmaPut] = word;
+            run_pusher();
+            return;
+        case kCache1DmaPush:
+            regs_[key] = word;
+            run_pusher();
+            return;
         default:
             regs_[key] = word;
             return;

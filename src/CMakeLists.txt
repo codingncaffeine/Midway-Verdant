@@ -20,6 +20,7 @@ add_library(mvcore STATIC
   mcpx/pit.cpp
   mcpx/rtc.cpp
   nv2a/nv2a_stub.cpp
+  nv2a/pushbuffer.cpp
   pci/pci.cpp
   smbus/smbus.cpp
   smbus/smc.cpp

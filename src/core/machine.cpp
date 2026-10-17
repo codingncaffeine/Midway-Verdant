@@ -34,6 +34,7 @@ Machine::Machine(const MachineConfig& config)
       ide_(bus_, sched_, [this](bool level) { pic_.set_irq(14, level); }) {
     trace::set_clock_source(&trace_now_);
     smc_.set_av_pack(config.av_pack);
+    smc_.set_scratch(config.smc_scratch);
     if (config.rtc_base_time) rtc_.set_base_time(*config.rtc_base_time);
 
     // The PCI functions of a retail console (bus 0 is the MCPX; the AGP bridge leads to bus 1 and the GPU).

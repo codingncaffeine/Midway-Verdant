@@ -6,6 +6,7 @@
 #include "core/clock.h"
 #include "core/scheduler.h"
 #include "debug/trace.h"
+#include "nv2a/pushbuffer.h"
 #include "pci/pci.h"
 
 namespace mv {
@@ -24,6 +25,13 @@ public:
                          kPtimerDenominator = 0x009210, kPtimerTime0 = 0x009400, kPtimerTime1 = 0x009410, kPtimerAlarm0 = 0x009420;
     static constexpr u32 kPfbWbc = 0x100410;
     static constexpr u32 kPcrtcIntr0 = 0x600100, kPcrtcIntrEn0 = 0x600140, kPcrtcStart = 0x600800;
+    static constexpr u32 kPfifoIntr0 = 0x002100, kPfifoIntrEn0 = 0x002140, kPgraphIntr = 0x400100, kPgraphIntrEn = 0x400140,
+                         kPvideoIntr = 0x008100, kPvideoIntrEn = 0x008140;
+    static constexpr u32 kPfifoRamht = 0x002210, kPfifoRamfc = 0x002214;
+    static constexpr u32 kPfifoRunoutStatus = 0x002400, kCache1Status = 0x003214, kCache1DmaPush = 0x003220, kCache1DmaInstance = 0x00322C, kCache1DmaPut = 0x003240,
+                         kCache1DmaGet = 0x003244;
+    static constexpr u32 kPramin = 0x700000, kUser = 0x800000;
+    static constexpr u32 kPrmcioInputStatus1 = 0x6013DA;  // the VGA input status register: retrace bits
     static constexpr u32 kPmcIntrPfifo = 1u << 8, kPmcIntrPgraph = 1u << 12, kPmcIntrPtimer = 1u << 20, kPmcIntrPcrtc = 1u << 24;
 
     Nv2aStub(Bus& bus, Scheduler& sched, std::function<void(bool)> irq);
@@ -37,14 +45,26 @@ public:
     u64 writes() const { return writes_; }
     u64 vblanks() const { return vblanks_; }
     u32 framebuffer_start() const { return reg(kPcrtcStart); }
+    const PushbufferWalker& pushbuffer() const { return walker_; }
+    // Objects bound to the channel's eight subchannels (class numbers, 0 = none).
+    std::array<u32, 8> bound_classes() const { return bound_; }
+    u32 ramin32(u32 offset) const { return reg(kPramin + offset); }
+
+    // RAMHT lookup: the context word for a handle on channel 0, or 0.
+    u32 lookup_handle(u32 handle) const;
+    PushbufferWalker::DmaObject dma_object(u32 instance) const;
 
 protected:
     void on_bar_changed(int index, u32 old_base, u32 new_base) override;
 
 private:
     u64 ptimer_ticks() const;
+    Cycles frame_period() const;
+    bool in_vertical_retrace() const;
     void update_irq();
     void schedule_vblank();
+    void run_pusher();
+    void on_method(const PushbufferMethod& m);
 
     Bus& bus_;
     Scheduler& sched_;
@@ -54,6 +74,21 @@ private:
     u64 reads_{0}, writes_{0}, vblanks_{0};
     bool irq_level_{false};
     TimerEvent vblank_;
+    PushbufferWalker walker_;
+    std::array<u32, 8> bound_{};
+    std::array<u32, 8> bound_handles_{};
+    u64 method_log_lines_{0};
+    // The synchronisation state the CPU side observes: per subchannel, the notifier and semaphore DMA objects.
+    struct SyncState {
+        u32 notifier_handle{0};
+        u32 semaphore_handle{0};
+        u32 semaphore_offset{0};
+    };
+    std::array<SyncState, 8> sync_{};
+    u64 semaphore_releases_{0}, notifies_{0};
+public:
+    u64 semaphore_releases() const { return semaphore_releases_; }
+    u64 notifies() const { return notifies_; }
 };
 
 // A PCI function that exists for the bus scan and stores its configuration, with its regions unmapped: the

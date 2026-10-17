@@ -38,6 +38,8 @@ struct MachineConfig {
     std::size_t ram_bytes{64u * 1024 * 1024};
     Smc::Revision smc_revision{Smc::Revision::P01};
     Smc::AvPack av_pack{Smc::AvPack::Hdtv};
+    // The SMC scratch register the kernel reads at boot (bit 2 asks for the short animation, bit 3 for the dashboard).
+    u8 smc_scratch{0};
     std::optional<i64> rtc_base_time;  // unix seconds; unset = host clock
 };
 

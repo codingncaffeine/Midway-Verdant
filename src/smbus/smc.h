@@ -37,6 +37,7 @@ public:
     u8 led_sequence() const { return regs_[kRegLedSequence]; }
     u8 fan_speed() const { return regs_[kRegFanSpeed]; }
     u8 scratch() const { return regs_[kRegScratch]; }
+    void set_scratch(u8 v) { regs_[kRegScratch] = v; }
     bool challenge_answered() const { return response_written_ == 2; }
     u16 response() const { return static_cast<u16>(regs_[kRegResponse0] | (regs_[kRegResponse0 + 1] << 8)); }
 
