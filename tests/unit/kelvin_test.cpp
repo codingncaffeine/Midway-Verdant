@@ -75,6 +75,14 @@ TEST(Kelvin, ProgramAndConstantLoadsAutoIncrement) {
     EXPECT_EQ(k.state().constants[0x60][1], bits(1.0f));
     EXPECT_EQ(k.state().constants[0x61][3], bits(7.0f));
     EXPECT_EQ(k.state().constant_load, 0x62u);
+    // The viewport registers land in the constant file where the XDK's programs read them.
+    k.method(mthd::kViewportScale + 4, bits(-128.0f));
+    k.method(mthd::kViewportOffset, bits(128.5f));
+    k.method(0x0440 + 4 * 5, bits(7.0f));  // projection matrix row 1, column 1
+    EXPECT_EQ(k.state().constants[58][1], bits(-128.0f));
+    EXPECT_EQ(k.state().constants[59][0], bits(128.5f));
+    EXPECT_EQ(k.state().constants[5][1], bits(7.0f));
+    EXPECT_EQ(k.state().reg(mthd::kViewportOffset), bits(128.5f)) << "and stay readable as registers";
 }
 
 TEST(Kelvin, IndexedDrawFetchesArraysFromMemory) {

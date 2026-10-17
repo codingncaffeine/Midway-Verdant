@@ -21,6 +21,33 @@ float s16_norm(u32 half) {
 
 float s16_plain(u32 half) { return static_cast<float>(static_cast<i16>(half & 0xFFFFu)); }
 
+// The fixed-function registers that alias the vertex constant file: method -> (constant slot * 4 + component).
+// Slots per the public XF context table: composite matrix 0, projection 4, model-view i at 8 + 8i with its inverse
+// at 12 + 8i, lights 0x28.., eye position 0x38, fog 0x39, viewport scale 0x3A, offset 0x3B, texgen planes of
+// texture i at 0x40 + 8i, texture matrix i at 0x44 + 8i.
+bool xf_context_slot(u32 method, u32& slot_word) {
+    auto range = [&](u32 base, u32 words, u32 slot) {
+        if (method >= base && method < base + words * 4) {
+            slot_word = slot * 4 + ((method - base) >> 2);
+            return true;
+        }
+        return false;
+    };
+    if (range(0x0680, 16, 0x00)) return true;   // composite matrix
+    if (range(0x0440, 16, 0x04)) return true;   // projection matrix
+    for (u32 i = 0; i < 4; ++i) {
+        if (range(0x0480 + 0x40 * i, 16, 0x08 + 8 * i)) return true;  // model-view i
+        if (range(0x0580 + 0x40 * i, 16, 0x0C + 8 * i)) return true;  // inverse model-view i
+        if (range(0x0840 + 0x40 * i, 16, 0x40 + 8 * i)) return true;  // texgen planes S T R Q of texture i
+        if (range(0x06C0 + 0x40 * i, 16, 0x44 + 8 * i)) return true;  // texture matrix i
+    }
+    if (range(0x0A50, 4, 0x38)) return true;    // eye position
+    if (range(0x09C0, 3, 0x39)) return true;    // fog parameters
+    if (range(0x0AF0, 4, 0x3A)) return true;    // viewport scale
+    if (range(0x0A20, 4, 0x3B)) return true;    // viewport offset
+    return false;
+}
+
 // Immediate-mode attribute numbers (the XDK's vertex declaration order).
 constexpr u32 kAttrPosition = 0, kAttrNormal = 2, kAttrDiffuse = 3, kAttrSpecular = 4, kAttrTexcoord0 = 9;
 
@@ -93,6 +120,12 @@ void Kelvin::method(u32 method, u32 value) {
             state_.constant_word = 0;
             ++state_.constant_load;
         }
+        return;
+    }
+    // The fixed-function transform registers live in the constant file too (the "XF context"): a program can read
+    // the viewport scale and offset as c[58] and c[59], the matrices from slot 0 on, and the XDK's programs do.
+    if (u32 slot_word; xf_context_slot(method, slot_word)) {
+        state_.constants[slot_word >> 2][slot_word & 3u] = value;
         return;
     }
     if (method >= mthd::kVertexDataArrayFormat && method < mthd::kVertexDataArrayFormat + 0x40) {
