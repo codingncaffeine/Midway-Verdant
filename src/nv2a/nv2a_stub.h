@@ -113,6 +113,17 @@ public:
     // Bits of `offset` (a byte offset; the mask is in that byte's position) that clear as soon as they are
     // written: command bits hardware finishes at once at this level of modelling.
     void set_self_clearing(u32 offset, u32 mask) { self_clearing_[offset & ~3u] |= mask << (8u * (offset & 3u)); }
+    // An interrupt status register (write one to clear) and its enable register; the line follows status & enable.
+    void set_interrupt_pair(u32 status_offset, u32 enable_offset, std::function<void(bool)> irq) {
+        intr_status_ = status_offset;
+        intr_enable_ = enable_offset;
+        irq_ = std::move(irq);
+    }
+    // Raise status bits from a device-side event.
+    void raise(u32 bits);
+    // Some status registers clear on read instead of on write.
+    void set_status_read_clears(bool on) { status_read_clears_ = on; }
+    bool irq_level() const { return irq_level_; }
     u32 reg(u32 offset) const;
     u64 reads() const { return reads_; }
     u64 writes() const { return writes_; }
@@ -130,6 +141,12 @@ private:
     std::unordered_map<u32, u32> fixed_;
     std::unordered_map<u32, u32> self_clearing_;
     u64 reads_{0}, writes_{0};
+    u32 intr_status_{0xFFFFFFFF}, intr_enable_{0xFFFFFFFF};
+    std::function<void(bool)> irq_;
+    bool irq_level_{false};
+    u32 previous_status_{0};
+    bool status_read_clears_{false};
+    void update_irq();
 };
 
 }  // namespace mv

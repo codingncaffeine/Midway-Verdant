@@ -40,6 +40,9 @@ struct MachineConfig {
     Smc::AvPack av_pack{Smc::AvPack::Hdtv};
     // The SMC scratch register the kernel reads at boot (bit 2 asks for the short animation, bit 3 for the dashboard).
     u8 smc_scratch{0};
+    // Development probe: APU interrupt status bits raised every audio frame (1500 Hz); 0 = none.
+    u32 apu_probe_irq_bits{0};
+    bool apu_probe_read_clears{false};
     std::optional<i64> rtc_base_time;  // unix seconds; unset = host clock
 };
 
@@ -139,6 +142,10 @@ private:
     std::string power_off_reason_;
     Milestones milestones_;
     bool eeprom_generated_{false};
+    TimerEvent apu_frame_;
+    u64 apu_frames_{0};
+public:
+    u64 apu_frames() const { return apu_frames_; }
 };
 
 }  // namespace mv

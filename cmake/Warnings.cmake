@@ -4,6 +4,7 @@ add_library(mv_warnings INTERFACE)
 if(MSVC)
   # Warnings from the standard library and other external headers are not ours to fix.
   target_compile_options(mv_warnings INTERFACE /W4 /permissive- /utf-8 /EHsc /Zc:preprocessor /external:anglebrackets /external:W0)
+  target_compile_definitions(mv_warnings INTERFACE _CRT_SECURE_NO_WARNINGS NOMINMAX)
   if(MV_WERROR)
     target_compile_options(mv_warnings INTERFACE /WX)
   endif()

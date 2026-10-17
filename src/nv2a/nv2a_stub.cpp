@@ -300,12 +300,17 @@ u32 RegisterStoreDevice::mmio_read(PhysAddr addr, unsigned size) {
     const u32 v = size == 4 ? word : (size == 2 ? ((word >> shift) & 0xFFFFu) : ((word >> shift) & 0xFFu));
     ++reads_;
     trace::log(category_, "{} read  +{:05x} size {} -> {:08x}", PciDevice::name(), off, size, v);
+    if (status_read_clears_ && (off & ~3u) == intr_status_) {
+        regs_[intr_status_] = 0;
+        update_irq();
+    }
     return v;
 }
 
 void RegisterStoreDevice::mmio_write(PhysAddr addr, unsigned size, u32 value) {
     const u32 off = addr - mapped_at_;
     const u32 key = off & ~3u;
+    if (key == intr_status_) previous_status_ = reg(key);
     if (size == 4) {
         regs_[key] = value;
     } else {
@@ -314,8 +319,32 @@ void RegisterStoreDevice::mmio_write(PhysAddr addr, unsigned size, u32 value) {
         regs_[key] = (reg(key) & ~mask) | ((value << shift) & mask);
     }
     if (auto sc = self_clearing_.find(key); sc != self_clearing_.end()) regs_[key] &= ~sc->second;
+    if (key == intr_status_) {
+        // Interrupt status is write-one-to-clear: the store above is undone and the written bits are cleared.
+        const u32 written = (size == 4) ? value : ((value & ((size == 2) ? 0xFFFFu : 0xFFu)) << (8u * (off & 3u)));
+        regs_[key] = previous_status_ & ~written;
+        update_irq();
+    }
+    if (key == intr_enable_) update_irq();
     ++writes_;
     trace::log(category_, "{} write +{:05x} size {} <- {:08x}", PciDevice::name(), off, size, value);
+}
+
+void RegisterStoreDevice::raise(u32 bits) {
+    if (intr_status_ == 0xFFFFFFFF) return;
+    regs_[intr_status_] |= bits;
+    previous_status_ = regs_[intr_status_];
+    update_irq();
+}
+
+void RegisterStoreDevice::update_irq() {
+    if (intr_status_ == 0xFFFFFFFF) return;
+    previous_status_ = regs_[intr_status_];
+    const bool level = (regs_[intr_status_] & reg(intr_enable_)) != 0;
+    if (level != irq_level_) {
+        irq_level_ = level;
+        if (irq_) irq_(level);
+    }
 }
 
 }  // namespace mv

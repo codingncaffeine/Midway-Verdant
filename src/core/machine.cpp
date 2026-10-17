@@ -48,6 +48,19 @@ Machine::Machine(const MachineConfig& config)
     // the DSP model answers for real (Phase 6) [verify which bit it wants].
     apu_.set_fixed(0x20010, 0xFFFFFFFF);
     apu_.set_fixed(0x30010, 0xFFFFFFFF);
+    // The APU's interrupt: status at +0x1000 (write one to clear), enable at +0x1004, PCI line 5.
+    apu_.set_interrupt_pair(0x1000, 0x1004, [this](bool level) { pic_.set_irq(5, level); });
+    apu_.set_status_read_clears(config.apu_probe_read_clears);
+    // Probe: an audio frame tick at 1500 Hz raising every enabled status bit, to learn which the kernel services.
+    apu_frame_.name = "apu.frame";
+    apu_frame_.fire = [this](Cycles now) {
+        ++apu_frames_;
+        const u32 bits = config_.apu_probe_irq_bits & apu_.reg(0x1004);
+        if (bits) apu_.raise(bits);
+        const Cycles period = cycles_from_ticks(1, clk::kApuFramesPerSecond);
+        sched_.schedule(apu_frame_, (now / period + 1) * period);
+    };
+    sched_.schedule(apu_frame_, cycles_from_ticks(1, clk::kApuFramesPerSecond));
     pci_.add({0, 6, 0}, aci_);
     aci_.define_bar(0, PciDevice::BarKind::Io, 256);
     aci_.define_bar(1, PciDevice::BarKind::Io, 128);

@@ -24,6 +24,7 @@ void print_usage() {
         "  --hdd FILE         a raw hard-disk image (8 GiB retail layout); no drive without it\n"
         "  --hdd-unlocked     present the disk unlocked instead of locked with the EEPROM's key\n"
         "  --smc-scratch N    the SMC scratch flags the kernel reads at boot (4 = short animation, 8 = dashboard)\n"
+        "  --apu-irq-bits M   development probe: raise these APU interrupt status bits every audio frame\n"
         "  --seconds N        run for N seconds of host time (default 5)\n"
         "  --until EVENT      stop early at a milestone: rom-hidden, bootloader, kernel\n"
         "  --trace LIST       comma-separated: post,pci,smbus,mmio,pio,irq,flash,cpu,boot,timer,gpu,all\n"
@@ -81,6 +82,10 @@ int main(int argc, char** argv) {
             cfg.hdd_image = need("--hdd");
         } else if (a == "--hdd-unlocked") {
             cfg.hdd_locked = false;
+        } else if (a == "--apu-irq-read-clears") {
+            cfg.apu_probe_read_clears = true;
+        } else if (a == "--apu-irq-bits") {
+            cfg.apu_probe_irq_bits = static_cast<mv::u32>(std::strtoul(need("--apu-irq-bits"), nullptr, 0));
         } else if (a == "--smc-scratch") {
             cfg.smc_scratch = static_cast<mv::u8>(std::strtoul(need("--smc-scratch"), nullptr, 0));
         } else if (a == "--seconds") {
@@ -168,6 +173,7 @@ int main(int argc, char** argv) {
                 static_cast<unsigned long long>(machine.nv2a().writes()), static_cast<unsigned long long>(machine.nv2a().vblanks()),
                 static_cast<unsigned long long>(machine.apu().reads()), static_cast<unsigned long long>(machine.apu().writes()),
                 static_cast<unsigned long long>(machine.aci().reads()), static_cast<unsigned long long>(machine.aci().writes()));
+    std::printf("apu frames %llu; apu irq %s\n", static_cast<unsigned long long>(machine.apu_frames()), machine.apu().irq_level() ? "high" : "low");
     std::printf("gpu fifo: %llu methods, %llu semaphore releases, %llu notifies%s\n",
                 static_cast<unsigned long long>(machine.nv2a().pushbuffer().methods_seen()),
                 static_cast<unsigned long long>(machine.nv2a().semaphore_releases()), static_cast<unsigned long long>(machine.nv2a().notifies()),
