@@ -32,6 +32,7 @@ bool Replay::run(Kelvin& kelvin, Observer* observer, std::string& error, u32 unt
     while (reader_.next(rec)) {
         switch (rec.type) {
             case capture::Rec::Pages: {
+                if (page_observer_) page_observer_(rec.first_page, rec.page_count);
                 const std::size_t off = static_cast<std::size_t>(rec.first_page) * capture::kPageSize;
                 const std::size_t len = static_cast<std::size_t>(rec.page_count) * capture::kPageSize;
                 if (off + len <= ram_.size()) std::memcpy(ram_.data() + off, rec.page_data, len);

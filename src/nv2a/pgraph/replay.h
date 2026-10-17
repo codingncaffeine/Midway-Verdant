@@ -1,5 +1,6 @@
 #pragma once
 #include <filesystem>
+#include <functional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -38,6 +39,9 @@ public:
     bool run(Kelvin& kelvin, Observer* observer, std::string& error, u32 until_frame = 0);
 
     MemoryView memory() const { return {ram_.data(), static_cast<u32>(ram_.size())}; }
+    u8* mutable_ram() { return ram_.data(); }
+    // Called with every page record before it lands in RAM (first page, count).
+    void set_page_observer(std::function<void(u32, u32)> f) { page_observer_ = std::move(f); }
     DmaObject resolve(u32 handle) const override;
     u32 frames() const { return frames_; }
     u32 scanout_start() const { return scanout_start_; }
@@ -50,6 +54,7 @@ private:
     u32 frames_{0};
     u32 scanout_start_{0};
     u64 methods_{0};
+    std::function<void(u32, u32)> page_observer_;
 };
 
 }  // namespace mv::pgraph

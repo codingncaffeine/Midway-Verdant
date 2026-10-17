@@ -17,6 +17,7 @@ option(MV_BUILD_TESTS "Build the test suite" ON)
 
 include(cmake/Warnings.cmake)
 include(cmake/Shaders.cmake)
+include(cmake/Vulkan.cmake)
 
 if(MV_SANITIZE)
   if(MSVC)

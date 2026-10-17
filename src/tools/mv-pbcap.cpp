@@ -5,6 +5,9 @@
 //   mv-pbcap methods FILE        every method as "class method value", one per line (diffs against traces)
 //   mv-pbcap replay FILE [N]     run the Kelvin state machine over the capture (N frames, default all): draws, vertices,
 //                                primitives, texture and surface formats per frame, fetch errors
+//   mv-pbcap shaders FILE FRAME DRAW  print the state, the vertex program listing and both GLSL shaders of one draw
+//   mv-pbcap render FILE DIR [N] render N frames (default all) through the Vulkan backend; every surface a frame touched
+//                                goes to DIR as frameNN_ADDRESS.png, and the scanout surface as frameNN_scanout.png
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
@@ -17,6 +20,13 @@
 #include "nv2a/capture.h"
 #include "nv2a/pgraph/kelvin.h"
 #include "nv2a/pgraph/replay.h"
+#include "nv2a/vulkan/vk_device.h"
+#include "nv2a/vulkan/vk_renderer.h"
+#include "nv2a/shaders/psh_translate.h"
+#include "nv2a/shaders/vsh_translate.h"
+#include "nv2a/pgraph/texture.h"
+#include "debug/png.h"
+#include <filesystem>
 #include <set>
 
 namespace {
@@ -219,16 +229,138 @@ int replay(const char* path, mv::u32 frames) {
     return 0;
 }
 
+struct ShaderDumpSink : mv::pgraph::RenderSink {
+    const mv::pgraph::Replay* replay{nullptr};
+    mv::u32 want_frame{0}, want_draw{0}, frame{0}, n{0};
+    bool done{false};
+    void clear(const mv::pgraph::KelvinState&, mv::u32) override {}
+    void semaphore_release(const mv::pgraph::KelvinState&, mv::u32) override { ++frame; n = 0; }
+    void draw(const mv::pgraph::KelvinState& s, const mv::pgraph::DrawBatch&) override {
+        if (frame != want_frame || n++ != want_draw || done) return;
+        done = true;
+        using namespace mv::pgraph;
+        const SurfaceState d = s.surface();
+        std::printf("surface %08x format %08x %ux%u; alpha test %d func %x ref %x; blend %d %x/%x eq %x; depth test %d func %x write %d; cull %d; color mask %08x; shade %x\n",
+                    d.color_offset, d.format, d.clip_width(), d.clip_height(), s.alpha_test(), s.reg(mthd::kAlphaFunc), s.reg(mthd::kAlphaRef), s.blend(),
+                    s.reg(mthd::kBlendSfactor), s.reg(mthd::kBlendDfactor), s.reg(mthd::kBlendEquation), s.depth_test(), s.reg(mthd::kDepthFunc), s.depth_write(),
+                    s.cull_face(), s.color_mask(), s.reg(mthd::kShadeModel));
+        for (mv::u32 t = 0; t < 4; ++t) {
+            const TextureStage ts = s.texture(t);
+            const DmaObject dma = replay->resolve(s.dma_handle(ts.dma_select() == 2 ? mthd::kDmaB : mthd::kDmaA));
+            std::printf("texture %u: mode %u enabled %d format %08x (colour %02x dim %u cube %d levels %u %ux%u rect %ux%u pitch %u) at %08x filter %08x address %08x\n", t,
+                        s.shader_stage_program(t), ts.enabled(), ts.format, ts.color_format(), ts.dimensionality(), ts.cubemap(), ts.mip_levels(), 1u << ts.log_width(),
+                        1u << ts.log_height(), ts.rect_width(), ts.rect_height(), ts.pitch(), dma.base + ts.offset, ts.filter, ts.address);
+        }
+        std::printf("combiner control %08x; stage programs %08x; other stage input %08x\n", s.reg(mthd::kCombinerControl), s.reg(mthd::kShaderStageProgram), s.reg(mthd::kShaderOtherStageInput));
+        for (mv::u32 i = 0; i < 8; ++i)
+            std::printf("stage %u: colour icw %08x ocw %08x alpha icw %08x ocw %08x factor0 %08x factor1 %08x\n", i, s.reg(mthd::kCombinerColorIcw + 4 * i),
+                        s.reg(mthd::kCombinerColorOcw + 4 * i), s.reg(mthd::kCombinerAlphaIcw + 4 * i), s.reg(mthd::kCombinerAlphaOcw + 4 * i),
+                        s.reg(mthd::kCombinerFactor0 + 4 * i), s.reg(mthd::kCombinerFactor1 + 4 * i));
+        std::printf("final: cw0 %08x cw1 %08x; specular fog factors %08x %08x\n", s.reg(mthd::kCombinerSpecFogCw0), s.reg(mthd::kCombinerSpecFogCw1), s.reg(0x1E20), s.reg(0x1E24));
+        const vsh::Program p = vsh::extract_program(s);
+        const vsh::Translation vt = vsh::translate(p, vsh::Options{});
+        std::printf("---- vertex program (%zu instructions)\n", p.instructions.size());
+        for (const auto& line : vt.disassembly) std::printf("  %s\n", line.c_str());
+        std::printf("---- vertex shader GLSL\n%s", vt.glsl.c_str());
+        const psh::Translation pt = psh::translate(psh::key_from_state(s));
+        std::printf("---- fragment shader GLSL%s\n%s", pt.error.empty() ? "" : (" (ERROR: " + pt.error + ")").c_str(), pt.glsl.c_str());
+    }
+};
+
+int shaders(const char* path, mv::u32 frame, mv::u32 draw_index) {
+    mv::pgraph::Replay r;
+    std::string error;
+    if (!r.open(path, error)) {
+        std::fprintf(stderr, "mv-pbcap: %s\n", error.c_str());
+        return 1;
+    }
+    mv::pgraph::Kelvin kelvin;
+    ShaderDumpSink sink;
+    sink.replay = &r;
+    sink.want_frame = frame;
+    sink.want_draw = draw_index;
+    kelvin.set_sink(&sink);
+    r.run(kelvin, nullptr, error, frame + 1);
+    if (!sink.done) std::printf("no draw %u in frame %u\n", draw_index, frame);
+    return 0;
+}
+
+struct RenderObserver : mv::pgraph::Replay::Observer {
+    mv::pgraph::VulkanRenderer* renderer{nullptr};
+    std::filesystem::path dir;
+    const mv::pgraph::Replay* replay{nullptr};
+    mv::u32 scanout{0};
+    void register_write(mv::u32 offset, mv::u32 value) override {
+        if (offset == 0x600800) scanout = value;
+    }
+    void frame_end(mv::u32 index, mv::u32) override {
+        renderer->end_frame();
+        std::string error;
+        for (const auto& s : renderer->surfaces()) {
+            std::printf("   surface %08x %ux%u %s format %x: %llu draws, %llu clears%s\n", s.phys, s.width, s.height, s.swizzled ? "swizzled" : "pitch",
+                        s.color_format, static_cast<unsigned long long>(s.draws_this_frame), static_cast<unsigned long long>(s.clears_this_frame),
+                        s.rendered_this_frame ? "" : " (untouched)");
+            if (!s.rendered_this_frame) continue;
+            std::vector<mv::u8> rgba;
+            if (!renderer->surface_rgba(s, rgba)) continue;
+            const auto path = dir / std::format("frame{:02}_{:08x}.png", index, s.phys);
+            if (!mv::png::write(path, s.width, s.height, rgba.data(), s.width * 4, error)) std::fprintf(stderr, "mv-pbcap: %s\n", error.c_str());
+            else std::printf("frame %u: %s (%ux%u, %s, format %x)\n", index, path.string().c_str(), s.width, s.height, s.swizzled ? "swizzled" : "pitch", s.color_format);
+        }
+        const auto& st = renderer->stats();
+        std::printf("frame %u: %llu draws, %llu clears, %llu skipped, %llu pipelines, %llu shaders, %llu textures, %llu write-backs\n", index,
+                    static_cast<unsigned long long>(st.draws), static_cast<unsigned long long>(st.clears), static_cast<unsigned long long>(st.skipped),
+                    static_cast<unsigned long long>(st.pipelines), static_cast<unsigned long long>(st.shaders),
+                    static_cast<unsigned long long>(st.textures_decoded), static_cast<unsigned long long>(st.writebacks));
+    }
+};
+
+int render(const char* path, const char* dir, mv::u32 frames) {
+    mv::vk::Device device;
+    std::string error;
+    if (!device.init(error)) {
+        std::fprintf(stderr, "mv-pbcap: %s\n", error.c_str());
+        return 1;
+    }
+    std::printf("vulkan device: %s\n", device.name().c_str());
+    mv::pgraph::Replay r;
+    if (!r.open(path, error)) {
+        std::fprintf(stderr, "mv-pbcap: %s\n", error.c_str());
+        return 1;
+    }
+    std::filesystem::create_directories(dir);
+    mv::pgraph::VulkanRenderer renderer(device, r, r.mutable_ram(), r.memory().size);
+    if (!renderer.init(error)) {
+        std::fprintf(stderr, "mv-pbcap: renderer: %s\n", error.c_str());
+        return 1;
+    }
+    mv::pgraph::Kelvin kelvin;
+    kelvin.set_sink(&renderer);
+    RenderObserver observer;
+    observer.renderer = &renderer;
+    observer.dir = dir;
+    observer.replay = &r;
+    r.set_page_observer([&](mv::u32 first_page, mv::u32 count) { renderer.invalidate(first_page * 4096, count * 4096); });
+    if (!r.run(kelvin, &observer, error, frames)) {
+        std::fprintf(stderr, "mv-pbcap: %s\n", error.c_str());
+        return 1;
+    }
+    for (const auto& e : renderer.stats().errors) std::printf("renderer note: %s\n", e.c_str());
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
     if (argc < 3) {
-        std::fprintf(stderr, "usage: mv-pbcap summary|methods|replay FILE [FRAMES]\n");
+        std::fprintf(stderr, "usage: mv-pbcap summary|methods|replay FILE [FRAMES] | render FILE DIR [FRAMES]\n");
         return 2;
     }
     if (std::strcmp(argv[1], "summary") == 0) return summary(argv[2]);
     if (std::strcmp(argv[1], "methods") == 0) return methods(argv[2]);
     if (std::strcmp(argv[1], "replay") == 0) return replay(argv[2], argc > 3 ? static_cast<mv::u32>(std::atoi(argv[3])) : 0u);
+    if (std::strcmp(argv[1], "shaders") == 0 && argc >= 5) return shaders(argv[2], static_cast<mv::u32>(std::atoi(argv[3])), static_cast<mv::u32>(std::atoi(argv[4])));
+    if (std::strcmp(argv[1], "render") == 0 && argc >= 4) return render(argv[2], argv[3], argc > 4 ? static_cast<mv::u32>(std::atoi(argv[4])) : 0u);
     std::fprintf(stderr, "mv-pbcap: unknown command %s\n", argv[1]);
     return 2;
 }
