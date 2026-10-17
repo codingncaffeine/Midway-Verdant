@@ -1,0 +1,44 @@
+# Local-only notes, plans, reference material and work files (house rule: plans stay local)
+/local-notes/
+/reference/
+/scratch/
+/snapshots/
+/gitignore/
+
+# Proprietary material is never committed: ROMs, BIOS images, kernels, EEPROMs, disc and disk images, executables
+*.bin
+*.rom
+*.iso
+*.xiso
+*.xbe
+*.qcow2
+*.img
+*.raw
+eeprom*
+mcpx*
+bios/
+roms/
+
+# Build output
+/build*/
+/out/
+CMakeUserPresets.json
+compile_commands.json
+.cache/
+*.o
+*.obj
+*.a
+*.so
+*.dll
+*.exe
+
+# Editors
+.vs/
+.vscode/
+.idea/
+*.swp
+*.user
+
+# Release artifacts
+/packaging/out/
+/packaging/out-old/
