@@ -32,6 +32,7 @@ void print_usage() {
         "  --dump-ram FILE    write the guest RAM to FILE when the run ends\n"
         "  --capture FILE     write a pushbuffer capture (GPU methods, RAM pages, objects) for offline replay\n"
         "  --watch HEX,...    log every change of these physical RAM words (polled each tick) under the boot trace\n"
+        "  --break-smbus AA:CC  log the CPU registers and stack (boot trace) when SMBus address AA gets command CC written\n"
         "  --version, --help\n");
 }
 
@@ -118,6 +119,15 @@ int main(int argc, char** argv) {
                 if (comma == std::string::npos) break;
                 pos = comma + 1;
             }
+        } else if (a == "--break-smbus") {
+            const std::string spec = need("--break-smbus");
+            const auto colon = spec.find(':');
+            if (colon == std::string::npos) {
+                std::fprintf(stderr, "midway-verdant: --break-smbus wants AA:CC (hex)\n");
+                return 2;
+            }
+            cfg.break_smbus_write = std::make_pair(static_cast<mv::u8>(std::strtoul(spec.substr(0, colon).c_str(), nullptr, 16)),
+                                                   static_cast<mv::u8>(std::strtoul(spec.substr(colon + 1).c_str(), nullptr, 16)));
         } else if (a == "--rtc-time") {
             cfg.rtc_base_time = std::atoll(need("--rtc-time"));
         } else {
@@ -177,11 +187,12 @@ int main(int argc, char** argv) {
             if (stats.by_vector[v]) std::printf(" %02x×%llu", v, static_cast<unsigned long long>(stats.by_vector[v]));
         std::printf("\n");
     }
-    std::printf("smbus transactions: %llu; gpu register reads %llu writes %llu, vblanks %llu; apu r/w %llu/%llu; aci r/w %llu/%llu\n",
+    std::printf("smbus transactions: %llu; gpu register reads %llu writes %llu, vblanks %llu, scanout %08x; apu r/w %llu/%llu; aci r/w %llu/%llu\n",
                 static_cast<unsigned long long>(machine.smbus().transactions()), static_cast<unsigned long long>(machine.nv2a().reads()),
                 static_cast<unsigned long long>(machine.nv2a().writes()), static_cast<unsigned long long>(machine.nv2a().vblanks()),
-                static_cast<unsigned long long>(machine.apu().reads()), static_cast<unsigned long long>(machine.apu().writes()),
-                static_cast<unsigned long long>(machine.aci().reads()), static_cast<unsigned long long>(machine.aci().writes()));
+                machine.nv2a().framebuffer_start(), static_cast<unsigned long long>(machine.apu().reads()),
+                static_cast<unsigned long long>(machine.apu().writes()), static_cast<unsigned long long>(machine.aci().reads()),
+                static_cast<unsigned long long>(machine.aci().writes()));
     {
         auto& gp = machine.apu().gp();
         const auto& st = machine.apu().gp_stats();

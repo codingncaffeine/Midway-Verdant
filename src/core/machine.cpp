@@ -6,6 +6,7 @@
 #include <fstream>
 
 #include "core/clock.h"
+#include "debug/guest_stack.h"
 #include "debug/trace.h"
 #include "smbus/eeprom_image.h"
 
@@ -83,6 +84,15 @@ Machine::Machine(const MachineConfig& config)
         else if (bits & Smc::kResetBitReset) request_power_off("SMC reset request (reboot not modelled yet)");
     });
     flash_.add_on_rom_hidden([this] { milestones_.rom_hidden = sched_.now(); });
+    if (config_.break_smbus_write) {
+        smbus_.set_cycle_hook([this](const SmbusController::Transaction& t) {
+            if (t.read || t.address7 != config_.break_smbus_write->first || t.command != config_.break_smbus_write->second) return;
+            CpuBackend::Regs r{};
+            if (cpu_ && cpu_->read_regs(r))
+                trace::log(trace::Cat::Boot, "break: smbus {:02x} cmd {:02x} write {:04x}\n{}", t.address7, t.command, t.data,
+                           debug::describe_stack(bus_, r));
+        });
+    }
 }
 
 Machine::~Machine() {

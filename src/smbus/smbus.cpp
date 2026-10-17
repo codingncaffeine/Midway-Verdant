@@ -86,6 +86,7 @@ void SmbusController::start_cycle() {
     pending_.command = command_;
     pending_.data = data_;
     pending_.acked = false;
+    if (cycle_hook_) cycle_hook_(pending_);
     status_ = static_cast<u8>(status_ | kStatusBusy);
     // Bits on the wire: address+ack, command+ack, each data byte+ack, at 100 kHz.
     unsigned bytes = 1;

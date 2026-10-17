@@ -48,6 +48,9 @@ struct MachineConfig {
     std::optional<std::filesystem::path> capture_path;
     // Instrument: physical RAM words the io thread polls every tick, logging each change with its guest time.
     std::vector<PhysAddr> watch;
+    // Instrument: when software writes this SMBus (7-bit address, command) pair, log the CPU's registers and
+    // stack under the boot trace — the call chain behind a device write.
+    std::optional<std::pair<u8, u8>> break_smbus_write;
 };
 
 // The console: every device on one bus and one timeline, a CPU backend running the firmware against them, and

@@ -10,6 +10,7 @@ add_library(mvcore STATIC
   crypto/sha1.cpp
   cpu/kvm/kvm_backend.cpp
   debug/trace.cpp
+  debug/guest_stack.cpp
   flash/flash.cpp
   ide/ide.cpp
   ide/ata_disk.cpp

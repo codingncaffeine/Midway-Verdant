@@ -59,6 +59,9 @@ public:
     };
     const std::vector<Transaction>& log() const { return log_; }
     u64 transactions() const { return count_; }
+    // Instrument: called on the CPU's thread the moment software starts a cycle, before it completes on the
+    // timeline — the caller's registers and stack are still those of the write.
+    void set_cycle_hook(std::function<void(const Transaction&)> hook) { cycle_hook_ = std::move(hook); }
 
 protected:
     void on_bar_changed(int index, u32 old_base, u32 new_base) override;
@@ -84,6 +87,7 @@ private:
     u16 pending_result_{0};
     std::vector<Transaction> log_;
     u64 count_{0};
+    std::function<void(const Transaction&)> cycle_hook_;
 };
 
 }  // namespace mv

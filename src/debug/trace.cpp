@@ -33,7 +33,12 @@ constexpr std::array<Name, 13> kNames{{{Cat::Post, "post"},
 
 void enable(u32 mask) { g_enabled = mask; }
 u32 enabled() { return g_enabled; }
-void set_sink(std::FILE* f) { g_sink = f ? f : stderr; }
+void set_sink(std::FILE* f) {
+    g_sink = f ? f : stderr;
+    // A file sink is fully buffered in large blocks: a write per line stalls the vCPU on every traced event and
+    // shifts the guest's timing between traced and untraced runs. The terminal sink stays line-flushed.
+    if (f) std::setvbuf(f, nullptr, _IOFBF, 4u << 20);
+}
 void set_clock_source(const Cycles* now) { g_now = now; }
 
 std::string_view name_of(Cat c) {
@@ -72,7 +77,7 @@ void emit(Cat c, std::string_view text) {
     const Cycles now = g_now ? *g_now : 0;
     std::fprintf(g_sink, "[%12llu] %-5.*s %.*s\n", static_cast<unsigned long long>(now),
                  static_cast<int>(name_of(c).size()), name_of(c).data(), static_cast<int>(text.size()), text.data());
-    std::fflush(g_sink);
+    if (g_sink == stderr) std::fflush(g_sink);
 }
 
 }  // namespace mv::trace
