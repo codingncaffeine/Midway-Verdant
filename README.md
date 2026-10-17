@@ -1,3 +1,5 @@
+<p align="center"><img src="assets/branding/banner.png" alt="Midway Verdant" width="768"></p>
+
 # Midway Verdant
 
 A clean-room, low-level emulator of the original Xbox for Linux (Windows to follow). The console's own boot ROM, BIOS and kernel run unmodified on an emulated machine: MCPX southbridge, NV2A graphics, the APU with its DSPs, IDE storage, USB controllers and the SMBus devices. Nothing in the firmware is patched or replaced with a high-level substitute. The goal is cycle accuracy, with a hardware-virtualised fast mode for play speed.

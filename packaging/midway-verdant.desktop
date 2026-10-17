@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Midway Verdant
+GenericName=Original Xbox Emulator
+Comment=Low-level, clean-room emulator of the original Xbox
+Exec=midway-verdant
+Icon=midway-verdant
+Terminal=false
+Categories=Game;Emulator;
+Keywords=xbox;emulator;
+StartupWMClass=midway-verdant
