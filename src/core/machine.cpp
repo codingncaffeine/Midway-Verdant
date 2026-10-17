@@ -29,8 +29,8 @@ Machine::Machine(const MachineConfig& config)
       adm1032_(),
       encoder_(VideoEncoder::Kind::Conexant),
       nv2a_(bus_, sched_, [this](bool level) { pic_.set_irq(3, level); }),
-      apu_(bus_, "apu", 0x01B0, 0x040100, 0xB1, 0, 512u * 1024, trace::Cat::Mmio),
-      aci_(bus_, "aci", 0x01B1, 0x040100, 0xB1, 2, 4096, trace::Cat::Mmio),
+      apu_(bus_, sched_, [this](bool level) { pic_.set_irq(5, level); }),
+      aci_(bus_, sched_, [this](bool level) { pic_.set_irq(6, level); }),
       ide_(bus_, sched_, [this](bool level) { pic_.set_irq(14, level); }) {
     trace::set_clock_source(&trace_now_);
     smc_.set_av_pack(config.av_pack);
@@ -42,34 +42,7 @@ Machine::Machine(const MachineConfig& config)
     pci_.add({0, 1, 1}, smbus_);
     pci_.add({1, 0, 0}, nv2a_);
     pci_.add({0, 5, 0}, apu_);
-    apu_.set_cfg8(0x3C, 5);
-    apu_.set_cfg8(0x3D, 1);
-    // The kernel polls the global processor's status word after each write to it; all ones lets it proceed until
-    // the DSP model answers for real (Phase 6) [verify which bit it wants].
-    apu_.set_fixed(0x20010, 0xFFFFFFFF);
-    apu_.set_fixed(0x30010, 0xFFFFFFFF);
-    // The APU's interrupt: status at +0x1000 (write one to clear), enable at +0x1004, PCI line 5.
-    apu_.set_interrupt_pair(0x1000, 0x1004, [this](bool level) { pic_.set_irq(5, level); });
-    apu_.set_status_read_clears(config.apu_probe_read_clears);
-    // Probe: an audio frame tick at 1500 Hz raising every enabled status bit, to learn which the kernel services.
-    apu_frame_.name = "apu.frame";
-    apu_frame_.fire = [this](Cycles now) {
-        ++apu_frames_;
-        const u32 bits = config_.apu_probe_irq_bits & apu_.reg(0x1004);
-        if (bits) apu_.raise(bits);
-        const Cycles period = cycles_from_ticks(1, clk::kApuFramesPerSecond);
-        sched_.schedule(apu_frame_, (now / period + 1) * period);
-    };
-    sched_.schedule(apu_frame_, cycles_from_ticks(1, clk::kApuFramesPerSecond));
     pci_.add({0, 6, 0}, aci_);
-    aci_.define_bar(0, PciDevice::BarKind::Io, 256);
-    aci_.define_bar(1, PciDevice::BarKind::Io, 128);
-    aci_.set_cfg8(0x3C, 6);
-    aci_.set_cfg8(0x3D, 1);
-    aci_.set_fixed(0x130, 0x00000100);  // global status: primary codec ready [verify bit layout]
-    aci_.set_fixed(0x134, 0x00000000);  // codec access semaphore: free
-    // Bus-master channel control registers: the "reset registers" bit finishes at once.
-    for (u32 cr : {0x10Bu, 0x11Bu, 0x12Bu, 0x16Bu, 0x17Bu}) aci_.set_self_clearing(cr, 0x02);
     pci_.add({0, 9, 0}, ide_);
     auto placeholder = [this](PciAddress at, std::string_view name, u16 device, u32 class_code, u8 rev, u8 header = 0) {
         auto d = std::make_unique<PciPlaceholder>(name, device, class_code, rev, header);

@@ -22,6 +22,8 @@
 #include "mcpx/rtc.h"
 #include "nv2a/capture.h"
 #include "nv2a/nv2a_stub.h"
+#include "aci/aci.h"
+#include "apu/apu.h"
 #include "pci/pci.h"
 #include "smbus/smbus.h"
 #include "smbus/smc.h"
@@ -41,9 +43,6 @@ struct MachineConfig {
     Smc::AvPack av_pack{Smc::AvPack::Hdtv};
     // The SMC scratch register the kernel reads at boot (bit 2 asks for the short animation, bit 3 for the dashboard).
     u8 smc_scratch{0};
-    // Development probe: APU interrupt status bits raised every audio frame (1500 Hz); 0 = none.
-    u32 apu_probe_irq_bits{0};
-    bool apu_probe_read_clears{false};
     std::optional<i64> rtc_base_time;  // unix seconds; unset = host clock
     // Write a pushbuffer capture (methods, RAM pages, objects, scanout registers) there.
     std::optional<std::filesystem::path> capture_path;
@@ -78,8 +77,8 @@ public:
     Nv2aStub& nv2a() { return nv2a_; }
     IdeController& ide() { return ide_; }
     AtaDisk* hdd() { return hdd_; }
-    RegisterStoreDevice& apu() { return apu_; }
-    RegisterStoreDevice& aci() { return aci_; }
+    Apu& apu() { return apu_; }
+    Aci& aci() { return aci_; }
     PciBus& pci() { return pci_; }
     Lpc& lpc() { return lpc_; }
     CpuBackend* cpu() { return cpu_.get(); }
@@ -131,8 +130,8 @@ private:
     Adm1032 adm1032_;
     VideoEncoder encoder_;
     Nv2aStub nv2a_;
-    RegisterStoreDevice apu_;
-    RegisterStoreDevice aci_;
+    Apu apu_;
+    Aci aci_;
     IdeController ide_;
     DiskImage hdd_image_;
     AtaDisk* hdd_{nullptr};
@@ -146,11 +145,9 @@ private:
     std::string power_off_reason_;
     Milestones milestones_;
     bool eeprom_generated_{false};
-    TimerEvent apu_frame_;
-    u64 apu_frames_{0};
     std::unique_ptr<capture::Writer> capture_;
 public:
-    u64 apu_frames() const { return apu_frames_; }
+    u64 apu_frames() const { return apu_.frames(); }
 };
 
 }  // namespace mv

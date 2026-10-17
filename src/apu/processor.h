@@ -1,6 +1,8 @@
 #pragma once
 #include <functional>
+#include <map>
 #include <string>
+#include <utility>
 
 #include "apu/dsp/core.h"
 #include "apu/dsp/dma.h"
@@ -35,6 +37,8 @@ public:
     void peripheral_write(u32 address, u32 value) override;
     const std::string& last_problem() const { return problem_; }
     u32 interrupts() const { return interrupts_; }
+    // Instruments: how often the program touched each peripheral register (reads, writes), by address.
+    const std::map<u32, std::pair<u64, u64>>& peripheral_traffic() const { return traffic_; }
 
 private:
     dsp::Core core_;
@@ -43,6 +47,7 @@ private:
     bool running_{false};
     u32 interrupts_{0};
     std::string problem_;
+    std::map<u32, std::pair<u64, u64>> traffic_;
 };
 
 }  // namespace mv::apu

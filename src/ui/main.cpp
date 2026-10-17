@@ -24,10 +24,9 @@ void print_usage() {
         "  --hdd FILE         a raw hard-disk image (8 GiB retail layout); no drive without it\n"
         "  --hdd-unlocked     present the disk unlocked instead of locked with the EEPROM's key\n"
         "  --smc-scratch N    the SMC scratch flags the kernel reads at boot (4 = short animation, 8 = dashboard)\n"
-        "  --apu-irq-bits M   development probe: raise these APU interrupt status bits every audio frame\n"
         "  --seconds N        run for N seconds of host time (default 5)\n"
         "  --until EVENT      stop early at a milestone: rom-hidden, bootloader, kernel\n"
-        "  --trace LIST       comma-separated: post,pci,smbus,mmio,pio,irq,flash,cpu,boot,timer,gpu,all\n"
+        "  --trace LIST       comma-separated: post,pci,smbus,mmio,pio,irq,flash,cpu,boot,timer,gpu,apu,aci,all\n"
         "  --trace-file FILE  write the trace there instead of stderr\n"
         "  --rtc-time UNIX    fix the clock's start for a deterministic run\n"
         "  --dump-ram FILE    write the guest RAM to FILE when the run ends\n"
@@ -83,10 +82,6 @@ int main(int argc, char** argv) {
             cfg.hdd_image = need("--hdd");
         } else if (a == "--hdd-unlocked") {
             cfg.hdd_locked = false;
-        } else if (a == "--apu-irq-read-clears") {
-            cfg.apu_probe_read_clears = true;
-        } else if (a == "--apu-irq-bits") {
-            cfg.apu_probe_irq_bits = static_cast<mv::u32>(std::strtoul(need("--apu-irq-bits"), nullptr, 0));
         } else if (a == "--smc-scratch") {
             cfg.smc_scratch = static_cast<mv::u8>(std::strtoul(need("--smc-scratch"), nullptr, 0));
         } else if (a == "--seconds") {
@@ -176,7 +171,26 @@ int main(int argc, char** argv) {
                 static_cast<unsigned long long>(machine.nv2a().writes()), static_cast<unsigned long long>(machine.nv2a().vblanks()),
                 static_cast<unsigned long long>(machine.apu().reads()), static_cast<unsigned long long>(machine.apu().writes()),
                 static_cast<unsigned long long>(machine.aci().reads()), static_cast<unsigned long long>(machine.aci().writes()));
-    std::printf("apu frames %llu; apu irq %s\n", static_cast<unsigned long long>(machine.apu_frames()), machine.apu().irq_level() ? "high" : "low");
+    {
+        auto& gp = machine.apu().gp();
+        const auto& st = machine.apu().gp_stats();
+        std::printf("apu frames %llu; irq %s; gp %s, %llu frames run, last %llu cycles, max %llu; dma %llu transfers (%llu bytes); fifo0 cur %08x%s%s%s%s\n",
+                    static_cast<unsigned long long>(machine.apu_frames()), machine.apu().irq_level() ? "high" : "low",
+                    gp.running() ? "running" : "in reset", static_cast<unsigned long long>(st.frames_run),
+                    static_cast<unsigned long long>(st.last_cycles), static_cast<unsigned long long>(st.max_cycles),
+                    static_cast<unsigned long long>(gp.dma().transfers()), static_cast<unsigned long long>(gp.dma().bytes_moved()),
+                    machine.apu().reg(mv::Apu::kGpFifoRegs + mv::Apu::kFifoCurrent), gp.last_problem().empty() ? "" : " PROBLEM: ",
+                    gp.last_problem().c_str(), gp.dma().last_error().empty() ? "" : " DMA: ", gp.dma().last_error().c_str());
+        std::printf("vp: %llu voices on, %llu retired, %llu front-end traps%s; fectl %08x ists %08x ien %08x\n",
+                    static_cast<unsigned long long>(machine.apu().setup_engine().voices_started()),
+                    static_cast<unsigned long long>(machine.apu().setup_engine().voices_retired()),
+                    static_cast<unsigned long long>(machine.apu().traps()), machine.apu().front_end_trapped() ? " (trapped now)" : "",
+                    machine.apu().reg(mv::Apu::kFectl), machine.apu().reg(mv::Apu::kIsts), machine.apu().reg(mv::Apu::kIen));
+        std::printf("gp peripherals (reads/writes):");
+        for (const auto& [addr, rw] : gp.peripheral_traffic())
+            std::printf(" %06x %llu/%llu", addr, static_cast<unsigned long long>(rw.first), static_cast<unsigned long long>(rw.second));
+        std::printf("\n");
+    }
     std::printf("gpu fifo: %llu methods, %llu semaphore releases, %llu notifies%s\n",
                 static_cast<unsigned long long>(machine.nv2a().pushbuffer().methods_seen()),
                 static_cast<unsigned long long>(machine.nv2a().semaphore_releases()), static_cast<unsigned long long>(machine.nv2a().notifies()),

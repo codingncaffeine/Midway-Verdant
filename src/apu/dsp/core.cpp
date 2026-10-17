@@ -969,8 +969,9 @@ void Core::execute(const Decoded& d, u32 ext, u32 at) {
         case Op::MovepPpReg: case Op::MovepXqqReg: case Op::MovepYqqReg: {
             const u32 periph_address = info.op == Op::MovepPpReg ? (0xFFFFC0u | d.f('p')) : (0xFFFF80u | d.f('q'));
             const bool periph_y = info.op == Op::MovepPpReg ? (d.f('s') & 1u) : (info.op == Op::MovepYqqReg);
-            if (d.f('W')) write_reg6(d.f('d'), read_space(periph_y, periph_address));
-            else write_space(periph_y, periph_address, read_reg6(d.f('d')));
+            // W = 1 writes the peripheral from the register (the kernel's program loads its DMA pointers this way).
+            if (d.f('W')) write_space(periph_y, periph_address, read_reg6(d.f('d')));
+            else write_reg6(d.f('d'), read_space(periph_y, periph_address));
             return;
         }
         case Op::LuaEa: {

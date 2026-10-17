@@ -158,3 +158,19 @@ TEST(DspCore, UnknownInstructionStopsWithAMessage) {
     EXPECT_TRUE(m.core.error());
     EXPECT_NE(m.core.error_text().find("ILLEGAL"), std::string::npos) << m.core.error_text();
 }
+
+TEST(DspCore, RegisterFormPeripheralMovesWriteWithWSetAndReadWithWClear) {
+    Machine m;
+    // MOVEP A,X:$FFFFD4 (08CE14: W=1, d=A, p=$14) writes the peripheral; MOVEP X:$FFFFD4,A (084E14: W=0) reads it.
+    m.core.regs().a = i64{0x00004000000000};  // $4000 in A1, the word a register move carries
+    m.emit(0x08CE14);
+    m.run(1);
+    ASSERT_EQ(m.periph.writes.size(), 1u) << "W = 1 moves the register to the peripheral";
+    EXPECT_EQ(m.periph.writes[0].first, 0xFFFFD4u);
+    EXPECT_EQ(m.periph.writes[0].second, 0x4000u);
+    m.periph.read_value = 0x123456;
+    m.emit(0x084E14);
+    m.run(1);
+    EXPECT_EQ(m.periph.writes.size(), 1u) << "W = 0 does not write";
+    EXPECT_EQ(m.core.regs().a, i64{0x00123456000000}) << "the peripheral word lands in A1";
+}

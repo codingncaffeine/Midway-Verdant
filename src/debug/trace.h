@@ -21,6 +21,8 @@ enum class Cat : u32 {
     Boot = 1u << 8,    // boot-chain milestones recognised from behaviour
     Timer = 1u << 9,   // PIT/RTC/PM timer programming
     Gpu = 1u << 10,    // NV2A register traffic
+    Apu = 1u << 11,    // APU register traffic and processor events
+    Aci = 1u << 12,    // AC97 controller register traffic and buffer events
     All = 0xFFFFFFFFu,
 };
 

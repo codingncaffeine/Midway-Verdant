@@ -16,7 +16,7 @@ struct Name {
     Cat cat;
     std::string_view name;
 };
-constexpr std::array<Name, 11> kNames{{{Cat::Post, "post"},
+constexpr std::array<Name, 13> kNames{{{Cat::Post, "post"},
                                        {Cat::Pci, "pci"},
                                        {Cat::Smbus, "smbus"},
                                        {Cat::Mmio, "mmio"},
@@ -26,7 +26,9 @@ constexpr std::array<Name, 11> kNames{{{Cat::Post, "post"},
                                        {Cat::Cpu, "cpu"},
                                        {Cat::Boot, "boot"},
                                        {Cat::Timer, "timer"},
-                                       {Cat::Gpu, "gpu"}}};
+                                       {Cat::Gpu, "gpu"},
+                                       {Cat::Apu, "apu"},
+                                       {Cat::Aci, "aci"}}};
 }  // namespace
 
 void enable(u32 mask) { g_enabled = mask; }

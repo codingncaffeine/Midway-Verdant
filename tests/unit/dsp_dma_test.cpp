@@ -187,7 +187,10 @@ TEST(DspDma, TheKernelsGpProgramRunsFramesAgainstTheCapturedMemory) {
     }
     EXPECT_EQ(frames_halted, 4u) << "the program halts itself at the end of every frame";
     EXPECT_FALSE(gp.core().error()) << gp.core().error_text();
-    EXPECT_EQ(mem.fifo_bytes[0], 128u) << "one frame of 32 samples, four bytes each, to output FIFO 0";
+    // After the set-up frame, every frame runs three DMA lists: 31 scratch reads and 14 scratch writes of one
+    // 128-byte channel frame each, then one 128-byte frame of 32 stereo samples to output FIFO 0.
+    EXPECT_EQ(mem.fifo_bytes[0], 3u * 128u) << "one output frame per frame after the first";
+    EXPECT_EQ(gp.dma().transfers(), 3u * 46u);
     EXPECT_TRUE(gp.dma().last_error().empty()) << gp.dma().last_error();
     for (const auto& [f, n] : mem.fifo_bytes) std::printf("  FIFO %u: %llu bytes\n", f, static_cast<unsigned long long>(n));
 }

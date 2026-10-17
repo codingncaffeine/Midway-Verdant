@@ -41,6 +41,7 @@ u64 Processor::run_frame(u64 cycle_budget) {
 }
 
 u32 Processor::peripheral_read(u32 address) {
+    ++traffic_[address].first;
     switch (address) {
         case 0xFFFFC5: return interrupts_ | (dma_.eol() ? kInterruptDmaEol : 0u);
         case 0xFFFFD4: return dma_.read(dsp::Dma::NextBlock);
@@ -52,6 +53,7 @@ u32 Processor::peripheral_read(u32 address) {
 }
 
 void Processor::peripheral_write(u32 address, u32 value) {
+    ++traffic_[address].second;
     switch (address) {
         case 0xFFFFC4:
             if (value & 1u) core_.set_halted(true);
