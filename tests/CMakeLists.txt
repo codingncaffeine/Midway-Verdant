@@ -17,6 +17,7 @@ add_executable(mv_tests
   unit/crypto_test.cpp
   unit/eeprom_test.cpp
   unit/pushbuffer_test.cpp
+  unit/capture_test.cpp
 )
 target_link_libraries(mv_tests PRIVATE mvcore gtest_main)
 include(GoogleTest)
@@ -27,5 +28,8 @@ add_test(NAME cli_version COMMAND midway-verdant --version)
 set_tests_properties(cli_version PROPERTIES PASS_REGULAR_EXPRESSION "^Midway Verdant [0-9]+\\.[0-9]+\\.[0-9]+")
 
 # The boot smoke test runs only where the user's console dumps are (local-notes/user-files.env); elsewhere it skips.
-add_test(NAME boot_smoke COMMAND "${CMAKE_SOURCE_DIR}/tests/boot/boot-smoke.sh" "${CMAKE_BINARY_DIR}")
-set_tests_properties(boot_smoke PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+# It is a shell script around the KVM fast mode, so it exists on Linux only until the WHPX fast mode lands (Phase 8).
+if(NOT WIN32)
+  add_test(NAME boot_smoke COMMAND "${CMAKE_SOURCE_DIR}/tests/boot/boot-smoke.sh" "${CMAKE_BINARY_DIR}")
+  set_tests_properties(boot_smoke PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+endif()

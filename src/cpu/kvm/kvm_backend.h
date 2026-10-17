@@ -4,6 +4,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include "cpu/backend.h"
 
@@ -31,13 +32,15 @@ public:
     std::string stop_detail() const override { return stop_detail_; }
     Stats stats() const override { return stats_; }
     bool read_regs(Regs& out) override;
+    void set_dirty_tracking(bool on) override { dirty_tracking_ = on; }
+    void take_dirty_pages(std::vector<u32>& pages) override;
 
     // Replace the top page's backing when the MCPX ROM is hidden.
     void on_rom_hidden();
 
 private:
     void thread_main();
-    bool set_slot(u32 slot, u64 guest_phys, u64 size, void* host, bool readonly, std::string& error);
+    bool set_slot(u32 slot, u64 guest_phys, u64 size, void* host, bool readonly, std::string& error, bool log_dirty = false);
     bool setup_cpuid(std::string& error);
     void handle_io();
     void handle_mmio();
@@ -56,6 +59,8 @@ private:
     std::string stop_detail_;
     Stats stats_;
     bool tsc_scaled_{false};
+    bool dirty_tracking_{false};
+    std::vector<u64> dirty_bitmap_;
     u32 cpuid_signature_{0x0000068A};
 };
 

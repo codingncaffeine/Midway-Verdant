@@ -117,6 +117,8 @@ Machine::~Machine() {
         cpu_->stop();
         cpu_->join();
     }
+    nv2a_.set_capture(nullptr, nullptr);
+    if (capture_) capture_->close();
     trace::set_clock_source(nullptr);
 }
 
@@ -192,7 +194,14 @@ bool Machine::init(std::string& error) {
         error = why_not;
         return false;
     }
+    if (config_.capture_path) {
+        capture_ = std::make_unique<capture::Writer>();
+        if (!capture_->open(*config_.capture_path, static_cast<u32>(bus_.ram_size()), error)) return false;
+        cpu_->set_dirty_tracking(true);
+        bus_.set_dirty_tracking(true);
+    }
     if (!cpu_->init(*this, error)) return false;
+    if (capture_) nv2a_.set_capture(capture_.get(), cpu_.get());
     pic_.set_on_intr([this](bool asserted) {
         if (asserted && cpu_) cpu_->kick();
     });

@@ -1,5 +1,6 @@
 #include "core/bus.h"
 
+#include <bit>
 #include <cstdlib>
 #include <cstring>
 #include <new>
@@ -56,7 +57,35 @@ bool Bus::write_ram(PhysAddr addr, const void* in, std::size_t len) {
     u8* p = ram_pointer(addr, len);
     if (!p) return false;
     std::memcpy(p, in, len);
+    if (dirty_tracking_) mark_dirty(addr, len);
     return true;
+}
+
+void Bus::set_dirty_tracking(bool on) {
+    dirty_tracking_ = on;
+    dirty_.assign(on ? (ram_size_ / kPageSize + 63) / 64 : 0, 0);
+}
+
+void Bus::mark_dirty(PhysAddr addr, std::size_t len) {
+    if (!dirty_tracking_ || len == 0) return;
+    const u8* p = ram_pointer(addr, len);
+    if (!p) return;
+    const u64 start = static_cast<u64>(p - ram_.data());
+    const u64 first = start / kPageSize;
+    const u64 last = (start + static_cast<u64>(len) - 1) / kPageSize;
+    for (u64 page = first; page <= last; ++page) dirty_[page / 64] |= u64{1} << (page % 64);
+}
+
+void Bus::take_dirty_pages(std::vector<u32>& pages) {
+    for (std::size_t w = 0; w < dirty_.size(); ++w) {
+        u64 bits = dirty_[w];
+        while (bits) {
+            const unsigned bit = static_cast<unsigned>(std::countr_zero(bits));
+            pages.push_back(static_cast<u32>(w * 64 + bit));
+            bits &= bits - 1;
+        }
+        dirty_[w] = 0;
+    }
 }
 
 u32 Bus::read(PhysAddr addr, unsigned size) {
@@ -73,6 +102,7 @@ u32 Bus::read(PhysAddr addr, unsigned size) {
 void Bus::write(PhysAddr addr, unsigned size, u32 value) {
     if (u8* p = ram_pointer(addr, size)) {
         std::memcpy(p, &value, size);
+        if (dirty_tracking_) mark_dirty(addr, size);
         return;
     }
     if (MmioHandler* h = mmio_at(addr)) {
@@ -94,6 +124,7 @@ u64 Bus::read64(PhysAddr addr) {
 void Bus::write64(PhysAddr addr, u64 value) {
     if (u8* p = ram_pointer(addr, 8)) {
         std::memcpy(p, &value, 8);
+        if (dirty_tracking_) mark_dirty(addr, 8);
         return;
     }
     write(addr, 4, static_cast<u32>(value));

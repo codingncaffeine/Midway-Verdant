@@ -20,6 +20,7 @@
 #include "mcpx/pic.h"
 #include "mcpx/pit.h"
 #include "mcpx/rtc.h"
+#include "nv2a/capture.h"
 #include "nv2a/nv2a_stub.h"
 #include "pci/pci.h"
 #include "smbus/smbus.h"
@@ -44,6 +45,8 @@ struct MachineConfig {
     u32 apu_probe_irq_bits{0};
     bool apu_probe_read_clears{false};
     std::optional<i64> rtc_base_time;  // unix seconds; unset = host clock
+    // Write a pushbuffer capture (methods, RAM pages, objects, scanout registers) there.
+    std::optional<std::filesystem::path> capture_path;
 };
 
 // The console: every device on one bus and one timeline, a CPU backend running the firmware against them, and
@@ -104,6 +107,7 @@ public:
     // The kernel image in RAM, once unpacked.
     KernelImage kernel() const { return KernelImage(bus_); }
     bool eeprom_generated() const { return eeprom_generated_; }
+    capture::Writer* capture() { return capture_.get(); }
 
 private:
     void check_memory_milestones();
@@ -144,6 +148,7 @@ private:
     bool eeprom_generated_{false};
     TimerEvent apu_frame_;
     u64 apu_frames_{0};
+    std::unique_ptr<capture::Writer> capture_;
 public:
     u64 apu_frames() const { return apu_frames_; }
 };

@@ -1,5 +1,8 @@
 #include "nv2a/nv2a_stub.h"
 
+#include <algorithm>
+
+#include "cpu/backend.h"
 #include "debug/trace.h"
 
 namespace mv {
@@ -121,6 +124,12 @@ PushbufferWalker::DmaObject Nv2aStub::dma_object(u32 instance) const {
 }
 
 void Nv2aStub::on_method(const PushbufferMethod& m) {
+    if (capture_) {
+        capture_->method(m.subchannel, m.method == 0 ? 0 : bound_[m.subchannel], m.method, m.value);
+        // The objects a handle names are recorded when the stream binds them: SET_OBJECT, and the context DMA
+        // methods every class keeps at 0x180..0x1A8 (the 2D classes name surface objects there too).
+        if (m.method == 0 || (m.method >= 0x180 && m.method <= 0x1A8)) capture_object(m.value);
+    }
     if (m.method == 0) {
         bound_handles_[m.subchannel] = m.value;
         const u32 ctx = lookup_handle(m.value);
@@ -176,6 +185,33 @@ void Nv2aStub::on_method(const PushbufferMethod& m) {
     }
 }
 
+void Nv2aStub::capture_object(u32 handle) {
+    const u32 instance = lookup_handle(handle) & 0xFFFFu;
+    u32 dw[4];
+    for (u32 i = 0; i < 4; ++i) dw[i] = ramin32(instance * 16 + i * 4);
+    capture_->object(handle, dw);
+}
+
+void Nv2aStub::capture_dirty_pages() {
+    // Everything written to RAM since the last run, by the guest (the backend's log) or by a device (the bus's),
+    // coalesced into contiguous runs of pages.
+    dirty_scratch_.clear();
+    if (cpu_) cpu_->take_dirty_pages(dirty_scratch_);
+    bus_.take_dirty_pages(dirty_scratch_);
+    std::sort(dirty_scratch_.begin(), dirty_scratch_.end());
+    dirty_scratch_.erase(std::unique(dirty_scratch_.begin(), dirty_scratch_.end()), dirty_scratch_.end());
+    const u32 page_count = static_cast<u32>(bus_.ram_size() / capture::kPageSize);
+    std::size_t i = 0;
+    while (i < dirty_scratch_.size()) {
+        const u32 first = dirty_scratch_[i];
+        std::size_t j = i + 1;
+        while (j < dirty_scratch_.size() && dirty_scratch_[j] == first + static_cast<u32>(j - i)) ++j;
+        const u32 count = static_cast<u32>(j - i);
+        if (first < page_count) capture_->pages(first, std::min(count, page_count - first), bus_.ram() + static_cast<std::size_t>(first) * capture::kPageSize);
+        i = j;
+    }
+}
+
 void Nv2aStub::run_pusher() {
     if (!(reg(kCache1DmaPush) & 1u)) return;
     const u32 put = reg(kCache1DmaPut);
@@ -185,6 +221,10 @@ void Nv2aStub::run_pusher() {
     if (!dma.valid) {
         trace::log(trace::Cat::Gpu, "pusher: no DMA object bound (instance {:04x})", reg(kCache1DmaInstance));
         return;
+    }
+    if (capture_) {
+        capture_dirty_pages();
+        capture_->run(sched_.now(), get, put);
     }
     get = walker_.run(dma, get, put);
     regs_[kCache1DmaGet] = get;
@@ -232,6 +272,8 @@ void Nv2aStub::mmio_write(PhysAddr addr, unsigned size, u32 value) {
     }
     ++writes_;
     trace::log(trace::Cat::Gpu, "write +{:06x} size {} <- {:08x}", off, size, value);
+    // The scanout blocks (PCRTC, PRAMDAC) go into the capture: a replay needs to know which surface is displayed.
+    if (capture_ && ((key >= 0x600000 && key < 0x601000) || (key >= 0x680000 && key < 0x681000))) capture_->reg(key, word);
     switch (key) {
         case kPfbWbc:
             // Bit 16 starts a frame-buffer cache operation and clears when it is done; done at once here.

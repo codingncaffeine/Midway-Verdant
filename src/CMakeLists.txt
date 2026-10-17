@@ -19,6 +19,7 @@ add_library(mvcore STATIC
   mcpx/pic.cpp
   mcpx/pit.cpp
   mcpx/rtc.cpp
+  nv2a/capture.cpp
   nv2a/nv2a_stub.cpp
   nv2a/pushbuffer.cpp
   pci/pci.cpp
@@ -38,3 +39,7 @@ target_link_libraries(mvcore PUBLIC Threads::Threads)
 # midway-verdant: the emulator. Headless until the window shell lands.
 add_executable(midway-verdant ui/main.cpp)
 target_link_libraries(midway-verdant PRIVATE mvcore)
+
+# mv-pbcap: the pushbuffer capture reader (summaries and dumps of what --capture wrote).
+add_executable(mv-pbcap tools/mv-pbcap.cpp)
+target_link_libraries(mv-pbcap PRIVATE mvcore)

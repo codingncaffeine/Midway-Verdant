@@ -1,15 +1,19 @@
 #pragma once
 #include <functional>
 #include <unordered_map>
+#include <vector>
 
 #include "core/bus.h"
 #include "core/clock.h"
 #include "core/scheduler.h"
 #include "debug/trace.h"
+#include "nv2a/capture.h"
 #include "nv2a/pushbuffer.h"
 #include "pci/pci.h"
 
 namespace mv {
+
+class CpuBackend;
 
 // PCI 1:0.0, the NV2A, as a register store with the few behaviours the boot chain polls for: the chip identity,
 // the PFB command bit that clears itself, the PTIMER counting on the master clock, the vertical-blank interrupt
@@ -54,6 +58,13 @@ public:
     u32 lookup_handle(u32 handle) const;
     PushbufferWalker::DmaObject dma_object(u32 instance) const;
 
+    // The pushbuffer capture instrument: every method, the RAM pages written before each pusher run (from the
+    // CPU backend's dirty log and the bus's), the objects behind the handles, the scanout register writes.
+    void set_capture(capture::Writer* writer, CpuBackend* cpu) {
+        capture_ = writer;
+        cpu_ = cpu;
+    }
+
 protected:
     void on_bar_changed(int index, u32 old_base, u32 new_base) override;
 
@@ -65,6 +76,8 @@ private:
     void schedule_vblank();
     void run_pusher();
     void on_method(const PushbufferMethod& m);
+    void capture_dirty_pages();
+    void capture_object(u32 handle);
 
     Bus& bus_;
     Scheduler& sched_;
@@ -86,6 +99,9 @@ private:
     };
     std::array<SyncState, 8> sync_{};
     u64 semaphore_releases_{0}, notifies_{0};
+    capture::Writer* capture_{nullptr};
+    CpuBackend* cpu_{nullptr};
+    std::vector<u32> dirty_scratch_;
 public:
     u64 semaphore_releases() const { return semaphore_releases_; }
     u64 notifies() const { return notifies_; }

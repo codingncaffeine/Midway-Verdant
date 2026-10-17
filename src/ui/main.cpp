@@ -31,6 +31,7 @@ void print_usage() {
         "  --trace-file FILE  write the trace there instead of stderr\n"
         "  --rtc-time UNIX    fix the clock's start for a deterministic run\n"
         "  --dump-ram FILE    write the guest RAM to FILE when the run ends\n"
+        "  --capture FILE     write a pushbuffer capture (GPU methods, RAM pages, objects) for offline replay\n"
         "  --version, --help\n");
 }
 
@@ -109,6 +110,8 @@ int main(int argc, char** argv) {
             mv::trace::set_sink(trace_file);
         } else if (a == "--dump-ram") {
             dump_ram = need("--dump-ram");
+        } else if (a == "--capture") {
+            cfg.capture_path = need("--capture");
         } else if (a == "--rtc-time") {
             cfg.rtc_base_time = std::atoll(need("--rtc-time"));
         } else {
@@ -229,6 +232,10 @@ int main(int argc, char** argv) {
                 machine.pic().intr_asserted() ? 1 : 0);
     std::printf("pit: ch0 mode %u reload %u counting %d\n", machine.pit().channel(0).mode, machine.pit().channel(0).reload,
                 machine.pit().channel(0).counting ? 1 : 0);
+    if (machine.capture())
+        std::printf("capture: %llu methods, %llu pages, %llu bytes to %s\n", static_cast<unsigned long long>(machine.capture()->methods_written()),
+                    static_cast<unsigned long long>(machine.capture()->pages_written()),
+                    static_cast<unsigned long long>(machine.capture()->bytes_written()), cfg.capture_path->string().c_str());
     if (!dump_ram.empty()) {
         if (std::FILE* f = std::fopen(dump_ram.c_str(), "wb")) {
             std::fwrite(machine.bus().ram(), 1, machine.bus().ram_size(), f);

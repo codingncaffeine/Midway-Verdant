@@ -9,6 +9,8 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
+#include <algorithm>
+#include <bit>
 #include <cerrno>
 #include <chrono>
 #include <cstring>
@@ -61,10 +63,10 @@ void KvmBackend::fail(Stop why, std::string detail) {
     stop_requested_ = true;
 }
 
-bool KvmBackend::set_slot(u32 slot, u64 guest_phys, u64 size, void* host, bool readonly, std::string& error) {
+bool KvmBackend::set_slot(u32 slot, u64 guest_phys, u64 size, void* host, bool readonly, std::string& error, bool log_dirty) {
     kvm_userspace_memory_region region{};
     region.slot = slot;
-    region.flags = readonly ? KVM_MEM_READONLY : 0;
+    region.flags = (readonly ? KVM_MEM_READONLY : 0u) | (log_dirty ? KVM_MEM_LOG_DIRTY_PAGES : 0u);
     region.guest_phys_addr = guest_phys;
     region.memory_size = size;
     region.userspace_addr = reinterpret_cast<u64>(host);
@@ -133,8 +135,9 @@ bool KvmBackend::init(Machine& machine, std::string& error) {
 
     Bus& bus = machine.bus();
     Flash& flash = machine.flash();
-    if (!set_slot(kSlotRam, 0, bus.ram_size(), bus.ram(), false, error)) return false;
-    if (!set_slot(kSlotRamAlias, Bus::kRamAliasBase, bus.ram_size(), bus.ram(), false, error)) return false;
+    if (!set_slot(kSlotRam, 0, bus.ram_size(), bus.ram(), false, error, dirty_tracking_)) return false;
+    if (!set_slot(kSlotRamAlias, Bus::kRamAliasBase, bus.ram_size(), bus.ram(), false, error, dirty_tracking_)) return false;
+    if (dirty_tracking_) dirty_bitmap_.assign((bus.ram_size() / 4096 + 63) / 64, 0);
     if (!set_slot(kSlotFlash, Flash::kBase, Flash::kWindow - 4096, const_cast<u8*>(flash.window()), true, error)) return false;
     const void* top = flash.rom_visible() ? flash.overlay_page() : flash.window() + Flash::kWindow - 4096;
     if (!set_slot(kSlotTopPage, 0xFFFFF000u, 4096, const_cast<void*>(top), true, error)) return false;
@@ -390,6 +393,28 @@ void KvmBackend::thread_main() {
     }
     running_ = false;
     machine_->wake();
+}
+
+void KvmBackend::take_dirty_pages(std::vector<u32>& pages) {
+    if (!dirty_tracking_ || vm_fd_ < 0) return;
+    // Both RAM slots (direct and the GPU-side alias) back the same pages; the union of their logs is what changed.
+    std::vector<u64> merged(dirty_bitmap_.size(), 0);
+    for (u32 slot : {kSlotRam, kSlotRamAlias}) {
+        std::fill(dirty_bitmap_.begin(), dirty_bitmap_.end(), 0);
+        kvm_dirty_log log{};
+        log.slot = slot;
+        log.dirty_bitmap = dirty_bitmap_.data();
+        if (ioctl(vm_fd_, KVM_GET_DIRTY_LOG, &log) < 0) continue;
+        for (std::size_t i = 0; i < merged.size(); ++i) merged[i] |= dirty_bitmap_[i];
+    }
+    for (std::size_t w = 0; w < merged.size(); ++w) {
+        u64 bits = merged[w];
+        while (bits) {
+            const unsigned bit = static_cast<unsigned>(std::countr_zero(bits));
+            pages.push_back(static_cast<u32>(w * 64 + bit));
+            bits &= bits - 1;
+        }
+    }
 }
 
 bool KvmBackend::read_regs(Regs& out) {

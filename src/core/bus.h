@@ -73,6 +73,14 @@ public:
     u8* ram_pointer(PhysAddr addr, std::size_t len);
     const u8* ram_pointer(PhysAddr addr, std::size_t len) const;
 
+    // Dirty-page tracking for the capture instruments: when on, every write that lands in RAM through the bus
+    // (device DMA, semaphores, notifiers; the CPU backends keep their own record) marks its 4 KiB pages.
+    // `take_dirty_pages` appends the marked page indices and clears the record.
+    void set_dirty_tracking(bool on);
+    bool dirty_tracking() const { return dirty_tracking_; }
+    void take_dirty_pages(std::vector<u32>& pages);
+    void mark_dirty(PhysAddr addr, std::size_t len);
+
     // Unknown-access bookkeeping: (page, is_write) -> count; printed by the runner at the end.
     struct Unknown {
         bool is_write;
@@ -92,6 +100,8 @@ private:
     std::vector<PioHandler*> pio_;     // 65536 ports
     std::map<std::pair<PhysAddr, bool>, u64> unknown_mmio_;
     std::map<std::pair<u16, bool>, u64> unknown_pio_;
+    bool dirty_tracking_{false};
+    std::vector<u64> dirty_;  // one bit per RAM page
 };
 
 }  // namespace mv

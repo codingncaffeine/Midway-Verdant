@@ -3,6 +3,7 @@
 #include <memory>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "core/types.h"
 
@@ -49,6 +50,11 @@ public:
         u64 tsc;
     };
     virtual bool read_regs(Regs& out) = 0;
+
+    // Dirty-page tracking for the capture instruments. Switched on before `init`, the backend records which RAM
+    // pages the guest writes; `take_dirty_pages` appends their indices (4 KiB pages) and clears the record.
+    virtual void set_dirty_tracking(bool on) { (void)on; }
+    virtual void take_dirty_pages(std::vector<u32>& pages) { (void)pages; }
 };
 
 // The fast mode on this host, or nullptr with a reason when there is none.
