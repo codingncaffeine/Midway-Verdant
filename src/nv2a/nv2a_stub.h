@@ -22,13 +22,19 @@ class CpuBackend;
 class Nv2aStub : public PciDevice, public MmioHandler {
 public:
     static constexpr u32 kMmioSize = 16u * 1024 * 1024;
-    static constexpr u32 kPmcBoot0 = 0x02A000A1;  // chip identity read by firmware [verify]
+    // Chip identity: a retail console's GPU is silicon revision A2. The BIOS X-codes read the low byte and give an
+    // A1 chip a 191 MHz core clock (coefficient 0x11701) and every other revision 233 MHz (0x11C01), which the
+    // homebrew runtime checks for before it runs; the kernel derives its timer ratio from the same coefficient.
+    static constexpr u32 kPmcBoot0 = 0x02A000A2;
     // Register offsets (public NV20-family layout, see local-notes/hw/nv2a.md).
     static constexpr u32 kPmcIntr0 = 0x000100, kPmcIntrEn0 = 0x000140, kPmcEnable = 0x000200;
     static constexpr u32 kPtimerIntr0 = 0x009100, kPtimerIntrEn0 = 0x009140, kPtimerNumerator = 0x009200,
                          kPtimerDenominator = 0x009210, kPtimerTime0 = 0x009400, kPtimerTime1 = 0x009410, kPtimerAlarm0 = 0x009420;
     static constexpr u32 kPfbWbc = 0x100410;
     static constexpr u32 kPcrtcIntr0 = 0x600100, kPcrtcIntrEn0 = 0x600140, kPcrtcStart = 0x600800;
+    // PRAMDAC +0x6A0: the kernel's display-mode set toggles bit 0 and waits until bit 4 reads the same — the
+    // hardware mirrors the request bit at the next frame boundary (measured from the kernel's behaviour).
+    static constexpr u32 kPramdacModeLatch = 0x6806A0;
     // PGRAPH: interrupt status (NOTIFY bit 0, MISSING_HW 4, CONTEXT_SWITCH 12, ERROR 20), the error source, the
     // trapped method and its data, and the FIFO access bit software clears to hold the engine and sets to resume.
     static constexpr u32 kPgraphNsource = 0x400108, kPgraphStatus = 0x400700, kPgraphTrappedAddr = 0x400704, kPgraphTrappedData = 0x400708,

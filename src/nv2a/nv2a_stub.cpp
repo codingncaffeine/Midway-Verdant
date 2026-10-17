@@ -22,6 +22,9 @@ Nv2aStub::Nv2aStub(Bus& bus, Scheduler& sched, std::function<void(bool)> irq)
     vblank_.fire = [this](Cycles) {
         ++vblanks_;
         regs_[kPcrtcIntr0] |= 1u;
+        // The mode latch acknowledges software's toggle at the frame boundary: bit 4 takes bit 0.
+        const u32 latch = reg(kPramdacModeLatch);
+        regs_[kPramdacModeLatch] = (latch & ~0x10u) | ((latch & 1u) << 4);
         update_irq();
         schedule_vblank();
     };
