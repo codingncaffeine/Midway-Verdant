@@ -63,8 +63,13 @@ void AtaDisk::reset() {
     tf_.status = ata::kStatusDrdy | ata::kStatusDsc;
     pending_ = Pending::None;
     buffer_.clear();
+}
+
+void AtaDisk::hardware_reset() {
+    // Only a power cycle or a hardware reset locks the drive again and lifts a freeze; SRST does neither.
     frozen_ = false;
     locked_ = security_enabled_;
+    reset();
 }
 
 u64 AtaDisk::lba() const {
@@ -544,6 +549,7 @@ Cycles AtapiCdrom::start_command(u8 command) {
             return kCommandLatency;
         case 0xA0:  // PACKET: the 12-byte command block follows on the data port
             cdb_pos_ = 0;
+            dma_ = (tf_.features & 0x01) != 0;
             tf_.sector_count = 0x01;  // interrupt reason: command
             tf_.status = ata::kStatusDrdy | ata::kStatusDrq;
             pending_ = Pending::PacketReady;
@@ -595,6 +601,18 @@ void AtapiCdrom::check_condition(u8 sense_key, u8 asc, u8 ascq) {
 }
 
 void AtapiCdrom::data_in(const u8* data, u32 len) {
+    if (dma_) {
+        // A DMA data phase: the bytes move through the bus master once the host starts its engine. No byte count,
+        // no DRQ; the completion interrupt is the only one the host sees. The console's kernel fetches its sense
+        // data this way and waits on exactly that interrupt.
+        buffer_.assign(data, data + len);
+        if (len & 1) buffer_.push_back(0);
+        buffer_pos_ = 0;
+        tf_.status = ata::kStatusBsy;
+        pending_ = Pending::DmaData;
+        channel_->schedule(*this, kCommandLatency);
+        return;
+    }
     // The host set the byte count limit in the LBA mid/high registers before the PACKET command.
     const u32 limit = static_cast<u32>(tf_.lba_mid) | (static_cast<u32>(tf_.lba_high) << 8);
     const u32 n = limit ? std::min(len, limit) : len;
@@ -612,7 +630,8 @@ void AtapiCdrom::data_in(const u8* data, u32 len) {
 void AtapiCdrom::run_packet() {
     ++packets_;
     const u8 op = cdb_[0];
-    trace::log(trace::Cat::Pio, "dvd packet {:02x}", op);
+    trace::log(trace::Cat::Pio, "dvd packet {:02x} cdb {:02x}{:02x}{:02x}{:02x} {:02x}{:02x}{:02x}{:02x} {:02x}{:02x}{:02x}{:02x}{}", op, cdb_[0],
+               cdb_[1], cdb_[2], cdb_[3], cdb_[4], cdb_[5], cdb_[6], cdb_[7], cdb_[8], cdb_[9], cdb_[10], cdb_[11], dma_ ? " dma" : "");
     switch (op) {
         case 0x00:  // TEST UNIT READY
             check_condition(0x02, 0x3A, 0x00);  // not ready: medium not present
@@ -662,9 +681,11 @@ void AtapiCdrom::run_packet() {
         case 0xA8:  // READ(12)
         case 0x43:  // READ TOC
         case 0xAD:  // READ DVD STRUCTURE
-        case 0x5A:  // MODE SENSE(10)
-        case 0x55:  // MODE SELECT(10)
+        case 0x55:  // MODE SELECT(10): the security page's challenge lands here once a disc is in (Phase 7)
             check_condition(0x02, 0x3A, 0x00);
+            break;
+        case 0x5A:  // MODE SENSE(10)
+            mode_sense10();
             break;
         case 0x46: {  // GET CONFIGURATION: profile list with DVD-ROM, no current profile
             u8 cfg[20]{};
@@ -689,12 +710,68 @@ void AtapiCdrom::run_packet() {
     }
 }
 
+// Mode pages describe the drive, so they answer with or without a disc. The console's kernel reads page 0x3E, the
+// drive's security page (layout per the community documentation in local-notes/hw/dvd.md), at initialisation and
+// insists on its byte 3 reading 1; page 0x2A is the standard capabilities page.
+void AtapiCdrom::mode_sense10() {
+    const u8 page = static_cast<u8>(cdb_[2] & 0x3F);
+    const u32 allocation = static_cast<u32>((cdb_[7] << 8) | cdb_[8]);
+    u8 reply[8 + 32]{};
+    u32 page_len = 0;
+    u8* p = reply + 8;
+    switch (page) {
+        case 0x3E:
+            page_len = 20;
+            p[0] = 0x3E;
+            p[1] = 18;
+            p[2] = 0x00;  // partition: video
+            p[3] = 0x01;
+            p[4] = 0x00;  // not authenticated
+            p[5] = 0x00;  // book type / version: no disc
+            break;
+        case 0x2A:
+            page_len = 26;
+            p[0] = 0x2A;
+            p[1] = 24;
+            p[2] = 0x3F;  // reads CD-R, CD-RW, method 2, DVD-ROM, DVD-R, DVD-RAM
+            p[3] = 0x00;  // writes nothing
+            p[4] = 0x71;  // audio play, composite, digital ports, mode 2 form 2, multi-session
+            p[5] = 0x03;  // CD-DA stream accurate
+            p[6] = 0x29;  // tray loader, eject, lock
+            p[8] = 0x1B;  // maximum read speed 7056 kB/s
+            p[9] = 0x90;
+            p[11] = 0x01;  // 256 volume levels
+            p[12] = 0x02;  // 512 KiB buffer
+            p[14] = 0x1B;  // current read speed
+            p[15] = 0x90;
+            break;
+        default:
+            check_condition(0x05, 0x24, 0x00);  // illegal request: invalid field in CDB
+            return;
+    }
+    const u32 total = 8 + page_len;
+    reply[0] = static_cast<u8>((total - 2) >> 8);
+    reply[1] = static_cast<u8>(total - 2);
+    data_in(reply, allocation ? std::min(total, allocation) : total);
+}
+
 void AtapiCdrom::continue_command() {
     switch (pending_) {
         case Pending::IdentifyReady:
             tf_.status = ata::kStatusDrdy | ata::kStatusDrq;
             channel_->raise_interrupt();
             break;
+        case Pending::DmaData: {
+            if (!channel_->dma_active()) return;  // the engine starts us again
+            const bool ok = channel_->dma_transfer(buffer_.data(), nullptr, static_cast<u32>(buffer_.size()));
+            buffer_.clear();
+            channel_->dma_complete(ok);
+            if (ok)
+                finish_ok();
+            else
+                check_condition(0x0B, 0x00, 0x00);  // aborted command
+            break;
+        }
         case Pending::Complete:
             finish_ok();
             break;

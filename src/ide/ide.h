@@ -23,8 +23,10 @@ public:
     virtual ~IdeDevice() = default;
     virtual std::string_view name() const = 0;
     virtual bool is_atapi() const = 0;
-    // Power-on / software reset state: signature registers, status.
+    // Software reset (SRST) state: signature registers, status; a device's security state survives it.
     virtual void reset() = 0;
+    // Power-on or hardware reset: everything, including the security state (a locked drive locks again).
+    virtual void hardware_reset() { reset(); }
     // A command byte was written; returns the time until the device's first response.
     virtual Cycles start_command(u8 command) = 0;
     // The scheduled continuation of the command (data ready, completion).

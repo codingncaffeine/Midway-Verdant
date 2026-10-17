@@ -29,6 +29,7 @@ add_executable(mv_tests
   unit/dsp_dma_test.cpp
   unit/apu_test.cpp
   unit/aci_test.cpp
+  unit/ide_test.cpp
 )
 target_link_libraries(mv_tests PRIVATE mvcore gtest_main)
 target_compile_definitions(mv_tests PRIVATE MV_SOURCE_DIR="${CMAKE_SOURCE_DIR}")

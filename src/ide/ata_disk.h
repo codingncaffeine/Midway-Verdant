@@ -34,6 +34,7 @@ public:
     bool locked() const { return locked_; }
 
     void reset() override;
+    void hardware_reset() override;
     Cycles start_command(u8 command) override;
     void continue_command() override;
     u16 read_data() override;
@@ -92,9 +93,10 @@ public:
     u64 packets() const { return packets_; }
 
 private:
-    enum class Pending { None, IdentifyReady, PacketReady, DataReady, Complete };
+    enum class Pending { None, IdentifyReady, PacketReady, DataReady, DmaData, Complete };
     void build_identify(u8* out) const;
     void run_packet();
+    void mode_sense10();
     void data_in(const u8* data, u32 len);
     void check_condition(u8 sense_key, u8 asc, u8 ascq);
     void finish_ok();
@@ -105,6 +107,7 @@ private:
     std::vector<u8> buffer_;
     std::size_t buffer_pos_{0};
     u8 sense_key_{0}, asc_{0}, ascq_{0};
+    bool dma_{false};  // the current PACKET command's data phase goes through the bus master (features bit 0)
     u64 packets_{0};
 };
 

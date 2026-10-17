@@ -55,7 +55,7 @@ IdeChannel::IdeChannel(Bus& bus, Scheduler& sched, std::function<void(bool)> irq
 
 void IdeChannel::attach(int position, std::unique_ptr<IdeDevice> dev) {
     dev->attach(this);
-    dev->reset();
+    dev->hardware_reset();
     devices_[static_cast<std::size_t>(position)] = std::move(dev);
 }
 
@@ -70,6 +70,9 @@ void IdeChannel::raise_interrupt() {
     if (nien_) return;
     if (!irq_level_) {
         irq_level_ = true;
+        // The bus master's interrupt bit follows the device's INTRQ edge whether or not a transfer ran (SFF-8038i):
+        // the console's kernel tests it before the device status whenever it has armed the engine.
+        bm_status_ |= 0x04;
         if (irq_) irq_(true);
     }
 }
