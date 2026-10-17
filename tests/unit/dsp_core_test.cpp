@@ -96,7 +96,7 @@ TEST(DspCore, HardwareLoopRepeatsAndRestoresState) {
     // R0 = 0; DO #4, end ; MOVE X0,X:(R0)+ ; end: NOP
     m.emit(0x300000);            // MOVE #0,R0
     m.emit(0x44F400, 0x000007);  // MOVE #7,X0
-    m.emit(0x060480, 0x000006);  // DO #4,$0006 (LA = expr - 1 = 5: the MOVE below is the last instruction)
+    m.emit(0x060480, 0x000006);  // DO #4,$0006 (LA = expr - 1 = 5: the one-word MOVE below is the last instruction)
     m.emit(0x445800);            // P:5  MOVE X0,X:(R0)+
     m.emit(0x000000);            // P:6  NOP
     m.run(8);  // two moves, DO, four passes, NOP

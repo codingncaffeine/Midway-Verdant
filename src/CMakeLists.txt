@@ -29,6 +29,8 @@ add_library(mvcore STATIC
   nv2a/shaders/vsh_interpreter.cpp
   apu/dsp/decode.cpp
   apu/dsp/core.cpp
+  apu/dsp/dma.cpp
+  apu/processor.cpp
   nv2a/shaders/glsl_compiler.cpp
   nv2a/vulkan/vk_loader.cpp
   nv2a/vulkan/vk_device.cpp

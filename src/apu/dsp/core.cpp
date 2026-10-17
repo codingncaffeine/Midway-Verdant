@@ -1112,7 +1112,9 @@ u32 Core::step() {
     execute(d, ext, at);
     ++instructions_;
     cycles_ += words;
-    if (!rep_active_) end_of_loop_check(at);
+    // The loop address names the LAST word of the loop's final instruction (the kernel's DOR at P:03CA ends on
+    // the extension word of a two-word ADD).
+    if (!rep_active_) end_of_loop_check(at + words - 1);
     return words;
 }
 
