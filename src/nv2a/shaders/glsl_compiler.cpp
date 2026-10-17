@@ -1,8 +1,13 @@
 #include "nv2a/shaders/glsl_compiler.h"
 
+// The installed package nests SPIRV under glslang/; the source tree (a fetched build) keeps it at the top.
 #include <glslang/Public/ResourceLimits.h>
 #include <glslang/Public/ShaderLang.h>
+#if __has_include(<glslang/SPIRV/GlslangToSpv.h>)
 #include <glslang/SPIRV/GlslangToSpv.h>
+#else
+#include <SPIRV/GlslangToSpv.h>
+#endif
 
 #include <mutex>
 
