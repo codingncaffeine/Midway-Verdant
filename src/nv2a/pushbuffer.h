@@ -1,6 +1,7 @@
 #pragma once
 #include <array>
 #include <functional>
+#include <string>
 #include <vector>
 
 #include "core/bus.h"
