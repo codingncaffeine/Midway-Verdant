@@ -161,3 +161,38 @@ TEST(Rtc, TimeRegistersFollowTheTimelineAndPeriodicInterruptsFire) {
     EXPECT_LE(count, 105);
     EXPECT_GE(irq_raised, 100);
 }
+
+// The slave's INT output is a wire into master line 2: it must rise again when the slave's EOI (or a mask write)
+// uncovers a request that arrived while a higher-priority slave interrupt was in service. The console's kernel
+// hit the lost case with the SMBus (IRQ 11, level) in service when the IDE (IRQ 14, edge) completed.
+TEST(Pic, SlaveEoiUncoversALowerRequestAndRaisesTheCascadeAgain) {
+    Bus bus(4096);
+    Pic pic(bus);
+    init_pics(bus, 0x30, 0x38);
+    bus.pio_write(0x4D1, 1, 0x18);  // IRQ 11 and 12 level-triggered, as the kernel programs the ELCR
+    pic.set_irq(11, true);
+    EXPECT_EQ(pic.acknowledge(), 0x3B);
+    // While the SMBus handler runs, the IDE completes.
+    pic.set_irq(14, true);
+    EXPECT_EQ(pic.pending_vector(), -1) << "IRQ 14 does not beat IRQ 11 in service";
+    // The handler reads the SMBus status (the line drops), then EOIs the slave and the master.
+    pic.set_irq(11, false);
+    bus.pio_write(0xA0, 1, 0x20);
+    bus.pio_write(0x20, 1, 0x20);
+    EXPECT_EQ(pic.master().isr, 0);
+    EXPECT_EQ(pic.slave().isr, 0);
+    EXPECT_EQ(pic.pending_vector(), 0x3E) << "the IDE request must now reach the CPU through the cascade";
+    EXPECT_TRUE(pic.intr_asserted());
+    EXPECT_EQ(pic.acknowledge(), 0x3E);
+    bus.pio_write(0xA0, 1, 0x20);
+    bus.pio_write(0x20, 1, 0x20);
+    EXPECT_EQ(pic.pending_vector(), -1);
+    EXPECT_FALSE(pic.intr_asserted());
+    // The same through a mask: a request behind a masked line is delivered when the mask lifts.
+    bus.pio_write(0xA1, 1, 0x40);  // mask IRQ 14
+    pic.set_irq(14, false);
+    pic.set_irq(14, true);
+    EXPECT_EQ(pic.pending_vector(), -1);
+    bus.pio_write(0xA1, 1, 0x00);
+    EXPECT_EQ(pic.pending_vector(), 0x3E);
+}

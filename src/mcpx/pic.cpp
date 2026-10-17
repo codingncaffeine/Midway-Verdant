@@ -61,16 +61,11 @@ void Pic::unit_set_line(Unit& u, unsigned line, bool asserted) {
 
 void Pic::set_irq(unsigned irq, bool asserted) {
     if (irq > 15 || irq == 2) return;
-    if (irq < 8) {
+    if (irq < 8)
         unit_set_line(units_[0], irq, asserted);
-    } else {
+    else
         unit_set_line(units_[1], irq - 8, asserted);
-        // The slave's INT output drives master line 2.
-        const bool slave_out = highest_pending(units_[1]) >= 0 &&
-                               beats_in_service(units_[1], highest_pending(units_[1]), highest_in_service(units_[1]), false);
-        unit_set_line(units_[0], 2, slave_out);
-    }
-    update_output();
+    update_output();  // the cascade line follows the slave's state there
 }
 
 int Pic::pending_vector() {
@@ -120,21 +115,26 @@ int Pic::acknowledge() {
     } else {
         m.isr = static_cast<u8>(m.isr | mbit);
     }
-    // Re-evaluate the cascade line: the slave's output may now be low.
-    if (irq == 2) {
-        const Unit& s = units_[1];
-        const bool slave_out = highest_pending(s) >= 0 && beats_in_service(s, highest_pending(s), highest_in_service(s), false);
-        if (!slave_out) {
-            m.lines = static_cast<u8>(m.lines & ~0x04u);
-            m.irr = static_cast<u8>(m.irr & ~0x04u);
-        }
-    }
     update_output();
     trace::log(trace::Cat::Irq, "acknowledge irq {} -> vector {:02x}", irq == 2 ? 8 + highest_pending(units_[1]) : irq, vector);
     return vector;
 }
 
 void Pic::update_output() {
+    // Master line 2 is the slave's INT output, a wire that follows the slave's state after every change of either
+    // unit: an acknowledge lowers it, and an EOI or a mask write on the slave that uncovers a request raises it
+    // again. Re-evaluating it only on slave line changes lost the console's IDE completion behind an SMBus EOI.
+    Unit& m = units_[0];
+    const Unit& s = units_[1];
+    const int sirq = highest_pending(s);
+    const bool slave_out = sirq >= 0 && beats_in_service(s, sirq, highest_in_service(s), false);
+    if (slave_out) {
+        m.lines = static_cast<u8>(m.lines | 0x04u);
+        m.irr = static_cast<u8>(m.irr | 0x04u);
+    } else {
+        m.lines = static_cast<u8>(m.lines & ~0x04u);
+        m.irr = static_cast<u8>(m.irr & ~0x04u);
+    }
     const bool now = pending_vector() >= 0;
     if (now != intr_) {
         intr_ = now;
