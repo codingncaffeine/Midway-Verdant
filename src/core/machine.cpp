@@ -201,6 +201,16 @@ void Machine::request_power_off(std::string why) {
 }
 
 void Machine::check_memory_milestones() {
+    if (!config_.watch.empty()) {
+        if (watch_last_.size() != config_.watch.size()) watch_last_.assign(config_.watch.size(), 0);
+        for (std::size_t i = 0; i < config_.watch.size(); ++i) {
+            u32 v = 0;
+            if (bus_.read_ram(config_.watch[i], &v, 4) && v != watch_last_[i]) {
+                trace::log(trace::Cat::Boot, "watch {:08x}: {:08x} -> {:08x}", config_.watch[i], watch_last_[i], v);
+                watch_last_[i] = v;
+            }
+        }
+    }
     if (!milestones_.bootloader_magic) {
         u32 magic = 0;
         if (bus_.read_ram(0x95FE4, &magic, 4) && magic == 0x7854794A) {

@@ -69,3 +69,40 @@ TEST(Pushbuffer, StopsAtAnUnknownHeaderAndOutsideTheDmaObject) {
     PushbufferWalker w3(bus);
     EXPECT_EQ(w3.run(PushbufferWalker::DmaObject{}, 0, 0x100), 0u);
 }
+
+TEST(Pushbuffer, ASinkCanStopTheWalkMidHeaderAndTheRestIsDeliveredOnResume) {
+    Bus bus(1u << 20);
+    PushbufferWalker w(bus);
+    std::vector<PushbufferMethod> seen;
+    w.set_sink([&](const PushbufferMethod& m) {
+        seen.push_back(m);
+        if (m.method == 0x0100 && m.value != 0) w.request_stop();  // the engine traps on this one
+    });
+    PushbufferWalker::DmaObject dma{0, (1u << 20) - 1, true};
+    // One header of four increasing methods from 0x0100: the first carries data, so the walk must stop after it;
+    // then a second header the resumed walk reaches.
+    u32 p = 0x2000;
+    put(bus, p, hdr(4, 1, 0x0100)); put(bus, p + 4, 0x304); put(bus, p + 8, 5); put(bus, p + 12, 6); put(bus, p + 16, 7); p += 20;
+    put(bus, p, hdr(1, 1, 0x0300)); put(bus, p + 4, 9); p += 8;
+    const u32 put_ptr = p;
+
+    const u32 get1 = w.run(dma, 0x2000, put_ptr);
+    EXPECT_EQ(get1, 0x2008u) << "stopped right after the trapping data word";
+    EXPECT_TRUE(w.mid_header());
+    ASSERT_EQ(seen.size(), 1u);
+    EXPECT_EQ(seen[0].method, 0x0100u);
+    EXPECT_EQ(seen[0].value, 0x304u);
+    EXPECT_FALSE(w.errored());
+
+    const u32 get2 = w.run(dma, get1, put_ptr);
+    EXPECT_EQ(get2, put_ptr);
+    EXPECT_FALSE(w.mid_header());
+    ASSERT_EQ(seen.size(), 5u);
+    EXPECT_EQ(seen[1].method, 0x0104u) << "the header's remaining methods continue increasing";
+    EXPECT_EQ(seen[1].value, 5u);
+    EXPECT_EQ(seen[3].method, 0x010Cu);
+    EXPECT_EQ(seen[4].method, 0x0300u);
+    EXPECT_EQ(seen[4].value, 9u);
+    EXPECT_EQ(seen[4].subchannel, 1u);
+    EXPECT_EQ(w.methods_seen(), 5u);
+}

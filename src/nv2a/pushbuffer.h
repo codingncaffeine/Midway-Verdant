@@ -38,6 +38,11 @@ public:
     // are offsets within the DMA object (physical addresses when the object spans RAM from zero).
     u32 run(const DmaObject& dma, u32 get, u32 put);
 
+    // A sink may ask the walk to stop right after the method it was handed (the engine trapped on it); the
+    // rest of that header's methods are delivered when the walk resumes.
+    void request_stop() { stop_requested_ = true; }
+    bool mid_header() const { return pending_.remaining != 0; }
+
     u64 methods_seen() const { return methods_; }
     u64 words_fetched() const { return words_; }
     bool errored() const { return error_; }
@@ -45,6 +50,7 @@ public:
 
 private:
     bool fetch(const DmaObject& dma, u32 offset, u32& out);
+    bool deliver(const DmaObject& dma, u32& get);
 
     Bus& bus_;
     Sink sink_;
@@ -52,6 +58,11 @@ private:
     u64 methods_{0}, words_{0};
     bool error_{false};
     std::string last_error_;
+    bool stop_requested_{false};
+    struct PendingHeader {
+        u32 remaining{0}, method{0}, subchannel{0}, header_at{0};
+        bool increasing{false};
+    } pending_;
 };
 
 }  // namespace mv

@@ -29,6 +29,17 @@ public:
                          kPtimerDenominator = 0x009210, kPtimerTime0 = 0x009400, kPtimerTime1 = 0x009410, kPtimerAlarm0 = 0x009420;
     static constexpr u32 kPfbWbc = 0x100410;
     static constexpr u32 kPcrtcIntr0 = 0x600100, kPcrtcIntrEn0 = 0x600140, kPcrtcStart = 0x600800;
+    // PGRAPH: interrupt status (NOTIFY bit 0, MISSING_HW 4, CONTEXT_SWITCH 12, ERROR 20), the error source, the
+    // trapped method and its data, and the FIFO access bit software clears to hold the engine and sets to resume.
+    static constexpr u32 kPgraphNsource = 0x400108, kPgraphStatus = 0x400700, kPgraphTrappedAddr = 0x400704, kPgraphTrappedData = 0x400708,
+                         kPgraphFifo = 0x400720;
+    static constexpr u32 kPgraphIntrError = 1u << 20, kNsourceDataError = 1u << 1;
+    static constexpr u32 kMethodNoOperation = 0x0100;
+    // Two 3D-class methods whose values software reads back from the engine's register file: the kernel passes a
+    // software method's arguments through them (a register offset or a flip address, and a value) [verify the
+    // register names against the public listing].
+    static constexpr u32 kMethodZStencilClearValue = 0x1D8C, kMethodColorClearValue = 0x1D90;
+    static constexpr u32 kPgraphShadowZStencilClear = 0x401A88, kPgraphShadowColorClear = 0x40186C;
     static constexpr u32 kPfifoIntr0 = 0x002100, kPfifoIntrEn0 = 0x002140, kPgraphIntr = 0x400100, kPgraphIntrEn = 0x400140,
                          kPvideoIntr = 0x008100, kPvideoIntrEn = 0x008140;
     static constexpr u32 kPfifoRamht = 0x002210, kPfifoRamfc = 0x002214;
@@ -98,13 +109,16 @@ private:
         u32 semaphore_offset{0};
     };
     std::array<SyncState, 8> sync_{};
-    u64 semaphore_releases_{0}, notifies_{0};
+    u64 semaphore_releases_{0}, notifies_{0}, software_methods_{0};
+    bool pgraph_stalled_{false};
     capture::Writer* capture_{nullptr};
     CpuBackend* cpu_{nullptr};
     std::vector<u32> dirty_scratch_;
 public:
     u64 semaphore_releases() const { return semaphore_releases_; }
     u64 notifies() const { return notifies_; }
+    u64 software_methods() const { return software_methods_; }
+    bool pgraph_stalled() const { return pgraph_stalled_; }
 };
 
 // A PCI function that exists for the bus scan and stores its configuration, with its regions unmapped: the

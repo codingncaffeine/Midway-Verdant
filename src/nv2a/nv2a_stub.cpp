@@ -143,6 +143,26 @@ void Nv2aStub::on_method(const PushbufferMethod& m) {
         ++method_log_lines_;
         trace::log(trace::Cat::Gpu, "fifo: [{:04x}] {:04x} <- {:08x}", bound_[m.subchannel], m.method, m.value);
     }
+    // A no-operation carrying data is a software method: a legal method with data the engine cannot take, so it
+    // raises ERROR with the DATA_ERROR source, holds its FIFO, and the host reads the trapped method and data
+    // (the kernel queues its display flips this way; an illegal-method source would only be acknowledged).
+    if (bound_[m.subchannel] == 0x97) {
+        if (m.method == kMethodZStencilClearValue) regs_[kPgraphShadowZStencilClear] = m.value;
+        else if (m.method == kMethodColorClearValue) regs_[kPgraphShadowColorClear] = m.value;
+    }
+    if (m.method == kMethodNoOperation && m.value != 0) {
+        regs_[kPgraphTrappedAddr] = (m.subchannel << 13) | m.method;
+        regs_[kPgraphTrappedData] = m.value;
+        regs_[kPgraphNsource] |= kNsourceDataError;
+        regs_[kPgraphIntr] |= kPgraphIntrError;
+        regs_[kPgraphFifo] = 0;
+        pgraph_stalled_ = true;
+        ++software_methods_;
+        walker_.request_stop();
+        trace::log(trace::Cat::Gpu, "pgraph: software method {:04x} data {:08x} on subchannel {} (FIFO held)", m.method, m.value, m.subchannel);
+        update_irq();
+        return;
+    }
     // The synchronisation methods every class shares, and Kelvin's semaphore: these are what the CPU waits on,
     // so they are executed here while every drawing method is only logged (the real engine arrives in Phase 4).
     SyncState& s = sync_[m.subchannel];
@@ -214,6 +234,7 @@ void Nv2aStub::capture_dirty_pages() {
 
 void Nv2aStub::run_pusher() {
     if (!(reg(kCache1DmaPush) & 1u)) return;
+    if (pgraph_stalled_) return;  // held on a trapped method until software sets the FIFO access bit
     const u32 put = reg(kCache1DmaPut);
     u32 get = reg(kCache1DmaGet);
     if (get == put) return;
@@ -283,9 +304,21 @@ void Nv2aStub::mmio_write(PhysAddr addr, unsigned size, u32 value) {
         case kPtimerIntr0:
         case kPfifoIntr0:
         case kPgraphIntr:
-        case kPvideoIntr:
             regs_[key] &= ~word;  // interrupt status: write one to clear
+            if (word & kPgraphIntrError) regs_[kPgraphNsource] = 0;
             update_irq();
+            return;
+        case kPvideoIntr:
+            regs_[key] &= ~word;
+            update_irq();
+            return;
+        case kPgraphFifo:
+            regs_[key] = word;
+            if ((word & 1u) && pgraph_stalled_) {
+                pgraph_stalled_ = false;
+                trace::log(trace::Cat::Gpu, "pgraph: FIFO released, the walk resumes");
+                run_pusher();
+            }
             return;
         case kPcrtcIntrEn0:
         case kPtimerIntrEn0:

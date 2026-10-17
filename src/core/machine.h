@@ -46,6 +46,8 @@ struct MachineConfig {
     std::optional<i64> rtc_base_time;  // unix seconds; unset = host clock
     // Write a pushbuffer capture (methods, RAM pages, objects, scanout registers) there.
     std::optional<std::filesystem::path> capture_path;
+    // Instrument: physical RAM words the io thread polls every tick, logging each change with its guest time.
+    std::vector<PhysAddr> watch;
 };
 
 // The console: every device on one bus and one timeline, a CPU backend running the firmware against them, and
@@ -145,6 +147,7 @@ private:
     std::string power_off_reason_;
     Milestones milestones_;
     bool eeprom_generated_{false};
+    std::vector<u32> watch_last_;
     std::unique_ptr<capture::Writer> capture_;
 public:
     u64 apu_frames() const { return apu_.frames(); }

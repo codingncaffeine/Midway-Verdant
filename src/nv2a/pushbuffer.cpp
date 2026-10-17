@@ -6,6 +6,26 @@
 
 namespace mv {
 
+// The data words of the current header, from `get`; stops early when the sink asks.
+bool PushbufferWalker::deliver(const DmaObject& dma, u32& get) {
+    while (pending_.remaining) {
+        u32 v;
+        if (!fetch(dma, get, v)) {
+            error_ = true;
+            last_error_ = std::format("data fetch failed at {:08x}", get);
+            return false;
+        }
+        get += 4;
+        ++methods_;
+        --pending_.remaining;
+        const u32 method = pending_.method;
+        if (pending_.increasing) pending_.method += 4;
+        if (sink_) sink_({pending_.subchannel, method, v, pending_.header_at});
+        if (stop_requested_) return true;
+    }
+    return true;
+}
+
 bool PushbufferWalker::fetch(const DmaObject& dma, u32 offset, u32& out) {
     if (!dma.valid || offset > dma.limit || offset + 4 > dma.limit + 1) return false;
     if (!bus_.read_ram(dma.base + offset, &out, 4)) return false;
@@ -15,6 +35,14 @@ bool PushbufferWalker::fetch(const DmaObject& dma, u32 offset, u32& out) {
 
 u32 PushbufferWalker::run(const DmaObject& dma, u32 get, u32 put) {
     error_ = false;
+    // Resuming inside a header: the rest of its data words come first.
+    if (pending_.remaining) {
+        if (!deliver(dma, get)) return get;
+        if (stop_requested_) {
+            stop_requested_ = false;
+            return get;
+        }
+    }
     for (int guard = 0; guard < 4'000'000 && get != put; ++guard) {
         u32 w;
         if (!fetch(dma, get, w)) {
@@ -61,20 +89,14 @@ u32 PushbufferWalker::run(const DmaObject& dma, u32 get, u32 put) {
         const bool increasing = type == 0;
         const u32 count = (w >> 18) & 0x7FFu;
         const u32 subchannel = (w >> 13) & 7u;
-        u32 method = w & 0x1FFCu;
+        const u32 method = w & 0x1FFCu;
         const u32 header_at = get;
         get += 4;
-        for (u32 i = 0; i < count; ++i) {
-            u32 v;
-            if (!fetch(dma, get, v)) {
-                error_ = true;
-                last_error_ = std::format("data fetch failed at {:08x}", get);
-                return get;
-            }
-            get += 4;
-            ++methods_;
-            if (sink_) sink_({subchannel, method, v, header_at});
-            if (increasing) method += 4;
+        pending_ = {count, method, subchannel, header_at, increasing};
+        if (!deliver(dma, get)) return get;
+        if (stop_requested_) {
+            stop_requested_ = false;
+            return get;
         }
     }
     return get;

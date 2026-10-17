@@ -31,6 +31,7 @@ void print_usage() {
         "  --rtc-time UNIX    fix the clock's start for a deterministic run\n"
         "  --dump-ram FILE    write the guest RAM to FILE when the run ends\n"
         "  --capture FILE     write a pushbuffer capture (GPU methods, RAM pages, objects) for offline replay\n"
+        "  --watch HEX,...    log every change of these physical RAM words (polled each tick) under the boot trace\n"
         "  --version, --help\n");
 }
 
@@ -107,6 +108,16 @@ int main(int argc, char** argv) {
             dump_ram = need("--dump-ram");
         } else if (a == "--capture") {
             cfg.capture_path = need("--capture");
+        } else if (a == "--watch") {
+            std::string list = need("--watch");
+            std::size_t pos = 0;
+            while (pos < list.size()) {
+                const auto comma = list.find(',', pos);
+                const std::string item = list.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
+                if (!item.empty()) cfg.watch.push_back(static_cast<mv::PhysAddr>(std::strtoul(item.c_str(), nullptr, 16)));
+                if (comma == std::string::npos) break;
+                pos = comma + 1;
+            }
         } else if (a == "--rtc-time") {
             cfg.rtc_base_time = std::atoll(need("--rtc-time"));
         } else {
@@ -195,6 +206,8 @@ int main(int argc, char** argv) {
                 static_cast<unsigned long long>(machine.nv2a().pushbuffer().methods_seen()),
                 static_cast<unsigned long long>(machine.nv2a().semaphore_releases()), static_cast<unsigned long long>(machine.nv2a().notifies()),
                 machine.nv2a().pushbuffer().errored() ? (" ERROR: " + machine.nv2a().pushbuffer().last_error()).c_str() : "");
+    std::printf("gpu software methods %llu%s\n", static_cast<unsigned long long>(machine.nv2a().software_methods()),
+                machine.nv2a().pgraph_stalled() ? " (PGRAPH held now)" : "");
     std::printf("ide: %llu commands, %llu sectors read, %llu written; hdd %s, unlock attempts %llu; dvd packets %llu\n",
                 static_cast<unsigned long long>(machine.ide().primary().commands()),
                 static_cast<unsigned long long>(machine.ide().primary().sectors_read()),
