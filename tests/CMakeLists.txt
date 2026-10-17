@@ -10,6 +10,10 @@ FetchContent_MakeAvailable(googletest)
 
 add_executable(mv_tests
   unit/version_test.cpp
+  unit/clock_test.cpp
+  unit/bus_test.cpp
+  unit/legacy_test.cpp
+  unit/smbus_test.cpp
 )
 target_link_libraries(mv_tests PRIVATE mvcore gtest_main)
 include(GoogleTest)
@@ -18,3 +22,7 @@ gtest_discover_tests(mv_tests DISCOVERY_TIMEOUT 60 PROPERTIES TIMEOUT 120)
 # The emulator answers --version; a build that cannot is not a build.
 add_test(NAME cli_version COMMAND midway-verdant --version)
 set_tests_properties(cli_version PROPERTIES PASS_REGULAR_EXPRESSION "^Midway Verdant [0-9]+\\.[0-9]+\\.[0-9]+")
+
+# The boot smoke test runs only where the user's console dumps are (local-notes/user-files.env); elsewhere it skips.
+add_test(NAME boot_smoke COMMAND "${CMAKE_SOURCE_DIR}/tests/boot/boot-smoke.sh" "${CMAKE_BINARY_DIR}")
+set_tests_properties(boot_smoke PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
