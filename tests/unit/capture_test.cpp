@@ -69,6 +69,7 @@ TEST(Capture, RoundTripsEveryRecordType) {
     EXPECT_EQ(rec.value, 0x03C00000u);
     EXPECT_FALSE(r.next(rec));
     EXPECT_TRUE(r.error().empty()) << r.error();
+    r.close();  // Windows refuses to delete an open file
     std::filesystem::remove(path);
 }
 

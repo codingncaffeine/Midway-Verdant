@@ -89,6 +89,7 @@ public:
     Reader& operator=(const Reader&) = delete;
 
     bool open(const std::filesystem::path& path, std::string& error);
+    void close();
     u32 ram_size() const { return ram_size_; }
     // The next record, or false at the end (or on a truncated file: `error()` then says so).
     bool next(Record& out);

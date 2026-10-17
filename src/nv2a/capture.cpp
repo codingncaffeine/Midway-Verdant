@@ -70,8 +70,11 @@ void Writer::reg(u32 offset, u32 value) {
     put32(value);
 }
 
-Reader::~Reader() {
+Reader::~Reader() { close(); }
+
+void Reader::close() {
     if (file_) std::fclose(file_);
+    file_ = nullptr;
 }
 
 bool Reader::get(void* p, std::size_t n) {
@@ -93,14 +96,17 @@ bool Reader::open(const std::filesystem::path& path, std::string& error) {
     u32 version = 0;
     if (!get(magic, 8) || std::memcmp(magic, kMagic, 8) != 0) {
         error = "not a pushbuffer capture (bad magic)";
+        close();
         return false;
     }
     if (!get(&version, 4) || version != kVersion) {
         error = std::format("capture version {} (this build reads {})", version, kVersion);
+        close();
         return false;
     }
     if (!get(&ram_size_, 4)) {
         error = "truncated header";
+        close();
         return false;
     }
     return true;
