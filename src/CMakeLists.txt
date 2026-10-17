@@ -23,6 +23,7 @@ add_library(mvcore STATIC
   nv2a/nv2a_stub.cpp
   nv2a/pgraph/kelvin.cpp
   nv2a/pgraph/replay.cpp
+  nv2a/pgraph/texture.cpp
   nv2a/shaders/vsh_translate.cpp
   nv2a/shaders/psh_translate.cpp
   nv2a/shaders/glsl_compiler.cpp
