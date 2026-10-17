@@ -23,6 +23,8 @@ add_library(mvcore STATIC
   nv2a/nv2a_stub.cpp
   nv2a/pgraph/kelvin.cpp
   nv2a/pgraph/replay.cpp
+  nv2a/shaders/vsh_translate.cpp
+  nv2a/shaders/glsl_compiler.cpp
   nv2a/pushbuffer.cpp
   pci/pci.cpp
   smbus/smbus.cpp
@@ -37,6 +39,12 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
 endif()
 find_package(Threads REQUIRED)
 target_link_libraries(mvcore PUBLIC Threads::Threads)
+# The shader compiler is an implementation detail of the renderer; its headers stay out of our public includes.
+target_link_libraries(mvcore PRIVATE glslang::glslang glslang::SPIRV glslang::glslang-default-resource-limits)
+# glslang's headers are not warning-clean under our flags; that one file is built with them as system headers.
+if(NOT MSVC)
+  set_source_files_properties(nv2a/shaders/glsl_compiler.cpp PROPERTIES COMPILE_OPTIONS "-Wno-shadow;-Wno-conversion")
+endif()
 
 # midway-verdant: the emulator. Headless until the window shell lands.
 add_executable(midway-verdant ui/main.cpp)

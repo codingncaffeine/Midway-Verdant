@@ -16,6 +16,7 @@ option(MV_SANITIZE "Build with AddressSanitizer and UndefinedBehaviorSanitizer" 
 option(MV_BUILD_TESTS "Build the test suite" ON)
 
 include(cmake/Warnings.cmake)
+include(cmake/Shaders.cmake)
 
 if(MV_SANITIZE)
   if(MSVC)

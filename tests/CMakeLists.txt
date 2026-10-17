@@ -19,8 +19,10 @@ add_executable(mv_tests
   unit/pushbuffer_test.cpp
   unit/capture_test.cpp
   unit/kelvin_test.cpp
+  unit/vsh_test.cpp
 )
 target_link_libraries(mv_tests PRIVATE mvcore gtest_main)
+target_compile_definitions(mv_tests PRIVATE MV_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 include(GoogleTest)
 gtest_discover_tests(mv_tests DISCOVERY_TIMEOUT 60 PROPERTIES TIMEOUT 120)
 
