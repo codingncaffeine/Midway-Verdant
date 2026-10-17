@@ -84,12 +84,12 @@ bool Smc::write_byte(u8 command, u8 value) {
 
 std::optional<u8> Adm1032::read_byte(u8 command) {
     switch (command) {
-        case 0x00: return 40;  // local temperature
-        case 0x01: return 45;  // remote (CPU) temperature
-        case 0x02: return 0;   // status
+        case 0x00: return u8{40};  // local temperature
+        case 0x01: return u8{45};  // remote (CPU) temperature
+        case 0x02: return u8{0};   // status
         case 0x03: return regs_[0x03];
-        case 0xFE: return 0x41;  // manufacturer ID
-        case 0xFF: return 0x42;  // die revision
+        case 0xFE: return u8{0x41};  // manufacturer ID
+        case 0xFF: return u8{0x42};  // die revision
         default: return regs_[command];
     }
 }

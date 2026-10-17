@@ -20,7 +20,9 @@ void print_usage() {
         "Usage: midway-verdant --mcpx FILE --bios FILE [options]\n\n"
         "  --mcpx FILE        the 512-byte MCPX boot ROM dump\n"
         "  --bios FILE        the flash image (256 KiB, 512 KiB or 1 MiB)\n"
-        "  --eeprom FILE      a 256-byte EEPROM image (optional)\n"
+        "  --eeprom FILE      a 256-byte EEPROM image; generated there from the kernel's key when missing\n"
+        "  --hdd FILE         a raw hard-disk image (8 GiB retail layout); no drive without it\n"
+        "  --hdd-unlocked     present the disk unlocked instead of locked with the EEPROM's key\n"
         "  --seconds N        run for N seconds of host time (default 5)\n"
         "  --until EVENT      stop early at a milestone: rom-hidden, bootloader, kernel\n"
         "  --trace LIST       comma-separated: post,pci,smbus,mmio,pio,irq,flash,cpu,boot,timer,gpu,all\n"
@@ -74,6 +76,10 @@ int main(int argc, char** argv) {
             cfg.flash_image = need("--bios");
         } else if (a == "--eeprom") {
             cfg.eeprom_image = need("--eeprom");
+        } else if (a == "--hdd") {
+            cfg.hdd_image = need("--hdd");
+        } else if (a == "--hdd-unlocked") {
+            cfg.hdd_locked = false;
         } else if (a == "--seconds") {
             seconds = std::atof(need("--seconds"));
         } else if (a == "--until") {
@@ -134,6 +140,8 @@ int main(int argc, char** argv) {
     std::printf("milestones: rom hidden %s | smc challenge %s | bootloader %s | kernel %s | power off %s\n", ms(m.rom_hidden).c_str(),
                 ms(m.smc_challenge_answered).c_str(), ms(m.bootloader_magic).c_str(), ms(m.kernel_header).c_str(), ms(m.power_off).c_str());
     if (!machine.power_off_reason().empty()) std::printf("power off: %s\n", machine.power_off_reason().c_str());
+    if (const auto v = machine.kernel().version())
+        std::printf("kernel: %u.%u.%u.%u%s\n", v->major, v->minor, v->build, v->qfe, machine.eeprom_generated() ? " (EEPROM generated from its key)" : "");
 
     std::string post;
     for (const auto& e : machine.post().history()) post += std::format("{:02x} ", e.code);
@@ -152,9 +160,18 @@ int main(int argc, char** argv) {
             if (stats.by_vector[v]) std::printf(" %02x×%llu", v, static_cast<unsigned long long>(stats.by_vector[v]));
         std::printf("\n");
     }
-    std::printf("smbus transactions: %llu; gpu register reads %llu writes %llu\n",
+    std::printf("smbus transactions: %llu; gpu register reads %llu writes %llu, vblanks %llu; apu r/w %llu/%llu; aci r/w %llu/%llu\n",
                 static_cast<unsigned long long>(machine.smbus().transactions()), static_cast<unsigned long long>(machine.nv2a().reads()),
-                static_cast<unsigned long long>(machine.nv2a().writes()));
+                static_cast<unsigned long long>(machine.nv2a().writes()), static_cast<unsigned long long>(machine.nv2a().vblanks()),
+                static_cast<unsigned long long>(machine.apu().reads()), static_cast<unsigned long long>(machine.apu().writes()),
+                static_cast<unsigned long long>(machine.aci().reads()), static_cast<unsigned long long>(machine.aci().writes()));
+    std::printf("ide: %llu commands, %llu sectors read, %llu written; hdd %s, unlock attempts %llu; dvd packets %llu\n",
+                static_cast<unsigned long long>(machine.ide().primary().commands()),
+                static_cast<unsigned long long>(machine.ide().primary().sectors_read()),
+                static_cast<unsigned long long>(machine.ide().primary().sectors_written()),
+                machine.hdd() ? (machine.hdd()->locked() ? "locked" : "unlocked") : "absent",
+                static_cast<unsigned long long>(machine.hdd() ? machine.hdd()->unlock_attempts() : 0),
+                static_cast<unsigned long long>(static_cast<const mv::AtapiCdrom*>(machine.ide().primary().device(1)) ? static_cast<const mv::AtapiCdrom*>(machine.ide().primary().device(1))->packets() : 0));
     mv::CpuBackend::Regs regs{};
     if (machine.cpu()->read_regs(regs)) {
         std::printf("cpu: cs %04x eip %08x eflags %08x cr0 %08x cr3 %08x esp %08x tsc %llu\n", regs.cs, regs.eip, regs.eflags, regs.cr0,

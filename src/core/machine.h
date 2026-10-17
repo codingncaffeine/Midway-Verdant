@@ -9,9 +9,12 @@
 #include <vector>
 
 #include "core/bus.h"
+#include "core/kernel_image.h"
 #include "core/scheduler.h"
 #include "cpu/backend.h"
 #include "flash/flash.h"
+#include "ide/ata_disk.h"
+#include "ide/ide.h"
 #include "mcpx/isa_misc.h"
 #include "mcpx/lpc.h"
 #include "mcpx/pic.h"
@@ -27,7 +30,11 @@ namespace mv {
 struct MachineConfig {
     std::filesystem::path mcpx_rom;
     std::filesystem::path flash_image;
+    // Loaded when the file exists; otherwise generated from the kernel's own key at first use and written there.
     std::optional<std::filesystem::path> eeprom_image;
+    // A raw hard-disk image (8 GiB for a retail layout); absent = no drive on the cable.
+    std::optional<std::filesystem::path> hdd_image;
+    bool hdd_locked{true};
     std::size_t ram_bytes{64u * 1024 * 1024};
     Smc::Revision smc_revision{Smc::Revision::P01};
     Smc::AvPack av_pack{Smc::AvPack::Hdtv};
@@ -61,6 +68,10 @@ public:
     Eeprom& eeprom() { return eeprom_; }
     SmbusController& smbus() { return smbus_; }
     Nv2aStub& nv2a() { return nv2a_; }
+    IdeController& ide() { return ide_; }
+    AtaDisk* hdd() { return hdd_; }
+    RegisterStoreDevice& apu() { return apu_; }
+    RegisterStoreDevice& aci() { return aci_; }
     PciBus& pci() { return pci_; }
     Lpc& lpc() { return lpc_; }
     CpuBackend* cpu() { return cpu_.get(); }
@@ -85,6 +96,9 @@ public:
     const Milestones& milestones() const { return milestones_; }
     void request_power_off(std::string why);
     std::string power_off_reason() const { return power_off_reason_; }
+    // The kernel image in RAM, once unpacked.
+    KernelImage kernel() const { return KernelImage(bus_); }
+    bool eeprom_generated() const { return eeprom_generated_; }
 
 private:
     void check_memory_milestones();
@@ -108,6 +122,11 @@ private:
     Adm1032 adm1032_;
     VideoEncoder encoder_;
     Nv2aStub nv2a_;
+    RegisterStoreDevice apu_;
+    RegisterStoreDevice aci_;
+    IdeController ide_;
+    DiskImage hdd_image_;
+    AtaDisk* hdd_{nullptr};
     std::vector<std::unique_ptr<PciDevice>> placeholders_;
     std::unique_ptr<CpuBackend> cpu_;
 
@@ -117,6 +136,7 @@ private:
     bool power_off_{false};
     std::string power_off_reason_;
     Milestones milestones_;
+    bool eeprom_generated_{false};
 };
 
 }  // namespace mv

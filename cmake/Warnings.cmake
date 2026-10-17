@@ -2,7 +2,8 @@
 # so warnings are errors from the first commit (MV_WERROR, on by default).
 add_library(mv_warnings INTERFACE)
 if(MSVC)
-  target_compile_options(mv_warnings INTERFACE /W4 /permissive- /utf-8 /EHsc /Zc:preprocessor)
+  # Warnings from the standard library and other external headers are not ours to fix.
+  target_compile_options(mv_warnings INTERFACE /W4 /permissive- /utf-8 /EHsc /Zc:preprocessor /external:anglebrackets /external:W0)
   if(MV_WERROR)
     target_compile_options(mv_warnings INTERFACE /WX)
   endif()

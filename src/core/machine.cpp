@@ -7,6 +7,7 @@
 
 #include "core/clock.h"
 #include "debug/trace.h"
+#include "smbus/eeprom_image.h"
 
 namespace mv {
 
@@ -27,7 +28,10 @@ Machine::Machine(const MachineConfig& config)
       eeprom_(),
       adm1032_(),
       encoder_(VideoEncoder::Kind::Conexant),
-      nv2a_(bus_) {
+      nv2a_(bus_, sched_, [this](bool level) { pic_.set_irq(3, level); }),
+      apu_(bus_, "apu", 0x01B0, 0x040100, 0xB1, 0, 512u * 1024, trace::Cat::Mmio),
+      aci_(bus_, "aci", 0x01B1, 0x040100, 0xB1, 2, 4096, trace::Cat::Mmio),
+      ide_(bus_, sched_, [this](bool level) { pic_.set_irq(14, level); }) {
     trace::set_clock_source(&trace_now_);
     smc_.set_av_pack(config.av_pack);
     if (config.rtc_base_time) rtc_.set_base_time(*config.rtc_base_time);
@@ -36,6 +40,23 @@ Machine::Machine(const MachineConfig& config)
     pci_.add({0, 1, 0}, lpc_);
     pci_.add({0, 1, 1}, smbus_);
     pci_.add({1, 0, 0}, nv2a_);
+    pci_.add({0, 5, 0}, apu_);
+    apu_.set_cfg8(0x3C, 5);
+    apu_.set_cfg8(0x3D, 1);
+    // The kernel polls the global processor's status word after each write to it; all ones lets it proceed until
+    // the DSP model answers for real (Phase 6) [verify which bit it wants].
+    apu_.set_fixed(0x20010, 0xFFFFFFFF);
+    apu_.set_fixed(0x30010, 0xFFFFFFFF);
+    pci_.add({0, 6, 0}, aci_);
+    aci_.define_bar(0, PciDevice::BarKind::Io, 256);
+    aci_.define_bar(1, PciDevice::BarKind::Io, 128);
+    aci_.set_cfg8(0x3C, 6);
+    aci_.set_cfg8(0x3D, 1);
+    aci_.set_fixed(0x130, 0x00000100);  // global status: primary codec ready [verify bit layout]
+    aci_.set_fixed(0x134, 0x00000000);  // codec access semaphore: free
+    // Bus-master channel control registers: the "reset registers" bit finishes at once.
+    for (u32 cr : {0x10Bu, 0x11Bu, 0x12Bu, 0x16Bu, 0x17Bu}) aci_.set_self_clearing(cr, 0x02);
+    pci_.add({0, 9, 0}, ide_);
     auto placeholder = [this](PciAddress at, std::string_view name, u16 device, u32 class_code, u8 rev, u8 header = 0) {
         auto d = std::make_unique<PciPlaceholder>(name, device, class_code, rev, header);
         pci_.add(at, *d);
@@ -55,20 +76,9 @@ Machine::Machine(const MachineConfig& config)
     nic->define_bar(0, PciDevice::BarKind::Memory, 1024);
     nic->define_bar(1, PciDevice::BarKind::Io, 16);
     nic->set_cfg8(0x3C, 4);
-    PciDevice* apu = placeholder({0, 5, 0}, "apu", 0x01B0, 0x040100, 0xB1);
-    apu->define_bar(0, PciDevice::BarKind::Memory, 512u * 1024);
-    apu->set_cfg8(0x3C, 5);
-    PciDevice* aci = placeholder({0, 6, 0}, "aci", 0x01B1, 0x040100, 0xB1);
-    aci->define_bar(0, PciDevice::BarKind::Io, 256);
-    aci->define_bar(1, PciDevice::BarKind::Io, 128);
-    aci->define_bar(2, PciDevice::BarKind::Memory, 4096);
-    aci->set_cfg8(0x3C, 6);
     PciDevice* bridge = placeholder({0, 8, 0}, "pci-bridge", 0x01B8, 0x060400, 0xB1, 1);
     bridge->set_cfg8(0x19, 2);  // secondary bus
     bridge->set_cfg8(0x1A, 2);
-    PciDevice* ide = placeholder({0, 9, 0}, "ide", 0x01BC, 0x01018A, 0xB1);
-    ide->define_bar(4, PciDevice::BarKind::Io, 16);
-    ide->set_cfg8(0x3C, 14);
     PciDevice* agp = placeholder({0, 0x1E, 0}, "agp-bridge", 0x01B7, 0x060400, 0xA1, 1);
     agp->set_cfg8(0x19, 1);
     agp->set_cfg8(0x1A, 1);
@@ -99,14 +109,69 @@ Machine::~Machine() {
 bool Machine::init(std::string& error) {
     if (!flash_.load_image(config_.flash_image, error)) return false;
     if (!flash_.load_mcpx_rom(config_.mcpx_rom, error)) return false;
-    if (config_.eeprom_image) {
+    if (config_.eeprom_image && std::filesystem::exists(*config_.eeprom_image)) {
         std::ifstream f(*config_.eeprom_image, std::ios::binary);
         if (!f) {
             error = std::format("cannot open EEPROM image {}", config_.eeprom_image->string());
             return false;
         }
         f.read(reinterpret_cast<char*>(eeprom_.image().data()), 256);
+        eeprom_.mark_provisioned();
+    } else {
+        eeprom_.set_provisioner([this](std::array<u8, 256>& image) {
+            const KernelImage k(bus_);
+            std::string why;
+            if (!k.present(&why)) {
+                trace::log(trace::Cat::Boot, "EEPROM needed before the kernel is in RAM ({}); left blank", why);
+                return false;
+            }
+            const auto key = k.eeprom_key();
+            if (!key) {
+                trace::log(trace::Cat::Boot, "kernel export table has no EEPROM key; EEPROM left blank");
+                return false;
+            }
+            eeprom::Settings s;
+            for (std::size_t i = 0; i < 16; ++i) s.hdd_key[i] = static_cast<u8>(0x4D + 7 * i);  // any key: the disk image is unlocked with it
+            image = eeprom::generate(*key, s);
+            eeprom_generated_ = true;
+            const auto v = k.version();
+            trace::log(trace::Cat::Boot, "EEPROM generated with the kernel's own key (kernel {}.{}.{}.{})", v ? v->major : 0,
+                       v ? v->minor : 0, v ? v->build : 0, v ? v->qfe : 0);
+            if (config_.eeprom_image) {
+                std::ofstream f(*config_.eeprom_image, std::ios::binary);
+                if (f) {
+                    f.write(reinterpret_cast<const char*>(image.data()), 256);
+                    trace::log(trace::Cat::Boot, "EEPROM saved to {}", config_.eeprom_image->string());
+                }
+            }
+            return true;
+        });
     }
+    // The cable: the hard disk as master when an image is given, the DVD drive as slave always.
+    if (config_.hdd_image) {
+        if (!hdd_image_.open(*config_.hdd_image, false, error)) return false;
+        auto disk = std::make_unique<AtaDisk>(hdd_image_);
+        hdd_ = disk.get();
+        disk->set_locked(config_.hdd_locked);
+        disk->set_password_oracle([this]() -> std::optional<std::array<u8, 32>> {
+            // The password the kernel will present: HMAC of the drive identity with the HDD key the EEPROM holds,
+            // decrypted with the kernel's own EEPROM key.
+            const KernelImage k(bus_);
+            const auto key = k.eeprom_key();
+            if (!key) return std::nullopt;
+            std::string why;
+            const auto hdd_key = eeprom::verify(*key, eeprom_.image(), &why);
+            if (!hdd_key) {
+                trace::log(trace::Cat::Boot, "HDD password oracle: EEPROM does not verify ({})", why);
+                return std::nullopt;
+            }
+            return AtaDisk::password_for(*hdd_key, hdd_->model(), hdd_->serial());
+        });
+        ide_.attach(0, std::move(disk));
+        trace::log(trace::Cat::Boot, "HDD image {} ({} sectors){}", config_.hdd_image->string(), hdd_image_.sectors(),
+                   config_.hdd_locked ? ", locked" : "");
+    }
+    ide_.attach(1, std::make_unique<AtapiCdrom>());
     std::string why_not;
     cpu_ = make_fast_backend(why_not);
     if (!cpu_) {

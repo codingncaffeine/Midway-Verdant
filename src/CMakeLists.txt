@@ -6,9 +6,14 @@ add_library(mvcore STATIC
   core/scheduler.cpp
   core/bus.cpp
   core/machine.cpp
+  core/kernel_image.cpp
+  crypto/sha1.cpp
   cpu/kvm/kvm_backend.cpp
   debug/trace.cpp
   flash/flash.cpp
+  ide/ide.cpp
+  ide/ata_disk.cpp
+  ide/disk_image.cpp
   mcpx/isa_misc.cpp
   mcpx/lpc.cpp
   mcpx/pic.cpp
@@ -18,6 +23,7 @@ add_library(mvcore STATIC
   pci/pci.cpp
   smbus/smbus.cpp
   smbus/smc.cpp
+  smbus/eeprom_image.cpp
 )
 target_include_directories(mvcore PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_BINARY_DIR}/generated")
 target_link_libraries(mvcore PUBLIC mv_warnings)

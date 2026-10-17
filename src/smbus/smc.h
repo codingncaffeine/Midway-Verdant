@@ -63,20 +63,36 @@ private:
 class Eeprom : public SmbusDevice {
 public:
     std::string_view name() const override { return "eeprom"; }
-    std::optional<u8> read_byte(u8 command) override { return image_[command]; }
+    std::optional<u8> read_byte(u8 command) override {
+        provision_if_needed();
+        return image_[command];
+    }
     bool write_byte(u8 command, u8 value) override {
+        provision_if_needed();
         image_[command] = value;
         dirty_ = true;
         return true;
     }
+    // An image loaded from the user's file is final; an empty one is provisioned by the machine the first time
+    // the kernel touches it (by then the kernel, and its EEPROM key, are in RAM).
+    void set_provisioner(std::function<bool(std::array<u8, 256>&)> p) { provisioner_ = std::move(p); }
+    void mark_provisioned() { provisioned_ = true; }
+    bool provisioned() const { return provisioned_; }
     std::array<u8, 256>& image() { return image_; }
     const std::array<u8, 256>& image() const { return image_; }
     bool dirty() const { return dirty_; }
     void clear_dirty() { dirty_ = false; }
 
 private:
+    void provision_if_needed() {
+        if (provisioned_) return;
+        provisioned_ = true;
+        if (provisioner_ && provisioner_(image_)) dirty_ = true;
+    }
     std::array<u8, 256> image_{};
     bool dirty_{false};
+    bool provisioned_{false};
+    std::function<bool(std::array<u8, 256>&)> provisioner_;
 };
 
 // The ADM1032 temperature monitor at 0x4C (not on 1.6 boards): local and remote temperatures and the usual
