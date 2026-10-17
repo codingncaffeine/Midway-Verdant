@@ -25,6 +25,7 @@ add_executable(mv_tests
   unit/vulkan_test.cpp
   unit/vsh_interpreter_test.cpp
   unit/dsp_decode_test.cpp
+  unit/dsp_core_test.cpp
 )
 target_link_libraries(mv_tests PRIVATE mvcore gtest_main)
 target_compile_definitions(mv_tests PRIVATE MV_SOURCE_DIR="${CMAKE_SOURCE_DIR}")

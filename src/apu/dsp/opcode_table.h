@@ -1,6 +1,6 @@
 // Generated from the public DSP56300 Family Manual (Rev. 5), chapter 13 "Instruction Formats and Opcodes": one line
 // per encoding (mnemonic, operand form, 24-bit pattern with 0/1 fixed bits and letters for fields). Regenerate with
-// local-notes/hw/dsp56300-opcodes.sh (which also lists the two hand corrections); do not edit by hand.
+// local-notes/hw/dsp56300-opcodes.sh (which also lists the hand corrections); do not edit by hand.
 #pragma once
 namespace mv::dsp {
 struct OpcodePattern { const char* mnemonic; const char* operands; const char* pattern; };
@@ -17,7 +17,7 @@ inline constexpr OpcodePattern kOpcodePatterns[] = {
     {"Bcc", "xxxx", "00001101000100000100CCCC"},
     {"Bcc", "xxx", "00000101CCCC01aaaa0aaaaa"},
     {"Bcc", "Rn", "0000110100011RRR0100CCCC"},
-    {"BCHG", "#n,[X or Y]:ea", "0000101101MMMRRROS00bbbb"},
+    {"BCHG", "#n,[X or Y]:ea", "0000101101MMMRRR0S00bbbb"},
     {"BCHG", "#n,[X or Y]:aa", "0000101100aaaaaa0S00bbbb"},
     {"BCHG", "#n,[X or Y]:pp", "0000101110pppppp0S00bbbb"},
     {"BCHG", "#n,[X or Y]:qq", "0000000101qqqqqq0S0bbbbb"},
@@ -62,7 +62,7 @@ inline constexpr OpcodePattern kOpcodePatterns[] = {
     {"BSSET", "#n,[X or Y]:pp,xxxx", "0000110111pppppp0S1bbbbb"},
     {"BSSET", "#n,[X or Y]:qq,xxxx", "0000010010qqqqqq1S1bbbbb"},
     {"BSSET", "#n,S,xxxx", "0000110111DDDDDD101bbbbb"},
-    {"BTST", "#n,[X or Y]:ea", "0000101101MMMRRROS10bbbb"},
+    {"BTST", "#n,[X or Y]:ea", "0000101101MMMRRR0S10bbbb"},
     {"BTST", "#n,[X or Y]:aa", "0000101100aaaaaa0S10bbbb"},
     {"BTST", "#n,[X or Y]:pp", "0000101110pppppp0S10bbbb"},
     {"BTST", "#n,[X or Y]:qq", "0000000101qqqqqq0S10bbbb"},
@@ -194,5 +194,6 @@ inline constexpr OpcodePattern kOpcodePatterns[] = {
     {"TRAPcc", "", "00000000000000000001CCCC"},
     {"VSL", "S,i,L:ea", "0000101S11MMMRRR110i0000"},
     {"WAIT", "", "000000000000000010000110"},
+    {"SUB", "#xx,D", "0000000101iiiiii1000d100"},
 };
 }  // namespace mv::dsp
