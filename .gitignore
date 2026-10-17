@@ -14,8 +14,6 @@
 *.qcow2
 *.img
 *.raw
-eeprom*
-mcpx*
 bios/
 roms/
 

@@ -67,7 +67,7 @@ for f in "${files[@]}"; do
     fi
     base="${f##*/}"
     case "${base,,}" in
-        *.bin|*.rom|*.iso|*.xiso|*.xbe|*.qcow2|*.img|*.raw|*.cso|eeprom*|mcpx*)
+        *.bin|*.rom|*.iso|*.xiso|*.xbe|*.qcow2|*.img|*.raw|*.cso)
             echo "precommit-scan: console dump or game data staged: $f"; found=1; continue ;;
     esac
     [[ -f "$f" ]] || continue

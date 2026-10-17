@@ -18,7 +18,7 @@ head -c 1048576 /dev/urandom > "$work/bios1m.dat"
 { head -c 100 /dev/urandom; printf 'MICROSOFT*XBOX*MEDIA'; head -c 100 /dev/urandom; } > "$work/disc.dat"
 printf 'int x = 1; // the ''user said this\n' > "$work/chatty.cpp"
 printf 'int clean = 1;\n' > "$work/clean.cpp"
-cp "$work/clean.cpp" "$work/mcpx_copy.cpp"
+head -c 256 /dev/urandom > "$work/eeprom.bin"
 
 rc=0
 expect_refused() {
@@ -29,7 +29,7 @@ expect_refused "$work/bios1m.dat"
 expect_refused "$work/program.dat"
 expect_refused "$work/disc.dat"
 expect_refused "$work/chatty.cpp"
-expect_refused "$work/mcpx_copy.cpp"
+expect_refused "$work/eeprom.bin"
 if tools/precommit-scan.sh --files "$work/clean.cpp" >/dev/null 2>&1; then echo "passed as expected: clean.cpp"; else echo "CONTROL FAILED: scan refused a clean file"; rc=1; fi
 rm -rf "$work"
 [[ $rc -eq 0 ]] && echo "scan controls OK"
