@@ -72,6 +72,13 @@ void Flash::hide_rom() {
     for (auto& cb : on_rom_hidden_) cb();
 }
 
+void Flash::reset() {
+    if (rom_visible_ || !has_rom_) return;
+    rom_visible_ = true;
+    trace::log(trace::Cat::Boot, "MCPX ROM visible again (reset)");
+    for (auto& cb : on_rom_shown_) cb();
+}
+
 u8 Flash::read8(PhysAddr addr) const {
     if (rom_visible() && addr >= kRomBase) return rom_[addr - kRomBase];
     return window_[addr - kBase];

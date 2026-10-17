@@ -48,6 +48,8 @@ public:
 
     // Samples consumed by a channel's buffers, in the order they were played; the host's audio output.
     void set_sample_sink(SampleSink sink) { sink_ = std::move(sink); }
+    // The reset line: every channel halted, the mixer and the global control cleared.
+    void reset();
 
     struct ChannelState {
         u32 bdbar{0};

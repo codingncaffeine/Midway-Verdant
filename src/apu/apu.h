@@ -55,6 +55,8 @@ public:
     std::string_view name() const override { return PciDevice::name(); }
     u32 mmio_read(PhysAddr addr, unsigned size) override;
     void mmio_write(PhysAddr addr, unsigned size, u32 value) override;
+    // The reset line: both processors held, every register cleared, no trap pending.
+    void reset();
 
     // A register word as the kernel would read it (offset into the window, 4-byte aligned).
     u32 reg(u32 offset);

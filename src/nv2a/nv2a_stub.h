@@ -65,6 +65,8 @@ public:
     u64 reads() const { return reads_; }
     u64 writes() const { return writes_; }
     u64 vblanks() const { return vblanks_; }
+    // The reset line: registers at power-on, no objects bound, the engine free; the frame timer keeps running.
+    void reset();
     u32 framebuffer_start() const { return reg(kPcrtcStart); }
     const PushbufferWalker& pushbuffer() const { return walker_; }
     // Objects bound to the channel's eight subchannels (class numbers, 0 = none).

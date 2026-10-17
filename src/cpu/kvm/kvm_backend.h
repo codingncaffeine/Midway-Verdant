@@ -35,11 +35,13 @@ public:
     void set_dirty_tracking(bool on) override { dirty_tracking_ = on; }
     void take_dirty_pages(std::vector<u32>& pages) override;
 
-    // Replace the top page's backing when the MCPX ROM is hidden.
+    // Replace the top page's backing when the MCPX ROM is hidden, and again when a reset shows it.
     void on_rom_hidden();
+    void on_rom_shown();
 
 private:
     void thread_main();
+    void set_top_page(const void* backing);
     bool set_slot(u32 slot, u64 guest_phys, u64 size, void* host, bool readonly, std::string& error, bool log_dirty = false);
     bool setup_cpuid(std::string& error);
     void handle_io();

@@ -247,3 +247,16 @@ TEST(Ide, AtapiModeSense10ReturnsTheSecurityPageWithoutMedia) {
     EXPECT_EQ(reply[11], 1) << "the byte the kernel insists on";
     EXPECT_EQ(reply[12], 0) << "not authenticated";
 }
+
+TEST(Ide, TheResetLineLocksTheDriveAgain) {
+    Rig r;
+    r.command(0xF2);
+    ASSERT_TRUE(r.wait_not_busy());
+    r.write_block(Rig::password_block(0x5A));
+    ASSERT_TRUE(r.wait_not_busy());
+    ASSERT_FALSE(r.disk->locked());
+    r.ide.reset();
+    EXPECT_TRUE(r.disk->locked()) << "a hardware reset puts a security-enabled drive back in the locked state";
+    EXPECT_FALSE(r.irq_level);
+    EXPECT_EQ(r.identify_security_word() & 0x0006, 0x0006);
+}

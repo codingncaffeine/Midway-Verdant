@@ -69,6 +69,13 @@ void PciDevice::write_bar_dword(int index, u32 value) {
     if (new_base != old_base) on_bar_changed(index, old_base, new_base);
 }
 
+void PciDevice::reset_config() {
+    for (int i = 0; i < 6; ++i) write_bar_dword(i, 0);
+    set_cfg16(0x04, 0);
+    set_cfg16(0x06, 0);
+    on_reset();
+}
+
 u32 PciDevice::config_read(u8 reg, unsigned size) {
     u32 v = 0;
     for (unsigned i = 0; i < size; ++i) v |= static_cast<u32>(cfg_[static_cast<u8>(reg + i)]) << (8 * i);
@@ -116,6 +123,11 @@ void PciBus::add(PciAddress at, PciDevice& dev) {
 PciDevice* PciBus::find(PciAddress at) const {
     auto it = devices_.find(at.key());
     return it == devices_.end() ? nullptr : it->second;
+}
+
+void PciBus::reset_all() {
+    for (auto& [key, dev] : devices_) dev->reset_config();
+    config_address_ = 0;
 }
 
 u32 PciBus::config_read(PciAddress at, u8 reg, unsigned size) {

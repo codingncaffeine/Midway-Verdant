@@ -18,6 +18,8 @@ public:
 
     u32 pio_read(u16 port, unsigned size) override;
     void pio_write(u16 port, unsigned size, u32 value) override;
+    // The reset line: no channel counting, no edge scheduled.
+    void reset();
 
     // Port 0x61 bits: gate for channel 2 and the speaker data bit.
     void set_gate2(bool on);

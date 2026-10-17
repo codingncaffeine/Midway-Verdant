@@ -19,6 +19,7 @@ public:
 protected:
     void on_config_write(u8 reg, unsigned size, u32 value) override;
     void on_bar_changed(int index, u32 old_base, u32 new_base) override;
+    void on_reset() override;
 
 private:
     Bus& bus_;

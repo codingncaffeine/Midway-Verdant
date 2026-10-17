@@ -22,6 +22,8 @@ public:
     int pending_vector();
     // Acknowledge the pending request (the INTA cycle): sets ISR, clears IRR in edge mode, returns the vector.
     int acknowledge();
+    // The reset line: both units back to power-on (everything masked, nothing pending, edge mode).
+    void reset();
 
     // Called whenever the INTR output changes level.
     void set_on_intr(std::function<void(bool asserted)> cb) { on_intr_ = std::move(cb); }

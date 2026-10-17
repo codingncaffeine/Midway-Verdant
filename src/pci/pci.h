@@ -51,11 +51,16 @@ public:
     u32 bar_base(int index) const;
     const Bar& bar(int index) const { return bars_[static_cast<std::size_t>(index)]; }
 
+    // The reset line: every BAR cleared (the hook unmaps the regions), the command and status registers cleared,
+    // then the subclass's own registers through `on_reset`. Identification and BAR sizes stay.
+    void reset_config();
+
 protected:
     // Subclasses see every configuration write after the standard registers were updated; the BAR hook fires
     // whenever a BAR's base changes so the device can move its regions on the bus.
     virtual void on_config_write(u8 reg, unsigned size, u32 value) { (void)reg; (void)size; (void)value; }
     virtual void on_bar_changed(int index, u32 old_base, u32 new_base) { (void)index; (void)old_base; (void)new_base; }
+    virtual void on_reset() {}
 
 private:
     friend class PciBus;
@@ -77,6 +82,8 @@ public:
 
     void add(PciAddress at, PciDevice& dev);
     PciDevice* find(PciAddress at) const;
+    // The reset line reaches every function.
+    void reset_all();
 
     u32 config_read(PciAddress at, u8 reg, unsigned size);
     void config_write(PciAddress at, u8 reg, unsigned size, u32 value);

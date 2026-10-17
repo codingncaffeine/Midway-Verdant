@@ -175,23 +175,25 @@ bool KvmBackend::init(Machine& machine, std::string& error) {
     sigaction(kKickSignal, &sa, nullptr);
 
     machine.flash().add_on_rom_hidden([this] { on_rom_hidden(); });
+    machine.flash().add_on_rom_shown([this] { on_rom_shown(); });
     reset();
     return true;
 }
 
-void KvmBackend::on_rom_hidden() {
+void KvmBackend::set_top_page(const void* backing) {
     std::string error;
-    const u8* plain = machine_->flash().window() + Flash::kWindow - 4096;
     // Replace the slot: delete (size 0) then add with the new backing.
     kvm_userspace_memory_region region{};
     region.slot = kSlotTopPage;
     region.memory_size = 0;
     region.guest_phys_addr = 0xFFFFF000u;
     ioctl(vm_fd_, KVM_SET_USER_MEMORY_REGION, &region);
-    if (!set_slot(kSlotTopPage, 0xFFFFF000u, 4096, const_cast<u8*>(plain), true, error)) {
-        fail(Stop::InternalError, error);
-    }
+    if (!set_slot(kSlotTopPage, 0xFFFFF000u, 4096, const_cast<void*>(backing), true, error)) fail(Stop::InternalError, error);
 }
+
+void KvmBackend::on_rom_hidden() { set_top_page(machine_->flash().window() + Flash::kWindow - 4096); }
+
+void KvmBackend::on_rom_shown() { set_top_page(machine_->flash().overlay_page()); }
 
 void KvmBackend::reset() {
     kvm_sregs sregs{};

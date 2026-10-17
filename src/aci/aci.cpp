@@ -22,6 +22,12 @@ Aci::Aci(Bus& bus, Scheduler& sched, std::function<void(bool)> irq)
     }
 }
 
+void Aci::reset() {
+    mixer_ = {};
+    for (u32 c = 0; c < kChannels; ++c) channel_reset(static_cast<Channel>(c));
+    glob_cnt_ = 0;
+}
+
 void Aci::on_bar_changed(int index, u32 old_base, u32 new_base) {
     switch (index) {
         case 0:

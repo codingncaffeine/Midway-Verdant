@@ -19,6 +19,13 @@ Pit::Pit(Bus& bus, Scheduler& sched, std::function<void(bool)> irq0) : sched_(sc
     channels_[2].gate = false;
 }
 
+void Pit::reset() {
+    sched_.cancel(irq_event_);
+    channels_ = {};
+    for (auto& c : channels_) c.gate = true;
+    channels_[2].gate = false;
+}
+
 u64 Pit::ticks_since_load(const Channel& c) const {
     const Cycles now = sched_.now();
     return now > c.load_time ? ticks_from_cycles(now - c.load_time, clk::kPitHz) : 0;

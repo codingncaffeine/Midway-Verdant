@@ -51,6 +51,8 @@ struct MachineConfig {
     // Instrument: when software writes this SMBus (7-bit address, command) pair, log the CPU's registers and
     // stack under the boot trace — the call chain behind a device write.
     std::optional<std::pair<u8, u8>> break_smbus_write;
+    // Instrument: press the front-panel reset this many seconds of host time into the run.
+    std::optional<double> reset_at_seconds;
 };
 
 // The console: every device on one bus and one timeline, a CPU backend running the firmware against them, and
@@ -108,6 +110,11 @@ public:
     const Milestones& milestones() const { return milestones_; }
     void request_power_off(std::string why);
     std::string power_off_reason() const { return power_off_reason_; }
+    // A warm reset, as the SMC's reset line gives one: the CPU restarts at its vector, every device on the board
+    // returns to power-on and the boot ROM shows again; RAM, the RTC, the SMC and the EEPROM keep their state.
+    // Performed on the io thread at the next tick.
+    void request_reset(std::string why);
+    unsigned boots() const { return boots_; }
     // The kernel image in RAM, once unpacked.
     KernelImage kernel() const { return KernelImage(bus_); }
     bool eeprom_generated() const { return eeprom_generated_; }
@@ -115,6 +122,7 @@ public:
 
 private:
     void check_memory_milestones();
+    void perform_reset(std::unique_lock<std::mutex>& lk);
 
     MachineConfig config_;
     Bus bus_;
@@ -148,6 +156,10 @@ private:
     std::chrono::steady_clock::time_point start_;
     bool power_off_{false};
     std::string power_off_reason_;
+    bool reset_pending_{false};
+    bool reset_at_done_{false};
+    std::string reset_reason_;
+    unsigned boots_{0};
     Milestones milestones_;
     bool eeprom_generated_{false};
     std::vector<u32> watch_last_;

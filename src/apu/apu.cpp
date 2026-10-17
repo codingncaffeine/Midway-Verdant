@@ -44,6 +44,15 @@ void Apu::on_bar_changed(int index, u32 old_base, u32 new_base) {
     trace::log(trace::Cat::Apu, "apu registers at {:08x}", new_base);
 }
 
+void Apu::reset() {
+    apply_reset(gp_, gp_reset_, 0, "gp");
+    apply_reset(ep_, ep_reset_, 0, "ep");
+    for (auto& r : regs_) r = 0;
+    other_.clear();
+    fe_trapped_ = false;
+    update_irq();
+}
+
 // ── the register window ─────────────────────────────────────────────────────────────────────────────────────────
 
 u32 Apu::reg(u32 offset) { return read_word(offset & ~3u); }

@@ -62,6 +62,8 @@ public:
     // Instrument: called on the CPU's thread the moment software starts a cycle, before it completes on the
     // timeline — the caller's registers and stack are still those of the write.
     void set_cycle_hook(std::function<void(const Transaction&)> hook) { cycle_hook_ = std::move(hook); }
+    // The reset line: the controller idle; the slaves keep their state (they are powered through a reset).
+    void reset();
 
 protected:
     void on_bar_changed(int index, u32 old_base, u32 new_base) override;

@@ -43,6 +43,9 @@ public:
     void hide_rom();
     // Several parties care (the machine for its milestone, the fast-mode backend for its memory slot).
     void add_on_rom_hidden(std::function<void()> cb) { on_rom_hidden_.push_back(std::move(cb)); }
+    // The reset line: the boot ROM overlays the top of the flash again, as at power-on.
+    void reset();
+    void add_on_rom_shown(std::function<void()> cb) { on_rom_shown_.push_back(std::move(cb)); }
 
     u32 mmio_read(PhysAddr addr, unsigned size) override;
     void mmio_write(PhysAddr addr, unsigned size, u32 value) override;
@@ -60,6 +63,7 @@ private:
     bool has_rom_{false};
     bool rom_visible_{true};
     std::vector<std::function<void()>> on_rom_hidden_;
+    std::vector<std::function<void()>> on_rom_shown_;
 };
 
 }  // namespace mv

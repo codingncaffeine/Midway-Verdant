@@ -196,3 +196,22 @@ TEST(Pic, SlaveEoiUncoversALowerRequestAndRaisesTheCascadeAgain) {
     bus.pio_write(0xA1, 1, 0x00);
     EXPECT_EQ(pic.pending_vector(), 0x3E);
 }
+
+TEST(Pic, TheResetLineDropsPendingRequestsAndMasksEverything) {
+    Bus bus(4096);
+    Pic pic(bus);
+    init_pics(bus, 0x30, 0x38);
+    pic.set_irq(5, true);
+    pic.set_irq(14, true);
+    ASSERT_EQ(pic.pending_vector(), 0x3E) << "the cascade outranks IRQ 5";
+    pic.reset();
+    EXPECT_EQ(pic.pending_vector(), -1);
+    EXPECT_FALSE(pic.intr_asserted());
+    EXPECT_EQ(pic.master().imr, 0xFF);
+    EXPECT_EQ(pic.slave().irr, 0);
+    // Re-initialised, a fresh edge is seen again.
+    init_pics(bus, 0x30, 0x38);
+    pic.set_irq(5, false);
+    pic.set_irq(5, true);
+    EXPECT_EQ(pic.pending_vector(), 0x35);
+}

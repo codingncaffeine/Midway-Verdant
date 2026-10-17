@@ -79,6 +79,13 @@ void SmbusController::pio_write(u16 port, unsigned size, u32 value) {
     }
 }
 
+void SmbusController::reset() {
+    sched_.cancel(completion_);
+    status_ = control_ = address_ = command_ = 0;
+    data_ = 0;
+    update_irq();
+}
+
 void SmbusController::start_cycle() {
     pending_.address7 = static_cast<u8>(address_ >> 1);
     pending_.read = (address_ & 1) != 0;

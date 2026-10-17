@@ -116,3 +116,15 @@ TEST(Smbus, InterruptFollowsCompletionWhenEnabled) {
     r.bus.pio_write(0xC000, 1, 0xFF);  // clear status drops the line
     r.bus.pio_write(0xC002, 1, 0x00);
 }
+
+TEST(Smbus, TheResetLineUnmapsTheControllerAndClearsItsRegisters) {
+    Rig r;
+    r.bus.pio_write(0xC004, 1, 0x20);
+    r.ctrl.reset_config();
+    EXPECT_EQ(r.ctrl.bar_base(1), 0u);
+    EXPECT_EQ(r.bus.pio_read(0xC004, 1), 0xFFu) << "nothing answers at the old block: open bus";
+    r.ctrl.config_write(0x14, 4, 0xC001);
+    r.ctrl.reset();
+    EXPECT_EQ(r.bus.pio_read(0xC004, 1), 0u) << "the address register reads clear after the reset";
+    EXPECT_TRUE(r.write_byte(0x10, 0x07, 0x01)) << "and the bus works again";
+}

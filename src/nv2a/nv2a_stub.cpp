@@ -31,6 +31,18 @@ Nv2aStub::Nv2aStub(Bus& bus, Scheduler& sched, std::function<void(bool)> irq)
     schedule_vblank();
 }
 
+void Nv2aStub::reset() {
+    regs_.clear();
+    regs_[0x000000] = kPmcBoot0;
+    regs_[kPtimerNumerator] = 1;
+    regs_[kPtimerDenominator] = 1;
+    bound_ = {};
+    bound_handles_ = {};
+    sync_ = {};
+    pgraph_stalled_ = false;
+    update_irq();
+}
+
 Cycles Nv2aStub::frame_period() const {
     // 59.94 Hz: the NTSC field rate the encoder puts out.
     return muldiv64(clk::kCpuHzNum * 1001, 1, clk::kCpuHzDen * 60000);

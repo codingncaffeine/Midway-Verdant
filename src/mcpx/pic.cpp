@@ -120,6 +120,11 @@ int Pic::acknowledge() {
     return vector;
 }
 
+void Pic::reset() {
+    units_ = {};
+    update_output();
+}
+
 void Pic::update_output() {
     // Master line 2 is the slave's INT output, a wire that follows the slave's state after every change of either
     // unit: an acknowledge lowers it, and an EOI or a mask write on the slave that uncovers a request raises it

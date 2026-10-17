@@ -33,6 +33,7 @@ void print_usage() {
         "  --capture FILE     write a pushbuffer capture (GPU methods, RAM pages, objects) for offline replay\n"
         "  --watch HEX,...    log every change of these physical RAM words (polled each tick) under the boot trace\n"
         "  --break-smbus AA:CC  log the CPU registers and stack (boot trace) when SMBus address AA gets command CC written\n"
+        "  --reset-at S       press the front-panel reset S seconds into the run (a warm reboot)\n"
         "  --version, --help\n");
 }
 
@@ -128,6 +129,8 @@ int main(int argc, char** argv) {
             }
             cfg.break_smbus_write = std::make_pair(static_cast<mv::u8>(std::strtoul(spec.substr(0, colon).c_str(), nullptr, 16)),
                                                    static_cast<mv::u8>(std::strtoul(spec.substr(colon + 1).c_str(), nullptr, 16)));
+        } else if (a == "--reset-at") {
+            cfg.reset_at_seconds = std::atof(need("--reset-at"));
         } else if (a == "--rtc-time") {
             cfg.rtc_base_time = std::atoll(need("--rtc-time"));
         } else {
@@ -164,6 +167,7 @@ int main(int argc, char** argv) {
     if (machine.cpu()->stop_reason() != mv::CpuBackend::Stop::None)
         std::printf("cpu: %s\n", machine.cpu()->stop_detail().c_str());
     const auto& m = machine.milestones();
+    if (machine.boots() > 0) std::printf("reboots: %u (the milestones below are the last boot's)\n", machine.boots());
     std::printf("milestones: rom hidden %s | smc challenge %s | bootloader %s | kernel %s | power off %s\n", ms(m.rom_hidden).c_str(),
                 ms(m.smc_challenge_answered).c_str(), ms(m.bootloader_magic).c_str(), ms(m.kernel_header).c_str(), ms(m.power_off).c_str());
     if (!machine.power_off_reason().empty()) std::printf("power off: %s\n", machine.power_off_reason().c_str());

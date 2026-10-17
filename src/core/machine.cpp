@@ -80,8 +80,10 @@ Machine::Machine(const MachineConfig& config)
     bus_.map_mmio(Flash::kBase, Flash::kWindow, &flash_);
 
     smc_.set_on_reset_request([this](u8 bits) {
-        if (bits & (Smc::kResetBitPowerOff | Smc::kResetBitPowerCycle)) request_power_off(std::format("SMC power request {:02x}", bits));
-        else if (bits & Smc::kResetBitReset) request_power_off("SMC reset request (reboot not modelled yet)");
+        if (bits & Smc::kResetBitPowerOff)
+            request_power_off(std::format("SMC power request {:02x}", bits));
+        else if (bits & (Smc::kResetBitReset | Smc::kResetBitPowerCycle))
+            request_reset(std::format("SMC {} request", (bits & Smc::kResetBitPowerCycle) ? "power-cycle" : "reset"));
     });
     flash_.add_on_rom_hidden([this] { milestones_.rom_hidden = sched_.now(); });
     if (config_.break_smbus_write) {
@@ -210,6 +212,40 @@ void Machine::request_power_off(std::string why) {
     wake();
 }
 
+void Machine::request_reset(std::string why) {
+    if (reset_pending_ || power_off_) return;
+    reset_pending_ = true;
+    reset_reason_ = std::move(why);
+    trace::log(trace::Cat::Boot, "reset requested: {}", reset_reason_);
+    wake();
+}
+
+void Machine::perform_reset(std::unique_lock<std::mutex>& lk) {
+    reset_pending_ = false;
+    // The CPU thread must be out of the hypervisor before its state and the memory slots change.
+    cpu_->stop();
+    lk.unlock();
+    cpu_->join();
+    lk.lock();
+    ++boots_;
+    trace::log(trace::Cat::Boot, "reset: {} (boot {})", reset_reason_, boots_ + 1);
+    // Everything the reset line reaches: the PCI functions (BARs unmapped, the bridge's ROM-hide bit cleared), the
+    // flash (the boot ROM shows again), the legacy devices, the engines, the drives. RAM keeps its contents (the
+    // kernel's launch data page lives there), and the RTC, the SMC and the EEPROM are powered through a reset.
+    pci_.reset_all();
+    flash_.reset();
+    pic_.reset();
+    pit_.reset();
+    smbus_.reset();
+    nv2a_.reset();
+    apu_.reset();
+    aci_.reset();
+    ide_.reset();
+    milestones_ = {};
+    cpu_->reset();
+    cpu_->start();
+}
+
 void Machine::check_memory_milestones() {
     if (!config_.watch.empty()) {
         if (watch_last_.size() != config_.watch.size()) watch_last_.assign(config_.watch.size(), 0);
@@ -252,6 +288,15 @@ Machine::StopReason Machine::run(std::chrono::nanoseconds host_duration, std::fu
         std::unique_lock lk(lock_);
         advance_time();
         check_memory_milestones();
+        if (config_.reset_at_seconds && !reset_at_done_ &&
+            std::chrono::steady_clock::now() - start_ >= std::chrono::duration<double>(*config_.reset_at_seconds)) {
+            reset_at_done_ = true;
+            request_reset("front-panel reset");
+        }
+        if (reset_pending_) {
+            perform_reset(lk);
+            continue;
+        }
         if (power_off_) {
             reason = StopReason::PowerOff;
             break;

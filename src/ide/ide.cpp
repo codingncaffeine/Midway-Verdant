@@ -77,6 +77,23 @@ void IdeChannel::raise_interrupt() {
     }
 }
 
+void IdeController::reset() { primary_->hardware_reset(); }
+
+void IdeChannel::hardware_reset() {
+    for (auto& ev : events_) sched_.cancel(ev);
+    for (auto& d : devices_) {
+        if (d) d->hardware_reset();
+    }
+    selected_ = 0;
+    nien_ = hob_ = false;
+    bm_command_ = bm_status_ = 0;
+    bm_prdt_ = 0;
+    if (irq_level_) {
+        irq_level_ = false;
+        if (irq_) irq_(false);
+    }
+}
+
 void IdeChannel::software_reset() {
     for (auto& d : devices_) {
         if (d) d->reset();

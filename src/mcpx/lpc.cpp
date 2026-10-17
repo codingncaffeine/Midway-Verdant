@@ -25,6 +25,12 @@ void Lpc::on_config_write(u8 reg, unsigned size, u32 value) {
     }
 }
 
+void Lpc::on_reset() {
+    // The bridge's own registers: the ROM-hide bit and the function enables, as the boot code finds them.
+    set_cfg32(0x80, 0);
+    set_cfg32(0x8C, 0);
+}
+
 void Lpc::on_bar_changed(int index, u32 old_base, u32 new_base) {
     if (index != 0 || !pm_) return;
     if (pm_mapped_at_) bus_.unmap_pio(static_cast<u16>(pm_mapped_at_), pm_size_);

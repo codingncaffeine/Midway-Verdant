@@ -63,6 +63,8 @@ public:
 
     void attach(int position, std::unique_ptr<IdeDevice> dev);  // 0 master, 1 slave
     IdeChannel& primary() { return *primary_; }
+    // The reset line reaches the drives: a hardware reset, so a locked disk locks again.
+    void reset();
 
     u32 pio_read(u16 port, unsigned size) override;
     void pio_write(u16 port, unsigned size, u32 value) override;
@@ -103,6 +105,7 @@ public:
     bool dma_is_write_to_memory() const { return (bm_command_ & 8u) != 0; }
     void dma_complete(bool ok);
     void software_reset();
+    void hardware_reset();
 
     u64 commands() const { return commands_; }
     u64 sectors_read() const { return sectors_read_; }
