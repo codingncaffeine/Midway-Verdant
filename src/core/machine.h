@@ -30,6 +30,13 @@
 
 namespace mv {
 
+namespace vk {
+class Device;
+}
+namespace pgraph {
+class VulkanRenderer;
+}
+
 struct MachineConfig {
     std::filesystem::path mcpx_rom;
     std::filesystem::path flash_image;
@@ -53,6 +60,8 @@ struct MachineConfig {
     std::optional<std::pair<u8, u8>> break_smbus_write;
     // Instrument: press the front-panel reset this many seconds of host time into the run.
     std::optional<double> reset_at_seconds;
+    // The live GPU: a Vulkan renderer fed by the pushbuffer, writing frames back into guest RAM.
+    bool gpu{false};
 };
 
 // The console: every device on one bus and one timeline, a CPU backend running the firmware against them, and
@@ -89,6 +98,7 @@ public:
     PciBus& pci() { return pci_; }
     Lpc& lpc() { return lpc_; }
     CpuBackend* cpu() { return cpu_.get(); }
+    const pgraph::VulkanRenderer* renderer() const { return renderer_.get(); }
 
     // The machine lock and the wake-up used by the CPU thread's HLT wait.
     std::mutex& lock() { return lock_; }
@@ -150,6 +160,8 @@ private:
     AtaDisk* hdd_{nullptr};
     std::vector<std::unique_ptr<PciDevice>> placeholders_;
     std::unique_ptr<CpuBackend> cpu_;
+    std::unique_ptr<vk::Device> gpu_device_;
+    std::unique_ptr<pgraph::VulkanRenderer> renderer_;
 
     std::mutex lock_;
     std::condition_variable wake_cv_;

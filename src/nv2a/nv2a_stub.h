@@ -8,20 +8,33 @@
 #include "core/scheduler.h"
 #include "debug/trace.h"
 #include "nv2a/capture.h"
+#include "nv2a/pgraph/kelvin.h"
 #include "nv2a/pushbuffer.h"
 #include "pci/pci.h"
 
 namespace mv {
 
 class CpuBackend;
+namespace pgraph {
+class VulkanRenderer;
+}
 
 // PCI 1:0.0, the NV2A, as a register store with the few behaviours the boot chain polls for: the chip identity,
 // the PFB command bit that clears itself, the PTIMER counting on the master clock, the vertical-blank interrupt
 // through PCRTC and PMC. Every other register is remembered and read back, every access logged. The real engines
 // replace this block by block in Phase 4.
-class Nv2aStub : public PciDevice, public MmioHandler {
+class Nv2aStub : public PciDevice, public MmioHandler, public pgraph::HandleResolver {
 public:
     static constexpr u32 kMmioSize = 16u * 1024 * 1024;
+    // The live GPU: a renderer attached here receives every Kelvin method through the state machine as the
+    // pushbuffer is consumed, and ends a frame at each semaphore release (the kernel's frame marker), which
+    // writes the render targets back into guest RAM for the scanout. Draws run on the thread that runs the
+    // pusher, under the machine lock — correct first, a render thread later.
+    void set_renderer(pgraph::VulkanRenderer* renderer);
+    pgraph::VulkanRenderer* renderer() const { return renderer_; }
+    u64 rendered_frames() const { return rendered_frames_; }
+    // HandleResolver: a DMA object as the engine reads it from instance memory.
+    pgraph::DmaObject resolve(u32 handle) const override;
     // Chip identity: a retail console's GPU is silicon revision A2. The BIOS X-codes read the low byte and give an
     // A1 chip a 191 MHz core clock (coefficient 0x11701) and every other revision 233 MHz (0x11C01), which the
     // homebrew runtime checks for before it runs; the kernel derives its timer ratio from the same coefficient.
@@ -120,6 +133,9 @@ private:
     bool irq_level_{false};
     TimerEvent vblank_;
     PushbufferWalker walker_;
+    pgraph::Kelvin kelvin_;
+    pgraph::VulkanRenderer* renderer_{nullptr};
+    u64 rendered_frames_{0};
     std::array<u32, 8> bound_{};
     std::array<u32, 8> bound_handles_{};
     u64 method_log_lines_{0};

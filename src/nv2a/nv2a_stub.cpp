@@ -1,5 +1,7 @@
 #include "nv2a/nv2a_stub.h"
 
+#include "nv2a/vulkan/vk_renderer.h"
+
 #include <algorithm>
 
 #include "cpu/backend.h"
@@ -42,6 +44,8 @@ void Nv2aStub::reset() {
     crtc_ = {};
     crtc_index_ = 0;
     pgraph_stalled_ = false;
+    kelvin_ = pgraph::Kelvin();
+    kelvin_.set_sink(renderer_);
     update_irq();
 }
 
@@ -140,6 +144,22 @@ PushbufferWalker::DmaObject Nv2aStub::dma_object(u32 instance) const {
     return d;
 }
 
+pgraph::DmaObject Nv2aStub::resolve(u32 handle) const {
+    const u32 instance = lookup_handle(handle) & 0xFFFFu;
+    const PushbufferWalker::DmaObject d = dma_object(instance);
+    pgraph::DmaObject r;
+    r.base = d.base;
+    r.limit = d.limit;
+    r.cls = ramin32(instance * 16) & 0xFFu;
+    r.valid = d.valid;
+    return r;
+}
+
+void Nv2aStub::set_renderer(pgraph::VulkanRenderer* renderer) {
+    renderer_ = renderer;
+    kelvin_.set_sink(renderer);
+}
+
 void Nv2aStub::on_method(const PushbufferMethod& m) {
     if (capture_) {
         capture_->method(m.subchannel, m.method == 0 ? 0 : bound_[m.subchannel], m.method, m.value);
@@ -179,6 +199,15 @@ void Nv2aStub::on_method(const PushbufferMethod& m) {
         trace::log(trace::Cat::Gpu, "pgraph: software method {:04x} data {:08x} on subchannel {} (FIFO held)", m.method, m.value, m.subchannel);
         update_irq();
         return;
+    }
+    // The live GPU: every Kelvin method goes through the state machine to the renderer; the semaphore release is
+    // the frame marker, so the frame is rendered and written back to RAM before the CPU can see the semaphore.
+    if (renderer_ && bound_[m.subchannel] == 0x97) {
+        kelvin_.method(m.method, m.value);
+        if (m.method == 0x1D70) {
+            renderer_->end_frame();
+            ++rendered_frames_;
+        }
     }
     // The synchronisation methods every class shares, and Kelvin's semaphore: these are what the CPU waits on,
     // so they are executed here while every drawing method is only logged (the real engine arrives in Phase 4).

@@ -8,6 +8,8 @@
 #include "core/clock.h"
 #include "debug/guest_stack.h"
 #include "debug/trace.h"
+#include "nv2a/vulkan/vk_device.h"
+#include "nv2a/vulkan/vk_renderer.h"
 #include "smbus/eeprom_image.h"
 
 namespace mv {
@@ -103,6 +105,9 @@ Machine::~Machine() {
         cpu_->join();
     }
     nv2a_.set_capture(nullptr, nullptr);
+    nv2a_.set_renderer(nullptr);
+    renderer_.reset();
+    gpu_device_.reset();
     if (capture_) capture_->close();
     trace::set_clock_source(nullptr);
 }
@@ -187,6 +192,14 @@ bool Machine::init(std::string& error) {
     }
     if (!cpu_->init(*this, error)) return false;
     if (capture_) nv2a_.set_capture(capture_.get(), cpu_.get());
+    if (config_.gpu) {
+        gpu_device_ = std::make_unique<vk::Device>();
+        if (!gpu_device_->init(error)) return false;
+        renderer_ = std::make_unique<pgraph::VulkanRenderer>(*gpu_device_, nv2a_, bus_.ram(), static_cast<u32>(bus_.ram_size()));
+        if (!renderer_->init(error)) return false;
+        nv2a_.set_renderer(renderer_.get());
+        trace::log(trace::Cat::Boot, "live GPU on {}", gpu_device_->name());
+    }
     pic_.set_on_intr([this](bool asserted) {
         if (asserted && cpu_) cpu_->kick();
     });

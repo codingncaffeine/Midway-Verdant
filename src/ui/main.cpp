@@ -14,6 +14,7 @@
 #include "core/machine.h"
 #include "core/version.h"
 #include "debug/trace.h"
+#include "nv2a/vulkan/vk_renderer.h"
 #include "ui/window.h"
 
 namespace {
@@ -39,6 +40,7 @@ void print_usage() {
         "  --break-smbus AA:CC  log the CPU registers and stack (boot trace) when SMBus address AA gets command CC written\n"
         "  --reset-at S       press the front-panel reset S seconds into the run (a warm reboot)\n"
         "  --window           show the console's scanout in a window (Escape or closing it ends the run)\n"
+        "  --gpu              render the console's graphics live on the host's Vulkan device (frames land in guest RAM)\n"
         "  --version, --help\n");
 }
 
@@ -137,6 +139,8 @@ int main(int argc, char** argv) {
                                                    static_cast<mv::u8>(std::strtoul(spec.substr(colon + 1).c_str(), nullptr, 16)));
         } else if (a == "--window") {
             want_window = true;
+        } else if (a == "--gpu") {
+            cfg.gpu = true;
         } else if (a == "--reset-at") {
             cfg.reset_at_seconds = std::atof(need("--reset-at"));
         } else if (a == "--rtc-time") {
@@ -195,6 +199,14 @@ int main(int argc, char** argv) {
         std::printf("cpu: %s\n", machine.cpu()->stop_detail().c_str());
     const auto& m = machine.milestones();
     if (machine.boots() > 0) std::printf("reboots: %u (the milestones below are the last boot's)\n", machine.boots());
+    if (const auto* r = machine.renderer()) {
+        const auto& st = r->stats();
+        std::printf("gpu: %llu frames rendered; %llu draws, %llu clears, %llu skipped, %llu pipelines, %llu shaders, %llu textures, %llu write-backs\n",
+                    static_cast<unsigned long long>(machine.nv2a().rendered_frames()), static_cast<unsigned long long>(st.draws),
+                    static_cast<unsigned long long>(st.clears), static_cast<unsigned long long>(st.skipped), static_cast<unsigned long long>(st.pipelines),
+                    static_cast<unsigned long long>(st.shaders), static_cast<unsigned long long>(st.textures_decoded),
+                    static_cast<unsigned long long>(st.writebacks));
+    }
     std::printf("milestones: rom hidden %s | smc challenge %s | bootloader %s | kernel %s | power off %s\n", ms(m.rom_hidden).c_str(),
                 ms(m.smc_challenge_answered).c_str(), ms(m.bootloader_magic).c_str(), ms(m.kernel_header).c_str(), ms(m.power_off).c_str());
     if (!machine.power_off_reason().empty()) std::printf("power off: %s\n", machine.power_off_reason().c_str());
