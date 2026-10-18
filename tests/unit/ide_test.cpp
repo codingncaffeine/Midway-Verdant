@@ -282,8 +282,10 @@ std::filesystem::path make_disc(const char* name, u64 partition, u64 total, bool
 }  // namespace
 
 TEST(DvdImage, RecognisesAnXisoAFullDumpAndRefusesOtherFiles) {
+    std::filesystem::path xiso, full, plain;
+    {  // the images close at the end of this block: Windows refuses to delete an open file
     std::string error;
-    const auto xiso = make_disc("mv-test-disc.xiso", 0, 64 * 2048, true);
+    xiso = make_disc("mv-test-disc.xiso", 0, 64 * 2048, true);
     DvdImage a;
     ASSERT_TRUE(a.open(xiso, error)) << error;
     EXPECT_EQ(a.kind(), DvdImage::Kind::Xiso);
@@ -294,7 +296,7 @@ TEST(DvdImage, RecognisesAnXisoAFullDumpAndRefusesOtherFiles) {
     EXPECT_FALSE(a.read(64, 1, sector));  // past the end
 
     // A full dump: the game partition at byte 0x18300000, sector 0 of the disc is the video partition.
-    const auto full = make_disc("mv-test-disc.iso", DvdImage::kRedumpGamePartition, DvdImage::kRedumpGamePartition + 100 * 2048, true);
+    full = make_disc("mv-test-disc.iso", DvdImage::kRedumpGamePartition, DvdImage::kRedumpGamePartition + 100 * 2048, true);
     DvdImage b;
     ASSERT_TRUE(b.open(full, error)) << error;
     EXPECT_EQ(b.kind(), DvdImage::Kind::Redump);
@@ -303,11 +305,12 @@ TEST(DvdImage, RecognisesAnXisoAFullDumpAndRefusesOtherFiles) {
     EXPECT_EQ(std::memcmp(sector, "MICROSOFT*XBOX*MEDIA", 20), 0);
 
     // Control: the same sizes without the magic are not game discs.
-    const auto plain = make_disc("mv-test-disc-plain.iso", 0, 64 * 2048, false);
+    plain = make_disc("mv-test-disc-plain.iso", 0, 64 * 2048, false);
     DvdImage c;
     EXPECT_FALSE(c.open(plain, error));
     EXPECT_NE(error.find("not an Xbox game disc"), std::string::npos) << error;
 
+    }
     std::filesystem::remove(xiso);
     std::filesystem::remove(full);
     std::filesystem::remove(plain);
