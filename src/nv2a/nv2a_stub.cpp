@@ -58,6 +58,8 @@ void Nv2aStub::reset() {
     dac_write_index_ = dac_read_index_ = dac_write_component_ = dac_read_component_ = 0;
     dac_identity_ = true;
     pgraph_stalled_ = false;
+    flip_stalled_ = false;
+    report_handle_ = 0;
     kelvin_ = pgraph::Kelvin();
     kelvin_.set_sink(renderer_);
     update_irq();
@@ -73,6 +75,43 @@ bool Nv2aStub::in_vertical_retrace() const {
     const Cycles frame = frame_period();
     const Cycles phase = sched_.now() % frame;
     return phase < frame * 20 / 262;
+}
+
+// PCRTC_RASTER: the line the display is reading, counting from the top of the picture through the blanking interval
+// to the frame's total and wrapping. Our frame starts with the vertical blank, so it starts at the first line below the
+// picture. The total comes from the CRTC's vertical total (CR06 with its overflow bits in CR07 and CR25, plus two).
+u32 Nv2aStub::raster_line() const {
+    const u32 visible = scanout_programmed() ? scanout_height() : 480u;
+    u32 total = (static_cast<u32>(crtc_[0x06]) | ((crtc_[0x07] & 0x01u) << 8) | ((crtc_[0x07] & 0x20u) << 4) | ((crtc_[0x25] & 0x01u) << 10)) + 2u;
+    if (crtc_[0x06] == 0 || total <= visible) total = visible + visible * 45u / 480u;
+    const Cycles frame = frame_period();
+    const u64 into = muldiv64(sched_.now() % frame, total, frame);
+    return static_cast<u32>((visible + into) % total);
+}
+
+void Nv2aStub::advance_flip_field(unsigned shift) {
+    const u32 modulo = flip_field(28);
+    set_flip_field(shift, modulo ? (flip_field(shift) + 1u) % modulo : flip_field(shift) + 1u);
+}
+
+// GET_REPORT: a 16-byte report at the report DMA object + the offset in bits 23:0 — the PTIMER time, the count, and a
+// status word of zero (done). The count is the z-pass pixel count since CLEAR_REPORT_VALUE; the renderer has no
+// occlusion queries yet, so a report says every pixel of the screen passed (a visibility test finds its object
+// visible) instead of leaving the report unwritten, which a title polling for it waits on forever.
+void Nv2aStub::write_report(u32 parameter) {
+    const auto dma = dma_object(lookup_handle(report_handle_) & 0xFFFFu);
+    const u32 offset = parameter & 0x00FFFFFFu;
+    if (!dma.valid || offset + 16 > dma.limit + 1) {
+        trace::log(trace::Cat::Gpu, "report with no report object (handle {:08x}, offset {:x})", report_handle_, offset);
+        return;
+    }
+    u8 report[16]{};
+    const u64 t = ptimer_ticks();
+    for (int i = 0; i < 8; ++i) report[i] = static_cast<u8>(t >> (8 * i));
+    const u32 count = (scanout_programmed() ? scanout_width() * scanout_height() : 640u * 480u);
+    for (int i = 0; i < 4; ++i) report[8 + i] = static_cast<u8>(count >> (8 * i));
+    bus_.write_ram(dma.base + offset, report, 16);
+    ++reports_;
 }
 
 void Nv2aStub::schedule_vblank() {
@@ -185,7 +224,8 @@ void Nv2aStub::on_method(const PushbufferMethod& m) {
         bound_handles_[m.subchannel] = m.value;
         const u32 ctx = lookup_handle(m.value);
         const u32 instance = ctx & 0xFFFFu;
-        bound_[m.subchannel] = ramin32(instance * 16) & 0xFFFFu;
+        // The class is the context's low byte; the bits above it are flags (endianness, the chid, a patch config).
+        bound_[m.subchannel] = ramin32(instance * 16) & 0xFFu;
         trace::log(trace::Cat::Gpu, "fifo: subchannel {} <- object {:08x} (class {:04x}, instance {:04x})", m.subchannel, m.value,
                    bound_[m.subchannel], instance);
         return;
@@ -202,7 +242,7 @@ void Nv2aStub::on_method(const PushbufferMethod& m) {
         else if (m.method == kMethodColorClearValue) regs_[kPgraphShadowColorClear] = m.value;
     }
     if (m.method == kMethodNoOperation && m.value != 0) {
-        regs_[kPgraphTrappedAddr] = (m.subchannel << 13) | m.method;
+        regs_[kPgraphTrappedAddr] = (m.subchannel << 16) | m.method;  // method in bits 12:0, subchannel in 18:16
         regs_[kPgraphTrappedData] = m.value;
         regs_[kPgraphNsource] |= kNsourceDataError;
         regs_[kPgraphIntr] |= kPgraphIntrError;
@@ -213,6 +253,27 @@ void Nv2aStub::on_method(const PushbufferMethod& m) {
         trace::log(trace::Cat::Gpu, "pgraph: software method {:04x} data {:08x} on subchannel {} (FIFO held)", m.method, m.value, m.subchannel);
         update_irq();
         return;
+    }
+    // The flip indices and the stall that keeps the GPU from drawing into the buffer still on the screen: titles set
+    // a modulo (the number of buffers), advance the write index when a frame is finished and stall until the
+    // vblank handler has advanced the read index through PGRAPH INCREMENT; and the visibility-test reports.
+    if (bound_[m.subchannel] == 0x97) {
+        switch (m.method) {
+            case 0x0120: set_flip_field(24, m.value); break;  // SET_FLIP_READ
+            case 0x0124: set_flip_field(20, m.value); break;  // SET_FLIP_WRITE
+            case 0x0128: set_flip_field(28, m.value); break;  // SET_FLIP_MODULO
+            case 0x012C: advance_flip_field(20); break;       // FLIP_INCREMENT_WRITE
+            case 0x0130:                                      // FLIP_STALL
+                if (!flip_released()) {
+                    flip_stalled_ = true;
+                    ++flip_stalls_;
+                    walker_.request_stop();
+                }
+                break;
+            case 0x01A8: report_handle_ = m.value; break;  // SET_CONTEXT_DMA_REPORT
+            case 0x17D0: write_report(m.value); break;     // GET_REPORT
+            default: break;
+        }
     }
     // The live GPU: every Kelvin method goes through the state machine to the renderer; the semaphore release is
     // the frame marker, so the frame is rendered and written back to RAM before the CPU can see the semaphore.
@@ -298,6 +359,10 @@ void Nv2aStub::capture_dirty_pages() {
 void Nv2aStub::run_pusher() {
     if (!(reg(kCache1DmaPush) & 1u)) return;
     if (pgraph_stalled_) return;  // held on a trapped method until software sets the FIFO access bit
+    if (flip_stalled_) {
+        if (!flip_released()) return;
+        flip_stalled_ = false;
+    }
     const u32 put = reg(kCache1DmaPut);
     u32 get = reg(kCache1DmaGet);
     if (get == put) return;
@@ -346,6 +411,8 @@ u32 Nv2aStub::mmio_read(PhysAddr addr, unsigned size) {
     switch (key) {
         case kPtimerTime0: word = static_cast<u32>((ptimer_ticks() & 0x7FFFFFFu) << 5); break;
         case kPtimerTime1: word = static_cast<u32>((ptimer_ticks() >> 27) & 0x1FFFFFFFu); break;
+        case kPcrtcRaster: word = raster_line(); break;
+        case kPfbCstatus: word = static_cast<u32>(bus_.ram_size()); break;  // the RAM size in bytes
         case kUser + 0x40: word = reg(kCache1DmaPut); break;
         case kUser + 0x44: word = reg(kCache1DmaGet); break;
         // The cache is always drained here: LOW_MARK (empty) set, HIGH_MARK (full) clear.
@@ -423,6 +490,15 @@ void Nv2aStub::mmio_write(PhysAddr addr, unsigned size, u32 value) {
         case kPvideoIntr:
             regs_[key] &= ~word;
             update_irq();
+            return;
+        case kPcrtcStart:
+            regs_[key] = word & 0x07FFFFFFu;  // a RAM address: the top bits are not decoded
+            return;
+        case kPgraphIncrement:
+            if (word & 2u) {
+                advance_flip_field(24);
+                if (flip_stalled_ && flip_released()) run_pusher();
+            }
             return;
         case kPgraphFifo:
             regs_[key] = word;

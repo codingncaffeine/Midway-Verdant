@@ -19,6 +19,7 @@
 #include "debug/png.h"
 #include "ide/hdd_format.h"
 #include "debug/trace.h"
+#include "nv2a/scanout.h"
 #include "nv2a/vulkan/vk_renderer.h"
 #include "ui/window.h"
 
@@ -309,8 +310,9 @@ int main(int argc, char** argv) {
             const mv::u32 w = gpu.scanout_programmed() ? gpu.scanout_width() : 640u;
             const mv::u32 h = gpu.scanout_programmed() ? gpu.scanout_height() : 480u;
             mv::u32 pitch = gpu.scanout_programmed() ? gpu.scanout_pitch() : 640u * 4u;
+            const mv::u32 bpp = gpu.scanout_bytes_per_pixel();
             const double t = static_cast<double>(now) / mv::clk::kCpuHz;
-            if (start == 0 || w < 64 || h < 64 || pitch < w * 4 || static_cast<mv::u64>(start) + static_cast<mv::u64>(pitch) * h > machine.bus().ram_size()) {
+            if (start == 0 || w < 64 || h < 64 || pitch < w * bpp || static_cast<mv::u64>(start) + static_cast<mv::u64>(pitch) * h > machine.bus().ram_size()) {
                 if (luma_log) std::fprintf(luma_log, "%.4f - %08x\n", t, start);
                 return;
             }
@@ -319,9 +321,9 @@ int main(int argc, char** argv) {
             static std::vector<mv::u8> composed;
             const auto ov = gpu.overlay();
             const auto lut = gpu.gamma_lut();
-            if (ov || lut) {
+            if (ov || lut || bpp != 4) {
                 composed.resize(static_cast<std::size_t>(w) * h * 4);
-                for (mv::u32 y = 0; y < h; ++y) std::memcpy(composed.data() + static_cast<std::size_t>(y) * w * 4, fb + static_cast<std::size_t>(y) * pitch, static_cast<std::size_t>(w) * 4);
+                mv::scanout_to_xrgb(fb, pitch, bpp, gpu.scanout_rgb565(), w, h, composed.data());
                 if (lut) mv::apply_gamma(*lut, composed.data(), w * 4, w, h);
                 if (ov) mv::draw_overlay(*ov, machine.bus().ram(), machine.bus().ram_size(), composed.data(), w * 4, w, h);
                 fb = composed.data();

@@ -11,6 +11,7 @@
 
 #include "core/machine.h"
 #include "nv2a/overlay.h"
+#include "nv2a/scanout.h"
 #include "ui/pad_input.h"
 
 namespace mv::ui {
@@ -83,7 +84,8 @@ unsigned ScanoutWindow::run(Machine& machine, std::atomic<bool>& stop) {
         impl_->pad_input.update(machine.pad(0));
         // The CRTC's registers belong to the machine; read them under its lock, the pixels without (a torn frame
         // is what a real display shows too).
-        u32 start, width, height, pitch;
+        u32 start, width, height, pitch, bpp;
+        bool rgb565;
         std::optional<Overlay> overlay;
         std::optional<std::array<u8, 768>> lut;
         {
@@ -92,6 +94,8 @@ unsigned ScanoutWindow::run(Machine& machine, std::atomic<bool>& stop) {
             start = gpu.framebuffer_start();
             overlay = gpu.overlay();
             lut = gpu.gamma_lut();
+            bpp = gpu.scanout_bytes_per_pixel();
+            rgb565 = gpu.scanout_rgb565();
             if (gpu.scanout_programmed()) {
                 width = gpu.scanout_width();
                 height = gpu.scanout_height();
@@ -102,7 +106,7 @@ unsigned ScanoutWindow::run(Machine& machine, std::atomic<bool>& stop) {
                 pitch = 640 * 4;
             }
         }
-        const bool sane = width >= 64 && width <= 2048 && height >= 64 && height <= 1080 && pitch >= width * 4;
+        const bool sane = width >= 64 && width <= 2048 && height >= 64 && height <= 1080 && pitch >= width * bpp;
         if (sane && (width != impl_->width || height != impl_->height)) {
             if (impl_->texture) SDL_DestroyTexture(impl_->texture);
             // The frame buffer's alpha byte means nothing to the display (the console's scanout ignores it, and the
@@ -130,11 +134,11 @@ unsigned ScanoutWindow::run(Machine& machine, std::atomic<bool>& stop) {
         if (showing) {
             const u8* pixels = bus.ram() + start;
             int stride = static_cast<int>(pitch);
-            if (overlay || lut) {
-                // The video overlay over a copy of the frame, as the console's display shows it.
+            if (overlay || lut || bpp != 4) {
+                // A 16-bit frame buffer is widened, and the video overlay drawn over a copy of the frame, as the
+                // console's display shows it.
                 impl_->composed.resize(static_cast<std::size_t>(width) * height * 4);
-                for (u32 y = 0; y < height; ++y)
-                    std::memcpy(impl_->composed.data() + static_cast<std::size_t>(y) * width * 4, pixels + static_cast<std::size_t>(y) * pitch, static_cast<std::size_t>(width) * 4);
+                scanout_to_xrgb(pixels, pitch, bpp, rgb565, width, height, impl_->composed.data());
                 if (lut) apply_gamma(*lut, impl_->composed.data(), width * 4, width, height);
                 if (overlay) draw_overlay(*overlay, bus.ram(), bus.ram_size(), impl_->composed.data(), width * 4, width, height);
                 pixels = impl_->composed.data();

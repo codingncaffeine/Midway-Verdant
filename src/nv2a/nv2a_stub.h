@@ -49,7 +49,11 @@ public:
     static constexpr u32 kPtimerIntr0 = 0x009100, kPtimerIntrEn0 = 0x009140, kPtimerNumerator = 0x009200,
                          kPtimerDenominator = 0x009210, kPtimerTime0 = 0x009400, kPtimerTime1 = 0x009410, kPtimerAlarm0 = 0x009420;
     static constexpr u32 kPfbWbc = 0x100410;
-    static constexpr u32 kPcrtcIntr0 = 0x600100, kPcrtcIntrEn0 = 0x600140, kPcrtcStart = 0x600800;
+    static constexpr u32 kPcrtcIntr0 = 0x600100, kPcrtcIntrEn0 = 0x600140, kPcrtcStart = 0x600800, kPcrtcRaster = 0x600808;
+    static constexpr u32 kPfbCstatus = 0x10020C, kPramdacGeneralControl = 0x680600;
+    // PGRAPH SURFACE holds the three flip indices (write bits 22:20, read 26:24, modulo 30:28); a write of bit 1 to
+    // INCREMENT advances the read index (the display has moved on to the next buffer) and releases a FLIP_STALL.
+    static constexpr u32 kPgraphSurface = 0x400710, kPgraphIncrement = 0x40071C;
     // PRAMDAC +0x6A0: the kernel's display-mode set toggles bit 0 and waits until bit 4 reads the same — the
     // hardware mirrors the request bit at the next frame boundary (measured from the kernel's behaviour).
     static constexpr u32 kPramdacModeLatch = 0x6806A0;
@@ -97,6 +101,10 @@ public:
         return 8u * (static_cast<u32>(crtc_[0x13]) | ((crtc_[0x19] & 0xE0u) << 3) | ((crtc_[0x25] & 0x20u) << 6));
     }
     bool scanout_programmed() const { return crtc_[0x13] != 0; }
+    // The scanout depth: CR28 bits 1:0 (3 = 32 bits a pixel, 2 = 16; unprogrammed reads as 32) and, in 16-bit modes,
+    // the layout the RAMDAC's general control picks (bit 12 set: R5G6B5, clear: X1R5G5B5).
+    u32 scanout_bytes_per_pixel() const { return (crtc_[0x28] & 3u) == 2u ? 2u : 4u; }
+    bool scanout_rgb565() const { return (reg(kPramdacGeneralControl) & (1u << 12)) != 0; }
     u32 framebuffer_start() const { return reg(kPcrtcStart); }
     // The video overlay as it stands, when a buffer is in use (read under the machine lock).
     std::optional<Overlay> overlay() const;
@@ -130,6 +138,12 @@ private:
     u64 ptimer_ticks() const;
     Cycles frame_period() const;
     bool in_vertical_retrace() const;
+    u32 raster_line() const;
+    u32 flip_field(unsigned shift) const { return (reg(kPgraphSurface) >> shift) & 7u; }
+    void set_flip_field(unsigned shift, u32 v) { regs_[kPgraphSurface] = (reg(kPgraphSurface) & ~(7u << shift)) | ((v & 7u) << shift); }
+    void advance_flip_field(unsigned shift);
+    bool flip_released() const { return flip_field(24) != flip_field(20); }
+    void write_report(u32 parameter);
     void update_irq();
     void schedule_vblank();
     void run_pusher();
@@ -170,6 +184,11 @@ private:
     u64 semaphore_releases_{0}, notifies_{0}, software_methods_{0};
     u64 pusher_wall_ns_{0};
     bool pgraph_stalled_{false};
+    // FLIP_STALL: the puller waits until the display has taken the buffer just finished (the read index moves off
+    // the write index).
+    bool flip_stalled_{false};
+    u32 report_handle_{0};
+    u64 flip_stalls_{0}, reports_{0};
     capture::Writer* capture_{nullptr};
     CpuBackend* cpu_{nullptr};
     std::vector<u32> dirty_scratch_;
@@ -179,6 +198,9 @@ public:
     u64 notifies() const { return notifies_; }
     u64 software_methods() const { return software_methods_; }
     bool pgraph_stalled() const { return pgraph_stalled_; }
+    bool flip_stalled() const { return flip_stalled_; }
+    u64 flip_stalls() const { return flip_stalls_; }
+    u64 reports() const { return reports_; }
 };
 
 // A PCI function that exists for the bus scan and stores its configuration, with its regions unmapped: the

@@ -15,6 +15,7 @@ add_executable(mv_tests
   unit/bus_test.cpp
   unit/legacy_test.cpp
   unit/nvnet_test.cpp
+  unit/nv2a_core_test.cpp
   unit/twod_test.cpp
   unit/smbus_test.cpp
   unit/crypto_test.cpp

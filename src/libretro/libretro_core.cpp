@@ -24,6 +24,7 @@
 #include "libretro/libretro.h"
 #include "libretro/retropad_map.h"
 #include "nv2a/overlay.h"
+#include "nv2a/scanout.h"
 
 namespace {
 
@@ -139,8 +140,9 @@ void grab_frame() {
     const mv::u32 w = gpu.scanout_programmed() ? gpu.scanout_width() : 640u;
     const mv::u32 h = gpu.scanout_programmed() ? gpu.scanout_height() : 480u;
     const mv::u32 pitch = gpu.scanout_programmed() ? gpu.scanout_pitch() : 640u * 4u;
+    const mv::u32 bpp = gpu.scanout_bytes_per_pixel();
     mv::Bus& bus = machine->bus();
-    if (start == 0 || w < 64 || h < 64 || w > 1920 || h > 1080 || pitch < w * 4 ||
+    if (start == 0 || w < 64 || h < 64 || w > 1920 || h > 1080 || pitch < w * bpp ||
         static_cast<mv::u64>(start) + static_cast<mv::u64>(pitch) * h > bus.ram_size()) {
         std::fill(frame.begin(), frame.end(), 0u);
         return;
@@ -149,7 +151,7 @@ void grab_frame() {
     frame_h = h;
     frame.resize(static_cast<std::size_t>(w) * h);
     const mv::u8* fb = bus.ram() + start;
-    for (mv::u32 y = 0; y < h; ++y) std::memcpy(frame.data() + static_cast<std::size_t>(y) * w, fb + static_cast<std::size_t>(y) * pitch, w * 4u);
+    mv::scanout_to_xrgb(fb, pitch, bpp, gpu.scanout_rgb565(), w, h, reinterpret_cast<mv::u8*>(frame.data()));
     if (const auto lut = gpu.gamma_lut()) mv::apply_gamma(*lut, reinterpret_cast<mv::u8*>(frame.data()), w * 4, w, h);
     if (const auto ov = gpu.overlay())
         mv::draw_overlay(*ov, bus.ram(), bus.ram_size(), reinterpret_cast<mv::u8*>(frame.data()), w * 4, w, h);
