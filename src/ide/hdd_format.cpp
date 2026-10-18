@@ -5,6 +5,13 @@
 #include <format>
 #include <vector>
 
+#if defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#include <winioctl.h>
+#endif
+
 namespace mv {
 
 namespace {
@@ -34,6 +41,23 @@ void folder_entry(u8* e, const char* name, u32 cluster) {
     std::memcpy(e + 0x30, &size, 4);
     const u32 stamp = 0x2D010000u;  // 2002-08-01 00:00, FAT date in the high half
     for (int i = 0; i < 3; ++i) std::memcpy(e + 0x34 + 4 * i, &stamp, 4);
+}
+
+// Marks a freshly created file sparse where the filesystem needs to be told: NTFS allocates the whole length of
+// an extended file unless the sparse attribute is set first; ext4, btrfs, xfs and APFS leave unwritten ranges
+// unallocated by themselves.
+bool make_sparse(const std::filesystem::path& path) {
+#if defined(_WIN32)
+    HANDLE h = CreateFileW(path.wstring().c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    DWORD returned = 0;
+    const BOOL ok = DeviceIoControl(h, FSCTL_SET_SPARSE, nullptr, 0, nullptr, 0, &returned, nullptr);
+    CloseHandle(h);
+    return ok != FALSE;
+#else
+    (void)path;
+    return true;
+#endif
 }
 
 bool format_fatx(std::FILE* f, const HddPartition& p, u32 serial, bool with_save_folders) {
@@ -92,6 +116,17 @@ bool create_blank_hdd(const std::filesystem::path& path, u32 serial_seed, std::s
     std::FILE* f = std::fopen(path.string().c_str(), "wb");
     if (!f) {
         error = std::format("cannot create {}", path.string());
+        return false;
+    }
+    // Sparse before anything lands past the first bytes: on NTFS an un-flagged file would allocate all 8 GB.
+    std::fclose(f);
+    if (!make_sparse(path)) {
+        error = std::format("cannot make {} sparse", path.string());
+        return false;
+    }
+    f = std::fopen(path.string().c_str(), "r+b");
+    if (!f) {
+        error = std::format("cannot reopen {}", path.string());
         return false;
     }
     bool ok = true;
