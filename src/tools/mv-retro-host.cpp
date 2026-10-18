@@ -32,6 +32,7 @@ struct Press {
     unsigned from, to;
 };
 std::vector<Press> presses;
+std::vector<std::pair<std::string, std::string>> options;  // --option key=value
 unsigned current_frame = 0;
 
 void core_log(retro_log_level, const char* fmt, ...) {
@@ -61,6 +62,11 @@ bool environment(unsigned cmd, void* data) {
         case RETRO_ENVIRONMENT_SET_CONTROLLER_INFO:
             return true;
         case RETRO_ENVIRONMENT_GET_VARIABLE:
+            for (const auto& [k, v] : options)
+                if (k == static_cast<retro_variable*>(data)->key) {
+                    static_cast<retro_variable*>(data)->value = v.c_str();
+                    return true;
+                }
             static_cast<retro_variable*>(data)->value = nullptr;  // the core's defaults
             return false;
         default:
@@ -133,7 +139,7 @@ T sym(void* lib, const char* name) {
 
 int main(int argc, char** argv) {
     if (argc < 3) {
-        std::fprintf(stderr, "usage: mv-retro-host CORE.so SYSTEM_DIR [GAME] --frames N [--png-every K DIR] [--press BUTTON@FROM-TO ...]\n");
+        std::fprintf(stderr, "usage: mv-retro-host CORE.so SYSTEM_DIR [GAME] --frames N [--png-every K DIR] [--press BUTTON@FROM-TO ...] [--option KEY=VALUE ...]\n");
         return 2;
     }
     const char* core_path = argv[1];
@@ -156,6 +162,10 @@ int main(int argc, char** argv) {
             }
             presses.push_back({button_id(spec.substr(0, at)), static_cast<unsigned>(std::atoi(spec.c_str() + at + 1)),
                                static_cast<unsigned>(std::atoi(spec.c_str() + dash + 1))});
+        } else if (a == "--option" && i + 1 < argc) {
+            const std::string kv = argv[++i];
+            const auto eq = kv.find('=');
+            if (eq != std::string::npos) options.emplace_back(kv.substr(0, eq), kv.substr(eq + 1));
         } else if (a.rfind("--", 0) != 0) {
             game = a;
         }

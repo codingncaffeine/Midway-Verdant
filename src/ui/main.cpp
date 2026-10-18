@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <filesystem>
 #include <format>
 #include <functional>
@@ -16,6 +17,7 @@
 #include "core/machine.h"
 #include "core/version.h"
 #include "debug/png.h"
+#include "ide/hdd_format.h"
 #include "debug/trace.h"
 #include "nv2a/vulkan/vk_renderer.h"
 #include "ui/window.h"
@@ -32,6 +34,7 @@ void print_usage() {
         "  --hdd FILE         a raw hard-disk image (8 GiB retail layout); no drive without it\n"
         "  --hdd-unlocked     present the disk unlocked instead of locked with the EEPROM's key\n"
         "  --dvd FILE         a game disc image (XISO or a full dump) in the DVD tray\n"
+        "  --create-hdd FILE  write a blank 8 GB retail hard-disk image (sparse, five FATX partitions) and exit\n"
         "  --smc-scratch N    the SMC scratch flags the kernel reads at boot (4 = short animation, 8 = dashboard)\n"
         "  --seconds N        run for N seconds of host time (default 5)\n"
         "  --until EVENT      stop early at a milestone: rom-hidden, bootloader, kernel\n"
@@ -101,6 +104,15 @@ int main(int argc, char** argv) {
             cfg.flash_image = need("--bios");
         } else if (a == "--eeprom") {
             cfg.eeprom_image = need("--eeprom");
+        } else if (a == "--create-hdd") {
+            std::string create_error;
+            const char* target = need("--create-hdd");
+            if (!mv::create_blank_hdd(target, static_cast<mv::u32>(std::time(nullptr)), create_error)) {
+                std::fprintf(stderr, "midway-verdant: %s\n", create_error.c_str());
+                return 1;
+            }
+            std::printf("created a blank 8 GB hard disk at %s\n", target);
+            return 0;
         } else if (a == "--dvd") {
             cfg.dvd_image = need("--dvd");
         } else if (a == "--hdd") {

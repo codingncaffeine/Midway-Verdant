@@ -10,6 +10,8 @@
 #include "core/scheduler.h"
 #include "ide/ata_disk.h"
 #include "ide/dvd_image.h"
+#include "ide/hdd_format.h"
+#include "ide/disk_image.h"
 #include "ide/ide.h"
 
 using namespace mv;
@@ -314,4 +316,44 @@ TEST(DvdImage, RecognisesAnXisoAFullDumpAndRefusesOtherFiles) {
     std::filesystem::remove(xiso);
     std::filesystem::remove(full);
     std::filesystem::remove(plain);
+}
+
+TEST(HddFormat, BlankDriveMatchesTheMeasuredRetailLayout) {
+    // Where the data area starts, as measured on a working drive image (local-notes/hw/ide.md): 16-bit tables on
+    // the cache partitions and C:, a 32-bit table on E:.
+    EXPECT_EQ(fatx_data_offset(0x2EE00000ull, 32), 0x19000u);   // X, Y, Z
+    EXPECT_EQ(fatx_data_offset(0x1F400000ull, 32), 0x11000u);   // C
+    EXPECT_EQ(fatx_data_offset(0x131F00000ull, 32), 0x133000u); // E
+
+    const auto path = std::filesystem::temp_directory_path() / "mv-test-blank-hdd.raw";
+    std::string error;
+    ASSERT_TRUE(create_blank_hdd(path, 0x12345678u, error)) << error;
+    EXPECT_EQ(std::filesystem::file_size(path), kRetailDiskBytes);
+    {
+        DiskImage disk;
+        ASSERT_TRUE(disk.open(path, true, error)) << error;
+        u8 s[512];
+        for (const HddPartition& p : kRetailPartitions) {
+            ASSERT_TRUE(disk.read(p.offset / 512, 1, s));
+            EXPECT_EQ(std::memcmp(s, "FATX", 4), 0) << p.name;
+            EXPECT_EQ(s[8], 32u) << p.name;   // sectors per cluster
+            EXPECT_EQ(s[12], 1u) << p.name;   // root cluster
+            EXPECT_EQ(s[18], 0xFFu) << p.name;
+            ASSERT_TRUE(disk.read((p.offset + 0x1000) / 512, 1, s));
+            EXPECT_EQ(s[0], 0xF8u) << p.name;  // media entry
+            const u64 root = p.offset + fatx_data_offset(p.size, 32);
+            ASSERT_TRUE(disk.read(root / 512, 1, s));
+            if (std::strcmp(p.name, "E") == 0) {
+                EXPECT_EQ(s[0], 5u);
+                EXPECT_EQ(s[1], 0x10u);
+                EXPECT_EQ(std::memcmp(s + 2, "TDATA", 5), 0);
+                EXPECT_EQ(std::memcmp(s + 64 + 2, "UDATA", 5), 0);
+                EXPECT_EQ(s[0x2C], 2u);
+                EXPECT_EQ(s[64 + 0x2C], 3u);
+            } else {
+                EXPECT_EQ(s[0], 0xFFu) << p.name << ": an empty root directory";
+            }
+        }
+    }
+    std::filesystem::remove(path);
 }

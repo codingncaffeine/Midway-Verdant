@@ -7,13 +7,16 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
+#include <ctime>
 #include <filesystem>
+#include <format>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <vector>
 
 #include "core/machine.h"
+#include "ide/hdd_format.h"
 #include "mv/version.h"
 #include "libretro/libretro.h"
 #include "libretro/retropad_map.h"
@@ -69,11 +72,37 @@ const char* option(const char* key) {
 }
 
 // The console's files in <system>/midway-verdant: the MCPX ROM is the 512-byte file, the flash image the
-// 256 KiB / 512 KiB / 1 MiB one, the hard disk the image of at least 8 GB; the EEPROM is eeprom.bin (generated
+// 256 KiB / 512 KiB / 1 MiB one; the EEPROM is eeprom.bin (generated
 // from the kernel's key on first use when missing).
 struct ConsoleFiles {
     std::filesystem::path mcpx, flash, eeprom, hdd;
 };
+
+// The hard disk for a drive slot: Drive 1 is xbox_hdd.raw (or, when that is absent, any raw image of 8 GB or more
+// already in the folder), Drives 2 and 3 are xbox_hdd_2.raw and xbox_hdd_3.raw. A slot with no file gets a blank
+// retail drive, created here: games boot from it and keep their saves on it.
+bool resolve_hdd(const std::filesystem::path& dir, unsigned slot, std::filesystem::path& out, std::string& error) {
+    const std::filesystem::path named = dir / (slot <= 1 ? std::string("xbox_hdd.raw") : std::format("xbox_hdd_{}.raw", slot));
+    std::error_code ec;
+    if (std::filesystem::exists(named, ec)) {
+        out = named;
+        return true;
+    }
+    if (slot <= 1) {
+        for (const auto& e : std::filesystem::directory_iterator(dir, ec)) {
+            if (!e.is_regular_file(ec)) continue;
+            const std::string name = e.path().filename().string();
+            if (e.file_size(ec) >= 8'000'000'000ull && name.find(".qcow2") == std::string::npos && name.rfind("xbox_hdd_", 0) != 0) {
+                out = e.path();
+                return true;
+            }
+        }
+    }
+    if (!mv::create_blank_hdd(named, static_cast<mv::u32>(std::time(nullptr)), error)) return false;
+    log(RETRO_LOG_INFO, "created a blank hard disk for drive %u: %s", slot, named.string().c_str());
+    out = named;
+    return true;
+}
 
 bool find_console_files(const std::filesystem::path& dir, ConsoleFiles& out, std::string& error) {
     std::error_code ec;
@@ -84,15 +113,12 @@ bool find_console_files(const std::filesystem::path& dir, ConsoleFiles& out, std
     for (const auto& e : std::filesystem::directory_iterator(dir, ec)) {
         if (!e.is_regular_file()) continue;
         const auto size = e.file_size(ec);
-        const std::string name = e.path().filename().string();
         if (size == 512 && out.mcpx.empty()) out.mcpx = e.path();
         else if ((size == 256 * 1024 || size == 512 * 1024 || size == 1024 * 1024) && out.flash.empty()) out.flash = e.path();
-        else if (size >= 8'000'000'000ull && out.hdd.empty() && name.find(".qcow2") == std::string::npos) out.hdd = e.path();
     }
     out.eeprom = dir / "eeprom.bin";
     if (out.mcpx.empty()) error = "No MCPX boot ROM (a 512-byte file) in " + dir.string();
     else if (out.flash.empty()) error = "No flash image (256 KiB, 512 KiB or 1 MiB) in " + dir.string();
-    else if (out.hdd.empty()) error = "No hard-disk image (a raw image of 8 GB or more) in " + dir.string();
     return error.empty();
 }
 
@@ -133,6 +159,7 @@ RETRO_API void retro_set_environment(retro_environment_t cb) {
     cb(RETRO_ENVIRONMENT_SET_SUPPORT_NO_GAME, &no_game);  // no disc: the console boots to its dashboard
     static const retro_variable vars[] = {
         {"midway_verdant_pads", "Controllers plugged in; 1|2|3|4"},
+        {"midway_verdant_drive", "Hard drive; Drive 1|Drive 2|Drive 3"},
         {nullptr, nullptr},
     };
     cb(RETRO_ENVIRONMENT_SET_VARIABLES, const_cast<retro_variable*>(vars));
@@ -189,6 +216,12 @@ RETRO_API bool retro_load_game(const retro_game_info* game) {
     std::string error;
     if (!find_console_files(std::filesystem::path(sys) / "midway-verdant", files, error)) {
         message(error.c_str());
+        return false;
+    }
+    unsigned slot = 1;
+    if (const char* d = option("midway_verdant_drive"); d && *d) slot = std::clamp(static_cast<unsigned>(d[std::strlen(d) - 1] - '0'), 1u, 3u);
+    if (!resolve_hdd(files.mcpx.parent_path(), slot, files.hdd, error)) {
+        message(("Midway Verdant: " + error).c_str());
         return false;
     }
     if (const char* p = option("midway_verdant_pads")) pads_plugged = std::clamp(static_cast<unsigned>(std::atoi(p)), 1u, kPads);
