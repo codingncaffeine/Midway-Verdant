@@ -272,6 +272,11 @@ void SetupEngine::retire(u32 handle, u32 list, u32 prev, u32 next, u32 state) {
     else set_field(prev, kFieldPitchLink, (field(prev, kFieldPitchLink) & 0xFFFF0000u) | next);
     set_field(handle, kFieldState, state & ~(kStateActive | kStateNew));
     book_[handle].off_pending = false;
+    // Turning a voice off (VOICE_OFF, the end of its release, a stream run dry) reports it done through its notifier:
+    // the first segment list's for a buffer voice, the list in play for a stream. DirectSound waits on it to know a
+    // buffer has stopped.
+    write_notifier(handle, (field(handle, kFieldFmt) & kFmtStream) ? book_[handle].ssl_index : 0u);
+    trace::log(trace::Cat::Apu, "vp: voice {:x} off, notifier {} done", handle, (field(handle, kFieldFmt) & kFmtStream) ? book_[handle].ssl_index : 0u);
     ++retired_;
     if (host_.global_reg(kRegTrapForce1) & kTrapForceIdleVoice) host_.front_end_trap(kSe2FeIdleVoice, handle);
 }
@@ -673,14 +678,19 @@ void SetupEngine::mix_voice(u32 handle, const Frame& samples, float gain) {
     ++frames_mixed_;
 }
 
-void SetupEngine::notify(u32 handle, u32 ssl) {
-    const PhysAddr at = host_.global_reg(kRegNotifierBase) + 16 * (kNotifierBase + handle * kNotifiersPerVoice + ssl);
+void SetupEngine::write_notifier(u32 handle, u32 index) {
+    const PhysAddr at = host_.global_reg(kRegNotifierBase) + 16 * (kNotifierBase + handle * kNotifiersPerVoice + index);
     const u8 tail[2] = {1, kNotifierDone};  // bytes 14 and 15: the status last
     bus_.write_ram(at + 14, tail, 2);
-    trace::log(trace::Cat::Apu, "vp: voice {:x} SSL {} {} (notifier at {:08x})", handle, ssl == 0 ? "A" : "B",
-               book_[handle].ssl_count[ssl] ? "done" : "starved", at);
     ++notifications_;
     host_.raise_interrupt(kIstsNotify);
+}
+
+void SetupEngine::notify(u32 handle, u32 ssl) {
+    const PhysAddr at = host_.global_reg(kRegNotifierBase) + 16 * (kNotifierBase + handle * kNotifiersPerVoice + ssl);
+    write_notifier(handle, ssl);
+    trace::log(trace::Cat::Apu, "vp: voice {:x} SSL {} {} (notifier at {:08x})", handle, ssl == 0 ? "A" : "B",
+               book_[handle].ssl_count[ssl] ? "done" : "starved", at);
 }
 
 }  // namespace mv::apu

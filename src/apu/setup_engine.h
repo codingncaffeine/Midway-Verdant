@@ -147,6 +147,7 @@ private:
     void filter(u32 handle, u32 fmt, Frame& samples);
     void mix_voice(u32 handle, const Frame& samples, float gain);
     void notify(u32 handle, u32 ssl);
+    void write_notifier(u32 handle, u32 index);
     Source source_for(u32 fmt) const;
 
     Bus& bus_;

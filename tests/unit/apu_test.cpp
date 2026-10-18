@@ -252,7 +252,12 @@ TEST(ApuVoices, VoiceOnLinksAtTheTopOfItsListAndAOneShotStaysThereSilentUntilVoi
     EXPECT_EQ(r.rd(Apu::kFectl) & (Apu::kFectlMethodMode | Apu::kFectlTrapReason), Apu::kFectlTrapped | Apu::kFectlTrapRequested);
     EXPECT_EQ(r.rd(Apu::kFeDecMethod), SE::kSe2FeIdleVoice);
     EXPECT_EQ(r.rd(Apu::kFeDecParam), 5u);
-    EXPECT_EQ(r.rd(Apu::kIsts), Apu::kIstsGlobal | Apu::kIstsFrontEndTrap);
+    EXPECT_EQ(r.rd(Apu::kIsts), Apu::kIstsGlobal | Apu::kIstsFrontEndTrap | SE::kIstsNotify) << "the idle trap and the notification";
+    {
+        u8 status = 0;
+        r.bus.read_ram(r.rd(SE::kRegNotifierBase) + 16 * (SE::kNotifierBase + 5 * SE::kNotifiersPerVoice) + 15, &status, 1);
+        EXPECT_EQ(status, SE::kNotifierDone) << "turning the voice off reports it done through its first notifier";
+    }
     EXPECT_TRUE(r.irq);
     EXPECT_TRUE(r.apu.front_end_trapped());
     r.service_trap();
