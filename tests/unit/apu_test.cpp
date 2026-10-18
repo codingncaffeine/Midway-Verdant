@@ -298,3 +298,59 @@ TEST(ApuVoices, ALoopingVoiceWrapsAndRetiresOnlyWhenTurnedOffAndQueuedTrapsWaitF
     r.service_trap();
     EXPECT_FALSE(r.irq);
 }
+
+TEST(ApuVoices, AStreamVoicePlaysItsSegmentListsInTurnAndReportsEachThroughItsNotifier) {
+    using SE = apu::SetupEngine;
+    VoiceRig r;
+    constexpr PhysAddr kSslTable = 0x9000, kNotifiers = 0xA000;
+    r.wr(SE::kRegSslTable, kSslTable);
+    r.wr(SE::kRegNotifierBase, kNotifiers);
+    r.wr(Apu::kIen, Apu::kIstsGlobal | Apu::kIstsFrontEndTrap | SE::kIstsNotify);
+    // List A at page 0x40: two segments of 32 samples; list B at page 0x48: one of 64 (16-bit containers).
+    r.vp(SE::kMethodSetCurrentSsl, 0x40);
+    r.vp(0x600, 0x1000);
+    r.vp(0x604, 0x00010020);
+    r.vp(0x608, 0x2000);
+    r.vp(0x60C, 0x00010020);
+    // B's page 0x48 is entry 8 of the same 64-entry window: the current SSL page is 64-aligned.
+    r.vp(0x640, 0x3000);
+    r.vp(0x644, 0x00010040);
+    EXPECT_EQ(r.ram32(kSslTable + 0x41 * 8), 0x2000u) << "segment 1 of list A in the table";
+    EXPECT_EQ(r.ram32(kSslTable + 0x48 * 8 + 4), 0x00010040u);
+
+    r.vp(SE::kMethodSetCurrentVoice, 5);
+    r.vp(0x304, 0x5180E0E6u);  // 16-bit, stream, persistent
+    r.vp(0x37C, 0);
+    r.vp(SE::kMethodVoiceSslA, (0x40u << 8) | 2);
+    r.vp(SE::kMethodVoiceSslB, (0x48u << 8) | 1);
+    r.vp(SE::kMethodSetAntecedentVoice, 0x1FFFFu);
+    r.vp(SE::kMethodVoiceOn, 5);
+    const PhysAddr notify_a = kNotifiers + 16 * (SE::kNotifierBase + 5 * SE::kNotifiersPerVoice + 0);
+    const PhysAddr notify_b = notify_a + 16;
+
+    r.sched.advance_to(Rig::frame(1));
+    EXPECT_EQ(r.ram32(notify_a + 12) >> 24, 0u) << "one segment of A played: nothing to report yet";
+    r.sched.advance_to(Rig::frame(2));
+    EXPECT_EQ(r.ram32(notify_a + 12) >> 24, SE::kNotifierDone) << "A's two segments done";
+    EXPECT_EQ(r.rd(Apu::kIsts) & SE::kIstsNotify, SE::kIstsNotify);
+    EXPECT_TRUE(r.irq);
+    r.wr(Apu::kIsts, r.rd(Apu::kIsts));
+    r.vp(SE::kMethodSetCurrentVoice, 5);
+    r.vp(SE::kMethodVoiceSslA, 0x40u << 8);  // the driver has nothing more for A
+    r.sched.advance_to(Rig::frame(3));
+    EXPECT_EQ(r.ram32(notify_b + 12) >> 24, 0u) << "B half played";
+    r.sched.advance_to(Rig::frame(4));
+    EXPECT_EQ(r.ram32(notify_b + 12) >> 24, SE::kNotifierDone) << "B done";
+    EXPECT_EQ(r.apu.setup_engine().notifications(), 3u) << "B done, and the voice reached the emptied A at once: starved";
+    r.sched.advance_to(Rig::frame(6));
+    EXPECT_EQ(r.apu.setup_engine().notifications(), 3u) << "the starvation is reported once, not every frame";
+    EXPECT_TRUE(r.field(5, SE::kFieldState) & SE::kStateActive) << "a persistent voice waits for more";
+
+    // Control: a voice without PERSIST ends on the empty list instead.
+    r.vp(SE::kMethodSetCurrentVoice, 6);
+    r.vp(0x304, 0x5100E0E6u);
+    r.vp(SE::kMethodVoiceSslA, 0x40u << 8);
+    r.vp(SE::kMethodVoiceOn, 6);
+    r.sched.advance_to(Rig::frame(7));
+    EXPECT_FALSE(r.field(6, SE::kFieldState) & SE::kStateActive);
+}

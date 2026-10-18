@@ -356,10 +356,11 @@ int main(int argc, char** argv) {
                     static_cast<unsigned long long>(gp.dma().transfers()), static_cast<unsigned long long>(gp.dma().bytes_moved()),
                     machine.apu().reg(mv::Apu::kGpFifoRegs + mv::Apu::kFifoCurrent), gp.last_problem().empty() ? "" : " PROBLEM: ",
                     gp.last_problem().c_str(), gp.dma().last_error().empty() ? "" : " DMA: ", gp.dma().last_error().c_str());
-        std::printf("vp: %llu voices on, %llu retired, %llu front-end traps%s; fectl %08x ists %08x ien %08x\n",
+        std::printf("vp: %llu voices on, %llu retired, %llu front-end traps%s, %llu stream notifications; fectl %08x ists %08x ien %08x\n",
                     static_cast<unsigned long long>(machine.apu().setup_engine().voices_started()),
                     static_cast<unsigned long long>(machine.apu().setup_engine().voices_retired()),
                     static_cast<unsigned long long>(machine.apu().traps()), machine.apu().front_end_trapped() ? " (trapped now)" : "",
+                    static_cast<unsigned long long>(machine.apu().setup_engine().notifications()),
                     machine.apu().reg(mv::Apu::kFectl), machine.apu().reg(mv::Apu::kIsts), machine.apu().reg(mv::Apu::kIen));
         std::printf("gp peripherals (reads/writes):");
         for (const auto& [addr, rw] : gp.peripheral_traffic())
