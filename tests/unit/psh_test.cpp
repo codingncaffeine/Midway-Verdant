@@ -301,3 +301,51 @@ TEST(Psh, DependentModesLookUpTheSourcesChannels) {
     EXPECT_NE(t.glsl.find("t2 = texture(tex2, vec3(t1.gb, 0.0));"), std::string::npos) << t.glsl;
     expect_compiles(t, "dependent");
 }
+
+TEST(Psh, BumpEnvModesCompileAndCarryTheirMatrices) {
+    for (const u32 mode : {6u, 7u}) {
+        for (const u32 format : {kFormat2D, kFormat3D}) {
+            KelvinState s = output_texture(1);
+            s.r[mthd::kShaderStageProgram >> 2] = 1u | (mode << 5);
+            enable_texture(s, 0, kFormat2D);
+            enable_texture(s, 1, format);
+            const Translation t = translate(key_from_state(s));
+            SCOPED_TRACE(std::format("mode {}, format {:08x}", mode, format));
+            EXPECT_EQ(t.samplers[1], format == kFormat3D ? SamplerKind::Sampler3D : SamplerKind::Sampler2D);
+            EXPECT_NE(t.glsl.find("vec2 dudv = vec2(psh_s8(t0.b), psh_s8(t0.g)) / 127.0;"), std::string::npos) << t.glsl;
+            EXPECT_EQ(t.glsl.find("bump_lum[1].x * t0.r") != std::string::npos, mode == 7) << t.glsl;
+            expect_compiles(t, "bump env");
+        }
+    }
+    // The matrix words of stage 2 as the method writes them (m00, m01, m11, m10), the luminance scale and offset.
+    KelvinState s;
+    const u32 b = mthd::kTextureStride * 2;
+    s.r[(mthd::kBumpEnvMat + b) >> 2] = fbits(1.0f);
+    s.r[(mthd::kBumpEnvMat + b + 4) >> 2] = fbits(2.0f);
+    s.r[(mthd::kBumpEnvMat + b + 8) >> 2] = fbits(3.0f);
+    s.r[(mthd::kBumpEnvMat + b + 12) >> 2] = fbits(4.0f);
+    s.r[(mthd::kBumpEnvScale + b) >> 2] = fbits(0.5f);
+    s.r[(mthd::kBumpEnvOffset + b) >> 2] = fbits(-0.25f);
+    Uniforms u{};
+    uniforms_from_state(s, {{{1.0f, 1.0f}, {1.0f, 1.0f}, {1.0f, 1.0f}, {1.0f, 1.0f}}}, u);
+    EXPECT_FLOAT_EQ(u.bump_mat[2][0], 1.0f);  // m00
+    EXPECT_FLOAT_EQ(u.bump_mat[2][1], 2.0f);  // m01
+    EXPECT_FLOAT_EQ(u.bump_mat[2][2], 4.0f);  // m10
+    EXPECT_FLOAT_EQ(u.bump_mat[2][3], 3.0f);  // m11
+    EXPECT_FLOAT_EQ(u.bump_lum[2][0], 0.5f);
+    EXPECT_FLOAT_EQ(u.bump_lum[2][1], -0.25f);
+    EXPECT_FLOAT_EQ(u.bump_mat[1][0], 0.0f);
+}
+
+TEST(Psh, BrdfIsAPlaceholderOfZero) {
+    KelvinState s = output_texture(2);
+    s.r[mthd::kShaderStageProgram >> 2] = 1u | (0x11u << 5) | (8u << 10);
+    enable_texture(s, 2, kFormat2D);
+    const Translation t = translate(key_from_state(s));
+    EXPECT_EQ(t.samplers[2], SamplerKind::None);
+    EXPECT_EQ(t.glsl.find("\n    t2 = "), std::string::npos) << t.glsl;
+    expect_compiles(t, "brdf");
+    // The reserved modes still refuse the draw.
+    s.r[mthd::kShaderStageProgram >> 2] = 0x13u << 5;
+    EXPECT_FALSE(translate(key_from_state(s)).error.empty());
+}

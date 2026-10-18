@@ -22,6 +22,9 @@ bool depth_format(u32 color_format) {
 // and the Direct3D 8 ps.1.x texture instruction it implements.
 enum : u32 {
     kModeNone = 0, kModeProject2D = 1, kModeProject3D = 2, kModeCube = 3, kModePassThrough = 4, kModeClipPlane = 5,
+    kModeBumpEnv = 6,                 // OFFSET_TEXTURE_2D: texbem
+    kModeBumpEnvLuminance = 7,        // OFFSET_TEXTURE_2D_SCALE: texbeml
+    kModeBrdf = 8,                    // no NV_texture_shader counterpart: a placeholder
     kModeDotST = 9,                   // DOT_PRODUCT_TEXTURE_2D: texm3x2tex
     kModeDotZW = 0xA,                 // DOT_PRODUCT_DEPTH_REPLACE: texm3x2depth
     kModeDotReflectDiffuse = 0xB,     // DOT_PRODUCT_DIFFUSE_CUBE_MAP (the middle row of a 3x3 reflect)
@@ -41,6 +44,8 @@ u32 stage_mode(const Key& key, u32 stage) { return (key.shader_stage_program >> 
 // as an inconsistent NV_texture_shader stage is.
 bool mode_valid_at(u32 mode, u32 stage) {
     switch (mode) {
+        case kModeBumpEnv: case kModeBumpEnvLuminance: case kModeDependentAR: case kModeDependentGB: return stage >= 1;
+        case kModeBrdf: return stage >= 2;
         case kModeDotProduct: return stage == 1 || stage == 2;
         case kModeDotST: case kModeDotZW: return stage >= 2;
         case kModeDotReflectDiffuse: return stage == 2;
@@ -134,6 +139,8 @@ SamplerKind sampler_kind(const Key& key, u32 stage) {
             return dim == 3 ? SamplerKind::Sampler3D : SamplerKind::Sampler2D;
         // The dependent modes read the kind of texture they are made for; another kind makes the stage inconsistent
         // (NV_texture_shader), which reads as none. A 2D texture in the 3D mode is a volume one texel deep.
+        case kModeBumpEnv:
+        case kModeBumpEnvLuminance:
         case kModeDotST:
         case kModeDependentAR:
         case kModeDependentGB:
@@ -307,6 +314,18 @@ void uniforms_from_state(const KelvinState& s, const std::array<std::array<float
     }
     for (u32 c = 0; c < 3; ++c) out.eye[c] = s.regf(mthd::kEyeVector + 4 * c);
     out.eye[3] = 0.0f;
+    // SET_TEXTURE_SET_BUMP_ENV_MAT's four words are m00, m01, m11, m10: the reference emulator stores the last two
+    // crosswise, and we follow it [verify: NV_texture_shader's a1..a4 order would be m00 m01 m10 m11].
+    for (u32 t = 0; t < 4; ++t) {
+        const u32 b = mthd::kTextureStride * t;
+        out.bump_mat[t][0] = s.regf(mthd::kBumpEnvMat + b);
+        out.bump_mat[t][1] = s.regf(mthd::kBumpEnvMat + b + 4);
+        out.bump_mat[t][2] = s.regf(mthd::kBumpEnvMat + b + 12);
+        out.bump_mat[t][3] = s.regf(mthd::kBumpEnvMat + b + 8);
+        out.bump_lum[t][0] = s.regf(mthd::kBumpEnvScale + b);
+        out.bump_lum[t][1] = s.regf(mthd::kBumpEnvOffset + b);
+        out.bump_lum[t][2] = out.bump_lum[t][3] = 0.0f;
+    }
 }
 
 Translation translate(const Key& key) {
@@ -329,6 +348,8 @@ Translation translate(const Key& key) {
         "    vec4 alpha_ref;\n"
         "    vec4 tex_scale[4];\n"
         "    vec4 eye;\n"
+        "    vec4 bump_mat[4];\n"
+        "    vec4 bump_lum[4];\n"
         "};\n";
     // Texture stages: which sampler each needs.
     for (u32 i = 0; i < 4; ++i) {
@@ -337,9 +358,14 @@ Translation translate(const Key& key) {
         const char* type = kind == SamplerKind::SamplerCube ? "samplerCube" : (kind == SamplerKind::Sampler3D ? "sampler3D" : "sampler2D");
         if (kind != SamplerKind::None) g += std::format("layout(set = 0, binding = {}) uniform {} tex{};\n", kSamplerBindingBase + i, type, i);
     }
-    bool dots = false;
-    for (u32 i = 0; i < 4; ++i) dots |= dot_mode(stage_mode(key, i)) && mode_valid_at(stage_mode(key, i), i);
-    if (dots) g += kDotMapFunctions;
+    bool dots = false, bumps = false;
+    for (u32 i = 0; i < 4; ++i) {
+        const u32 mode = stage_mode(key, i);
+        if (!mode_valid_at(mode, i)) continue;
+        dots |= dot_mode(mode);
+        bumps |= mode == kModeBumpEnv || mode == kModeBumpEnvLuminance;
+    }
+    if (dots || bumps) g += kDotMapFunctions;
     g += "\nlayout(location = 0) out vec4 frag_color;\n\n";
     g += "void main() {\n";
     g += "    vec4 v0 = vtx_d0;\n    vec4 v1 = vtx_d1;\n";
@@ -403,6 +429,33 @@ Translation translate(const Key& key) {
                 }
                 break;
             }
+            case kModeBumpEnv:
+            case kModeBumpEnvLuminance:
+                // The source's blue and green bytes, as two's complement / 127, are (du, dv) [verify -128: NV's own
+                // signed table would read byte / 128]; the stage's 2x2 matrix turns them into an offset of its (s, t),
+                // without a divide by q: s' = s + m00 du + m10 dv, t' = t + m01 du + m11 dv (NV_texture_shader
+                // OFFSET_TEXTURE_2D, D3D texbem). Blue and green are the bump texel's first and second bytes (a V8U8
+                // texel is the hardware's G8B8). Mode 7 then scales red, green and blue (not alpha) by the source's
+                // red, unsigned, times the luminance scale plus the offset, clamped to [0, 1]: NV_texture_shader
+                // OFFSET_TEXTURE_2D_SCALE. The reference emulator scales all four channels unclamped, and D3D's
+                // texbeml text has RGBA [verify]. A volume texture takes r as its third coordinate [verify].
+                if (kind != SamplerKind::None) {
+                    const std::string src = source_name(key, i);
+                    g += std::format(
+                        "    {{\n"
+                        "        vec2 dudv = vec2(psh_s8({1}.b), psh_s8({1}.g)) / 127.0;\n"
+                        "        vec2 st = vtx_t{0}.xy + vec2(dot(bump_mat[{0}].xz, dudv), dot(bump_mat[{0}].yw, dudv));\n"
+                        "        t{0} = {2};\n",
+                        i, src, lookup_2d(i, kind, "st", std::format("vtx_t{}.z", i)));
+                    if (mode == kModeBumpEnvLuminance)
+                        g += std::format("        t{0}.rgb *= clamp(bump_lum[{0}].x * {1}.r + bump_lum[{0}].y, 0.0, 1.0);\n", i, src);
+                    g += "    }\n";
+                }
+                break;
+            case kModeBrdf:
+                // BRDF has no public description beyond its name and the mode is left at (0, 0, 0, 0), as the
+                // reference emulator leaves it: a documented placeholder [verify].
+                break;
             case kModeDotProduct:
                 // A dot product alone: its result feeds the stages after it and its colour is (0, 0, 0, 0)
                 // (NV_texture_shader DOT_PRODUCT; D3D's texm3x2pad / texm3x3pad results are not readable).
@@ -465,7 +518,7 @@ Translation translate(const Key& key) {
                 }
                 break;
             default:
-                if (t.error.empty()) t.error = std::format("texture stage {} mode {} is not supported yet", i, mode);
+                if (t.error.empty()) t.error = std::format("texture stage {} mode {} is reserved", i, mode);
                 break;
         }
     }

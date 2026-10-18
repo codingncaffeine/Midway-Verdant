@@ -473,3 +473,45 @@ TEST(Vulkan, DependentGBLooksUpTheSourcesGreenAndBlue) {
     std::memcpy(&ar, &f.ram[0x100000 + 8 * 256 + 8 * 4], 4);
     EXPECT_EQ(ar, 0xFF00C011u) << "texel (0, 3)";
 }
+
+TEST(Vulkan, BumpEnvOffsetsTheLookupByTheMatrixTimesDuDv) {
+    TextureShaderFixture f;
+    std::string error;
+    if (!f.init(error)) GTEST_SKIP() << "no Vulkan device: " << error;
+    Kelvin& k = f.k;
+    // Stage 0: B 0x7F, G 0x81 = (du, dv) = (1, -1); R 0xFF = luminance 1.
+    load_texture(k, f.ram, 0, 0x200000, 0, [](u32, u32) { return 0xFFFF817Fu; });
+    load_texture(k, f.ram, 1, 0x210000, 2, [](u32 x, u32 y) { return 0xFF000011u | (0x40u * x) << 16 | (0x40u * y) << 8; });
+    // m00 0.5, m01 0.25, m10 0.25, m11 -0.25, written m00 m01 m11 m10: s' = s + 0.5 - 0.25, t' = t + 0.25 + 0.25.
+    const u32 mat = mthd::kBumpEnvMat + mthd::kTextureStride;
+    k.method(mat + 0, bits(0.5f));
+    k.method(mat + 4, bits(0.25f));
+    k.method(mat + 8, bits(-0.25f));
+    k.method(mat + 12, bits(0.25f));
+    k.method(mthd::kBumpEnvScale + mthd::kTextureStride, bits(0.5f));
+    k.method(mthd::kBumpEnvOffset + mthd::kTextureStride, bits(0.25f));
+    output_texture_stage(k, 1);
+    texcoord(k, 0, 0.5f, 0.5f, 0.0f, 1.0f);
+    texcoord(k, 1, 0.125f, 0.125f, 0.0f, 1.0f);  // (0.375, 0.625): texel (1, 2)
+    auto draw_into = [&](u32 mode, u32 offset) {
+        k.method(mthd::kShaderStageProgram, 1u | (mode << 5));
+        k.method(mthd::kSurfaceColorOffset, offset);
+        draw_full_triangle(k, f.ram);
+    };
+    draw_into(6, 0x100000);
+    draw_into(7, 0x110000);  // the texel's colour times 0.5 x 1 + 0.25
+    k.method(mthd::kBumpEnvScale + mthd::kTextureStride, bits(2.0f));
+    k.method(mthd::kBumpEnvOffset + mthd::kTextureStride, bits(0.0f));
+    draw_into(7, 0x120000);  // a factor of 2 clamps to 1
+    f.renderer->end_frame();
+    for (const auto& e : f.renderer->stats().errors) ADD_FAILURE() << "renderer: " << e;
+    EXPECT_EQ(f.renderer->stats().skipped, 0u);
+    auto at = [&](u32 offset) {
+        u32 v;
+        std::memcpy(&v, &f.ram[offset + 8 * 256 + 8 * 4], 4);
+        return v;
+    };
+    EXPECT_EQ(at(0x100000), 0xFF408011u) << "texel (1, 2)";
+    EXPECT_EQ(at(0x110000), 0xFF30600Du) << "red, green and blue times 0.75; alpha kept";
+    EXPECT_EQ(at(0x120000), 0xFF408011u) << "the factor clamped to 1";
+}

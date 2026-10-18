@@ -38,8 +38,10 @@ struct Uniforms {
     float alpha_ref[4];   // x = reference 0..1
     float tex_scale[4][4];  // xy = 1 / texture size for linear textures (1 otherwise), z = depth compare scale, w = unused
     float eye[4];           // xyz = SET_EYE_VECTOR, the constant eye of the dot-reflect-specular-constant mode
+    float bump_mat[4][4];   // per stage: the bump-environment matrix as (m00, m01, m10, m11)
+    float bump_lum[4][4];   // per stage: x = luminance scale, y = luminance offset
 };
-static_assert(sizeof(Uniforms) == 25 * 16);
+static_assert(sizeof(Uniforms) == 33 * 16);
 void uniforms_from_state(const KelvinState& state, const std::array<std::array<float, 2>, 4>& texture_scale, Uniforms& out);
 
 enum class SamplerKind : u8 { None, Sampler2D, SamplerCube, Sampler3D, Shadow2D };
