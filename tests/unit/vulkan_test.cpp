@@ -192,3 +192,27 @@ TEST(Vulkan, ADisabledAttributeReadsItsCurrentValue) {
     for (const auto& e : renderer.stats().errors) ADD_FAILURE() << "renderer: " << e;
     EXPECT_EQ(pixel_at(ram, 8, 8), 0xFF00FF00u) << "not the (0, 0, 0, 1) of an attribute without data";
 }
+
+TEST(Vulkan, AG8B8TargetHasTwoBytesAPixel) {
+    vk::Device device;
+    std::string error;
+    if (!device.init(error)) GTEST_SKIP() << "no Vulkan device: " << error;
+    std::vector<u8> ram(4u << 20, 0);
+    RamResolver handles;
+    handles.size = static_cast<u32>(ram.size());
+    VulkanRenderer renderer(device, handles, ram.data(), static_cast<u32>(ram.size()));
+    ASSERT_TRUE(renderer.init(error)) << error;
+    Kelvin k;
+    k.set_sink(&renderer);
+    setup_target(k, 10);  // G8B8: 64 pixels are 128 bytes of each 256-byte line
+    std::memset(&ram[0x10000], 0xEE, 64 * 256);
+    k.method(mthd::kVertexDataArrayFormat + 12, 2u);
+    k.method(mthd::kDiffuse4ub, 0xFF208040);  // A B G R from the top: green 0x80
+    draw_full_triangle(k, ram);
+    renderer.end_frame();
+    for (const auto& e : renderer.stats().errors) ADD_FAILURE() << "renderer: " << e;
+    EXPECT_EQ(ram[0x10000 + 8 * 256 + 8 * 2 + 1], 0x80) << "pixel (8, 8)'s second byte is its green";
+    EXPECT_EQ(ram[0x10000 + 8 * 256 + 63 * 2 + 1], 0x80) << "the line's last pixel ends at byte 128";
+    EXPECT_EQ(ram[0x10000 + 8 * 256 + 128], 0xEE) << "nothing written past the line's 64 pixels";
+    EXPECT_EQ(ram[0x10000 + 8 * 256 + 255], 0xEE);
+}

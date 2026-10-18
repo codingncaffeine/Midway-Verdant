@@ -22,6 +22,7 @@ VkFormat color_vk_format(u32 nv_format) {
         case 1: case 2: return VK_FORMAT_A1R5G5B5_UNORM_PACK16;
         case 3: return VK_FORMAT_R5G6B5_UNORM_PACK16;
         case 9: return VK_FORMAT_R8_UNORM;
+        case 10: return VK_FORMAT_R8G8_UNORM;  // G8B8: two bytes, B then G
         default: return VK_FORMAT_B8G8R8A8_UNORM;  // 4-8: the 32-bit layouts
     }
 }
@@ -96,7 +97,7 @@ VkSamplerAddressMode wrap_mode(u32 nv) {
 
 u32 VulkanRenderer::Surface::color_bytes() const {
     switch (color_format) {
-        case 1: case 2: case 3: return 2;
+        case 1: case 2: case 3: case 10: return 2;
         case 9: return 1;
         default: return 4;
     }
@@ -1457,7 +1458,11 @@ bool VulkanRenderer::surface_rgba(const SurfaceInfo& s, std::vector<u8>& rgba) c
             } else if (s.bytes_per_pixel == 2) {
                 u16 h;
                 std::memcpy(&h, p, 2);
-                if (s.color_format == 3) {
+                if (s.color_format == 10) {  // G8B8
+                    d[0] = 0;
+                    d[1] = p[1];
+                    d[2] = p[0];
+                } else if (s.color_format == 3) {
                     d[0] = static_cast<u8>(((h >> 11) & 31) * 255 / 31);
                     d[1] = static_cast<u8>(((h >> 5) & 63) * 255 / 63);
                     d[2] = static_cast<u8>((h & 31) * 255 / 31);
