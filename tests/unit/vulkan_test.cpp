@@ -261,3 +261,32 @@ TEST(Vulkan, ClearsDecodeTheValuePerFormatAndWriteOnlyTheChosenChannels) {
     EXPECT_EQ(word32(0x140000), 0x80405060u);
     EXPECT_EQ(word32(0x150000), 0xAABB3344u) << "green and blue keep the first clear";
 }
+
+TEST(Vulkan, TheAlphaTestComparesEightBitValues) {
+    vk::Device device;
+    std::string error;
+    if (!device.init(error)) GTEST_SKIP() << "no Vulkan device: " << error;
+    std::vector<u8> ram(4u << 20, 0);
+    RamResolver handles;
+    handles.size = static_cast<u32>(ram.size());
+    VulkanRenderer renderer(device, handles, ram.data(), static_cast<u32>(ram.size()));
+    ASSERT_TRUE(renderer.init(error)) << error;
+    Kelvin k;
+    k.set_sink(&renderer);
+    setup_target(k);
+    k.method(mthd::kColorClear, 0xFF0000FF);  // blue where the test discards
+    k.method(mthd::kClearSurface, 0xF0);
+    // An alpha of 0.501 is 128 in 8 bits: EQUAL to a reference of 0x80, though not as a float (0x80 / 255 = 0.50196).
+    k.method(mthd::kAlphaTestEnable, 1);
+    k.method(mthd::kAlphaFunc, 0x202);
+    k.method(mthd::kAlphaRef, 0x80);
+    k.method(mthd::kVertexDataArrayFormat + 12, 2u);
+    k.method(mthd::kDiffuse4f + 0, bits(0.0f));
+    k.method(mthd::kDiffuse4f + 4, bits(1.0f));
+    k.method(mthd::kDiffuse4f + 8, bits(0.0f));
+    k.method(mthd::kDiffuse4f + 12, bits(0.501f));
+    draw_full_triangle(k, ram);
+    renderer.end_frame();
+    for (const auto& e : renderer.stats().errors) ADD_FAILURE() << "renderer: " << e;
+    EXPECT_EQ(pixel_at(ram, 8, 8), 0x8000FF00u) << "the fragment passes the EQUAL test";
+}

@@ -42,7 +42,7 @@ TEST(Psh, ModulateTextureByDiffuseCompiles) {
     EXPECT_EQ(t.samplers[0], SamplerKind::Sampler2D);
     EXPECT_EQ(t.samplers[1], SamplerKind::None);
     EXPECT_NE(t.glsl.find("r0.rgb = ab;"), std::string::npos) << t.glsl;
-    EXPECT_NE(t.glsl.find("if (!(final_color.a > alpha_ref.x)) discard;"), std::string::npos) << t.glsl;
+    EXPECT_NE(t.glsl.find("if (!(round(clamp(final_color.a, 0.0, 1.0) * 255.0) > round(alpha_ref.x * 255.0))) discard;"), std::string::npos) << t.glsl;
     const CompiledShader c = compile_glsl(ShaderStage::Fragment, t.glsl, "modulate");
     EXPECT_TRUE(c.ok()) << c.log << "\n" << t.glsl;
 }

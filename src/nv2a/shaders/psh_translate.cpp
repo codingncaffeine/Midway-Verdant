@@ -329,7 +329,10 @@ Translation translate(const Key& key) {
     if (key.alpha_test) {
         const u32 func = key.alpha_func & 7u;
         if (func == 0) g += "    discard;\n";
-        else if (func != 7) g += std::format("    if (!(final_color.a {} alpha_ref.x)) discard;\n", compare_op(func));
+        // The test compares the alpha rounded to 8 bits with the 8-bit reference, so EQUAL and NOTEQUAL work on
+        // the values the guest wrote, not on floats that differ below an eighth bit.
+        else if (func != 7)
+            g += std::format("    if (!(round(clamp(final_color.a, 0.0, 1.0) * 255.0) {} round(alpha_ref.x * 255.0))) discard;\n", compare_op(func));
     }
     g += "    frag_color = clamp(final_color, 0.0, 1.0);\n";
     g += "}\n";
