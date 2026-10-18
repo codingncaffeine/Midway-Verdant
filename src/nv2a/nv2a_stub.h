@@ -103,6 +103,8 @@ public:
 
     // The pushbuffer capture instrument: every method, the RAM pages written before each pusher run (from the
     // CPU backend's dirty log and the bus's), the objects behind the handles, the scanout register writes.
+    // Called at every vblank once the scanout's frame buffer is in guest RAM, with the guest time (an instrument hook).
+    void set_vblank_hook(std::function<void(Cycles)> hook) { vblank_hook_ = std::move(hook); }
     void set_capture(capture::Writer* writer, CpuBackend* cpu) {
         capture_ = writer;
         cpu_ = cpu;
@@ -132,6 +134,7 @@ private:
     u64 reads_{0}, writes_{0}, vblanks_{0};
     bool irq_level_{false};
     TimerEvent vblank_;
+    std::function<void(Cycles)> vblank_hook_;
     PushbufferWalker walker_;
     pgraph::Kelvin kelvin_;
     pgraph::VulkanRenderer* renderer_{nullptr};

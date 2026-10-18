@@ -25,6 +25,7 @@ Nv2aStub::Nv2aStub(Bus& bus, Scheduler& sched, std::function<void(bool)> irq)
         ++vblanks_;
         // The scanout reads the frame buffer now: a rendered one comes down from the device first.
         if (renderer_) renderer_->write_back_at(reg(kPcrtcStart));
+        if (vblank_hook_) vblank_hook_(sched_.now());
         regs_[kPcrtcIntr0] |= 1u;
         // The mode latch acknowledges software's toggle at the frame boundary: bit 4 takes bit 0.
         const u32 latch = reg(kPramdacModeLatch);

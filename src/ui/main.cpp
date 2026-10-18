@@ -42,6 +42,7 @@ void print_usage() {
         "  --window           show the console's scanout in a window (Escape or closing it ends the run)\n"
         "  --gpu              render the console's graphics live on the host's Vulkan device (frames land in guest RAM)\n"
         "  --snapshots DIR    with --window: save what the window shows as DIR/shot-SSS.bmp every 2 seconds\n"
+        "  --luma-log FILE    write the scanout's guest time and mean luma (BT.601, 0-255) at every vblank\n"
         "  --cpu kvm|p6       the CPU: the hardware-virtualized fast mode (default) or our cycle-counted interpreter\n"
         "  --oracle           with --cpu p6: check every instruction against a KVM vCPU and report divergences\n"
         "  --version, --help\n");
@@ -72,6 +73,7 @@ int main(int argc, char** argv) {
     std::string dump_ram;
     bool want_window = false;
     std::string snapshot_dir;
+    std::FILE* luma_log = nullptr;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto need = [&](const char* what) -> const char* {
@@ -145,6 +147,12 @@ int main(int argc, char** argv) {
             want_window = true;
         } else if (a == "--gpu") {
             cfg.gpu = true;
+        } else if (a == "--luma-log") {
+            luma_log = std::fopen(need("--luma-log"), "w");
+            if (!luma_log) {
+                std::fprintf(stderr, "midway-verdant: cannot open the luma log\n");
+                return 2;
+            }
         } else if (a == "--snapshots") {
             snapshot_dir = need("--snapshots");
         } else if (a == "--reset-at") {
@@ -180,6 +188,30 @@ int main(int argc, char** argv) {
         return 2;
     }
 
+    if (luma_log) {
+        // The picture's brightness over guest time, to line the boot animation up with a recording of the real
+        // console: every fourth pixel of every fourth line of the frame buffer the scanout shows.
+        machine.nv2a().set_vblank_hook([&machine, luma_log](mv::Cycles now) {
+            mv::Nv2aStub& gpu = machine.nv2a();
+            const mv::u32 start = gpu.framebuffer_start();
+            const mv::u32 w = gpu.scanout_programmed() ? gpu.scanout_width() : 640u;
+            const mv::u32 h = gpu.scanout_programmed() ? gpu.scanout_height() : 480u;
+            const mv::u32 pitch = gpu.scanout_programmed() ? gpu.scanout_pitch() : 640u * 4u;
+            const double t = static_cast<double>(now) / mv::clk::kCpuHz;
+            if (start == 0 || w < 64 || h < 64 || pitch < w * 4 || static_cast<mv::u64>(start) + static_cast<mv::u64>(pitch) * h > machine.bus().ram_size()) {
+                std::fprintf(luma_log, "%.4f -\n", t);
+                return;
+            }
+            const mv::u8* fb = machine.bus().ram() + start;
+            double sum = 0;
+            mv::u64 n = 0;
+            for (mv::u32 y = 0; y < h; y += 4) {
+                const mv::u8* row = fb + static_cast<std::size_t>(y) * pitch;
+                for (mv::u32 x = 0; x < w; x += 4, ++n) sum += 0.114 * row[x * 4] + 0.587 * row[x * 4 + 1] + 0.299 * row[x * 4 + 2];
+            }
+            std::fprintf(luma_log, "%.4f %.1f\n", t, sum / static_cast<double>(n));
+        });
+    }
     const auto t0 = std::chrono::steady_clock::now();
     const auto duration = std::chrono::nanoseconds(static_cast<long long>(seconds * 1e9));
     mv::Machine::StopReason reason = mv::Machine::StopReason::Duration;
@@ -352,5 +384,9 @@ int main(int argc, char** argv) {
         }
     }
     if (trace_file) std::fclose(trace_file);
+    if (luma_log) {
+        machine.nv2a().set_vblank_hook(nullptr);
+        std::fclose(luma_log);
+    }
     return 0;
 }
