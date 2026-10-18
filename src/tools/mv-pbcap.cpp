@@ -419,10 +419,18 @@ struct RenderObserver : mv::pgraph::Replay::Observer {
             else std::printf("frame %u: %s (%ux%u, %s, format %x)\n", index, path.string().c_str(), s.width, s.height, s.swizzled ? "swizzled" : "pitch", s.color_format);
         }
         const auto& st = renderer->stats();
-        std::printf("frame %u: %llu draws, %llu clears, %llu skipped, %llu pipelines, %llu shaders, %llu textures, %llu write-backs\n", index,
+        std::printf("frame %u: %llu draws, %llu clears, %llu skipped, %llu pipelines, %llu shaders, %llu textures, %llu write-backs; ms draw %.1f (fetch %.1f, textures %.1f, pipelines %.1f), flush %.1f, write-back %.1f\n", index,
                     static_cast<unsigned long long>(st.draws), static_cast<unsigned long long>(st.clears), static_cast<unsigned long long>(st.skipped),
                     static_cast<unsigned long long>(st.pipelines), static_cast<unsigned long long>(st.shaders),
-                    static_cast<unsigned long long>(st.textures_decoded), static_cast<unsigned long long>(st.writebacks));
+                    static_cast<unsigned long long>(st.textures_decoded), static_cast<unsigned long long>(st.writebacks),
+                    static_cast<double>(st.ns_draw) / 1e6, static_cast<double>(st.ns_fetch) / 1e6, static_cast<double>(st.ns_texture) / 1e6,
+                    static_cast<double>(st.ns_pipeline) / 1e6, static_cast<double>(st.ns_flush) / 1e6, static_cast<double>(st.ns_write_back) / 1e6);
+        std::printf("   draw parts: shader compiles vs %.1f fs %.1f, indices %.1f, upload %.1f, descriptors %.1f, record %.1f ms\n", static_cast<double>(st.ns_vs) / 1e6, static_cast<double>(st.ns_fs) / 1e6,
+                    static_cast<double>(st.ns_indices) / 1e6, static_cast<double>(st.ns_upload) / 1e6, static_cast<double>(st.ns_descriptors) / 1e6,
+                    static_cast<double>(st.ns_record) / 1e6);
+        std::printf("   shader lookups: vs memo %llu, vs cache %llu; fs memo %llu, fs cache %llu\n", static_cast<unsigned long long>(st.vs_memo_hits),
+                    static_cast<unsigned long long>(st.vs_cache_hits), static_cast<unsigned long long>(st.fs_memo_hits), static_cast<unsigned long long>(st.fs_cache_hits));
+        std::printf("   write-back gpu copy+wait %.1f ms (textures above include the write-backs a sample forced)\n", static_cast<double>(st.ns_write_back_gpu) / 1e6);
     }
 };
 

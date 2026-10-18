@@ -125,7 +125,7 @@ u32 Device::memory_type(u32 type_bits, VkMemoryPropertyFlags flags, bool* found)
     return 0;
 }
 
-bool Device::create_buffer(VkDeviceSize size, VkBufferUsageFlags usage, bool host_visible, Buffer& out, std::string& error) {
+bool Device::create_buffer(VkDeviceSize size, VkBufferUsageFlags usage, BufferMemory where, Buffer& out, std::string& error) {
     out = Buffer{};
     VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
     bci.size = size;
@@ -138,9 +138,11 @@ bool Device::create_buffer(VkDeviceSize size, VkBufferUsageFlags usage, bool hos
     VkMemoryRequirements req{};
     fn_.vkGetBufferMemoryRequirements(device_, out.buffer, &req);
     bool found = false;
-    const VkMemoryPropertyFlags want = host_visible ? (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
-                                                    : VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
-    const u32 type = memory_type(req.memoryTypeBits, want, &found);
+    const bool host_visible = where != BufferMemory::Device;
+    const VkMemoryPropertyFlags host = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    u32 type = 0;
+    if (where == BufferMemory::HostRead) type = memory_type(req.memoryTypeBits, host | VK_MEMORY_PROPERTY_HOST_CACHED_BIT, &found);
+    if (!found) type = memory_type(req.memoryTypeBits, host_visible ? host : static_cast<VkMemoryPropertyFlags>(VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT), &found);
     if (!found) {
         error = "no suitable memory type for a buffer";
         destroy_buffer(out);

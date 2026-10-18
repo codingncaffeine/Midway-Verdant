@@ -1,6 +1,7 @@
 #include "nv2a/vulkan/vk_renderer.h"
 
 #include <algorithm>
+#include <chrono>
 #include <bit>
 #include <cstdlib>
 #include <cstring>
@@ -143,6 +144,7 @@ VulkanRenderer::~VulkanRenderer() {
     dev_.destroy_buffer(index_ring_);
     dev_.destroy_buffer(uniform_ring_);
     dev_.destroy_buffer(staging_);
+    dev_.destroy_buffer(readback_);
     if (fence_) f.vkDestroyFence(dev_.device(), fence_, nullptr);
     if (cb_) f.vkFreeCommandBuffers(dev_.device(), dev_.pool(), 1, &cb_);
 }
@@ -157,10 +159,11 @@ bool VulkanRenderer::init(std::string& error) {
     const auto& f = *fn_;
     if (!dev_.format_supports(VK_FORMAT_D24_UNORM_S8_UINT, VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT)) depth24_ = VK_FORMAT_D32_SFLOAT_S8_UINT;
 
-    if (!dev_.create_buffer(kVertexRingBytes, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, true, vertex_ring_, error)) return false;
-    if (!dev_.create_buffer(kIndexRingBytes, VK_BUFFER_USAGE_INDEX_BUFFER_BIT, true, index_ring_, error)) return false;
-    if (!dev_.create_buffer(kUniformRingBytes, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, true, uniform_ring_, error)) return false;
-    if (!dev_.create_buffer(kStagingBytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, true, staging_, error)) return false;
+    if (!dev_.create_buffer(kVertexRingBytes, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, vk::BufferMemory::HostWrite, vertex_ring_, error)) return false;
+    if (!dev_.create_buffer(kIndexRingBytes, VK_BUFFER_USAGE_INDEX_BUFFER_BIT, vk::BufferMemory::HostWrite, index_ring_, error)) return false;
+    if (!dev_.create_buffer(kUniformRingBytes, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, vk::BufferMemory::HostWrite, uniform_ring_, error)) return false;
+    if (!dev_.create_buffer(kStagingBytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, vk::BufferMemory::HostWrite, staging_, error)) return false;
+    if (!dev_.create_buffer(kStagingBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, vk::BufferMemory::HostRead, readback_, error)) return false;
 
     // Descriptor layout: the two uniform blocks and the four texture stages, in every pipeline.
     VkDescriptorSetLayoutBinding bindings[6]{};
@@ -246,9 +249,23 @@ void VulkanRenderer::end_pass() {
     }
 }
 
+namespace {
+// Adds the scope's wall time to a counter.
+struct Timed {
+    u64& acc;
+    std::chrono::steady_clock::time_point t0;
+    explicit Timed(u64& a) : acc(a), t0(std::chrono::steady_clock::now()) {}
+    ~Timed() { acc += static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count()); }
+};
+u64 ns_since(std::chrono::steady_clock::time_point t0) {
+    return static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
+}
+}  // namespace
+
 void VulkanRenderer::flush() {
     const auto& f = *fn_;
     if (!recording_) return;
+    Timed timed(stats_.ns_flush);
     end_pass();
     f.vkEndCommandBuffer(cb_);
     VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
@@ -417,8 +434,42 @@ bool VulkanRenderer::ensure_pass(Surface& t) {
     return true;
 }
 
+namespace {
+
+// The Morton address of a swizzled surface separates into an x part and a y part (disjoint bits), so two small
+// tables replace a bit-interleave per texel.
+void swizzle_tables(u32 width, u32 height, u32 log_w, u32 log_h, std::vector<u32>& xs, std::vector<u32>& ys) {
+    xs.resize(width);
+    ys.resize(height);
+    for (u32 x = 0; x < width; ++x) xs[x] = swizzled_offset(x, 0, 0, log_w, log_h, 0);
+    for (u32 y = 0; y < height; ++y) ys[y] = swizzled_offset(0, y, 0, log_w, log_h, 0);
+}
+
+// Scatters linear rows of texels into the swizzled layout at base.
+template <typename T>
+void scatter_swizzled(T* base, const T* rows, u32 width, u32 height, const std::vector<u32>& xs, const std::vector<u32>& ys) {
+    for (u32 y = 0; y < height; ++y) {
+        const T* row = rows + static_cast<std::size_t>(y) * width;
+        const u32 oy = ys[y];
+        for (u32 x = 0; x < width; ++x) base[oy | xs[x]] = row[x];
+    }
+}
+
+}  // namespace
+
+void VulkanRenderer::read_back(const vk::Image& image, VkImageAspectFlags aspect, u32 width, u32 height) {
+    Timed timed_gpu(stats_.ns_write_back_gpu);
+    VkCommandBuffer cb = dev_.begin_once();
+    VkBufferImageCopy region{};
+    region.imageSubresource = {aspect, 0, 0, 1};
+    region.imageExtent = {width, height, 1};
+    fn_->vkCmdCopyImageToBuffer(cb, image.image, VK_IMAGE_LAYOUT_GENERAL, readback_.buffer, 1, &region);
+    dev_.finish_once(cb);
+}
+
 void VulkanRenderer::write_back(Surface& s) {
     if (!s.dirty) return;
+    Timed timed(stats_.ns_write_back);
     if (pass_target_ == &s) end_pass();
     flush();
     const u32 bpp = s.color_bytes();
@@ -427,13 +478,8 @@ void VulkanRenderer::write_back(Surface& s) {
         note("surface too large to write back");
         return;
     }
-    VkCommandBuffer cb = dev_.begin_once();
-    VkBufferImageCopy region{};
-    region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-    region.imageExtent = {s.width, s.height, 1};
-    fn_->vkCmdCopyImageToBuffer(cb, s.color.image, VK_IMAGE_LAYOUT_GENERAL, staging_.buffer, 1, &region);
-    dev_.finish_once(cb);
-    const u8* pixels = static_cast<const u8*>(staging_.mapped);
+    read_back(s.color, VK_IMAGE_ASPECT_COLOR_BIT, s.width, s.height);
+    const u8* pixels = static_cast<const u8*>(readback_.mapped);
     if (!s.swizzled) {
         // Linear: a row at a time.
         const u32 row_bytes = s.width * bpp;
@@ -441,11 +487,18 @@ void VulkanRenderer::write_back(Surface& s) {
             const u64 off = static_cast<u64>(y) * s.pitch;
             if (static_cast<u64>(s.phys) + off + row_bytes <= ram_size_) std::memcpy(ram_ + s.phys + off, pixels + static_cast<std::size_t>(y) * row_bytes, row_bytes);
         }
-    } else {
-        for (u32 y = 0; y < s.height; ++y) {
-            for (u32 x = 0; x < s.width; ++x) {
-                const u32 off = swizzled_offset(x, y, 0, s.log_w, s.log_h, 0) * bpp;
-                if (static_cast<u64>(s.phys) + off + bpp <= ram_size_) std::memcpy(ram_ + s.phys + off, pixels + (static_cast<std::size_t>(y) * s.width + x) * bpp, bpp);
+    } else if (static_cast<u64>(s.phys) + bytes <= ram_size_) {
+        std::vector<u32> xs, ys;
+        swizzle_tables(s.width, s.height, s.log_w, s.log_h, xs, ys);
+        u8* base = ram_ + s.phys;
+        if (bpp == 4) {
+            scatter_swizzled(reinterpret_cast<u32*>(base), reinterpret_cast<const u32*>(pixels), s.width, s.height, xs, ys);
+        } else if (bpp == 2) {
+            scatter_swizzled(reinterpret_cast<u16*>(base), reinterpret_cast<const u16*>(pixels), s.width, s.height, xs, ys);
+        } else {
+            for (u32 y = 0; y < s.height; ++y) {
+                const u8* row = pixels + static_cast<std::size_t>(y) * s.width * bpp;
+                for (u32 x = 0; x < s.width; ++x) std::memcpy(base + static_cast<std::size_t>(ys[y] | xs[x]) * bpp, row + static_cast<std::size_t>(x) * bpp, bpp);
             }
         }
     }
@@ -461,40 +514,48 @@ void VulkanRenderer::write_back_zeta(Surface& s) {
     if (pass_target_ == &s) end_pass();
     flush();
     const bool z16 = s.zeta_format == 1;
-    const u32 host_bpp = z16 ? 2u : 4u;  // D16; a 24-bit or float depth copies as a 32-bit word
-    const std::size_t bytes = static_cast<std::size_t>(s.width) * s.height * host_bpp;
+    const u32 bpp = z16 ? 2u : 4u;  // D16; a 24-bit or float depth copies as a 32-bit word
+    const std::size_t bytes = static_cast<std::size_t>(s.width) * s.height * bpp;
     if (bytes > kStagingBytes) {
         note("depth surface too large to write back");
         return;
     }
-    VkCommandBuffer cb = dev_.begin_once();
-    VkBufferImageCopy region{};
-    region.imageSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1};
-    region.imageExtent = {s.width, s.height, 1};
-    fn_->vkCmdCopyImageToBuffer(cb, s.depth.image, VK_IMAGE_LAYOUT_GENERAL, staging_.buffer, 1, &region);
-    dev_.finish_once(cb);
-    const u8* px = static_cast<const u8*>(staging_.mapped);
-    const bool float_depth = !z16 && depth24_ == VK_FORMAT_D32_SFLOAT_S8_UINT;
-    const u32 guest_bpp = host_bpp;
-    for (u32 y = 0; y < s.height; ++y) {
-        for (u32 x = 0; x < s.width; ++x) {
-            const u32 off = s.swizzled ? swizzled_offset(x, y, 0, s.log_w, s.log_h, 0) * guest_bpp : y * s.zeta_pitch + x * guest_bpp;
-            if (static_cast<u64>(s.zeta_phys) + off + guest_bpp > ram_size_) continue;
-            const u8* src = px + (static_cast<std::size_t>(y) * s.width + x) * host_bpp;
-            if (z16) {
-                std::memcpy(ram_ + s.zeta_phys + off, src, 2);
-            } else {
+    if (static_cast<u64>(s.zeta_phys) + s.zeta_bytes() > ram_size_) return;
+    read_back(s.depth, VK_IMAGE_ASPECT_DEPTH_BIT, s.width, s.height);
+    const u8* px = static_cast<const u8*>(readback_.mapped);
+    std::vector<u32> xs, ys;
+    if (s.swizzled) swizzle_tables(s.width, s.height, s.log_w, s.log_h, xs, ys);
+    u8* base = ram_ + s.zeta_phys;
+    if (z16) {
+        if (s.swizzled) {
+            scatter_swizzled(reinterpret_cast<u16*>(base), reinterpret_cast<const u16*>(px), s.width, s.height, xs, ys);
+        } else {
+            for (u32 y = 0; y < s.height; ++y) std::memcpy(base + static_cast<std::size_t>(y) * s.zeta_pitch, px + static_cast<std::size_t>(y) * s.width * 2, s.width * 2u);
+        }
+    } else {
+        // Z24S8: the depth above a stencil byte left zero, converted a row at a time.
+        const bool float_depth = depth24_ == VK_FORMAT_D32_SFLOAT_S8_UINT;
+        std::vector<u32> row(s.width);
+        for (u32 y = 0; y < s.height; ++y) {
+            const u8* src = px + static_cast<std::size_t>(y) * s.width * 4;
+            for (u32 x = 0; x < s.width; ++x) {
                 u32 depth24;
                 if (float_depth) {
                     float f;
-                    std::memcpy(&f, src, 4);
+                    std::memcpy(&f, src + static_cast<std::size_t>(x) * 4, 4);
                     depth24 = static_cast<u32>(std::clamp(f, 0.0f, 1.0f) * 16777215.0f);
                 } else {
-                    std::memcpy(&depth24, src, 4);
+                    std::memcpy(&depth24, src + static_cast<std::size_t>(x) * 4, 4);
                     depth24 &= 0xFFFFFFu;
                 }
-                const u32 word = depth24 << 8;  // Z24S8: depth above a stencil byte left zero
-                std::memcpy(ram_ + s.zeta_phys + off, &word, 4);
+                row[x] = depth24 << 8;
+            }
+            if (s.swizzled) {
+                u32* out = reinterpret_cast<u32*>(base);
+                const u32 oy = ys[y];
+                for (u32 x = 0; x < s.width; ++x) out[oy | xs[x]] = row[x];
+            } else {
+                std::memcpy(base + static_cast<std::size_t>(y) * s.zeta_pitch, row.data(), static_cast<std::size_t>(s.width) * 4);
             }
         }
     }
@@ -522,18 +583,44 @@ VkShaderModule VulkanRenderer::module(const std::vector<u32>& spirv) {
 }
 
 VkShaderModule VulkanRenderer::vertex_shader(const KelvinState& s, std::string& error) {
+    Timed timed(stats_.ns_vs);
+    const bool vp = s.vertex_program_mode();
+    const bool smooth = s.reg(mthd::kShadeModel) != 0x1D00;
+    const bool lit = !vp && (s.reg(mthd::kLightingEnable) & 1u);
+    if (!vp && !vsh::fixed_function_supported(s, error)) return VK_NULL_HANDLE;
+    const u32 flags = (vp ? 1u : 0u) | (smooth ? 2u : 0u) | (lit ? 4u : 0u);
+    const u32 start = vp ? s.program_start() : 0;
+    for (const VsMemo& m : vs_memo_) {
+        if (m.module != VK_NULL_HANDLE && m.flags == flags && m.start == start &&
+            (!vp || std::memcmp(m.words.data(), &s.program[start][0], m.words.size() * 4) == 0)) {
+            ++stats_.vs_memo_hits;
+            return m.module;
+        }
+    }
     vsh::Program program;
     std::string key;
-    if (s.vertex_program_mode()) {
+    if (vp) {
         program = vsh::extract_program(s);
         key.assign(reinterpret_cast<const char*>(&s.program[program.start]), program.instructions.size() * 16);
     } else {
-        if (!vsh::fixed_function_supported(s, error)) return VK_NULL_HANDLE;
         program = vsh::fixed_function_program(s);
-        key = (s.reg(mthd::kLightingEnable) & 1u) ? "fixed-function lit" : "fixed-function";
+        key = lit ? "fixed-function lit" : "fixed-function";
     }
-    key += s.reg(mthd::kShadeModel) == 0x1D00 ? 'f' : 's';
-    if (auto it = vs_cache_.find(key); it != vs_cache_.end()) return it->second;
+    key += smooth ? 's' : 'f';
+    auto remember = [&](VkShaderModule m) {
+        VsMemo& e = vs_memo_[vs_memo_next_];
+        vs_memo_next_ = (vs_memo_next_ + 1) % kMemoEntries;
+        e.start = start;
+        e.flags = flags;
+        e.module = m;
+        e.words.clear();
+        if (vp) e.words.assign(&s.program[start][0], &s.program[start][0] + program.instructions.size() * 4);
+    };
+    if (auto it = vs_cache_.find(key); it != vs_cache_.end()) {
+        ++stats_.vs_cache_hits;
+        remember(it->second);
+        return it->second;
+    }
     vsh::Options options;
     options.smooth_shading = s.reg(mthd::kShadeModel) != 0x1D00;
     options.fixed_function_lighting = !s.vertex_program_mode() && (s.reg(mthd::kLightingEnable) & 1u);
@@ -549,13 +636,28 @@ VkShaderModule VulkanRenderer::vertex_shader(const KelvinState& s, std::string& 
     }
     VkShaderModule m = module(c.spirv);
     vs_cache_[key] = m;
+    remember(m);
     return m;
 }
 
 VkShaderModule VulkanRenderer::fragment_shader(const psh::Key& key, std::array<psh::SamplerKind, 4>& kinds, std::string& error) {
+    Timed timed(stats_.ns_fs);
+    for (const FsMemo& m : fs_memo_) {
+        if (m.module != VK_NULL_HANDLE && m.key == key) {
+            ++stats_.fs_memo_hits;
+            kinds = m.kinds;
+            return m.module;
+        }
+    }
+    auto remember = [&](VkShaderModule m) {
+        fs_memo_[fs_memo_next_] = {key, kinds, m};
+        fs_memo_next_ = (fs_memo_next_ + 1) % kMemoEntries;
+    };
     std::string k(reinterpret_cast<const char*>(&key), sizeof key);
     if (auto it = fs_cache_.find(k); it != fs_cache_.end()) {
+        ++stats_.fs_cache_hits;
         kinds = fs_kinds_[k];
+        remember(it->second);
         return it->second;
     }
     psh::Translation t = psh::translate(key);
@@ -573,10 +675,12 @@ VkShaderModule VulkanRenderer::fragment_shader(const psh::Key& key, std::array<p
     fs_cache_[k] = m;
     fs_kinds_[k] = t.samplers;
     kinds = t.samplers;
+    remember(m);
     return m;
 }
 
 VkPipeline VulkanRenderer::pipeline(const KelvinState& s, VkShaderModule vs, VkShaderModule fs, VkPrimitiveTopology topology, Surface& t, std::string& error) {
+    Timed timed(stats_.ns_pipeline);
     struct RasterKey {
         VkShaderModule vs, fs;
         VkRenderPass pass;
@@ -678,12 +782,24 @@ u32 VulkanRenderer::texture_phys(const KelvinState& s, const TextureStage& ts) c
 }
 
 const VulkanRenderer::TextureEntry* VulkanRenderer::texture(const KelvinState& s, u32 stage, std::string& error) {
+    Timed timed(stats_.ns_texture);
     const TextureStage ts = s.texture(stage);
-    const u32 phys = texture_phys(s, ts);
-    const u32 length = texture_size_in_memory(ts);
-    if (length == 0) {
-        error = std::format("texture stage {} format {:02x} has no known size", stage, ts.color_format());
-        return nullptr;
+    const u32 b = mthd::kTextureBase + stage * mthd::kTextureStride;
+    const std::array<u32, 11> regs{s.reg(b),        s.reg(b + 4),  s.reg(b + 8),  s.reg(b + 0xC),  s.reg(b + 0x10), s.reg(b + 0x14),
+                                   s.reg(b + 0x1C), s.reg(b + 0x20), s.reg(b + 0x24), s.dma_handle(mthd::kDmaA), s.dma_handle(mthd::kDmaB)};
+    StageCache& sc = stage_cache_[stage];
+    const bool same = sc.entry != nullptr && sc.regs == regs;
+    u32 phys, length;
+    if (same) {
+        phys = sc.phys;
+        length = sc.length;
+    } else {
+        phys = texture_phys(s, ts);
+        length = texture_size_in_memory(ts);
+        if (length == 0) {
+            error = std::format("texture stage {} format {:02x} has no known size", stage, ts.color_format());
+            return nullptr;
+        }
     }
     // A render target the guest now samples: its pixels must be in RAM first — the colour image, or the depth
     // buffer when the texture is a shadow map.
@@ -693,12 +809,16 @@ const VulkanRenderer::TextureEntry* VulkanRenderer::texture(const KelvinState& s
         const u64 z0 = surf->zeta_phys, z1 = static_cast<u64>(surf->zeta_phys) + surf->zeta_bytes();
         if (surf->zeta_dirty && z0 < static_cast<u64>(phys) + length && static_cast<u64>(phys) < z1) write_back_zeta(*surf);
     }
+    if (same && sc.entry->valid) return sc.entry;
     struct Ident {
         u32 phys, format, control1, rect, palette;
     } id{phys, ts.format, ts.control1, ts.image_rect, ts.palette};
     std::string key(reinterpret_cast<const char*>(&id), sizeof id);
     auto it = textures_.find(key);
-    if (it != textures_.end() && it->second->valid) return it->second.get();
+    if (it != textures_.end() && it->second->valid) {
+        sc = StageCache{regs, phys, length, it->second.get()};
+        return it->second.get();
+    }
 
     DecodedTexture d;
     const u8* palette = nullptr;
@@ -754,6 +874,7 @@ const VulkanRenderer::TextureEntry* VulkanRenderer::texture(const KelvinState& s
     entry->linear = format_info(ts.color_format()).linear;
     TextureEntry* raw = entry.get();
     textures_[key] = std::move(entry);
+    sc = StageCache{regs, phys, length, raw};
     return raw;
 }
 
@@ -832,6 +953,7 @@ void VulkanRenderer::clear(const KelvinState& s, u32 bits) {
 }
 
 void VulkanRenderer::draw(const KelvinState& s, const DrawBatch& batch) {
+    Timed timed(stats_.ns_draw);
     ++stats_.draws;
     std::string error;
     Surface* t = target_for(s);
@@ -840,7 +962,12 @@ void VulkanRenderer::draw(const KelvinState& s, const DrawBatch& batch) {
         return;
     }
     FetchedVertices v;
-    if (!fetch_vertices(s, handles_, MemoryView{ram_, ram_size_}, batch, v)) {
+    bool fetched;
+    {
+        Timed timed_fetch(stats_.ns_fetch);
+        fetched = fetch_vertices(s, handles_, MemoryView{ram_, ram_size_}, batch, v);
+    }
+    if (!fetched) {
         note("vertex fetch: " + v.error);
         ++stats_.skipped;
         return;
@@ -877,6 +1004,7 @@ void VulkanRenderer::draw(const KelvinState& s, const DrawBatch& batch) {
     }
 
     // Topology and the index list the host understands.
+    auto t_part = std::chrono::steady_clock::now();
     std::vector<u32> indices = v.indices;
     auto sequential = [&]() {
         if (indices.empty()) {
@@ -911,6 +1039,7 @@ void VulkanRenderer::draw(const KelvinState& s, const DrawBatch& batch) {
         case Primitive::End: return;
     }
 
+    stats_.ns_indices += ns_since(t_part);
     VkPipeline p = pipeline(s, vs, fs, topology, *t, error);
     if (!p) {
         note(error);
@@ -919,6 +1048,7 @@ void VulkanRenderer::draw(const KelvinState& s, const DrawBatch& batch) {
     }
 
     // Vertex data: every attribute as a vec4, disabled ones at their default.
+    t_part = std::chrono::steady_clock::now();
     VkDeviceSize vbytes = static_cast<VkDeviceSize>(v.count) * kVertexStride, voffset = 0;
     if (!ring_alloc(vertex_ring_, vertex_cursor_, vbytes, 16, voffset)) {
         note("vertex ring full for this frame");
@@ -981,6 +1111,8 @@ void VulkanRenderer::draw(const KelvinState& s, const DrawBatch& batch) {
         std::memcpy(static_cast<u8*>(uniform_ring_.mapped) + uoffset_ps, &pu, sizeof pu);
     }
 
+    stats_.ns_upload += ns_since(t_part);
+    t_part = std::chrono::steady_clock::now();
     // Descriptors.
     VkDescriptorSetAllocateInfo dai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
     dai.descriptorPool = descriptor_pool_;
@@ -1021,6 +1153,8 @@ void VulkanRenderer::draw(const KelvinState& s, const DrawBatch& batch) {
     }
     fn_->vkUpdateDescriptorSets(dev_.device(), 6, writes, 0, nullptr);
 
+    stats_.ns_descriptors += ns_since(t_part);
+    t_part = std::chrono::steady_clock::now();
     // Record.
     ensure_pass(*t);
     if (s.color_mask() != 0) t->dirty = true;
@@ -1047,6 +1181,7 @@ void VulkanRenderer::draw(const KelvinState& s, const DrawBatch& batch) {
     } else {
         fn_->vkCmdDraw(cb_, v.count, 1, 0, 0);
     }
+    stats_.ns_record += ns_since(t_part);
 }
 
 void VulkanRenderer::flush_frame() {

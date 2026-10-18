@@ -46,6 +46,12 @@ public:
 
     struct Stats {
         u64 draws{0}, clears{0}, skipped{0}, pipelines{0}, shaders{0}, textures_decoded{0}, writebacks{0}, flushes{0};
+        // Where the time goes, in nanoseconds: the whole draw and its parts (the texture part includes the
+        // write-backs a sample forces; the shader parts are the compiles, a lookup costs nothing measurable); the
+        // submits that wait; the copies back to RAM (and the device copy inside them).
+        u64 ns_draw{0}, ns_fetch{0}, ns_texture{0}, ns_pipeline{0}, ns_flush{0}, ns_write_back{0}, ns_write_back_gpu{0};
+        u64 ns_vs{0}, ns_fs{0}, ns_indices{0}, ns_upload{0}, ns_descriptors{0}, ns_record{0};
+        u64 vs_memo_hits{0}, vs_cache_hits{0}, fs_memo_hits{0}, fs_cache_hits{0};
         std::vector<std::string> errors;  // distinct messages, in order of first appearance
     };
     const Stats& stats() const { return stats_; }
@@ -89,6 +95,8 @@ private:
     // The depth buffer into guest RAM in the zeta format (Z16, or Z24S8 with the stencil left zero): a shadow map
     // the guest samples as a depth texture lives there.
     void write_back_zeta(Surface& s);
+    // Copies one image into the read-back buffer and waits for it.
+    void read_back(const vk::Image& image, VkImageAspectFlags aspect, u32 width, u32 height);
     VkRenderPass render_pass(VkFormat color, VkFormat depth);
     VkShaderModule module(const std::vector<u32>& spirv);
     VkShaderModule vertex_shader(const KelvinState& s, std::string& error);
@@ -114,14 +122,40 @@ private:
     std::unordered_map<u32, std::unique_ptr<Surface>> surfaces_;
     std::unordered_map<u64, VkRenderPass> passes_;
     std::unordered_map<std::string, VkShaderModule> vs_cache_, fs_cache_;
+    // The last shaders answered, checked before the string-keyed caches: a draw usually repeats the previous
+    // draw's program (the guest re-uploads it every draw, so the words are compared, not a version), and its
+    // combiner key, and decoding and hashing them again cost most of the renderer's time.
+    struct VsMemo {
+        u32 start{0}, flags{0};
+        std::vector<u32> words;  // a vertex program's words from start through its final instruction
+        VkShaderModule module{VK_NULL_HANDLE};
+    };
+    struct FsMemo {
+        psh::Key key;
+        std::array<psh::SamplerKind, 4> kinds{};
+        VkShaderModule module{VK_NULL_HANDLE};
+    };
+    // A few entries each, replaced round robin: a frame alternates between a handful of programs.
+    static constexpr u32 kMemoEntries = 8;
+    std::array<VsMemo, kMemoEntries> vs_memo_{};
+    std::array<FsMemo, kMemoEntries> fs_memo_{};
+    u32 vs_memo_next_{0}, fs_memo_next_{0};
     std::unordered_map<std::string, std::array<psh::SamplerKind, 4>> fs_kinds_;
     std::unordered_map<std::string, VkPipeline> pipelines_;
     std::unordered_map<std::string, std::unique_ptr<TextureEntry>> textures_;
+    // The last binding of each stage: the registers it was built from and what it resolved to, so a draw that
+    // changes nothing about its textures skips the address maths, the handle lookups and the hashing.
+    struct StageCache {
+        std::array<u32, 11> regs{};
+        u32 phys{0}, length{0};
+        const TextureEntry* entry{nullptr};
+    };
+    std::array<StageCache, 4> stage_cache_{};
     std::unordered_map<u64, VkSampler> samplers_;
     VkDescriptorSetLayout set_layout_{VK_NULL_HANDLE};
     VkPipelineLayout pipeline_layout_{VK_NULL_HANDLE};
     VkDescriptorPool descriptor_pool_{VK_NULL_HANDLE};
-    vk::Buffer vertex_ring_, index_ring_, uniform_ring_, staging_;
+    vk::Buffer vertex_ring_, index_ring_, uniform_ring_, staging_, readback_;
     VkDeviceSize vertex_cursor_{0}, index_cursor_{0}, uniform_cursor_{0};
     vk::Image dummy2d_, dummycube_, dummy3d_;
     VkSampler dummy_sampler_{VK_NULL_HANDLE};

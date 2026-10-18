@@ -206,6 +206,10 @@ int main(int argc, char** argv) {
                     static_cast<unsigned long long>(st.clears), static_cast<unsigned long long>(st.skipped), static_cast<unsigned long long>(st.pipelines),
                     static_cast<unsigned long long>(st.shaders), static_cast<unsigned long long>(st.textures_decoded),
                     static_cast<unsigned long long>(st.writebacks));
+        std::printf("gpu time: draw %.0f ms (fetch %.0f, textures %.0f, pipelines %.0f, shader compiles %.0f), flush %.0f, write-back %.0f (device copies %.0f)\n",
+                    static_cast<double>(st.ns_draw) / 1e6, static_cast<double>(st.ns_fetch) / 1e6, static_cast<double>(st.ns_texture) / 1e6,
+                    static_cast<double>(st.ns_pipeline) / 1e6, static_cast<double>(st.ns_vs + st.ns_fs) / 1e6, static_cast<double>(st.ns_flush) / 1e6,
+                    static_cast<double>(st.ns_write_back) / 1e6, static_cast<double>(st.ns_write_back_gpu) / 1e6);
     }
     std::printf("milestones: rom hidden %s | smc challenge %s | bootloader %s | kernel %s | power off %s\n", ms(m.rom_hidden).c_str(),
                 ms(m.smc_challenge_answered).c_str(), ms(m.bootloader_magic).c_str(), ms(m.kernel_header).c_str(), ms(m.power_off).c_str());

@@ -7,6 +7,11 @@
 
 namespace mv::vk {
 
+// Where a buffer's memory lives. The device's own memory; host memory the CPU fills and the GPU reads (any
+// host-visible type, write-combined included); host memory the CPU reads back, which wants a cached type: a load
+// from write-combined memory is a bus round trip, and a 2 MiB surface read four bytes at a time took 90 ms.
+enum class BufferMemory { Device, HostWrite, HostRead };
+
 struct Buffer {
     VkBuffer buffer{VK_NULL_HANDLE};
     VkDeviceMemory memory{VK_NULL_HANDLE};
@@ -48,7 +53,7 @@ public:
     const VkPhysicalDeviceLimits& limits() const { return limits_; }
 
     u32 memory_type(u32 type_bits, VkMemoryPropertyFlags flags, bool* found) const;
-    bool create_buffer(VkDeviceSize size, VkBufferUsageFlags usage, bool host_visible, Buffer& out, std::string& error);
+    bool create_buffer(VkDeviceSize size, VkBufferUsageFlags usage, BufferMemory where, Buffer& out, std::string& error);
     void destroy_buffer(Buffer& b);
     bool create_image(VkFormat format, u32 width, u32 height, u32 depth, u32 levels, u32 layers, VkImageUsageFlags usage,
                       VkImageAspectFlags aspect, bool cube, Image& out, std::string& error);
