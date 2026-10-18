@@ -35,6 +35,7 @@ add_library(mvcore STATIC
   mcpx/rtc.cpp
   nv2a/capture.cpp
   nv2a/nv2a_stub.cpp
+  nv2a/overlay.cpp
   nv2a/pgraph/kelvin.cpp
   nv2a/pgraph/replay.cpp
   nv2a/pgraph/texture.cpp

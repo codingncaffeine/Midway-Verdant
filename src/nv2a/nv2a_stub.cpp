@@ -373,6 +373,10 @@ void Nv2aStub::mmio_write(PhysAddr addr, unsigned size, u32 value) {
             if (word & kPgraphIntrError) regs_[kPgraphNsource] = 0;
             update_irq();
             return;
+        case kPvideoStop:
+            // A stop request tears the overlay down at bit 0; the register itself reads back zero.
+            if (word & 1u) regs_[kPvideoBuffer] = 0;
+            return;
         case kPvideoIntr:
             regs_[key] &= ~word;
             update_irq();
@@ -485,6 +489,36 @@ void RegisterStoreDevice::update_irq() {
         irq_level_ = level;
         if (irq_) irq_(level);
     }
+}
+
+}  // namespace mv
+
+namespace mv {
+
+std::optional<Overlay> Nv2aStub::overlay() const {
+    const u32 use = reg(kPvideoBuffer);
+    if (!(use & 0x11u)) return std::nullopt;
+    const u32 i = (use & 1u) ? 0u : 1u;  // buffer 0 when both are in use
+    auto r = [&](u32 offset) { return reg(kPvideoBase + offset + 4 * i); };
+    Overlay ov;
+    ov.address = (r(0x00) + r(0x20)) & 0x07FFFFFFu;  // BASE + OFFSET
+    ov.limit = r(0x08);
+    const u32 size_in = r(0x28), point_in = r(0x30), point_out = r(0x48), size_out = r(0x50), format = r(0x58);
+    ov.in_w = size_in & 0x7FFu;
+    ov.in_h = (size_in >> 16) & 0x7FFu;
+    ov.s0 = point_in & 0x7FFFu;
+    ov.t0 = (point_in >> 16) & 0xFFFEu;
+    ov.dsdx = r(0x38) ? r(0x38) : (1u << 20);
+    ov.dtdy = r(0x40) ? r(0x40) : (1u << 20);
+    ov.out_x = point_out & 0xFFFu;
+    ov.out_y = (point_out >> 16) & 0xFFFu;
+    ov.out_w = size_out & 0xFFFu;
+    ov.out_h = (size_out >> 16) & 0xFFFu;
+    ov.pitch = format & 0x1FFFu;
+    ov.yuy2 = ((format >> 16) & 3u) == 1u;
+    ov.color_key = (format >> 20) & 1u;
+    ov.key = reg(kPvideoColorKey);
+    return ov;
 }
 
 }  // namespace mv

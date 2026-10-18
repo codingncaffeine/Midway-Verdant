@@ -6,8 +6,11 @@
 #include <cstring>
 #include <filesystem>
 #include <mutex>
+#include <optional>
+#include <vector>
 
 #include "core/machine.h"
+#include "nv2a/overlay.h"
 
 namespace mv::ui {
 
@@ -19,6 +22,7 @@ struct ScanoutWindow::Impl {
     bool sdl_up{false};
     std::string snapshot_dir;
     double snapshot_seconds{0};
+    std::vector<u8> composed;  // the frame with the video overlay drawn over it
 };
 
 ScanoutWindow::ScanoutWindow() : impl_(new Impl) {}
@@ -75,10 +79,12 @@ unsigned ScanoutWindow::run(Machine& machine, std::atomic<bool>& stop) {
         // The CRTC's registers belong to the machine; read them under its lock, the pixels without (a torn frame
         // is what a real display shows too).
         u32 start, width, height, pitch;
+        std::optional<Overlay> overlay;
         {
             std::lock_guard g(machine.lock());
             Nv2aStub& gpu = machine.nv2a();
             start = gpu.framebuffer_start();
+            overlay = gpu.overlay();
             if (gpu.scanout_programmed()) {
                 width = gpu.scanout_width();
                 height = gpu.scanout_height();
@@ -115,7 +121,18 @@ unsigned ScanoutWindow::run(Machine& machine, std::atomic<bool>& stop) {
         SDL_RenderClear(impl_->renderer);
         const bool showing = impl_->texture && sane && start != 0 && static_cast<u64>(start) + static_cast<u64>(pitch) * height <= bus.ram_size();
         if (showing) {
-            SDL_UpdateTexture(impl_->texture, nullptr, bus.ram() + start, static_cast<int>(pitch));
+            const u8* pixels = bus.ram() + start;
+            int stride = static_cast<int>(pitch);
+            if (overlay) {
+                // The video overlay over a copy of the frame, as the console's display shows it.
+                impl_->composed.resize(static_cast<std::size_t>(width) * height * 4);
+                for (u32 y = 0; y < height; ++y)
+                    std::memcpy(impl_->composed.data() + static_cast<std::size_t>(y) * width * 4, pixels + static_cast<std::size_t>(y) * pitch, static_cast<std::size_t>(width) * 4);
+                draw_overlay(*overlay, bus.ram(), bus.ram_size(), impl_->composed.data(), width * 4, width, height);
+                pixels = impl_->composed.data();
+                stride = static_cast<int>(width * 4);
+            }
+            SDL_UpdateTexture(impl_->texture, nullptr, pixels, stride);
             SDL_RenderTexture(impl_->renderer, impl_->texture, nullptr, nullptr);
         }
         if (next_snapshot && SDL_GetTicks() - t_start >= next_snapshot) {

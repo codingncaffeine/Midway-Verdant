@@ -208,13 +208,22 @@ int main(int argc, char** argv) {
             const mv::u32 start = gpu.framebuffer_start();
             const mv::u32 w = gpu.scanout_programmed() ? gpu.scanout_width() : 640u;
             const mv::u32 h = gpu.scanout_programmed() ? gpu.scanout_height() : 480u;
-            const mv::u32 pitch = gpu.scanout_programmed() ? gpu.scanout_pitch() : 640u * 4u;
+            mv::u32 pitch = gpu.scanout_programmed() ? gpu.scanout_pitch() : 640u * 4u;
             const double t = static_cast<double>(now) / mv::clk::kCpuHz;
             if (start == 0 || w < 64 || h < 64 || pitch < w * 4 || static_cast<mv::u64>(start) + static_cast<mv::u64>(pitch) * h > machine.bus().ram_size()) {
                 if (luma_log) std::fprintf(luma_log, "%.4f - %08x\n", t, start);
                 return;
             }
             const mv::u8* fb = machine.bus().ram() + start;
+            // The video overlay goes over a copy of the frame, as the display shows it.
+            static std::vector<mv::u8> composed;
+            if (const auto ov = gpu.overlay()) {
+                composed.resize(static_cast<std::size_t>(w) * h * 4);
+                for (mv::u32 y = 0; y < h; ++y) std::memcpy(composed.data() + static_cast<std::size_t>(y) * w * 4, fb + static_cast<std::size_t>(y) * pitch, static_cast<std::size_t>(w) * 4);
+                mv::draw_overlay(*ov, machine.bus().ram(), machine.bus().ram_size(), composed.data(), w * 4, w, h);
+                fb = composed.data();
+                pitch = w * 4;
+            }
             if (luma_log) {
                 double sum = 0;
                 mv::u64 n = 0;

@@ -1,4 +1,5 @@
 #pragma once
+#include <optional>
 #include <functional>
 #include <unordered_map>
 #include <vector>
@@ -7,6 +8,7 @@
 #include "core/clock.h"
 #include "core/scheduler.h"
 #include "debug/trace.h"
+#include "nv2a/overlay.h"
 #include "nv2a/capture.h"
 #include "nv2a/pgraph/kelvin.h"
 #include "nv2a/pushbuffer.h"
@@ -60,7 +62,8 @@ public:
     static constexpr u32 kMethodZStencilClearValue = 0x1D8C, kMethodColorClearValue = 0x1D90;
     static constexpr u32 kPgraphShadowZStencilClear = 0x401A88, kPgraphShadowColorClear = 0x40186C;
     static constexpr u32 kPfifoIntr0 = 0x002100, kPfifoIntrEn0 = 0x002140, kPgraphIntr = 0x400100, kPgraphIntrEn = 0x400140,
-                         kPvideoIntr = 0x008100, kPvideoIntrEn = 0x008140;
+                         kPvideoIntr = 0x008100, kPvideoIntrEn = 0x008140,
+                         kPvideoBuffer = 0x008700, kPvideoStop = 0x008704, kPvideoBase = 0x008900, kPvideoColorKey = 0x008B00;
     static constexpr u32 kPfifoRamht = 0x002210, kPfifoRamfc = 0x002214;
     static constexpr u32 kPfifoRunoutStatus = 0x002400, kCache1Status = 0x003214, kCache1DmaPush = 0x003220, kCache1DmaInstance = 0x00322C, kCache1DmaPut = 0x003240,
                          kCache1DmaGet = 0x003244;
@@ -92,6 +95,8 @@ public:
     }
     bool scanout_programmed() const { return crtc_[0x13] != 0; }
     u32 framebuffer_start() const { return reg(kPcrtcStart); }
+    // The video overlay as it stands, when a buffer is in use (read under the machine lock).
+    std::optional<Overlay> overlay() const;
     const PushbufferWalker& pushbuffer() const { return walker_; }
     // Objects bound to the channel's eight subchannels (class numbers, 0 = none).
     std::array<u32, 8> bound_classes() const { return bound_; }
