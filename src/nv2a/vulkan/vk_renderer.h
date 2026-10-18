@@ -59,11 +59,13 @@ private:
         vk::Image color, depth;
         VkRenderPass pass{VK_NULL_HANDLE};
         VkFramebuffer framebuffer{VK_NULL_HANDLE};
-        bool dirty{false};           // rendered since the last write-back
+        bool dirty{false};           // colour rendered since the last write-back
+        bool zeta_dirty{false};      // depth rendered since the last write-back of the zeta surface
         bool rendered_this_frame{false};
         u64 draws_this_frame{0}, clears_this_frame{0};
         u32 bytes() const { return color_bytes() * (swizzled ? width * height : pitch * height); }
         u32 color_bytes() const;
+        u32 zeta_bytes() const { return (zeta_format == 1 ? 2u : 4u) * (swizzled ? width * height : zeta_pitch * height); }
     };
     struct TextureEntry {
         vk::Image image;
@@ -80,6 +82,9 @@ private:
     Surface* target_for(const KelvinState& s);
     bool ensure_pass(Surface& t);
     void write_back(Surface& s);
+    // The depth buffer into guest RAM in the zeta format (Z16, or Z24S8 with the stencil left zero): a shadow map
+    // the guest samples as a depth texture lives there.
+    void write_back_zeta(Surface& s);
     VkRenderPass render_pass(VkFormat color, VkFormat depth);
     VkShaderModule module(const std::vector<u32>& spirv);
     VkShaderModule vertex_shader(const KelvinState& s, std::string& error);

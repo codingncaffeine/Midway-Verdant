@@ -410,7 +410,9 @@ bool VulkanRenderer::ensure_pass(Surface& t) {
     fn_->vkCmdBeginRenderPass(cb_, &rbi, VK_SUBPASS_CONTENTS_INLINE);
     pass_open_ = true;
     pass_target_ = &t;
-    t.dirty = true;
+    // A pass may write depth; whether it writes colour is the draw's or the clear's to say (the colour mask, the
+    // clear bits), so a depth-only pass over an unused colour target never lands in guest RAM.
+    t.zeta_dirty = true;
     t.rendered_this_frame = true;
     return true;
 }
@@ -441,6 +443,54 @@ void VulkanRenderer::write_back(Surface& s) {
     s.dirty = false;
     ++stats_.writebacks;
     invalidate(s.phys, s.swizzled ? s.width * s.height * bpp : s.pitch * s.height);
+}
+
+void VulkanRenderer::write_back_zeta(Surface& s) {
+    if (!s.zeta_dirty) return;
+    s.zeta_dirty = false;
+    if (s.zeta_format == 0 || s.zeta_phys == 0) return;  // no depth surface bound (an offset of zero is never a real one)
+    if (pass_target_ == &s) end_pass();
+    flush();
+    const bool z16 = s.zeta_format == 1;
+    const u32 host_bpp = z16 ? 2u : 4u;  // D16; a 24-bit or float depth copies as a 32-bit word
+    const std::size_t bytes = static_cast<std::size_t>(s.width) * s.height * host_bpp;
+    if (bytes > kStagingBytes) {
+        note("depth surface too large to write back");
+        return;
+    }
+    VkCommandBuffer cb = dev_.begin_once();
+    VkBufferImageCopy region{};
+    region.imageSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1};
+    region.imageExtent = {s.width, s.height, 1};
+    fn_->vkCmdCopyImageToBuffer(cb, s.depth.image, VK_IMAGE_LAYOUT_GENERAL, staging_.buffer, 1, &region);
+    dev_.finish_once(cb);
+    const u8* px = static_cast<const u8*>(staging_.mapped);
+    const bool float_depth = !z16 && depth24_ == VK_FORMAT_D32_SFLOAT_S8_UINT;
+    const u32 guest_bpp = host_bpp;
+    for (u32 y = 0; y < s.height; ++y) {
+        for (u32 x = 0; x < s.width; ++x) {
+            const u32 off = s.swizzled ? swizzled_offset(x, y, 0, s.log_w, s.log_h, 0) * guest_bpp : y * s.zeta_pitch + x * guest_bpp;
+            if (static_cast<u64>(s.zeta_phys) + off + guest_bpp > ram_size_) continue;
+            const u8* src = px + (static_cast<std::size_t>(y) * s.width + x) * host_bpp;
+            if (z16) {
+                std::memcpy(ram_ + s.zeta_phys + off, src, 2);
+            } else {
+                u32 depth24;
+                if (float_depth) {
+                    float f;
+                    std::memcpy(&f, src, 4);
+                    depth24 = static_cast<u32>(std::clamp(f, 0.0f, 1.0f) * 16777215.0f);
+                } else {
+                    std::memcpy(&depth24, src, 4);
+                    depth24 &= 0xFFFFFFu;
+                }
+                const u32 word = depth24 << 8;  // Z24S8: depth above a stencil byte left zero
+                std::memcpy(ram_ + s.zeta_phys + off, &word, 4);
+            }
+        }
+    }
+    ++stats_.writebacks;
+    invalidate(s.zeta_phys, s.zeta_bytes());
 }
 
 void VulkanRenderer::invalidate(u32 phys, u32 len) {
@@ -626,10 +676,13 @@ const VulkanRenderer::TextureEntry* VulkanRenderer::texture(const KelvinState& s
         error = std::format("texture stage {} format {:02x} has no known size", stage, ts.color_format());
         return nullptr;
     }
-    // A render target the guest now samples: its pixels must be in RAM first.
+    // A render target the guest now samples: its pixels must be in RAM first — the colour image, or the depth
+    // buffer when the texture is a shadow map.
     for (auto& [k, surf] : surfaces_) {
         const u64 a0 = surf->phys, a1 = static_cast<u64>(surf->phys) + surf->bytes();
         if (surf->dirty && a0 < static_cast<u64>(phys) + length && static_cast<u64>(phys) < a1) write_back(*surf);
+        const u64 z0 = surf->zeta_phys, z1 = static_cast<u64>(surf->zeta_phys) + surf->zeta_bytes();
+        if (surf->zeta_dirty && z0 < static_cast<u64>(phys) + length && static_cast<u64>(phys) < z1) write_back_zeta(*surf);
     }
     struct Ident {
         u32 phys, format, control1, rect, palette;
@@ -730,6 +783,7 @@ void VulkanRenderer::clear(const KelvinState& s, u32 bits) {
         return;
     }
     ensure_pass(*t);
+    if (bits & 0xF0u) t->dirty = true;
     ++t->clears_this_frame;
     VkClearAttachment att[2]{};
     u32 n = 0;
@@ -960,6 +1014,7 @@ void VulkanRenderer::draw(const KelvinState& s, const DrawBatch& batch) {
 
     // Record.
     ensure_pass(*t);
+    if (s.color_mask() != 0) t->dirty = true;
     ++t->draws_this_frame;
     fn_->vkCmdBindPipeline(cb_, VK_PIPELINE_BIND_POINT_GRAPHICS, p);
     fn_->vkCmdBindDescriptorSets(cb_, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout_, 0, 1, &set, 0, nullptr);
@@ -987,6 +1042,7 @@ void VulkanRenderer::draw(const KelvinState& s, const DrawBatch& batch) {
 
 void VulkanRenderer::end_frame() {
     flush();
+    // Colour reaches RAM every frame (the scanout and the CPU read it); depth only when a texture samples it.
     for (auto& [k, s] : surfaces_)
         if (s->dirty) write_back(*s);
     vertex_cursor_ = index_cursor_ = uniform_cursor_ = 0;
