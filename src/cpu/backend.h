@@ -40,8 +40,17 @@ public:
         u64 exits{0}, mmio_exits{0}, pio_exits{0}, hlt_exits{0}, irq_injections{0}, irq_window_exits{0}, kicks{0}, intr_exits{0};
         u64 by_reason[64]{};
         u64 by_vector[256]{};
+        // The interpreter's: instructions retired and cycles on its clock (zero for the fast mode).
+        u64 instructions{0}, cycles{0};
     };
     virtual Stats stats() const = 0;
+
+    // The accurate mode owns the timeline: the machine advances the scheduler to its clock instead of the
+    // host's. The fast mode leaves it to the host clock.
+    virtual bool owns_timeline() const { return false; }
+    virtual Cycles timeline_cycles() const { return 0; }
+    // A line for the end-of-run report beyond the counters (the oracle's findings), or empty.
+    virtual std::string report() const { return {}; }
 
     // Registers for the report and the debugger (fast mode reads them from the hypervisor).
     struct Regs {
@@ -59,5 +68,7 @@ public:
 
 // The fast mode on this host, or nullptr with a reason when there is none.
 std::unique_ptr<CpuBackend> make_fast_backend(std::string& why_not);
+// The accurate mode: our cycle-counted Pentium III interpreter, optionally checked by the KVM oracle.
+std::unique_ptr<CpuBackend> make_p6_backend(bool with_oracle);
 
 }  // namespace mv

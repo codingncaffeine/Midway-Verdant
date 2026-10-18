@@ -9,6 +9,14 @@ add_library(mvcore STATIC
   core/kernel_image.cpp
   crypto/sha1.cpp
   cpu/kvm/kvm_backend.cpp
+  cpu/p6/decode.cpp
+  cpu/p6/memory.cpp
+  cpu/p6/cpu.cpp
+  cpu/p6/system.cpp
+  cpu/p6/fpu.cpp
+  cpu/p6/simd.cpp
+  cpu/p6/p6_backend.cpp
+  cpu/p6/oracle.cpp
   debug/trace.cpp
   debug/guest_stack.cpp
   flash/flash.cpp
@@ -50,7 +58,7 @@ target_include_directories(mvcore PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_
 target_link_libraries(mvcore PUBLIC mv_warnings)
 # The Linux KVM header is not ISO C++ (flexible array members); that one file is built without -Wpedantic.
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-  set_source_files_properties(cpu/kvm/kvm_backend.cpp PROPERTIES COMPILE_OPTIONS "-Wno-pedantic")
+  set_source_files_properties(cpu/kvm/kvm_backend.cpp cpu/p6/oracle.cpp PROPERTIES COMPILE_OPTIONS "-Wno-pedantic")
 endif()
 find_package(Threads REQUIRED)
 target_link_libraries(mvcore PUBLIC Threads::Threads)

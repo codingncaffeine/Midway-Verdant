@@ -41,3 +41,10 @@ compile_commands.json
 # Release artifacts
 /packaging/out/
 /packaging/out-old/
+
+# Reference recordings of a real console (the user's files; never committed)
+*.mp4
+*.mkv
+*.webm
+*.wav
+*.flac

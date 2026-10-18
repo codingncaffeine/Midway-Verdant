@@ -178,10 +178,17 @@ bool Machine::init(std::string& error) {
                    config_.hdd_locked ? ", locked" : "");
     }
     ide_.attach(1, std::make_unique<AtapiCdrom>());
-    std::string why_not;
-    cpu_ = make_fast_backend(why_not);
-    if (!cpu_) {
-        error = why_not;
+    if (config_.cpu == "p6") {
+        cpu_ = make_p6_backend(config_.oracle);
+    } else if (config_.cpu == "kvm") {
+        std::string why_not;
+        cpu_ = make_fast_backend(why_not);
+        if (!cpu_) {
+            error = why_not;
+            return false;
+        }
+    } else {
+        error = "unknown CPU backend " + config_.cpu + " (kvm or p6)";
         return false;
     }
     if (config_.capture_path) {
@@ -203,6 +210,14 @@ bool Machine::init(std::string& error) {
     pic_.set_on_intr([this](bool asserted) {
         if (asserted && cpu_) cpu_->kick();
     });
+    if (cpu_->owns_timeline()) {
+        milestone_poll_.name = "milestones";
+        milestone_poll_.fire = [this](Cycles now) {
+            check_memory_milestones();
+            sched_.schedule(milestone_poll_, now + cycles_from_ns(100'000));
+        };
+        sched_.schedule(milestone_poll_, cycles_from_ns(100'000));
+    }
     return true;
 }
 
@@ -212,7 +227,13 @@ Cycles Machine::wall_cycles() const {
 }
 
 void Machine::advance_time() {
-    sched_.advance_to(wall_cycles());
+    if (cpu_ && cpu_->owns_timeline()) {
+        // The interpreter's clock is the timeline and it advances the scheduler itself at every deadline;
+        // here only what is already due fires.
+        sched_.advance_to(cpu_->timeline_cycles());
+    } else {
+        sched_.advance_to(wall_cycles());
+    }
     trace_now_ = sched_.now();
 }
 
@@ -326,7 +347,7 @@ Machine::StopReason Machine::run(std::chrono::nanoseconds host_duration, std::fu
         if (now >= deadline) break;
         // Sleep until the next timer or a short tick (milestones are polled), whichever is sooner.
         auto wake_at = now + std::chrono::milliseconds(2);
-        if (sched_.has_pending()) {
+        if (sched_.has_pending() && !cpu_->owns_timeline()) {
             const u64 next_ns = ns_from_cycles(sched_.next_deadline());
             const auto next_tp = start_ + std::chrono::nanoseconds(static_cast<i64>(next_ns));
             if (next_tp < wake_at) wake_at = next_tp;

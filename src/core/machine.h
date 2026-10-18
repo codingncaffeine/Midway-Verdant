@@ -62,6 +62,10 @@ struct MachineConfig {
     std::optional<double> reset_at_seconds;
     // The live GPU: a Vulkan renderer fed by the pushbuffer, writing frames back into guest RAM.
     bool gpu{false};
+    // The CPU: "kvm" (the fast mode) or "p6" (our interpreter, the accurate mode); with `oracle` the
+    // interpreter is checked instruction by instruction against a KVM vCPU.
+    std::string cpu{"kvm"};
+    bool oracle{false};
 };
 
 // The console: every device on one bus and one timeline, a CPU backend running the firmware against them, and
@@ -177,6 +181,9 @@ private:
     bool eeprom_generated_{false};
     std::vector<u32> watch_last_;
     std::unique_ptr<capture::Writer> capture_;
+    // In accurate mode the milestones are polled on the timeline (every 0.1 ms of guest time) so their
+    // timestamps are deterministic; in fast mode the io thread polls them in host time.
+    TimerEvent milestone_poll_;
 public:
     u64 apu_frames() const { return apu_.frames(); }
 };

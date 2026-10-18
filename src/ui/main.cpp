@@ -42,6 +42,8 @@ void print_usage() {
         "  --window           show the console's scanout in a window (Escape or closing it ends the run)\n"
         "  --gpu              render the console's graphics live on the host's Vulkan device (frames land in guest RAM)\n"
         "  --snapshots DIR    with --window: save what the window shows as DIR/shot-SSS.bmp every 2 seconds\n"
+        "  --cpu kvm|p6       the CPU: the hardware-virtualized fast mode (default) or our cycle-counted interpreter\n"
+        "  --oracle           with --cpu p6: check every instruction against a KVM vCPU and report divergences\n"
         "  --version, --help\n");
 }
 
@@ -149,6 +151,10 @@ int main(int argc, char** argv) {
             cfg.reset_at_seconds = std::atof(need("--reset-at"));
         } else if (a == "--rtc-time") {
             cfg.rtc_base_time = std::atoll(need("--rtc-time"));
+        } else if (a == "--cpu") {
+            cfg.cpu = need("--cpu");
+        } else if (a == "--oracle") {
+            cfg.oracle = true;
         } else {
             std::fprintf(stderr, "midway-verdant: unknown option %s\n", a.c_str());
             return 2;
@@ -230,6 +236,15 @@ int main(int argc, char** argv) {
     std::printf("post codes (%zu): %s\n", machine.post().history().size(), post.c_str());
 
     const auto stats = machine.cpu()->stats();
+    std::printf("cpu backend: %s\n", std::string(machine.cpu()->name()).c_str());
+    if (stats.instructions) {
+        const double guest_s = static_cast<double>(mv::ns_from_cycles(stats.cycles)) / 1e9;
+        std::printf("cpu p6: %llu instructions, %llu cycles (%.3f ms guest), %.1f M instructions/s host, %.3f guest-s per host-s; halts %llu, interrupts taken %llu\n",
+                    static_cast<unsigned long long>(stats.instructions), static_cast<unsigned long long>(stats.cycles), guest_s * 1e3,
+                    static_cast<double>(stats.instructions) / wall / 1e6, guest_s / wall, static_cast<unsigned long long>(stats.hlt_exits),
+                    static_cast<unsigned long long>(stats.irq_injections));
+    }
+    if (const std::string r = machine.cpu()->report(); !r.empty()) std::printf("%s\n", r.c_str());
     std::printf("cpu exits: %llu (mmio %llu, pio %llu, hlt %llu, irq window %llu), interrupts injected %llu\n",
                 static_cast<unsigned long long>(stats.exits), static_cast<unsigned long long>(stats.mmio_exits),
                 static_cast<unsigned long long>(stats.pio_exits), static_cast<unsigned long long>(stats.hlt_exits),
