@@ -8,13 +8,40 @@ namespace mv::pgraph::psh {
 
 namespace {
 
-constexpr u32 kShaderClipPlaneMode = 0x17F8, kShadowCompareFunc = 0x1E6C, kFogEnable = 0x02A4, kFogColor = 0x02A8,
-              kSpecularFogFactor = 0x1E20;
+constexpr u32 kShadowCompareFunc = 0x1E6C, kFogEnable = 0x02A4, kFogColor = 0x02A8, kSpecularFogFactor = 0x1E20;
 
 bool depth_format(u32 color_format) {
     switch (color_format) {
         case 0x2A: case 0x2B: case 0x2C: case 0x2D: case 0x2E: case 0x2F: case 0x30: case 0x31: return true;
         default: return false;
+    }
+}
+
+// The texture stage modes (SET_SHADER_STAGE_PROGRAM, five bits per stage). Their behaviour is the NV20 texture
+// shader's, as the public NV_texture_shader specification describes it (each mode below names its operation there),
+// and the Direct3D 8 ps.1.x texture instruction it implements.
+enum : u32 {
+    kModeNone = 0, kModeProject2D = 1, kModeProject3D = 2, kModeCube = 3, kModePassThrough = 4, kModeClipPlane = 5
+};
+
+u32 stage_mode(const Key& key, u32 stage) { return (key.shader_stage_program >> (5 * stage)) & 0x1Fu; }
+
+// What each stage's texture binding must receive.
+SamplerKind sampler_kind(const Key& key, u32 stage) {
+    const u32 mode = stage_mode(key, stage);
+    const u32 fmt = key.texture_format[stage];
+    const bool cube = (fmt >> 2) & 1u;
+    const u32 dim = (fmt >> 4) & 0xFu;
+    const u32 color = (fmt >> 8) & 0xFFu;
+    if (!key.texture_enabled[stage]) return SamplerKind::None;
+    switch (mode) {
+        case kModeProject2D:
+        case kModeProject3D:
+        case kModeCube:
+            if (mode == kModeCube || cube) return SamplerKind::SamplerCube;
+            if (mode == kModeProject3D && depth_format(color)) return SamplerKind::Shadow2D;
+            return dim == 3 ? SamplerKind::Sampler3D : SamplerKind::Sampler2D;
+        default: return SamplerKind::None;
     }
 }
 
@@ -127,6 +154,7 @@ Key key_from_state(const KelvinState& s) {
     k.final_cw1 = s.reg(mthd::kCombinerSpecFogCw1);
     k.shader_stage_program = s.reg(mthd::kShaderStageProgram);
     k.other_stage_input = s.reg(mthd::kShaderOtherStageInput);
+    k.clip_plane_mode = s.reg(mthd::kShaderClipPlaneMode) & 0xFFFFu;
     k.shadow_compare_func = s.reg(kShadowCompareFunc) & 7u;
     for (u32 t = 0; t < 4; ++t) {
         const TextureStage ts = s.texture(t);
@@ -195,23 +223,7 @@ Translation translate(const Key& key) {
         "};\n";
     // Texture stages: which sampler each needs.
     for (u32 i = 0; i < 4; ++i) {
-        const u32 mode = (key.shader_stage_program >> (5 * i)) & 0x1Fu;
-        const u32 fmt = key.texture_format[i];
-        const bool cube = (fmt >> 2) & 1u;
-        const u32 dim = (fmt >> 4) & 0xFu;
-        const u32 color = (fmt >> 8) & 0xFFu;
-        SamplerKind kind = SamplerKind::None;
-        if (mode == 0 || mode == 4 || mode == 5 || !key.texture_enabled[i]) {
-            kind = SamplerKind::None;
-        } else if (mode == 3 || cube) {
-            kind = SamplerKind::SamplerCube;
-        } else if (mode == 2 && depth_format(color)) {
-            kind = SamplerKind::Shadow2D;
-        } else if (dim == 3) {
-            kind = SamplerKind::Sampler3D;
-        } else {
-            kind = SamplerKind::Sampler2D;
-        }
+        const SamplerKind kind = sampler_kind(key, i);
         t.samplers[i] = kind;
         const char* type = kind == SamplerKind::SamplerCube ? "samplerCube" : (kind == SamplerKind::Sampler3D ? "sampler3D" : "sampler2D");
         if (kind != SamplerKind::None) g += std::format("layout(set = 0, binding = {}) uniform {} tex{};\n", kSamplerBindingBase + i, type, i);
@@ -220,14 +232,16 @@ Translation translate(const Key& key) {
     g += "void main() {\n";
     g += "    vec4 v0 = vtx_d0;\n    vec4 v1 = vtx_d1;\n";
     g += std::format("    vec4 fog = vec4(fog_color.rgb, {});\n", key.fog_enable ? "clamp(vtx_fog, 0.0, 1.0)" : "1.0");
+    // A stage without a result (mode none, a disabled texture) reads (0, 0, 0, 0), as NV_texture_shader's NONE does.
+    for (u32 i = 0; i < 4; ++i) g += std::format("    vec4 t{} = vec4(0.0);\n", i);
     for (u32 i = 0; i < 4; ++i) {
-        const u32 mode = (key.shader_stage_program >> (5 * i)) & 0x1Fu;
+        const u32 mode = stage_mode(key, i);
         const SamplerKind kind = t.samplers[i];
-        g += std::format("    vec4 t{} = vec4(0.0);\n", i);
-        if (kind == SamplerKind::None && mode != 4 && mode != 5) continue;
         switch (mode) {
-            case 1:  // 2D projective
-            case 2:  // 3D projective
+            case kModeNone: break;
+            case kModeProject2D:
+            case kModeProject3D:
+                if (kind == SamplerKind::None) break;
                 if (kind == SamplerKind::Shadow2D) {
                     // The stored depth is the left operand: t = (texel FUNC r), with r = z/w clamped to the
                     // format's depth range (raw units, like the texel).
@@ -249,21 +263,37 @@ Translation translate(const Key& key) {
                     g += std::format("    t{0} = textureProj(tex{0}, vec3(vtx_t{0}.xy * tex_scale[{0}].xy, vtx_t{0}.w));\n", i);
                 }
                 break;
-            case 3:  // cube map
+            case kModeCube:
+                if (kind == SamplerKind::None) break;
                 if (kind == SamplerKind::SamplerCube) g += std::format("    t{0} = texture(tex{0}, vtx_t{0}.xyz);\n", i);
                 else g += std::format("    t{0} = textureProj(tex{0}, vec3(vtx_t{0}.xy * tex_scale[{0}].xy, vtx_t{0}.w));\n", i);
                 break;
-            case 4:  // pass through
-                g += std::format("    t{0} = vtx_t{0};\n", i);
+            case kModePassThrough:
+                // The texture coordinates become the colour, each clamped to [0, 1] (NV_texture_shader PASS_THROUGH;
+                // D3D's texcoord clamps the same way).
+                g += std::format("    t{0} = clamp(vtx_t{0}, vec4(0.0), vec4(1.0));\n", i);
                 break;
-            case 5:  // clip plane
-                g += std::format("    if (any(lessThan(vtx_t{0}, vec4(0.0)))) discard;\n", i);
+            case kModeClipPlane: {
+                // Each of s, t, r, q is tested against zero and any failing test discards the fragment (NV_texture_shader
+                // CULL_FRAGMENT). SET_SHADER_CLIP_PLANE_MODE bit 4 * stage + component picks the test: 0 passes
+                // when the component is >= 0 (discards below zero), 1 passes when it is < 0 (discards at or above).
+                const u32 sense = (key.clip_plane_mode >> (4 * i)) & 0xFu;
+                if (sense == 0) {
+                    g += std::format("    if (any(lessThan(vtx_t{0}, vec4(0.0)))) discard;\n", i);
+                } else {
+                    g += std::format("    if (any(notEqual(lessThan(vtx_t{0}, vec4(0.0)), bvec4({1}, {2}, {3}, {4})))) discard;\n", i,
+                                     (sense & 1u) ? "true" : "false", (sense & 2u) ? "true" : "false", (sense & 4u) ? "true" : "false",
+                                     (sense & 8u) ? "true" : "false");
+                }
                 break;
+            }
             default:
                 if (t.error.empty()) t.error = std::format("texture stage {} mode {} is not supported yet", i, mode);
                 break;
         }
     }
+    // The combiners' r0 starts with t0's alpha (NV_register_combiners: spare0 alpha = texture 0 alpha). With stage 0
+    // set to none that is 0 here; the reference emulator uses 1 there, which no public source settles [verify].
     g += "    vec4 r0 = vec4(0.0, 0.0, 0.0, t0.a);\n    vec4 r1 = vec4(0.0);\n";
 
     const u32 stages = key.combiner_control & 0xFFu;

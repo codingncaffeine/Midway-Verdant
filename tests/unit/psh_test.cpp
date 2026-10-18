@@ -136,3 +136,47 @@ TEST(Psh, ShadowCompareTakesTheStoredDepthAsTheLeftOperand) {
     const CompiledShader c = compile_glsl(ShaderStage::Fragment, t.glsl, "shadow");
     EXPECT_TRUE(c.ok()) << c.log << "\n" << t.glsl;
 }
+
+namespace {
+// One stage of combiners whose final colour is texture stage `stage` (A = t, B = one; G = t.a).
+KelvinState output_texture(u32 stage) {
+    KelvinState s;
+    s.r[mthd::kCombinerControl >> 2] = 1;
+    s.r[mthd::kCombinerColorIcw >> 2] = icw(in(8 + stage), in(0, 1), in(0), in(0));
+    s.r[mthd::kCombinerColorOcw >> 2] = 12u << 4;
+    s.r[mthd::kCombinerSpecFogCw0 >> 2] = icw(in(12), in(0, 1), in(0), in(0));
+    s.r[mthd::kCombinerSpecFogCw1 >> 2] = icw(in(0), in(0), in(8 + stage, 0, true), 0);
+    return s;
+}
+
+void expect_compiles(const Translation& t, const char* name) {
+    ASSERT_TRUE(t.error.empty()) << t.error;
+    const CompiledShader c = compile_glsl(ShaderStage::Fragment, t.glsl, name);
+    EXPECT_TRUE(c.ok()) << c.log << "\n" << t.glsl;
+}
+}  // namespace
+
+TEST(Psh, PassThroughClampsTheCoordinatesToZeroOne) {
+    KelvinState s = output_texture(0);
+    s.r[mthd::kShaderStageProgram >> 2] = 4;
+    const Translation t = translate(key_from_state(s));
+    EXPECT_EQ(t.samplers[0], SamplerKind::None);
+    EXPECT_NE(t.glsl.find("t0 = clamp(vtx_t0, vec4(0.0), vec4(1.0));"), std::string::npos) << t.glsl;
+    expect_compiles(t, "pass-through");
+}
+
+TEST(Psh, ClipPlaneTakesEachComponentsSenseFromTheModeRegister) {
+    KelvinState s = output_texture(1);
+    s.r[mthd::kShaderStageProgram >> 2] = 5u << 5;           // stage 1: clip plane
+    s.r[mthd::kShaderClipPlaneMode >> 2] = 0x5u << 4;         // stage 1: s and r discard at or above zero
+    const Key k = key_from_state(s);
+    EXPECT_EQ(k.clip_plane_mode, 0x50u);
+    const Translation t = translate(k);
+    EXPECT_NE(t.glsl.find("if (any(notEqual(lessThan(vtx_t1, vec4(0.0)), bvec4(true, false, true, false)))) discard;"), std::string::npos)
+        << t.glsl;
+    expect_compiles(t, "clip-plane");
+    // All four senses zero: the plain test, discarding below zero.
+    s.r[mthd::kShaderClipPlaneMode >> 2] = 0x5u;  // stage 0's bits only
+    const Translation t0 = translate(key_from_state(s));
+    EXPECT_NE(t0.glsl.find("if (any(lessThan(vtx_t1, vec4(0.0)))) discard;"), std::string::npos) << t0.glsl;
+}

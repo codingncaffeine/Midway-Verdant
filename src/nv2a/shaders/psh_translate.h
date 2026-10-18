@@ -17,6 +17,7 @@ struct Key {
     u32 final_cw0{0}, final_cw1{0};
     u32 shader_stage_program{0};
     u32 other_stage_input{0};
+    u32 clip_plane_mode{0};  // SET_SHADER_CLIP_PLANE_MODE: four bits per stage, one per component
     u32 shadow_compare_func{0};
     std::array<u32, 4> texture_format{};  // only the fields that shape the shader (dimensionality, cube, colour)
     std::array<bool, 4> texture_enabled{};

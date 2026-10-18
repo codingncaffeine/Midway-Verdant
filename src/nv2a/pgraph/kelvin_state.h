@@ -31,6 +31,7 @@ constexpr u32 kViewportOffset = 0x0A20, kCombinerFactor0 = 0x0A60, kCombinerFact
               kCombinerColorIcw = 0x0AC0, kViewportScale = 0x0AF0;
 constexpr u32 kTransformProgram = 0x0B00, kTransformConstant = 0x0B80;  // 32 words each
 constexpr u32 kVertexDataArrayOffset = 0x1720, kVertexDataArrayFormat = 0x1760;  // 16 each
+constexpr u32 kShaderClipPlaneMode = 0x17F8, kEyeVector = 0x181C;  // the eye vector: three floats
 constexpr u32 kBeginEnd = 0x17FC, kArrayElement16 = 0x1800, kArrayElement32 = 0x1808, kDrawArrays = 0x1810, kInlineArray = 0x1818;
 constexpr u32 kVertexData2fM = 0x1880, kVertexData2s = 0x1900, kVertexData4ub = 0x1940, kVertexData4sM = 0x1980, kVertexData4fM = 0x1A00;
 constexpr u32 kVertex3f = 0x1500, kVertex4f = 0x1518, kNormal3f = 0x1530, kNormal3s = 0x1540, kDiffuse4f = 0x1550, kDiffuse3f = 0x1560,
@@ -40,6 +41,8 @@ constexpr u32 kVertex3f = 0x1500, kVertex4f = 0x1518, kNormal3f = 0x1530, kNorma
               kTexcoord2_4s = 0x1600, kTexcoord3_2f = 0x1608, kTexcoord3_2s = 0x1610, kTexcoord3_4f = 0x1620, kTexcoord3_4s = 0x1630;
 constexpr u32 kFogCoord = 0x1698, kWeight1f = 0x169C, kWeight2f = 0x16A0, kWeight3f = 0x16B0, kWeight4f = 0x16C0;
 constexpr u32 kTextureBase = 0x1B00, kTextureStride = 0x40;  // offset, format, address, control0, control1, filter, rect, palette, border
+// Per texture stage (stride kTextureStride): the bump-environment matrix (four floats), its luminance scale and offset.
+constexpr u32 kBumpEnvMat = 0x1B28, kBumpEnvScale = 0x1B38, kBumpEnvOffset = 0x1B3C;
 constexpr u32 kSemaphoreOffset = 0x1D6C, kSemaphoreRelease = 0x1D70, kZstencilClear = 0x1D8C, kColorClear = 0x1D90, kClearSurface = 0x1D94,
               kClearRectH = 0x1D98, kClearRectV = 0x1D9C;
 constexpr u32 kCombinerColorOcw = 0x1E40, kCombinerControl = 0x1E60, kShaderStageProgram = 0x1E70, kDotRgbMapping = 0x1E74,
