@@ -106,3 +106,24 @@ TEST(Psh, TranslatesTheBootAnimationsCombiners) {
                 key.shader_stage_program, static_cast<int>(t.samplers[0]), static_cast<int>(t.samplers[1]), static_cast<int>(t.samplers[2]),
                 static_cast<int>(t.samplers[3]));
 }
+
+TEST(Psh, ShadowCompareTakesTheStoredDepthAsTheLeftOperand) {
+    // A depth texture in a 3D-projective stage is a shadow lookup: t = (stored depth FUNC r). The function numbering
+    // and the operand order are two sources' conventions that only agree this way round (nxdk: 4 = LESS on r OP
+    // texel; the behaviour reference: 4 = GREATER on texel OP r); the reverse lit every shadowed face and darkened
+    // every lit one.
+    KelvinState s;
+    s.r[mthd::kCombinerControl >> 2] = 1;
+    s.r[mthd::kCombinerColorIcw >> 2] = icw(in(8), in(0, 1), in(0), in(0));
+    s.r[mthd::kCombinerColorOcw >> 2] = 12u << 4;
+    s.r[mthd::kShaderStageProgram >> 2] = 2;               // stage 0: 3D projective
+    s.r[(mthd::kTextureBase + 4) >> 2] = 0x0001302a;       // 2D, colour 0x30 (16-bit depth)
+    s.r[(mthd::kTextureBase + 0xC) >> 2] = 0x40000000;     // enabled
+    s.r[0x1E6C >> 2] = 4;                                  // SET_SHADOW_COMPARE_FUNC
+    const Translation t = translate(key_from_state(s));
+    ASSERT_TRUE(t.error.empty()) << t.error;
+    EXPECT_EQ(t.samplers[0], SamplerKind::Shadow2D);
+    EXPECT_NE(t.glsl.find("texel > clamp(p.z, 0.0, tex_scale[0].z)"), std::string::npos) << t.glsl;
+    const CompiledShader c = compile_glsl(ShaderStage::Fragment, t.glsl, "shadow");
+    EXPECT_TRUE(c.ok()) << c.log << "\n" << t.glsl;
+}

@@ -225,6 +225,8 @@ Translation translate(const Key& key) {
             case 1:  // 2D projective
             case 2:  // 3D projective
                 if (kind == SamplerKind::Shadow2D) {
+                    // The stored depth is the left operand: t = (texel FUNC r), with r = z/w clamped to the
+                    // format's depth range (raw units, like the texel).
                     g += std::format(
                         "    {{\n"
                         "        vec3 p = vtx_t{0}.xyz / vtx_t{0}.w;\n"
@@ -234,7 +236,7 @@ Translation translate(const Key& key) {
                         i,
                         key.shadow_compare_func == 0 ? std::string("false")
                         : key.shadow_compare_func == 7 ? std::string("true")
-                                                       : std::format("p.z {} texel", compare_op(key.shadow_compare_func)));
+                                                       : std::format("texel {} clamp(p.z, 0.0, tex_scale[{}].z)", compare_op(key.shadow_compare_func), i));
                 } else if (kind == SamplerKind::Sampler3D) {
                     g += std::format("    t{0} = textureProj(tex{0}, vtx_t{0});\n", i);
                 } else if (kind == SamplerKind::SamplerCube) {
