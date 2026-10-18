@@ -98,7 +98,6 @@ target_link_libraries(mv-pbcap PRIVATE mvcore)
 add_library(midway_verdant_libretro SHARED libretro/libretro_core.cpp)
 target_link_libraries(midway_verdant_libretro PRIVATE mvcore)
 set_target_properties(midway_verdant_libretro PROPERTIES PREFIX "" CXX_VISIBILITY_PRESET hidden)
-target_compile_definitions(midway_verdant_libretro PRIVATE RETRO_IMPORT_SYMBOLS=0)
 
 # mv-retro-host: a headless libretro frontend that drives the core frame by frame for tests (POSIX dlopen).
 if(NOT WIN32)
