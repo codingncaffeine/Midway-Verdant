@@ -290,3 +290,25 @@ TEST(Vulkan, TheAlphaTestComparesEightBitValues) {
     for (const auto& e : renderer.stats().errors) ADD_FAILURE() << "renderer: " << e;
     EXPECT_EQ(pixel_at(ram, 8, 8), 0x8000FF00u) << "the fragment passes the EQUAL test";
 }
+
+TEST(Vulkan, AZ24S8WriteBackKeepsTheStencil) {
+    vk::Device device;
+    std::string error;
+    if (!device.init(error)) GTEST_SKIP() << "no Vulkan device: " << error;
+    std::vector<u8> ram(4u << 20, 0);
+    RamResolver handles;
+    handles.size = static_cast<u32>(ram.size());
+    VulkanRenderer renderer(device, handles, ram.data(), static_cast<u32>(ram.size()));
+    ASSERT_TRUE(renderer.init(error)) << error;
+    Kelvin k;
+    k.set_sink(&renderer);
+    setup_target(k);
+    k.method(mthd::kZstencilClear, 0x80000042);  // depth 0x800000 in bits 31-8, stencil 0x42
+    k.method(mthd::kClearSurface, 0x03);
+    renderer.end_frame();
+    renderer.write_back_all();  // depth reaches RAM when the GPU idles (or a texture samples it)
+    for (const auto& e : renderer.stats().errors) ADD_FAILURE() << "renderer: " << e;
+    u32 word;
+    std::memcpy(&word, &ram[0x20000 + 8 * 256 + 8 * 4], 4);
+    EXPECT_EQ(word, 0x80000042u) << "the zeta word holds the depth over the stencil byte";
+}

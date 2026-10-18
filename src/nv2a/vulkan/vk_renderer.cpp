@@ -531,10 +531,15 @@ void scatter_swizzled(T* base, const T* rows, u32 width, u32 height, const std::
 void VulkanRenderer::read_back(const vk::Image& image, VkImageAspectFlags aspect, u32 width, u32 height) {
     Timed timed_gpu(stats_.ns_write_back_gpu);
     VkCommandBuffer cb = dev_.begin_once();
-    VkBufferImageCopy region{};
-    region.imageSubresource = {aspect, 0, 0, 1};
-    region.imageExtent = {width, height, 1};
-    fn_->vkCmdCopyImageToBuffer(cb, image.image, VK_IMAGE_LAYOUT_GENERAL, readback_.buffer, 1, &region);
+    // Depth and stencil are two copies: the depth's words first, then one stencil byte per texel after them.
+    const bool both = (aspect & VK_IMAGE_ASPECT_DEPTH_BIT) && (aspect & VK_IMAGE_ASPECT_STENCIL_BIT);
+    VkBufferImageCopy regions[2]{};
+    regions[0].imageSubresource = {both ? static_cast<VkImageAspectFlags>(VK_IMAGE_ASPECT_DEPTH_BIT) : aspect, 0, 0, 1};
+    regions[0].imageExtent = {width, height, 1};
+    regions[1] = regions[0];
+    regions[1].imageSubresource.aspectMask = VK_IMAGE_ASPECT_STENCIL_BIT;
+    regions[1].bufferOffset = static_cast<VkDeviceSize>(width) * height * 4;
+    fn_->vkCmdCopyImageToBuffer(cb, image.image, VK_IMAGE_LAYOUT_GENERAL, readback_.buffer, both ? 2 : 1, regions);
     dev_.finish_once(cb);
 }
 
@@ -585,15 +590,16 @@ void VulkanRenderer::write_back_zeta(Surface& s) {
     if (pass_target_ == &s) end_pass();
     flush();
     const bool z16 = s.zeta_format == 1;
-    const u32 bpp = z16 ? 2u : 4u;  // D16; a 24-bit or float depth copies as a 32-bit word
-    const std::size_t bytes = static_cast<std::size_t>(s.width) * s.height * bpp;
+    // D16; a 24-bit or float depth copies as a 32-bit word, followed by the stencil bytes.
+    const std::size_t bytes = static_cast<std::size_t>(s.width) * s.height * (z16 ? 2u : 5u);
     if (bytes > kStagingBytes) {
         note("depth surface too large to write back");
         return;
     }
     if (static_cast<u64>(s.zeta_phys) + s.zeta_bytes() > ram_size_) return;
-    read_back(s.depth, VK_IMAGE_ASPECT_DEPTH_BIT, s.width, s.height);
+    read_back(s.depth, z16 ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT, s.width, s.height);
     const u8* px = static_cast<const u8*>(readback_.mapped);
+    const u8* stencil = px + static_cast<std::size_t>(s.width) * s.height * 4;
     std::vector<u32> xs, ys;
     if (s.swizzled) swizzle_tables(s.width, s.height, s.log_w, s.log_h, xs, ys);
     u8* base = ram_ + s.zeta_phys;
@@ -604,7 +610,7 @@ void VulkanRenderer::write_back_zeta(Surface& s) {
             for (u32 y = 0; y < s.height; ++y) std::memcpy(base + static_cast<std::size_t>(y) * s.zeta_pitch, px + static_cast<std::size_t>(y) * s.width * 2, s.width * 2u);
         }
     } else {
-        // Z24S8: the depth above a stencil byte left zero, converted a row at a time.
+        // Z24S8: the depth in bits 31-8 above the stencil byte, converted a row at a time.
         const bool float_depth = depth24_ == VK_FORMAT_D32_SFLOAT_S8_UINT;
         std::vector<u32> row(s.width);
         for (u32 y = 0; y < s.height; ++y) {
@@ -619,7 +625,7 @@ void VulkanRenderer::write_back_zeta(Surface& s) {
                     std::memcpy(&depth24, src + static_cast<std::size_t>(x) * 4, 4);
                     depth24 &= 0xFFFFFFu;
                 }
-                row[x] = depth24 << 8;
+                row[x] = (depth24 << 8) | stencil[static_cast<std::size_t>(y) * s.width + x];
             }
             if (s.swizzled) {
                 u32* out = reinterpret_cast<u32*>(base);

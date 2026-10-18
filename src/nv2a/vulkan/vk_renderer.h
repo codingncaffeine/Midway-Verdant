@@ -110,10 +110,11 @@ private:
     Surface* target_for(const KelvinState& s);
     bool ensure_pass(Surface& t);
     void write_back(Surface& s);
-    // The depth buffer into guest RAM in the zeta format (Z16, or Z24S8 with the stencil left zero): a shadow map
-    // the guest samples as a depth texture lives there.
+    // The depth buffer into guest RAM in the zeta format (Z16, or Z24S8: depth in bits 31-8, stencil in 7-0): a
+    // shadow map the guest samples as a depth texture lives there.
     void write_back_zeta(Surface& s);
-    // Copies one image into the read-back buffer and waits for it.
+    // Copies one image into the read-back buffer and waits for it (depth and stencil together: the depth's words,
+    // then the stencil bytes).
     void read_back(const vk::Image& image, VkImageAspectFlags aspect, u32 width, u32 height);
     VkRenderPass render_pass(VkFormat color, VkFormat depth);
     VkShaderModule module(const std::vector<u32>& spirv);
