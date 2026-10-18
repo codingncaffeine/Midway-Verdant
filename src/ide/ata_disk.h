@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "ide/dvd_image.h"
+#include "core/clock.h"
 #include "ide/ide.h"
 
 namespace mv {
@@ -89,6 +90,14 @@ public:
     std::string_view name() const override { return "dvd"; }
     bool is_atapi() const override { return true; }
     void reset() override;
+    // Power-on or the reset line: the disc spins up again.
+    void hardware_reset() override;
+    // After power-on, the reset line or a tray load the drive spins the disc up and identifies it before it can be
+    // read: until then a media command ends with NOT READY, LOGICAL UNIT IS IN PROCESS OF BECOMING READY (02/04/01),
+    // the standard MMC answer, and the host polls. The time is a typical drive's [verify on a console]; without it the
+    // kernel reads the game's header before its boot animation can take the game's logo.
+    static constexpr u64 kSpinUpNs = 2'000'000'000;
+    bool spinning_up() const;
     Cycles start_command(u8 command) override;
     void continue_command() override;
     u16 read_data() override;
@@ -127,6 +136,7 @@ private:
     u8 sense_key_{0}, asc_{0}, ascq_{0};
     bool dma_{false};  // the current PACKET command's data phase goes through the bus master (features bit 0)
     u64 packets_{0};
+    Cycles ready_at_{cycles_from_ns(kSpinUpNs)};  // power-on is time 0
 };
 
 }  // namespace mv

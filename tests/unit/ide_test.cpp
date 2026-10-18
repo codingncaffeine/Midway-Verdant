@@ -357,3 +357,36 @@ TEST(HddFormat, BlankDriveMatchesTheMeasuredRetailLayout) {
     }
     std::filesystem::remove(path);
 }
+
+TEST(Ide, TheDvdDriveIsBecomingReadyWhileTheDiscSpinsUp) {
+    std::filesystem::path path;
+    {
+    DvdRig r;
+    path = make_disc("mv-test-spinup.xiso", 0, 64 * 2048, true);
+    auto disc = std::make_unique<DvdImage>();
+    std::string error;
+    ASSERT_TRUE(disc->open(path, error)) << error;
+    static_cast<AtapiCdrom*>(r.ide.primary().device(1))->insert(std::move(disc));
+    // Just after power-on: NOT READY, LOGICAL UNIT IS IN PROCESS OF BECOMING READY (02/04/01), not "no medium".
+    r.test_unit_ready_fails();
+    r.packet({0x03, 0, 0, 0, 18}, false, 18);
+    ASSERT_TRUE(r.wait_not_busy());
+    std::array<u8, 18> sense{};
+    for (std::size_t i = 0; i < sense.size(); i += 2) {
+        const u16 v = static_cast<u16>(r.bus.pio_read(0x1F0, 2));
+        sense[i] = static_cast<u8>(v);
+        sense[i + 1] = static_cast<u8>(v >> 8);
+    }
+    EXPECT_EQ(sense[2], 0x02);
+    EXPECT_EQ(sense[12], 0x04);
+    EXPECT_EQ(sense[13], 0x01);
+    // Still spinning just before the spin-up time; ready just after it.
+    r.sched.advance_to(cycles_from_ns(AtapiCdrom::kSpinUpNs - 10'000'000));
+    r.test_unit_ready_fails();
+    r.sched.advance_to(cycles_from_ns(AtapiCdrom::kSpinUpNs + 10'000'000));
+    r.packet({0x00}, false, 0);
+    ASSERT_TRUE(r.wait_not_busy());
+    EXPECT_FALSE(r.status() & ata::kStatusErr) << "the disc is up to speed: TEST UNIT READY passes";
+    }
+    std::filesystem::remove(path);
+}

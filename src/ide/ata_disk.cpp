@@ -509,6 +509,13 @@ void AtaDisk::handle_security_data() {
 
 AtapiCdrom::AtapiCdrom() = default;
 
+void AtapiCdrom::hardware_reset() {
+    reset();
+    ready_at_ = (channel_ ? channel_->scheduler().now() : 0) + cycles_from_ns(kSpinUpNs);
+}
+
+bool AtapiCdrom::spinning_up() const { return channel_ && channel_->scheduler().now() < ready_at_; }
+
 void AtapiCdrom::reset() {
     tf_.error = 0x01;
     tf_.sector_count = 1;
@@ -636,6 +643,11 @@ void AtapiCdrom::run_packet() {
     const u8 op = cdb_[0];
     trace::log(trace::Cat::Pio, "dvd packet {:02x} cdb {:02x}{:02x}{:02x}{:02x} {:02x}{:02x}{:02x}{:02x} {:02x}{:02x}{:02x}{:02x}{}", op, cdb_[0],
                cdb_[1], cdb_[2], cdb_[3], cdb_[4], cdb_[5], cdb_[6], cdb_[7], cdb_[8], cdb_[9], cdb_[10], cdb_[11], dma_ ? " dma" : "");
+    // Commands that need the disc spinning wait for the spin-up (see kSpinUpNs); the others answer at once.
+    if (disc_ && spinning_up() && (op == 0x00 || op == 0x25 || op == 0x28 || op == 0xA8 || op == 0xAD || op == 0x43)) {
+        check_condition(0x02, 0x04, 0x01);
+        return;
+    }
     switch (op) {
         case 0x00:  // TEST UNIT READY
             if (disc_)
@@ -668,6 +680,7 @@ void AtapiCdrom::run_packet() {
         }
         case 0x1B:  // START STOP UNIT (load/eject)
             trace::log(trace::Cat::Boot, "DVD tray {}", (cdb_[4] & 0x02) ? ((cdb_[4] & 0x01) ? "load" : "eject") : "spin command");
+            if ((cdb_[4] & 0x03) == 0x03 && channel_) ready_at_ = channel_->scheduler().now() + cycles_from_ns(kSpinUpNs);  // a load spins up again
             finish_ok();
             break;
         case 0x1E:  // PREVENT ALLOW MEDIUM REMOVAL
