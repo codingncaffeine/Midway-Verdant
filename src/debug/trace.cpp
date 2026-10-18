@@ -16,7 +16,7 @@ struct Name {
     Cat cat;
     std::string_view name;
 };
-constexpr std::array<Name, 13> kNames{{{Cat::Post, "post"},
+constexpr std::array<Name, 14> kNames{{{Cat::Post, "post"},
                                        {Cat::Pci, "pci"},
                                        {Cat::Smbus, "smbus"},
                                        {Cat::Mmio, "mmio"},
@@ -28,6 +28,7 @@ constexpr std::array<Name, 13> kNames{{{Cat::Post, "post"},
                                        {Cat::Timer, "timer"},
                                        {Cat::Gpu, "gpu"},
                                        {Cat::Apu, "apu"},
+                                       {Cat::Usb, "usb"},
                                        {Cat::Aci, "aci"}}};
 }  // namespace
 

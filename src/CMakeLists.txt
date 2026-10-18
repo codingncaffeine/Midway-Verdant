@@ -25,6 +25,9 @@ add_library(mvcore STATIC
   ide/ata_disk.cpp
   ide/disk_image.cpp
   ide/dvd_image.cpp
+  usb/ohci.cpp
+  usb/usb_device.cpp
+  usb/xbox_pad.cpp
   mcpx/isa_misc.cpp
   mcpx/lpc.cpp
   mcpx/pic.cpp

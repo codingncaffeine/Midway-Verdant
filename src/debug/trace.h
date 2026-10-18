@@ -23,6 +23,7 @@ enum class Cat : u32 {
     Gpu = 1u << 10,    // NV2A register traffic
     Apu = 1u << 11,    // APU register traffic and processor events
     Aci = 1u << 12,    // AC97 controller register traffic and buffer events
+    Usb = 1u << 13,    // OHCI register traffic, root-hub ports and transfers
     All = 0xFFFFFFFFu,
 };
 

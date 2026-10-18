@@ -1,5 +1,6 @@
 #include "core/machine.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstring>
 #include <format>
@@ -34,6 +35,8 @@ Machine::Machine(const MachineConfig& config)
       nv2a_(bus_, sched_, [this](bool level) { pic_.set_irq(3, level); }),
       apu_(bus_, sched_, [this](bool level) { pic_.set_irq(5, level); }),
       aci_(bus_, sched_, [this](bool level) { pic_.set_irq(6, level); }),
+      usb0_("ohci0", bus_, sched_, 1, [this](bool level) { pic_.set_irq(1, level); }),
+      usb1_("ohci1", bus_, sched_, 9, [this](bool level) { pic_.set_irq(9, level); }),
       ide_(bus_, sched_, [this](bool level) { pic_.set_irq(14, level); }) {
     trace::set_clock_source(&trace_now_);
     smc_.set_av_pack(config.av_pack);
@@ -56,12 +59,12 @@ Machine::Machine(const MachineConfig& config)
     PciDevice* host = placeholder({0, 0, 0}, "host", 0x02A5, 0x060000, 0xA1);
     host->set_cfg32(0x10, 0x40000008);
     placeholder({0, 0, 3}, "dram", 0x02A6, 0x050000, 0xA1);
-    PciDevice* ohci0 = placeholder({0, 2, 0}, "ohci0", 0x01C2, 0x0C0310, 0xB1);
-    ohci0->define_bar(0, PciDevice::BarKind::Memory, 4096);
-    ohci0->set_cfg8(0x3C, 1);
-    PciDevice* ohci1 = placeholder({0, 3, 0}, "ohci1", 0x01C2, 0x0C0310, 0xB1);
-    ohci1->define_bar(0, PciDevice::BarKind::Memory, 4096);
-    ohci1->set_cfg8(0x3C, 9);
+    pci_.add({0, 2, 0}, usb0_);
+    pci_.add({0, 3, 0}, usb1_);
+    {
+        static constexpr unsigned kRootPortOfFrontPort[4] = {3, 4, 1, 2};
+        for (unsigned i = 0; i < std::min(config.pads, 4u); ++i) usb0_.attach(kRootPortOfFrontPort[i], &pads_[i].hub);
+    }
     PciDevice* nic = placeholder({0, 4, 0}, "nvnet", 0x01C3, 0x020000, 0xB1);
     nic->define_bar(0, PciDevice::BarKind::Memory, 1024);
     nic->define_bar(1, PciDevice::BarKind::Io, 16);
@@ -282,6 +285,8 @@ void Machine::perform_reset(std::unique_lock<std::mutex>& lk) {
     nv2a_.reset();
     apu_.reset();
     aci_.reset();
+    usb0_.reset();
+    usb1_.reset();
     ide_.reset();
     milestones_ = {};
     cpu_->reset();

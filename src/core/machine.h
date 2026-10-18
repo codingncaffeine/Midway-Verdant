@@ -1,4 +1,5 @@
 #pragma once
+#include <array>
 #include <condition_variable>
 #include <filesystem>
 #include <functional>
@@ -27,6 +28,8 @@
 #include "pci/pci.h"
 #include "smbus/smbus.h"
 #include "smbus/smc.h"
+#include "usb/ohci.h"
+#include "usb/xbox_pad.h"
 
 namespace mv {
 
@@ -47,6 +50,8 @@ struct MachineConfig {
     bool hdd_locked{true};
     // A game disc image (XISO or a full dump) in the DVD tray at power-on; absent = an empty, closed tray.
     std::optional<std::filesystem::path> dvd_image;
+    // Pads plugged into the front ports at power-on, from port 1 (0-4).
+    unsigned pads{1};
     std::size_t ram_bytes{64u * 1024 * 1024};
     Smc::Revision smc_revision{Smc::Revision::P01};
     Smc::AvPack av_pack{Smc::AvPack::Hdtv};
@@ -101,6 +106,9 @@ public:
     AtaDisk* hdd() { return hdd_; }
     Apu& apu() { return apu_; }
     Aci& aci() { return aci_; }
+    Ohci& usb0() { return usb0_; }
+    // The gamepad on a front port (0-3); present whether or not it is plugged in.
+    usb::XidGamepad& pad(unsigned front_port) { return pads_[front_port].gamepad; }
     PciBus& pci() { return pci_; }
     Lpc& lpc() { return lpc_; }
     CpuBackend* cpu() { return cpu_.get(); }
@@ -162,6 +170,9 @@ private:
     Nv2aStub nv2a_;
     Apu apu_;
     Aci aci_;
+    Ohci usb0_, usb1_;
+    // The pads on the front ports, plugged into USB0 at power-on (front ports 1-4 = root ports 3, 4, 1, 2).
+    std::array<usb::XboxPad, 4> pads_;
     IdeController ide_;
     DiskImage hdd_image_;
     AtaDisk* hdd_{nullptr};
