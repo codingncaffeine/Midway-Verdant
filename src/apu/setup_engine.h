@@ -146,6 +146,7 @@ private:
     std::array<Bookkeeping, kMaxVoices> book_{};
     std::array<u8, kBins> submix_headroom_{};
     std::array<double, kBins> bin_energy_{};  // instrument: sum of squares per bin since the last listing
+    u64 stereo_samples_{0}, stereo_differ_{0};  // instrument: samples stereo voices rendered since the last listing, and those with L != R
     u8 hrtf_headroom_{0};
     std::array<u8, 4> hrtf_submix_{0, 1, 2, 3};
     Mix mix_{};

@@ -120,18 +120,19 @@ bool SetupEngine::method(u32 offset, u32 value) {
                 src.base = field(handle, kFieldPslStart) & kOffsetMask;
                 const u32 ebo = field(handle, kFieldNext) & kOffsetMask, n = std::min(ebo + 1, 4096u);
                 double sum = 0, peak = 0;
-                u32 crossings = 0;
+                u32 crossings = 0, differ = 0;
                 float last = 0.0f;
                 for (u32 i = 0; i < n; ++i) {
                     float s[2];
                     read_sample(handle, src, i, s);
                     if (i > 0 && (s[0] < 0.0f) != (last < 0.0f)) ++crossings;
+                    if (s[0] != s[1]) ++differ;
                     last = s[0];
                     sum += static_cast<double>(s[0]) * static_cast<double>(s[0]);
                     peak = std::max(peak, static_cast<double>(std::fabs(s[0])));
                 }
-                trace::log(trace::Cat::Apu, "vp: voice {:x} on: buffer +{:x} ebo {:x} lbo {:x} fmt {:08x}: rms {:.1f} dB peak {:.1f} dB, {} zero crossings over {} samples", handle,
-                           src.base, ebo, field(handle, kFieldPshSample) & kOffsetMask, fmt, 10 * std::log10(sum / n + 1e-12), 20 * std::log10(peak + 1e-9), crossings, n);
+                trace::log(trace::Cat::Apu, "vp: voice {:x} on: buffer +{:x} ebo {:x} lbo {:x} fmt {:08x}: rms {:.1f} dB peak {:.1f} dB, {} zero crossings, L != R in {} of {} samples", handle,
+                           src.base, ebo, field(handle, kFieldPshSample) & kOffsetMask, fmt, 10 * std::log10(sum / n + 1e-12), 20 * std::log10(peak + 1e-9), crossings, differ, n);
                 b.adpcm_key = ~0ull;  // the reads above filled the ADPCM block cache; playback starts from a clean one
             }
             return true;
@@ -236,6 +237,8 @@ void SetupEngine::frame() {
         }
         bin_energy_.fill(0.0);
         trace::log(trace::Cat::Apu, "vp: frame {} bin rms dB:{}", frames_, bins.empty() ? " silent" : bins);
+        if (stereo_samples_) trace::log(trace::Cat::Apu, "vp: frame {} stereo voices rendered {} samples, {} with L != R", frames_, stereo_samples_, stereo_differ_);
+        stereo_samples_ = stereo_differ_ = 0;
     }
 }
 
@@ -601,6 +604,11 @@ void SetupEngine::mix_voice(u32 handle, const Frame& samples, float gain) {
                                   (vola & 0xFu) | ((volb & 0xFu) << 4) | ((volc & 0xFu) << 8),
                                   ((vola >> 16) & 0xFu) | (((volb >> 16) & 0xFu) << 4) | (((volc >> 16) & 0xFu) << 8)};
     const bool stereo = (fmt & kFmtStereo) != 0;
+    if (stereo)
+        for (const auto& s : samples) {
+            ++stereo_samples_;
+            if (s[0] != s[1]) ++stereo_differ_;
+        }
     for (u32 k = 0; k < 8; ++k) {
         u32 bin = bins[k];
         u32 headroom;

@@ -271,6 +271,13 @@ void Apu::on_frame(Cycles now) {
                 const i32 s = static_cast<i32>(std::clamp(std::lround(static_cast<double>(mix[bin][i]) * 8388608.0), -8388608L, 8388607L));
                 x[kMixBufWord + bin * apu::SetupEngine::kSamplesPerFrame + i] = static_cast<u32>(s) & 0xFFFFFFu;
             }
+        for (u32 i = 0; i < apu::SetupEngine::kSamplesPerFrame; ++i) {
+            const u32 l = x[kMixBufWord + i], r = x[kMixBufWord + apu::SetupEngine::kSamplesPerFrame + i];
+            if (l != 0 || r != 0) {
+                ++mix_samples_;
+                if (l != r) ++mix_differ_;
+            }
+        }
     }
     // Instrument, twice a second under the APU trace: the RMS level each processor wrote to its output FIFO 0.
     if (frames_ % 750 == 0 && trace::on(trace::Cat::Apu)) {
@@ -282,6 +289,12 @@ void Apu::on_frame(Cycles now) {
         };
         const double gp_db = level(gp_memory_), ep_db = level(ep_memory_);
         trace::log(trace::Cat::Apu, "fifo0 rms dB: gp {:.1f} ep {:.1f}", gp_db, ep_db);
+        // Where a stereo source turns mono: the frames whose two channels differ in MIXBUF bins 0/1 (counted every
+        // frame below) and in what the GP and the EP wrote to their output FIFO 0.
+        trace::log(trace::Cat::Apu, "stereo L != R: mixbuf bins 0/1 {} of {} samples, gp fifo0 {} of {} frames, ep fifo0 {} of {} frames", mix_differ_, mix_samples_,
+                   gp_memory_.out0_differ_, gp_memory_.out0_frames_, ep_memory_.out0_differ_, ep_memory_.out0_frames_);
+        mix_differ_ = mix_samples_ = 0;
+        gp_memory_.out0_differ_ = gp_memory_.out0_frames_ = ep_memory_.out0_differ_ = ep_memory_.out0_frames_ = 0;
     }
     // Instrument: MV_DEBUG_GP_FRAME=N writes the GP's instructions during frame N to scratch/gp-frame-N.trace.
     static const long debug_frame = std::getenv("MV_DEBUG_GP_FRAME") ? std::atol(std::getenv("MV_DEBUG_GP_FRAME")) : -1;
@@ -424,6 +437,14 @@ bool Apu::Memory::fifo_write(u32 fifo, const u8* in, u32 len) {
             std::memcpy(&s, in + i, 2);
             out0_energy_ += static_cast<double>(s) * s;
             ++out0_samples_;
+        }
+    if (fifo == 0)  // instrument: stereo frames (L, R as 16-bit pairs) whose channels differ
+        for (u32 i = 0; i + 3 < len; i += 4) {
+            i16 l, r;
+            std::memcpy(&l, in + i, 2);
+            std::memcpy(&r, in + i + 2, 2);
+            ++out0_frames_;
+            if (l != r) ++out0_differ_;
         }
     trace::log(trace::Cat::Apu, "fifo write: regs +{:04x} out{} at {:x}, {} bytes", fifo_regs_, fifo, apu_.read_word(fifo_regs_ + fifo * kFifoStride + kFifoCurrent), len);
     return ring_transfer(fifo_regs_ + fifo * kFifoStride, nullptr, in, len);

@@ -125,6 +125,7 @@ private:
     public:
         double out0_energy_{0};  // instrument: sum of squares of the 16-bit samples written to output FIFO 0
         u64 out0_samples_{0};
+        u64 out0_frames_{0}, out0_differ_{0};  // instrument: stereo frames written to output FIFO 0, and those with L != R
     private:
     };
 
@@ -155,6 +156,7 @@ private:
     u64 traps_{0};
     TimerEvent frame_;
     u64 frames_{0};
+    u64 mix_samples_{0}, mix_differ_{0};  // instrument: MIXBUF bin 0/1 samples with sound, and those where the two differ
     bool counting_{false};     // the frame clock runs (SECTL count mode on)
     Cycles frame_epoch_{0};    // when it was turned on
     u64 epoch_frames_{0};      // frames since then
