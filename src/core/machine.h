@@ -45,6 +45,8 @@ struct MachineConfig {
     // A raw hard-disk image (8 GiB for a retail layout); absent = no drive on the cable.
     std::optional<std::filesystem::path> hdd_image;
     bool hdd_locked{true};
+    // A game disc image (XISO or a full dump) in the DVD tray at power-on; absent = an empty, closed tray.
+    std::optional<std::filesystem::path> dvd_image;
     std::size_t ram_bytes{64u * 1024 * 1024};
     Smc::Revision smc_revision{Smc::Revision::P01};
     Smc::AvPack av_pack{Smc::AvPack::Hdtv};

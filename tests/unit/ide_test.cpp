@@ -1,11 +1,15 @@
 #include <gtest/gtest.h>
 
 #include <array>
+#include <cstdio>
+#include <cstring>
+#include <filesystem>
 #include <memory>
 
 #include "core/bus.h"
 #include "core/scheduler.h"
 #include "ide/ata_disk.h"
+#include "ide/dvd_image.h"
 #include "ide/ide.h"
 
 using namespace mv;
@@ -259,4 +263,52 @@ TEST(Ide, TheResetLineLocksTheDriveAgain) {
     EXPECT_TRUE(r.disk->locked()) << "a hardware reset puts a security-enabled drive back in the locked state";
     EXPECT_FALSE(r.irq_level);
     EXPECT_EQ(r.identify_security_word() & 0x0006, 0x0006);
+}
+
+namespace {
+// A file with the XDVDFS volume magic at sector 32 of a partition starting at `partition` (sparse elsewhere).
+std::filesystem::path make_disc(const char* name, u64 partition, u64 total, bool with_magic) {
+    const auto path = std::filesystem::temp_directory_path() / name;
+    std::FILE* f = std::fopen(path.string().c_str(), "wb");
+    EXPECT_NE(f, nullptr);
+    if (with_magic) {
+        std::fseek(f, static_cast<long>(partition + 32 * 2048), SEEK_SET);
+        std::fwrite("MICROSOFT*XBOX*MEDIA", 1, 20, f);
+    }
+    std::fclose(f);
+    std::filesystem::resize_file(path, total);
+    return path;
+}
+}  // namespace
+
+TEST(DvdImage, RecognisesAnXisoAFullDumpAndRefusesOtherFiles) {
+    std::string error;
+    const auto xiso = make_disc("mv-test-disc.xiso", 0, 64 * 2048, true);
+    DvdImage a;
+    ASSERT_TRUE(a.open(xiso, error)) << error;
+    EXPECT_EQ(a.kind(), DvdImage::Kind::Xiso);
+    EXPECT_EQ(a.sectors(), 64u);
+    u8 sector[2048];
+    ASSERT_TRUE(a.read(32, 1, sector));
+    EXPECT_EQ(std::memcmp(sector, "MICROSOFT*XBOX*MEDIA", 20), 0);
+    EXPECT_FALSE(a.read(64, 1, sector));  // past the end
+
+    // A full dump: the game partition at byte 0x18300000, sector 0 of the disc is the video partition.
+    const auto full = make_disc("mv-test-disc.iso", DvdImage::kRedumpGamePartition, DvdImage::kRedumpGamePartition + 100 * 2048, true);
+    DvdImage b;
+    ASSERT_TRUE(b.open(full, error)) << error;
+    EXPECT_EQ(b.kind(), DvdImage::Kind::Redump);
+    EXPECT_EQ(b.sectors(), 100u);
+    ASSERT_TRUE(b.read(32, 1, sector));
+    EXPECT_EQ(std::memcmp(sector, "MICROSOFT*XBOX*MEDIA", 20), 0);
+
+    // Control: the same sizes without the magic are not game discs.
+    const auto plain = make_disc("mv-test-disc-plain.iso", 0, 64 * 2048, false);
+    DvdImage c;
+    EXPECT_FALSE(c.open(plain, error));
+    EXPECT_NE(error.find("not an Xbox game disc"), std::string::npos) << error;
+
+    std::filesystem::remove(xiso);
+    std::filesystem::remove(full);
+    std::filesystem::remove(plain);
 }

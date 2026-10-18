@@ -32,6 +32,16 @@ std::string trimmed_trailing_spaces(std::string s) {
     return s;
 }
 constexpr Cycles kCommandLatency = 60'000;  // ~80 us: a drive's command overhead
+constexpr u64 kDvdNsPerByte = 125;          // ~8 MB/s: the drive reading a spinning disc
+u32 be32(const u8* p) { return (static_cast<u32>(p[0]) << 24) | (static_cast<u32>(p[1]) << 16) | (static_cast<u32>(p[2]) << 8) | p[3]; }
+void put_be16(u8* p, u32 v) {
+    p[0] = static_cast<u8>(v >> 8);
+    p[1] = static_cast<u8>(v);
+}
+void put_be24(u8* p, u32 v) {
+    p[0] = static_cast<u8>(v >> 16);
+    put_be16(p + 1, v);
+}
 }  // namespace
 
 AtaDisk::AtaDisk(DiskImage& image) : image_(image) {}
@@ -600,7 +610,8 @@ void AtapiCdrom::check_condition(u8 sense_key, u8 asc, u8 ascq) {
     channel_->raise_interrupt();
 }
 
-void AtapiCdrom::data_in(const u8* data, u32 len) {
+void AtapiCdrom::data_in(const u8* data, u32 len, Cycles latency) {
+    if (latency == 0) latency = kCommandLatency;
     if (dma_) {
         // A DMA data phase: the bytes move through the bus master once the host starts its engine. No byte count,
         // no DRQ; the completion interrupt is the only one the host sees. The console's kernel fetches its sense
@@ -610,21 +621,14 @@ void AtapiCdrom::data_in(const u8* data, u32 len) {
         buffer_pos_ = 0;
         tf_.status = ata::kStatusBsy;
         pending_ = Pending::DmaData;
-        channel_->schedule(*this, kCommandLatency);
+        channel_->schedule(*this, latency);
         return;
     }
-    // The host set the byte count limit in the LBA mid/high registers before the PACKET command.
-    const u32 limit = static_cast<u32>(tf_.lba_mid) | (static_cast<u32>(tf_.lba_high) << 8);
-    const u32 n = limit ? std::min(len, limit) : len;
-    buffer_.assign(data, data + n);
-    if (n & 1) buffer_.push_back(0);
-    buffer_pos_ = 0;
-    tf_.lba_mid = static_cast<u8>(n);
-    tf_.lba_high = static_cast<u8>(n >> 8);
-    tf_.sector_count = 0x02;  // interrupt reason: I/O (data to host)
-    tf_.status = ata::kStatusDrdy | ata::kStatusDrq;
-    pending_ = Pending::DataReady;
-    channel_->raise_interrupt();
+    // PIO: the host set the byte count limit in the LBA mid/high registers before the PACKET command; a longer
+    // transfer goes out in pieces of at most that size, an interrupt each.
+    payload_.assign(data, data + len);
+    payload_pos_ = 0;
+    next_pio_chunk();
 }
 
 void AtapiCdrom::run_packet() {
@@ -634,7 +638,10 @@ void AtapiCdrom::run_packet() {
                cdb_[1], cdb_[2], cdb_[3], cdb_[4], cdb_[5], cdb_[6], cdb_[7], cdb_[8], cdb_[9], cdb_[10], cdb_[11], dma_ ? " dma" : "");
     switch (op) {
         case 0x00:  // TEST UNIT READY
-            check_condition(0x02, 0x3A, 0x00);  // not ready: medium not present
+            if (disc_)
+                finish_ok();
+            else
+                check_condition(0x02, 0x3A, 0x00);  // not ready: medium not present
             break;
         case 0x03: {  // REQUEST SENSE
             u8 sense[18]{};
@@ -672,17 +679,34 @@ void AtapiCdrom::run_packet() {
             ev[2] = 0x04;  // media event class
             ev[3] = 0x10;  // supported: media
             ev[4] = 0x00;  // no change
-            ev[5] = 0x00;  // media status: no media
+            ev[5] = disc_ ? 0x02 : 0x00;  // media status: present, or no media
             data_in(ev, sizeof ev);
             break;
         }
-        case 0x25:  // READ CAPACITY
+        case 0x25: {  // READ CAPACITY: the last LBA of the game partition and the 2048-byte block size
+            if (!disc_) {
+                check_condition(0x02, 0x3A, 0x00);
+                break;
+            }
+            const u32 last = static_cast<u32>(disc_->sectors() - 1);
+            const u8 cap[8] = {static_cast<u8>(last >> 24), static_cast<u8>(last >> 16), static_cast<u8>(last >> 8), static_cast<u8>(last), 0, 0, 0x08, 0x00};
+            data_in(cap, sizeof cap);
+            break;
+        }
         case 0x28:  // READ(10)
+            read_sectors(be32(&cdb_[2]), static_cast<u32>((cdb_[7] << 8) | cdb_[8]));
+            break;
         case 0xA8:  // READ(12)
-        case 0x43:  // READ TOC
+            read_sectors(be32(&cdb_[2]), be32(&cdb_[6]));
+            break;
         case 0xAD:  // READ DVD STRUCTURE
-        case 0x55:  // MODE SELECT(10): the security page's challenge lands here once a disc is in (Phase 7)
-            check_condition(0x02, 0x3A, 0x00);
+            read_dvd_structure();
+            break;
+        case 0x55:  // MODE SELECT(10): the parameter list (the security page with a challenge) comes from the host
+            data_out(static_cast<u32>((cdb_[7] << 8) | cdb_[8]));
+            break;
+        case 0x43:  // READ TOC
+            check_condition(disc_ ? 0x05 : 0x02, disc_ ? 0x24 : 0x3A, 0x00);
             break;
         case 0x5A:  // MODE SENSE(10)
             mode_sense10();
@@ -724,10 +748,13 @@ void AtapiCdrom::mode_sense10() {
             page_len = 20;
             p[0] = 0x3E;
             p[1] = 18;
-            p[2] = 0x00;  // partition: video
+            // With a disc: the game partition selected, authenticated, book type D (an Xbox game disc) version 1, and
+            // the last challenge the host wrote. An image has no security sectors to answer challenges from.
+            if (disc_) std::memcpy(p + 2, security_page_.data() + 2, 18);
+            p[2] = disc_ ? 0x01 : 0x00;  // partition: game, or video
             p[3] = 0x01;
-            p[4] = 0x00;  // not authenticated
-            p[5] = 0x00;  // book type / version: no disc
+            p[4] = disc_ ? 0x01 : 0x00;  // authenticated
+            p[5] = disc_ ? 0xD1 : 0x00;  // book type / version
             break;
         case 0x2A:
             page_len = 26;
@@ -755,6 +782,132 @@ void AtapiCdrom::mode_sense10() {
     data_in(reply, allocation ? std::min(total, allocation) : total);
 }
 
+// READ(10)/READ(12) from the game partition. The data rate is the drive's: about 8 MB/s off a spinning disc.
+void AtapiCdrom::read_sectors(u64 lba, u32 count) {
+    if (!disc_) {
+        check_condition(0x02, 0x3A, 0x00);
+        return;
+    }
+    if (count == 0) {
+        finish_ok();
+        return;
+    }
+    if (lba + count > disc_->sectors()) {
+        check_condition(0x05, 0x21, 0x00);  // illegal request: logical block address out of range
+        return;
+    }
+    std::vector<u8> data(static_cast<std::size_t>(count) * DvdImage::kSectorSize);
+    if (!disc_->read(lba, count, data.data())) {
+        check_condition(0x03, 0x11, 0x00);  // medium error: unrecovered read error
+        return;
+    }
+    sectors_read_ += count;
+    data_in(data.data(), static_cast<u32>(data.size()), kCommandLatency + cycles_from_ns(static_cast<u64>(data.size()) * kDvdNsPerByte));
+}
+
+// READ DVD STRUCTURE: a 4-byte header (the data length that follows, plus 2) and the structure. Format 0x00 is the
+// physical format (one layer of an Xbox game disc, its last sector in layer 0 always 0x2033AF), 0x04 the
+// manufacturing information, 0xFD the Xbox security sectors (synthesised: an image does not carry them; the
+// authenticated security page tells the kernel not to run the challenges).
+void AtapiCdrom::read_dvd_structure() {
+    if (!disc_) {
+        check_condition(0x02, 0x3A, 0x00);
+        return;
+    }
+    const u8 format = cdb_[7];
+    const u32 allocation = static_cast<u32>((cdb_[8] << 8) | cdb_[9]);
+    u32 len = 0;
+    switch (format) {
+        case 0x00: case 0x04: len = 2048; break;
+        case 0xFD: len = 0x664 - 4; break;
+        default:
+            trace::log(trace::Cat::Pio, "dvd structure format {:02x} not supported", format);
+            check_condition(0x05, 0x24, 0x00);
+            return;
+    }
+    std::vector<u8> reply(4 + len, 0);
+    put_be16(reply.data(), len + 2);
+    u8* d = reply.data() + 4;
+    if (format == 0x00) {
+        d[0] = 0x01;          // book type DVD-ROM, part version 1
+        d[1] = 0x02;          // 120 mm, maximum rate 10.08 Mbit/s
+        d[2] = 0x31;          // two layers, opposite track path, embossed
+        d[3] = 0x10;
+        put_be24(d + 5, 0x030000);   // first physical sector of the data area
+        put_be24(d + 9, 0xFCFFFF);   // last physical sector of the data area
+        put_be24(d + 13, 0x2033AF);  // last sector in layer 0
+    } else if (format == 0x04) {
+        d[0] = 0x01;  // u32 1, as the dumps show
+        std::memcpy(d + 8, "MVIMAGE0", 8);
+        d[24] = 0x02;
+    } else {
+        d[768] = 1;   // challenge table version
+        d[769] = 23;  // challenge entries
+    }
+    data_in(reply.data(), allocation ? std::min(static_cast<u32>(reply.size()), allocation) : static_cast<u32>(reply.size()));
+}
+
+// A data-out phase of len bytes: through the bus master when the PACKET asked for DMA, else PIO words on the data
+// port (interrupt reason 0: data to the device).
+void AtapiCdrom::data_out(u32 len) {
+    if (len == 0) {
+        finish_ok();
+        return;
+    }
+    buffer_.clear();
+    buffer_.reserve(len);
+    payload_.assign(len, 0);
+    payload_pos_ = 0;
+    if (dma_) {
+        tf_.status = ata::kStatusBsy;
+        pending_ = Pending::DmaDataOut;
+        channel_->schedule(*this, kCommandLatency);
+        return;
+    }
+    tf_.lba_mid = static_cast<u8>(len);
+    tf_.lba_high = static_cast<u8>(len >> 8);
+    tf_.sector_count = 0x00;
+    tf_.status = ata::kStatusDrdy | ata::kStatusDrq;
+    pending_ = Pending::DataOut;
+    channel_->raise_interrupt();
+}
+
+// The host's parameter list is in payload_. MODE SELECT(10) of page 0x3E: the security page with a challenge.
+void AtapiCdrom::data_out_done() {
+    if (cdb_[0] == 0x55 && payload_.size() >= 8 + 20 && (payload_[8] & 0x3F) == 0x3E) {
+        std::memcpy(security_page_.data(), payload_.data() + 8, security_page_.size());
+        trace::log(trace::Cat::Pio, "dvd security page written: partition {} authenticated {} challenge id {:02x} value {:08x}", security_page_[2],
+                   security_page_[4], security_page_[7], be32(&security_page_[8]));
+    }
+    finish_ok();
+}
+
+// The host has read one PIO piece: the next, or the completion.
+void AtapiCdrom::pio_chunk_done() {
+    if (payload_pos_ < payload_.size())
+        next_pio_chunk();
+    else
+        finish_ok();
+}
+
+// The next piece of a PIO data-in phase: at most the byte count the host allowed, even.
+void AtapiCdrom::next_pio_chunk() {
+    const u32 limit = static_cast<u32>(tf_.lba_mid) | (static_cast<u32>(tf_.lba_high) << 8);
+    const std::size_t remaining = payload_.size() - payload_pos_;
+    std::size_t n = remaining;
+    if (limit && limit < n) n = std::max<std::size_t>(2, limit & ~1u);
+    buffer_.assign(payload_.begin() + static_cast<std::ptrdiff_t>(payload_pos_), payload_.begin() + static_cast<std::ptrdiff_t>(payload_pos_ + n));
+    payload_pos_ += n;
+    if (buffer_.size() & 1) buffer_.push_back(0);
+    buffer_pos_ = 0;
+    tf_.lba_mid = static_cast<u8>(n);
+    tf_.lba_high = static_cast<u8>(n >> 8);
+    tf_.sector_count = 0x02;  // interrupt reason: I/O (data to host)
+    tf_.status = ata::kStatusDrdy | ata::kStatusDrq;
+    pending_ = Pending::DataReady;
+    channel_->raise_interrupt();
+}
+
 void AtapiCdrom::continue_command() {
     switch (pending_) {
         case Pending::IdentifyReady:
@@ -772,6 +925,16 @@ void AtapiCdrom::continue_command() {
                 check_condition(0x0B, 0x00, 0x00);  // aborted command
             break;
         }
+        case Pending::DmaDataOut: {
+            if (!channel_->dma_active()) return;
+            const bool ok = channel_->dma_transfer(nullptr, payload_.data(), static_cast<u32>(payload_.size()));
+            channel_->dma_complete(ok);
+            if (ok)
+                data_out_done();
+            else
+                check_condition(0x0B, 0x00, 0x00);
+            break;
+        }
         case Pending::Complete:
             finish_ok();
             break;
@@ -783,7 +946,7 @@ void AtapiCdrom::continue_command() {
 u16 AtapiCdrom::read_data() {
     if (buffer_pos_ + 1 >= buffer_.size()) {
         buffer_.clear();
-        if (pending_ == Pending::DataReady) finish_ok();
+        if (pending_ == Pending::DataReady) pio_chunk_done();
         return 0;
     }
     const u16 v = static_cast<u16>(buffer_[buffer_pos_] | (buffer_[buffer_pos_ + 1] << 8));
@@ -794,13 +957,23 @@ u16 AtapiCdrom::read_data() {
             tf_.status = ata::kStatusDrdy;
             pending_ = Pending::None;
         } else if (pending_ == Pending::DataReady) {
-            finish_ok();
+            pio_chunk_done();
         }
     }
     return v;
 }
 
 void AtapiCdrom::write_data(u16 value) {
+    if (pending_ == Pending::DataOut) {
+        if (payload_pos_ < payload_.size()) payload_[payload_pos_++] = static_cast<u8>(value);
+        if (payload_pos_ < payload_.size()) payload_[payload_pos_++] = static_cast<u8>(value >> 8);
+        if (payload_pos_ >= payload_.size()) {
+            tf_.status = ata::kStatusBsy;
+            pending_ = Pending::None;
+            data_out_done();
+        }
+        return;
+    }
     if (pending_ != Pending::PacketReady) return;
     if (cdb_pos_ + 1 < cdb_.size()) {
         cdb_[cdb_pos_] = static_cast<u8>(value);

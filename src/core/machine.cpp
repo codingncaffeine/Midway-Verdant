@@ -177,7 +177,15 @@ bool Machine::init(std::string& error) {
         trace::log(trace::Cat::Boot, "HDD image {} ({} sectors){}", config_.hdd_image->string(), hdd_image_.sectors(),
                    config_.hdd_locked ? ", locked" : "");
     }
-    ide_.attach(1, std::make_unique<AtapiCdrom>());
+    auto dvd = std::make_unique<AtapiCdrom>();
+    if (config_.dvd_image) {
+        auto disc = std::make_unique<DvdImage>();
+        if (!disc->open(*config_.dvd_image, error)) return false;
+        trace::log(trace::Cat::Boot, "DVD image {} ({}, {} sectors)", config_.dvd_image->string(), disc->kind_name(), disc->sectors());
+        dvd->insert(std::move(disc));
+        smc_.set_tray(Smc::Tray::ClosedMedia);
+    }
+    ide_.attach(1, std::move(dvd));
     if (config_.cpu == "p6") {
         cpu_ = make_p6_backend(config_.oracle);
     } else if (config_.cpu == "kvm") {

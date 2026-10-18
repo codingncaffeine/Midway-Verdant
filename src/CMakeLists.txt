@@ -24,6 +24,7 @@ add_library(mvcore STATIC
   ide/ide.cpp
   ide/ata_disk.cpp
   ide/disk_image.cpp
+  ide/dvd_image.cpp
   mcpx/isa_misc.cpp
   mcpx/lpc.cpp
   mcpx/pic.cpp

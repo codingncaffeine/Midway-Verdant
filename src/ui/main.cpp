@@ -31,6 +31,7 @@ void print_usage() {
         "  --eeprom FILE      a 256-byte EEPROM image; generated there from the kernel's key when missing\n"
         "  --hdd FILE         a raw hard-disk image (8 GiB retail layout); no drive without it\n"
         "  --hdd-unlocked     present the disk unlocked instead of locked with the EEPROM's key\n"
+        "  --dvd FILE         a game disc image (XISO or a full dump) in the DVD tray\n"
         "  --smc-scratch N    the SMC scratch flags the kernel reads at boot (4 = short animation, 8 = dashboard)\n"
         "  --seconds N        run for N seconds of host time (default 5)\n"
         "  --until EVENT      stop early at a milestone: rom-hidden, bootloader, kernel\n"
@@ -100,6 +101,8 @@ int main(int argc, char** argv) {
             cfg.flash_image = need("--bios");
         } else if (a == "--eeprom") {
             cfg.eeprom_image = need("--eeprom");
+        } else if (a == "--dvd") {
+            cfg.dvd_image = need("--dvd");
         } else if (a == "--hdd") {
             cfg.hdd_image = need("--hdd");
         } else if (a == "--hdd-unlocked") {

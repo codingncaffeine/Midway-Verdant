@@ -1,11 +1,13 @@
 #pragma once
 #include <array>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <span>
 #include <string>
 #include <vector>
 
+#include "ide/dvd_image.h"
 #include "ide/ide.h"
 
 namespace mv {
@@ -78,8 +80,9 @@ private:
     bool ever_unlocked_{false};
 };
 
-// The DVD drive: an ATAPI device with, for now, no disc in it. Enough of the packet command set to let the
-// kernel conclude "no media" and go on to the dashboard.
+// The DVD drive: an ATAPI device, empty or holding a game disc image. With a disc it answers the reads, the
+// structure reads and the security page the console's kernel uses; an image carries no security sectors, so the
+// drive reports the disc as already authenticated with the game partition selected.
 class AtapiCdrom : public IdeDevice {
 public:
     AtapiCdrom();
@@ -91,13 +94,23 @@ public:
     u16 read_data() override;
     void write_data(u16 value) override;
     u64 packets() const { return packets_; }
+    // Puts a disc in the tray (before power-on: the kernel finds it at initialisation).
+    void insert(std::unique_ptr<DvdImage> disc) { disc_ = std::move(disc); }
+    bool has_disc() const { return disc_ != nullptr; }
+    u64 sectors_read() const { return sectors_read_; }
 
 private:
-    enum class Pending { None, IdentifyReady, PacketReady, DataReady, DmaData, Complete };
+    enum class Pending { None, IdentifyReady, PacketReady, DataReady, DmaData, DataOut, DmaDataOut, Complete };
     void build_identify(u8* out) const;
     void run_packet();
     void mode_sense10();
-    void data_in(const u8* data, u32 len);
+    void read_sectors(u64 lba, u32 count);
+    void read_dvd_structure();
+    void data_out(u32 len);
+    void data_out_done();
+    void next_pio_chunk();
+    void pio_chunk_done();
+    void data_in(const u8* data, u32 len, Cycles latency = 0);  // latency 0: the command overhead alone
     void check_condition(u8 sense_key, u8 asc, u8 ascq);
     void finish_ok();
 
@@ -106,6 +119,11 @@ private:
     std::size_t cdb_pos_{0};
     std::vector<u8> buffer_;
     std::size_t buffer_pos_{0};
+    std::vector<u8> payload_;      // a PIO data-in phase larger than the host's byte count goes out in chunks
+    std::size_t payload_pos_{0};
+    std::unique_ptr<DvdImage> disc_;
+    std::array<u8, 20> security_page_{};  // the last security page the host wrote (MODE SELECT page 0x3E)
+    u64 sectors_read_{0};
     u8 sense_key_{0}, asc_{0}, ascq_{0};
     bool dma_{false};  // the current PACKET command's data phase goes through the bus master (features bit 0)
     u64 packets_{0};
