@@ -56,6 +56,7 @@ public:
                          kFieldOffset = 0x58, kFieldNext = 0x5C, kFieldVolA = 0x60, kFieldVolB = 0x64, kFieldVolC = 0x68,
                          kFieldLfoEnv = 0x6C, kFieldFcA = 0x74, kFieldFcB = 0x78, kFieldPitchLink = 0x7C;
     static constexpr u32 kFmtSamplesPerBlockShift = 16, kFmtMultipass = 1u << 21, kFmtPersist = 1u << 23, kFmtStream = 1u << 24,
+                         kFmtClearMix = 1u << 26,
                          kFmtLoop = 1u << 25, kFmtStereo = 1u << 27, kFmtSampleSizeShift = 28, kFmtContainerShift = 30;
     static constexpr u32 kContainerAdpcm = 2;
     static constexpr u32 kStatePaused = 1u << 18, kStateNew = 1u << 20, kStateActive = 1u << 21;
@@ -135,6 +136,7 @@ private:
     // A voice's frame of samples; false when the voice ends during it (the rest of the frame is silence).
     bool render_buffer(u32 handle, u32 fmt, double step, Frame& out);
     bool render_stream(u32 handle, u32 fmt, double step, Frame& out);
+    bool read_submix(u32 fmt, Frame& out);
     void read_sample(u32 handle, const Source& src, u32 index, float out[2]);
     bool sge_byte(u32 sge_offset, PhysAddr& phys) const;
     u32 read_bytes(const Source& src, u32 byte_offset, u32 bytes) const;

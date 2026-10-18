@@ -300,7 +300,8 @@ void SetupEngine::walk(u32 list) {
                 Frame samples{};
                 Bookkeeping& b = book_[handle];
                 if (!b.finished) {
-                    const bool more = (fmt & kFmtStream) ? render_stream(handle, fmt, step, samples) : render_buffer(handle, fmt, step, samples);
+                    const bool more = (fmt & kFmtMultipass) ? read_submix(fmt, samples)
+                                      : (fmt & kFmtStream) ? render_stream(handle, fmt, step, samples) : render_buffer(handle, fmt, step, samples);
                     filter(handle, fmt, samples);
                     mix_voice(handle, samples, ea);
                     // A stream that runs dry ends; a one-shot buffer that reaches its end falls silent and stays on its
@@ -317,6 +318,18 @@ void SetupEngine::walk(u32 list) {
         else prev = handle;
         handle = next;
     }
+}
+
+// A multipass voice reads no memory: its input is one mix bin (CFG_FMT bits 20:16, where other voices keep their
+// samples per block) as the voices walked before it this frame left it, the same signal on both channels, and with
+// CLEAR_MIX (bit 26) the bin is emptied once read. The lists are walked 2D, 3D, multipass, so a submix's sources have
+// all been mixed by then. It then runs its envelopes, filter and eight sends like any other voice. A submix never runs
+// dry.
+bool SetupEngine::read_submix(u32 fmt, Frame& out) {
+    auto& bin = mix_[(fmt >> kFmtSamplesPerBlockShift) & 0x1Fu];
+    for (u32 i = 0; i < kSamplesPerFrame; ++i) out[i] = {bin[i], bin[i]};
+    if (fmt & kFmtClearMix) bin.fill(0.0f);
+    return true;
 }
 
 // ── envelopes ────────────────────────────────────────────────────────────────────────────────────────────────────

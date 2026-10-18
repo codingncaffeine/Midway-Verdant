@@ -638,3 +638,40 @@ TEST(ApuFrames, TheFrameClockRunsOnlyInCountModeAndTheEpFlagRisesEveryEighthFram
     EXPECT_EQ(r.rd(Apu::kXgsCnt), 24u * 32);
     EXPECT_EQ(r.apu.ep().core().regs().a >> 24, 3) << "flags at counts 0, 8 and 16: three EP frames in 24";
 }
+
+// A multipass voice takes no samples from memory: it reads the mix bin named in its format word as the voices before
+// it left it this frame (the multipass list is walked last) and sends it on with its own volumes; CLEAR_MIX empties
+// the bin once read.
+TEST(ApuSynthesis, AMultipassVoiceReadsItsSubmixBinAndClearMixEmptiesIt) {
+    using SE = apu::SetupEngine;
+    SynthRig r;
+    r.fill_pcm(64);
+    r.start(kPcm16Mono, 63, 0, 0, 0);
+    r.vp(SE::kMethodSetCurrentVoice, SynthRig::kVoice);
+    r.vp(0x300, 20);  // the source's V0 goes to bin 20
+    const u32 mp = SynthRig::kVoice + 1;
+    auto start_mp = [&](bool clear) {
+        r.vp(SE::kMethodSetCurrentVoice, mp);
+        r.vp(0x300, 0);  // V0 to bin 0
+        r.vp(0x304, SE::kFmtMultipass | (20u << SE::kFmtSamplesPerBlockShift) | (clear ? SE::kFmtClearMix : 0u) | 31u | (31u << 5));
+        r.vp(0x360, 0xFFF00000u | 0x000F000Fu);  // V0 at full volume
+        r.vp(0x364, 0xFFFFFFFFu);
+        r.vp(0x368, 0xFFFFFFFFu);
+        r.vp(0x37C, 0);
+        r.vp(SE::kMethodSetAntecedentVoice, 0x3FFFFu);  // the top of the multipass list
+        r.vp(SE::kMethodVoiceOn, mp);
+    };
+    start_mp(true);
+    r.sched.advance_to(Rig::frame(1));
+    for (u32 i = 0; i < 32; ++i) {
+        EXPECT_FLOAT_EQ(r.bin(0, i), SynthRig::pcm(i) / 32768.0f) << "the submix reaches bin 0, sample " << i;
+        EXPECT_EQ(r.bin(20, i), 0.0f) << "CLEAR_MIX emptied the submix bin, sample " << i;
+    }
+    r.vp(SE::kMethodSetCurrentVoice, mp);
+    r.vp(0x304, SE::kFmtMultipass | (20u << SE::kFmtSamplesPerBlockShift) | 31u | (31u << 5));
+    r.sched.advance_to(Rig::frame(2));
+    for (u32 i = 0; i < 32; ++i) {
+        EXPECT_FLOAT_EQ(r.bin(0, i), SynthRig::pcm(32 + i) / 32768.0f) << "sample " << (32 + i);
+        EXPECT_FLOAT_EQ(r.bin(20, i), SynthRig::pcm(32 + i) / 32768.0f) << "without CLEAR_MIX the bin keeps its sum";
+    }
+}
