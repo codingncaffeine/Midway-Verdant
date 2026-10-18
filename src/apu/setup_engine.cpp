@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <format>
 #include <string>
 
@@ -112,6 +113,27 @@ bool SetupEngine::method(u32 offset, u32 value) {
             b.adpcm_key = ~0ull;
             b.svf = {};
             ++started_;
+            if (trace::on(trace::Cat::Apu) && !(field(handle, kFieldFmt) & kFmtStream)) {
+                // What the voice will play: its buffer's level and peak over the first 4096 samples.
+                const u32 fmt = field(handle, kFieldFmt);
+                Source src = source_for(fmt);
+                src.base = field(handle, kFieldPslStart) & kOffsetMask;
+                const u32 ebo = field(handle, kFieldNext) & kOffsetMask, n = std::min(ebo + 1, 4096u);
+                double sum = 0, peak = 0;
+                u32 crossings = 0;
+                float last = 0.0f;
+                for (u32 i = 0; i < n; ++i) {
+                    float s[2];
+                    read_sample(handle, src, i, s);
+                    if (i > 0 && (s[0] < 0.0f) != (last < 0.0f)) ++crossings;
+                    last = s[0];
+                    sum += static_cast<double>(s[0]) * static_cast<double>(s[0]);
+                    peak = std::max(peak, static_cast<double>(std::fabs(s[0])));
+                }
+                trace::log(trace::Cat::Apu, "vp: voice {:x} on: buffer +{:x} ebo {:x} lbo {:x} fmt {:08x}: rms {:.1f} dB peak {:.1f} dB, {} zero crossings over {} samples", handle,
+                           src.base, ebo, field(handle, kFieldPshSample) & kOffsetMask, fmt, 10 * std::log10(sum / n + 1e-12), 20 * std::log10(peak + 1e-9), crossings, n);
+                b.adpcm_key = ~0ull;  // the reads above filled the ADPCM block cache; playback starts from a clean one
+            }
             return true;
         }
         case kMethodVoiceOff: {
@@ -121,7 +143,7 @@ bool SetupEngine::method(u32 offset, u32 value) {
         }
         case kMethodVoiceRelease: {
             // Both envelopes enter their release: the amplitude one at the TAR_LFO_ENV rate, the filter one at the
-            // CFG_MISC rate; the voice retires when the amplitude release ends (at once for a rate of zero).
+            // CFG_MISC rate; the voice retires when the amplitude release ends (never for a rate of zero).
             const u32 handle = value & kHandleMask;
             if (handle >= kMaxVoices) return true;
             const u32 ea = (field(handle, kFieldLfoEnv) & 0xFFFu) * 16, ef = (field(handle, kFieldMisc) & 0xFFFu) * 16;
@@ -326,7 +348,12 @@ float SetupEngine::step_envelope(u32 handle, bool amplitude, bool& ended) {
             level = value = sustain;
             break;
         case kRelease:
-            if (release == 0 || count == 0) {
+            if (release == 0) {
+                // A release rate of zero holds the level the release began at: the voice sounds on until VOICE_OFF.
+                // The boot sound releases its two bass drones this way and keeps re-pitching one of them for five
+                // seconds; the recording of a real console still carries both fundamentals after the releases.
+                value = level;
+            } else if (count == 0) {
                 phase = kForceRelease;
                 value = 0.0f;
             } else {
@@ -551,6 +578,21 @@ void SetupEngine::filter(u32 handle, u32 fmt, Frame& samples) {
 // bins are the HRTF submixes. A bin's headroom divides what is added to it by 2^headroom.
 void SetupEngine::mix_voice(u32 handle, const Frame& samples, float gain) {
     if (gain <= 0.0f) return;
+    // Instrument: MV_DEBUG_VOICES=41,4a mixes only the listed voices (hex handles); the rest still play silently.
+    static const std::array<bool, kMaxVoices> solo = [] {
+        std::array<bool, kMaxVoices> s{};
+        const char* e = std::getenv("MV_DEBUG_VOICES");
+        if (!e) s.fill(true);
+        for (; e && *e; ) {
+            char* end = nullptr;
+            const unsigned long h = std::strtoul(e, &end, 16);
+            if (end == e) break;
+            if (h < kMaxVoices) s[h] = true;
+            e = *end ? end + 1 : end;
+        }
+        return s;
+    }();
+    if (!solo[handle]) return;
     const u32 vbin = field(handle, kFieldVbin), fmt = field(handle, kFieldFmt);
     const u32 vola = field(handle, kFieldVolA), volb = field(handle, kFieldVolB), volc = field(handle, kFieldVolC);
     const std::array<u32, 8> bins{vbin & 0x1Fu, (vbin >> 5) & 0x1Fu, (vbin >> 10) & 0x1Fu, (vbin >> 16) & 0x1Fu, (vbin >> 21) & 0x1Fu,

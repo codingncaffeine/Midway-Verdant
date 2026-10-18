@@ -471,6 +471,29 @@ TEST(ApuSynthesis, TheAmplitudeEnvelopeRampsInItsAttackAndTheVoiceEndsWithItsRel
     EXPECT_FALSE(r.field(SynthRig::kVoice, SE::kFieldState) & SE::kStateActive);
 }
 
+TEST(ApuSynthesis, AReleaseRateOfZeroHoldsTheVoiceUntilVoiceOff) {
+    using SE = apu::SetupEngine;
+    SynthRig r;
+    for (u32 i = 0; i < 64; ++i) {
+        const u16 v = 16384;  // a constant half-scale signal
+        ASSERT_TRUE(r.bus.write_ram(SynthRig::kPage + i * 2, &v, 2));
+    }
+    r.vp(SE::kMethodSetCurrentVoice, SynthRig::kVoice);
+    r.vp(0x30C, 0x80000000u); // CFG_ENVA: sustain 128, no hold or decay
+    r.vp(0x36C, 0);           // TAR_LFO_ENV: release rate 0
+    r.start(kPcm16Mono | SE::kFmtLoop, 63, 0, 0, 0, SE::kSustain << SE::kStateEaShift);
+    r.sched.advance_to(Rig::frame(4));
+    const float sustained = r.bin(0, 0);
+    EXPECT_NEAR(sustained, 0.5f * 128.0f / 255.0f, 1e-6f) << "sustaining at level 128";
+    r.vp(SE::kMethodVoiceRelease, SynthRig::kVoice);
+    r.sched.advance_to(Rig::frame(400));
+    EXPECT_FLOAT_EQ(r.bin(0, 0), sustained) << "a zero release rate keeps the level the release began at";
+    EXPECT_EQ(r.apu.setup_engine().voices_retired(), 0u);
+    r.vp(SE::kMethodVoiceOff, SynthRig::kVoice);
+    r.sched.advance_to(Rig::frame(402));
+    EXPECT_EQ(r.apu.setup_engine().voices_retired(), 1u) << "VOICE_OFF ends it";
+}
+
 TEST(ApuSynthesis, TheVoiceBufferTableIsWrittenThroughItsMethods) {
     using SE = apu::SetupEngine;
     SynthRig r;
