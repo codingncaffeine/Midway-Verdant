@@ -113,6 +113,11 @@ VulkanRenderer::VulkanRenderer(vk::Device& device, const HandleResolver& handles
         debug_shadow_pass_ = s.find("shadow1") != std::string::npos;
         debug_show_v0_ = s.find("showv0") != std::string::npos;
         debug_skip_blend_ = s.find("skipblend") != std::string::npos;
+        // drawid: every draw paints its index in the frame (red = low byte, green = high byte, blue = 1) wherever it
+        // writes colour: a flat white shader blended by the constant colour.
+        debug_draw_id_ = s.find("drawid") != std::string::npos;
+        debug_flip_front_ = s.find("flipfront") != std::string::npos;
+        if (debug_draw_id_) debug_flat_ = true;
     }
 }
 
@@ -729,7 +734,7 @@ VkPipeline VulkanRenderer::pipeline(const KelvinState& s, VkShaderModule vs, VkS
         const u32 face = s.reg(mthd::kCullFace);
         rs.cullMode = face == 0x404 ? VK_CULL_MODE_FRONT_BIT : (face == 0x408 ? VK_CULL_MODE_FRONT_AND_BACK : VK_CULL_MODE_BACK_BIT);
     }
-    rs.frontFace = s.reg(mthd::kFrontFace) == 0x900 ? VK_FRONT_FACE_CLOCKWISE : VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    rs.frontFace = (s.reg(mthd::kFrontFace) == 0x900) != debug_flip_front_ ? VK_FRONT_FACE_CLOCKWISE : VK_FRONT_FACE_COUNTER_CLOCKWISE;
     VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
     ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
     VkPipelineDepthStencilStateCreateInfo ds{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
@@ -750,6 +755,12 @@ VkPipeline VulkanRenderer::pipeline(const KelvinState& s, VkShaderModule vs, VkS
     cb.srcColorBlendFactor = cb.srcAlphaBlendFactor = blend_factor(s.reg(mthd::kBlendSfactor));
     cb.dstColorBlendFactor = cb.dstAlphaBlendFactor = blend_factor(s.reg(mthd::kBlendDfactor));
     cb.colorBlendOp = cb.alphaBlendOp = blend_op(s.reg(mthd::kBlendEquation));
+    if (debug_draw_id_) {
+        cb.blendEnable = VK_TRUE;
+        cb.srcColorBlendFactor = cb.srcAlphaBlendFactor = VK_BLEND_FACTOR_CONSTANT_COLOR;
+        cb.dstColorBlendFactor = cb.dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
+        cb.colorBlendOp = cb.alphaBlendOp = VK_BLEND_OP_ADD;
+    }
     const u32 mask = s.color_mask();
     cb.colorWriteMask = (mask & (1u << 16) ? static_cast<u32>(VK_COLOR_COMPONENT_R_BIT) : 0u) | (mask & (1u << 8) ? static_cast<u32>(VK_COLOR_COMPONENT_G_BIT) : 0u) |
                         (mask & 1u ? static_cast<u32>(VK_COLOR_COMPONENT_B_BIT) : 0u) | (mask & (1u << 24) ? static_cast<u32>(VK_COLOR_COMPONENT_A_BIT) : 0u);
@@ -962,6 +973,10 @@ void VulkanRenderer::clear(const KelvinState& s, u32 bits) {
 void VulkanRenderer::draw(const KelvinState& s, const DrawBatch& batch) {
     Timed timed(stats_.ns_draw);
     ++stats_.draws;
+    const u32 draw_id = frame_draws_++;
+    if (debug_draw_id_)
+        std::fprintf(stderr, "drawid %u: surface %08x, stages %05x, blend %u, %zu indices, %zu ranges, %zu inline words, %u immediate\n", draw_id, s.surface().color_offset,
+                     s.reg(mthd::kShaderStageProgram), s.blend() ? 1u : 0u, batch.indices.size(), batch.ranges.size(), batch.inline_words.size(), batch.immediate_count);
     if (debug_skip_blend_ && s.blend()) return;  // MV_RENDER_DEBUG=skipblend: the opaque passes alone
     std::string error;
     Surface* t = target_for(s);
@@ -1178,8 +1193,13 @@ void VulkanRenderer::draw(const KelvinState& s, const DrawBatch& batch) {
     if (sd.clip_width() == 0 || sd.clip_height() == 0) scissor = {{0, 0}, {t->width, t->height}};
     fn_->vkCmdSetScissor(cb_, 0, 1, &scissor);
     const u32 bc = s.reg(mthd::kBlendColor);
-    const float constants[4] = {static_cast<float>((bc >> 16) & 0xFFu) / 255.0f, static_cast<float>((bc >> 8) & 0xFFu) / 255.0f,
+    float constants[4] = {static_cast<float>((bc >> 16) & 0xFFu) / 255.0f, static_cast<float>((bc >> 8) & 0xFFu) / 255.0f,
                                 static_cast<float>(bc & 0xFFu) / 255.0f, static_cast<float>(bc >> 24) / 255.0f};
+    if (debug_draw_id_) {
+        constants[0] = static_cast<float>(draw_id & 0xFFu) / 255.0f;
+        constants[1] = static_cast<float>((draw_id >> 8) & 0xFFu) / 255.0f;
+        constants[2] = constants[3] = 1.0f;
+    }
     fn_->vkCmdSetBlendConstants(cb_, constants);
     fn_->vkCmdSetStencilReference(cb_, VK_STENCIL_FACE_FRONT_AND_BACK, s.reg(mthd::kStencilRef) & 0xFFu);
     const VkDeviceSize vb_offset = voffset;
@@ -1209,6 +1229,7 @@ bool VulkanRenderer::write_back_at(u32 phys) {
 }
 
 void VulkanRenderer::end_frame() {
+    frame_draws_ = 0;
     flush();
     // Colour reaches RAM every frame (the scanout and the CPU read it); depth only when a texture samples it.
     for (auto& [k, s] : surfaces_)
