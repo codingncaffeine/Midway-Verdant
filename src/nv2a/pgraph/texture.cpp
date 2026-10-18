@@ -4,6 +4,8 @@
 #include <cstring>
 #include <format>
 
+#include "nv2a/yuv.h"
+
 namespace mv::pgraph {
 
 namespace {
@@ -99,6 +101,22 @@ void decode_texel(u32 format, const u8* p, const u8* palette, HostPixel pixel, u
     }
 }
 
+// The YUV 4:2:2 formats (linear only): every two pixels are four bytes holding both lumas and one U and V. 0x24
+// (CR8YB8CB8YA8) is Y0 U Y1 V in memory, YUY2; 0x25 (YB8CR8YA8CB8) is U Y0 V Y1, UYVY. `pair` is the group's first
+// byte, `odd` picks its second pixel.
+bool yuv_format(u32 format) { return format == 0x24 || format == 0x25; }
+
+void decode_yuv_texel(u32 format, const u8* pair, bool odd, u8* dst) {
+    int y0, u, y1, v;
+    if (format == 0x24) {
+        y0 = pair[0]; u = pair[1]; y1 = pair[2]; v = pair[3];
+    } else {
+        u = pair[0]; y0 = pair[1]; v = pair[2]; y1 = pair[3];
+    }
+    const u32 rgb = yuv601_to_xrgb(odd ? y1 : y0, u, v);
+    put(dst, (rgb >> 16) & 0xFFu, (rgb >> 8) & 0xFFu, rgb & 0xFFu, 255);
+}
+
 u32 dxt_color565(const u8* p) {
     u16 h;
     std::memcpy(&h, p, 2);
@@ -145,6 +163,7 @@ FormatInfo format_info(u32 f) {
         case 0x13: case 0x1B: case 0x1F: return {1, true};
         case 0x02: case 0x03: case 0x04: case 0x05: case 0x1A: case 0x27: case 0x28: case 0x29: case 0x32: return {2, false};
         case 0x10: case 0x11: case 0x16: case 0x17: case 0x1C: case 0x1D: case 0x20: case 0x35: return {2, true};
+        case 0x24: case 0x25: return {2, true};  // YUV 4:2:2: 4 bytes per 2 pixels
         case 0x06: case 0x07: case 0x3A: case 0x3B: case 0x3C: return {4, false};
         case 0x12: case 0x1E: case 0x3F: case 0x40: case 0x41: return {4, true};
         case 0x0C: return {0, false, true, false, 8};
@@ -260,15 +279,22 @@ bool decode_texture(const TextureStage& stage, u32 base, const MemoryView& memor
             return false;
         }
         const u32 pitch = stage.pitch();
-        const u8* src = memory.at(base, pitch * (out.height - 1) + out.width * f.bytes_per_pixel);
+        const bool yuv = yuv_format(format);
+        // A YUV line of odd width still ends on a whole two-pixel group.
+        const u32 row_bytes = (yuv ? (out.width + 1) & ~1u : out.width) * f.bytes_per_pixel;
+        const u8* src = memory.at(base, pitch * (out.height - 1) + row_bytes);
         if (!src) {
             out.error = std::format("linear texture at {:08x} ({}x{} pitch {}) is outside RAM", base, out.width, out.height, pitch);
             return false;
         }
         std::vector<u8> img(static_cast<std::size_t>(out.width) * out.height * texel);
-        for (u32 y = 0; y < out.height; ++y)
-            for (u32 x = 0; x < out.width; ++x)
-                decode_texel(format, src + y * pitch + x * f.bytes_per_pixel, palette, out.pixel, &img[(static_cast<std::size_t>(y) * out.width + x) * texel]);
+        for (u32 y = 0; y < out.height; ++y) {
+            for (u32 x = 0; x < out.width; ++x) {
+                u8* dst = &img[(static_cast<std::size_t>(y) * out.width + x) * texel];
+                if (yuv) decode_yuv_texel(format, src + y * pitch + (x & ~1u) * 2, (x & 1u) != 0, dst);
+                else decode_texel(format, src + y * pitch + x * f.bytes_per_pixel, palette, out.pixel, dst);
+            }
+        }
         out.images.push_back(std::move(img));
         return true;
     }

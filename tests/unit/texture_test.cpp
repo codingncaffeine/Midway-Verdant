@@ -135,3 +135,32 @@ TEST(Texture, DecodesDxt1BlocksAndCubeFaces) {
     EXPECT_FALSE(decode_texture(cube, 4096 - 64, MemoryView{ram.data(), 4096}, nullptr, d));
     EXPECT_NE(d.error.find("outside RAM"), std::string::npos) << d.error;
 }
+
+TEST(Texture, DecodesLinearYuvPairsWithTheirOwnChroma) {
+    // 4x2 linear YUV, pitch 16: each pair of pixels shares one U and V. Pair 0 is BT.601 red (U 90, V 240) with lumas
+    // 82 and 235; pair 1 is grey (U = V = 128) with lumas 16 (black) and 235 (white).
+    std::vector<u8> ram(4096, 0);
+    const u8 yuy2[8] = {82, 90, 235, 240, 16, 128, 235, 128};    // Y0 U Y1 V
+    const u8 uyvy[8] = {90, 82, 240, 235, 128, 16, 128, 235};    // U Y0 V Y1
+    std::memcpy(&ram[0x100 + 16], yuy2, 8);
+    std::memcpy(&ram[0x200 + 16], uyvy, 8);
+    for (u32 format : {0x24u, 0x25u}) {
+        const TextureStage t = stage_of(fmt(format, 0, 0), 16u << 16, (4u << 16) | 2u);
+        EXPECT_EQ(format_info(format).bytes_per_pixel, 2u);
+        EXPECT_TRUE(format_info(format).linear);
+        EXPECT_EQ(texture_size_in_memory(t), 32u);
+        DecodedTexture d;
+        ASSERT_TRUE(decode_texture(t, format == 0x24 ? 0x100 : 0x200, MemoryView{ram.data(), 4096}, nullptr, d)) << d.error;
+        EXPECT_EQ(d.pixel, HostPixel::Rgba8);
+        const auto& img = d.image(0, 0);
+        auto px = [&](u32 x, u32 y) {
+            const u8* p = &img[(y * 4 + x) * 4];
+            return (static_cast<u32>(p[0]) << 24) | (static_cast<u32>(p[1]) << 16) | (static_cast<u32>(p[2]) << 8) | p[3];
+        };
+        EXPECT_EQ(px(0, 1), 0xFF0100FFu) << "format " << format << ": luma 82 with the red chroma";
+        EXPECT_EQ(px(1, 1), 0xFFB3B2FFu) << "format " << format << ": luma 235, the same chroma";
+        EXPECT_EQ(px(2, 1), 0x000000FFu) << "format " << format << ": video black";
+        EXPECT_EQ(px(3, 1), 0xFFFFFFFFu) << "format " << format << ": video white";
+        EXPECT_EQ(px(0, 0), 0x008700FFu) << "format " << format << ": all-zero bytes are a dark green, not a placeholder";
+    }
+}

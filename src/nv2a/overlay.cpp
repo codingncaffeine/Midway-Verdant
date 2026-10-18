@@ -2,18 +2,9 @@
 
 #include <algorithm>
 
-namespace mv {
+#include "nv2a/yuv.h"
 
-namespace {
-// BT.601, video range: Y 16-235, Cb/Cr 16-240.
-inline u32 yuv_to_xrgb(int y, int u, int v) {
-    const int c = (y - 16) * 298, d = u - 128, e = v - 128;
-    const int r = std::clamp((c + 409 * e + 128) >> 8, 0, 255);
-    const int g = std::clamp((c - 100 * d - 208 * e + 128) >> 8, 0, 255);
-    const int b = std::clamp((c + 516 * d + 128) >> 8, 0, 255);
-    return (static_cast<u32>(r) << 16) | (static_cast<u32>(g) << 8) | static_cast<u32>(b);
-}
-}  // namespace
+namespace mv {
 
 void draw_overlay(const Overlay& ov, const u8* ram, u64 ram_size, u8* xrgb, u32 pitch, u32 w, u32 h) {
     if (ov.in_w == 0 || ov.in_h == 0 || ov.out_w == 0 || ov.out_h == 0 || ov.pitch == 0) return;
@@ -38,7 +29,7 @@ void draw_overlay(const Overlay& ov, const u8* ram, u64 ram_size, u8* xrgb, u32 
             } else {
                 u = pair[0]; y0 = pair[1]; v = pair[2]; y1 = pair[3];
             }
-            *px = yuv_to_xrgb((sx & 1u) ? y1 : y0, u, v);
+            *px = yuv601_to_xrgb((sx & 1u) ? y1 : y0, u, v);
         }
     }
 }
