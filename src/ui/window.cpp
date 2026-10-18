@@ -11,6 +11,7 @@
 
 #include "core/machine.h"
 #include "nv2a/overlay.h"
+#include "ui/pad_input.h"
 
 namespace mv::ui {
 
@@ -23,6 +24,7 @@ struct ScanoutWindow::Impl {
     std::string snapshot_dir;
     double snapshot_seconds{0};
     std::vector<u8> composed;  // the frame with the video overlay drawn over it
+    PadInput pad_input;
 };
 
 ScanoutWindow::ScanoutWindow() : impl_(new Impl) {}
@@ -36,7 +38,7 @@ ScanoutWindow::~ScanoutWindow() {
 }
 
 bool ScanoutWindow::open(std::string& error) {
-    if (!SDL_Init(SDL_INIT_VIDEO)) {
+    if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) {
         error = std::string("SDL_Init: ") + SDL_GetError();
         return false;
     }
@@ -71,11 +73,14 @@ unsigned ScanoutWindow::run(Machine& machine, std::atomic<bool>& stop) {
     const u64 t_start = SDL_GetTicks();
     u64 next_snapshot = impl_->snapshot_seconds > 0 ? static_cast<u64>(impl_->snapshot_seconds * 1000.0) : 0;
     if (next_snapshot) std::filesystem::create_directories(impl_->snapshot_dir);
+    impl_->pad_input.attach(machine.pad(0));
     while (!stop.load()) {
         SDL_Event e;
         while (SDL_PollEvent(&e)) {
             if (e.type == SDL_EVENT_QUIT || (e.type == SDL_EVENT_KEY_DOWN && e.key.key == SDLK_ESCAPE)) stop = true;
+            impl_->pad_input.handle_event(e);
         }
+        impl_->pad_input.update(machine.pad(0));
         // The CRTC's registers belong to the machine; read them under its lock, the pixels without (a torn frame
         // is what a real display shows too).
         u32 start, width, height, pitch;
@@ -150,6 +155,7 @@ unsigned ScanoutWindow::run(Machine& machine, std::atomic<bool>& stop) {
         SDL_RenderPresent(impl_->renderer);
         ++presented;
     }
+    machine.pad(0).set_rumble(nullptr);  // the window and its gamepad go away
     return presented;
 }
 

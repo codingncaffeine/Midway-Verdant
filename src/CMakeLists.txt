@@ -84,7 +84,7 @@ endif()
 
 # midway-verdant: the emulator shell — the SDL3 window around the core (the core itself never sees SDL).
 include(${CMAKE_SOURCE_DIR}/cmake/SDL3.cmake)
-add_executable(midway-verdant ui/main.cpp ui/window.cpp)
+add_executable(midway-verdant ui/main.cpp ui/window.cpp ui/pad_input.cpp)
 target_link_libraries(midway-verdant PRIVATE mvcore SDL3::SDL3)
 
 # mv-pbcap: the pushbuffer capture reader (summaries and dumps of what --capture wrote).
