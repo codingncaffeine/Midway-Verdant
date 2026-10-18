@@ -1,5 +1,6 @@
 #pragma once
 #if defined(__linux__)
+#include <unordered_map>
 #include <atomic>
 #include <mutex>
 #include <string>
@@ -60,6 +61,10 @@ private:
     Stop stop_reason_{Stop::None};
     std::string stop_detail_;
     Stats stats_;
+    // MV_PROFILE_EIP=1: where the guest was each time the vCPU was kicked (a sampling profiler for spin loops
+    // that make no exits), printed when the CPU thread ends.
+    bool profile_eip_{false};
+    std::unordered_map<u32, u64> eip_samples_;
     bool tsc_scaled_{false};
     bool dirty_tracking_{false};
     std::vector<u64> dirty_bitmap_;

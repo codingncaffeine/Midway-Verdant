@@ -1,6 +1,8 @@
 #if defined(__linux__)
 #include "cpu/kvm/kvm_backend.h"
 
+#include <vector>
+#include <cstdlib>
 #include <fcntl.h>
 #include <linux/kvm.h>
 #include <pthread.h>
@@ -45,7 +47,10 @@ struct CpuidFour {
 };
 }  // namespace
 
-KvmBackend::KvmBackend() = default;
+KvmBackend::KvmBackend() {
+    const char* p = std::getenv("MV_PROFILE_EIP");
+    profile_eip_ = p && *p && *p != '0';
+}
 
 KvmBackend::~KvmBackend() {
     stop();
@@ -261,6 +266,16 @@ void KvmBackend::stop() {
 
 void KvmBackend::join() {
     if (thread_.joinable()) thread_.join();
+    if (profile_eip_ && !eip_samples_.empty()) {
+        std::vector<std::pair<u32, u64>> top(eip_samples_.begin(), eip_samples_.end());
+        std::sort(top.begin(), top.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+        u64 total = 0;
+        for (const auto& [eip, n] : top) total += n;
+        std::fprintf(stderr, "eip profile (%llu samples):\n", static_cast<unsigned long long>(total));
+        for (std::size_t i = 0; i < top.size() && i < 20; ++i)
+            std::fprintf(stderr, "  %08x  %6llu  %5.1f%%\n", top[i].first, static_cast<unsigned long long>(top[i].second), 100.0 * static_cast<double>(top[i].second) / static_cast<double>(total));
+        eip_samples_.clear();
+    }
     running_ = false;
 }
 
@@ -356,6 +371,10 @@ void KvmBackend::thread_main() {
         ++stats_.exits;
         if (rc < 0 && errno == EINTR) {
             ++stats_.intr_exits;
+            if (profile_eip_) {
+                kvm_regs r{};
+                if (ioctl(vcpu_fd_, KVM_GET_REGS, &r) == 0) ++eip_samples_[static_cast<u32>(r.rip)];
+            }
             continue;  // kicked: loop to inject or stop
         }
         if (rc < 0) {
