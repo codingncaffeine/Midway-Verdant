@@ -2,6 +2,7 @@
 
 #include "nv2a/vulkan/vk_renderer.h"
 
+#include <chrono>
 #include <algorithm>
 
 #include "cpu/backend.h"
@@ -309,7 +310,9 @@ void Nv2aStub::run_pusher() {
         capture_dirty_pages();
         capture_->run(sched_.now(), get, put);
     }
+    const auto t0 = std::chrono::steady_clock::now();
     get = walker_.run(dma, get, put);
+    pusher_wall_ns_ += static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
     regs_[kCache1DmaGet] = get;
 }
 

@@ -53,6 +53,7 @@ public:
     struct Stats {
         u64 draws{0}, clears{0}, skipped{0}, pipelines{0}, shaders{0}, textures_decoded{0}, writebacks{0}, flushes{0};
         u64 batch_flushes{0};  // batches submitted mid-frame because the rings or the descriptor pool were full
+        u64 surface_samples{0};  // textures bound straight to a render target's image
         // Where the time goes, in nanoseconds: the whole draw and its parts (the texture part includes the
         // write-backs a sample forces; the shader parts are the compiles, a lookup costs nothing measurable); the
         // submits that wait; the copies back to RAM (and the device copy inside them).
@@ -64,6 +65,14 @@ public:
     const Stats& stats() const { return stats_; }
 
 private:
+    struct TextureEntry {
+        vk::Image image;
+        u32 phys{0}, length{0};
+        bool valid{false};
+        u32 width{0}, height{0};
+        bool linear{false};
+        bool surface{false};  // a render target's own image, sampled in place (owned by the surface)
+    };
     struct Surface {
         u32 phys{0};
         u32 zeta_phys{0};
@@ -81,18 +90,19 @@ private:
         bool zeta_dirty{false};      // depth rendered since the last write-back of the zeta surface
         bool rendered_this_frame{false};
         u64 draws_this_frame{0}, clears_this_frame{0};
-        u32 bytes() const { return color_bytes() * (swizzled ? width * height : pitch * height); }
+        // The target sampled in place: views for an X8 texture (alpha one) and for the depth aspect alone, and the
+        // entries a draw binds.
+        VkImageView x8_view{VK_NULL_HANDLE}, depth_view{VK_NULL_HANDLE};
+        TextureEntry color_tex, color_x8_tex, depth_tex;
+        // The frame the target was last drawn in, and whether a GPU-side copy (a blit) wrote its memory since: a clean
+        // target drawn this frame or the last, with nothing written over it, still holds what RAM holds.
+        u64 last_rendered_frame{0};
+        bool ram_newer{false};
+        // The guest memory each image covers: a pitch is already in bytes.
+        u32 bytes() const { return swizzled ? color_bytes() * width * height : pitch * height; }
         u32 color_bytes() const;
-        u32 zeta_bytes() const { return (zeta_format == 1 ? 2u : 4u) * (swizzled ? width * height : zeta_pitch * height); }
+        u32 zeta_bytes() const { return swizzled ? (zeta_format == 1 ? 2u : 4u) * width * height : zeta_pitch * height; }
     };
-    struct TextureEntry {
-        vk::Image image;
-        u32 phys{0}, length{0};
-        bool valid{false};
-        u32 width{0}, height{0};
-        bool linear{false};
-    };
-
     void note(const std::string& message);
     void begin_commands();
     void flush();  // end the pass, submit, wait, begin again
@@ -111,6 +121,12 @@ private:
     VkShaderModule fragment_shader(const psh::Key& key, std::array<psh::SamplerKind, 4>& kinds, std::string& error);
     VkPipeline pipeline(const KelvinState& s, VkShaderModule vs, VkShaderModule fs, VkPrimitiveTopology topology, Surface& t, std::string& error);
     const TextureEntry* texture(const KelvinState& s, u32 stage, std::string& error);
+    // A render target the stage can sample in place (same address and size, a format of the same bytes), or null.
+    const TextureEntry* surface_texture(const TextureStage& ts, u32 phys);
+    // Orders the attachment writes recorded so far before later sampling, and earlier sampling before later writes.
+    void surface_barrier();
+    void destroy_surface_views(Surface& s);
+    void invalidate_textures(u32 phys, u32 len);  // the decoded textures over a range (RAM now holds what a target wrote)
     VkSampler sampler(const TextureStage& ts, u32 levels);
     bool ring_alloc(vk::Buffer& ring, VkDeviceSize& cursor, VkDeviceSize bytes, VkDeviceSize alignment, VkDeviceSize& offset);
     // Whether a draw with these vertex and index sizes still fits the rings and the descriptor pool of the batch.
@@ -174,6 +190,11 @@ private:
     Stats stats_;
     // Debug overrides from MV_RENDER_DEBUG (comma separated): flat (white fragments), nodepth, nocull, noblend.
     bool debug_flat_{false}, debug_nodepth_{false}, debug_nocull_{false}, debug_noblend_{false}, debug_shadow_pass_{false}, debug_show_v0_{false}, debug_skip_blend_{false}, debug_draw_id_{false}, debug_flip_front_{false}, debug_ff_dump_{false};
+    u64 frame_index_{1};  // frames ended so far, plus one
+    bool attachments_written_{false}, sampled_since_barrier_{false};  // hazards the next surface_barrier() covers
+    bool depth16_sampled_{false}, depth24_sampled_{false};  // the device samples (and filters) these depth formats
+    bool debug_tex_log_{false};
+    bool debug_roundtrip_{false};  // MV_RENDER_DEBUG=roundtrip: sampled targets go through RAM as before (an A/B control)
     u32 frame_draws_{0};  // draws since the frame began (the index mv-pbcap draws lists)
 };
 

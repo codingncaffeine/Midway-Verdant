@@ -366,6 +366,7 @@ int main(int argc, char** argv) {
                     static_cast<unsigned long long>(st.clears), static_cast<unsigned long long>(st.skipped), static_cast<unsigned long long>(st.pipelines),
                     static_cast<unsigned long long>(st.shaders), static_cast<unsigned long long>(st.textures_decoded),
                     static_cast<unsigned long long>(st.writebacks));
+        std::printf("gpu: %llu textures sampled straight from a render target\n", static_cast<unsigned long long>(st.surface_samples));
         std::printf("gpu time: draw %.0f ms (fetch %.0f, textures %.0f, pipelines %.0f, shader compiles %.0f), flush %.0f, write-back %.0f (device copies %.0f)\n",
                     static_cast<double>(st.ns_draw) / 1e6, static_cast<double>(st.ns_fetch) / 1e6, static_cast<double>(st.ns_texture) / 1e6,
                     static_cast<double>(st.ns_pipeline) / 1e6, static_cast<double>(st.ns_vs + st.ns_fs) / 1e6, static_cast<double>(st.ns_flush) / 1e6,
@@ -468,6 +469,7 @@ int main(int argc, char** argv) {
                 static_cast<unsigned long long>(machine.nv2a().pushbuffer().methods_seen()),
                 static_cast<unsigned long long>(machine.nv2a().semaphore_releases()), static_cast<unsigned long long>(machine.nv2a().notifies()),
                 machine.nv2a().pushbuffer().errored() ? (" ERROR: " + machine.nv2a().pushbuffer().last_error()).c_str() : "");
+    std::printf("gpu pusher: %.0f ms of host time on the CPU thread (methods and rendering)\n", static_cast<double>(machine.nv2a().pusher_wall_ns()) / 1e6);
     std::printf("gpu software methods %llu%s\n", static_cast<unsigned long long>(machine.nv2a().software_methods()),
                 machine.nv2a().pgraph_stalled() ? " (PGRAPH held now)" : "");
     std::printf("ide: %llu commands, %llu sectors read, %llu written; hdd %s, unlock attempts %llu; dvd packets %llu\n",

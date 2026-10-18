@@ -168,12 +168,14 @@ private:
     };
     std::array<SyncState, 8> sync_{};
     u64 semaphore_releases_{0}, notifies_{0}, software_methods_{0};
+    u64 pusher_wall_ns_{0};
     bool pgraph_stalled_{false};
     capture::Writer* capture_{nullptr};
     CpuBackend* cpu_{nullptr};
     std::vector<u32> dirty_scratch_;
 public:
     u64 semaphore_releases() const { return semaphore_releases_; }
+    u64 pusher_wall_ns() const { return pusher_wall_ns_; }  // instrument: host time the vCPU spent inside the pusher (methods + renderer)
     u64 notifies() const { return notifies_; }
     u64 software_methods() const { return software_methods_; }
     bool pgraph_stalled() const { return pgraph_stalled_; }
