@@ -120,6 +120,8 @@ private:
     VkShaderModule vertex_shader(const KelvinState& s, std::string& error);
     VkShaderModule fragment_shader(const psh::Key& key, std::array<psh::SamplerKind, 4>& kinds, std::string& error);
     VkPipeline pipeline(const KelvinState& s, VkShaderModule vs, VkShaderModule fs, VkPrimitiveTopology topology, Surface& t, std::string& error);
+    // The pipeline of a clear that writes only some colour channels (the colour comes in as the blend constants).
+    VkPipeline clear_pipeline(VkRenderPass pass, VkColorComponentFlags mask, std::string& error);
     const TextureEntry* texture(const KelvinState& s, u32 stage, std::string& error);
     // A render target the stage can sample in place (same address and size, a format of the same bytes), or null.
     const TextureEntry* surface_texture(const TextureStage& ts, u32 phys);
@@ -168,6 +170,8 @@ private:
     u32 vs_memo_next_{0}, fs_memo_next_{0};
     std::unordered_map<std::string, std::array<psh::SamplerKind, 4>> fs_kinds_;
     std::unordered_map<std::string, VkPipeline> pipelines_;
+    std::unordered_map<u64, VkPipeline> clear_pipelines_;  // by render pass and channel mask
+    VkShaderModule clear_vs_{VK_NULL_HANDLE}, clear_fs_{VK_NULL_HANDLE};
     std::unordered_map<std::string, std::unique_ptr<TextureEntry>> textures_;
     // The last binding of each stage: the registers it was built from and what it resolved to, so a draw that
     // changes nothing about its textures skips the address maths, the handle lookups and the hashing.

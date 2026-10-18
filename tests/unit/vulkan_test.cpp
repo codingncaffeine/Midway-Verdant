@@ -60,7 +60,7 @@ void load_passthrough_combiners(Kelvin& k) {
 
 // A 64x64 linear target at 0x10000 (pitch 256) with a Z24S8 buffer at 0x20000, the pass-through program and
 // combiners, no depth test, no culling.
-void setup_target(Kelvin& k, u32 color_format = 8) {
+void setup_target(Kelvin& k, u32 color_format = 8, u32 color_offset = 0x10000) {
     k.method(mthd::kDmaColor, 9);
     k.method(mthd::kDmaZeta, 10);
     k.method(mthd::kDmaVertexA, 3);
@@ -68,7 +68,7 @@ void setup_target(Kelvin& k, u32 color_format = 8) {
     k.method(mthd::kSurfaceClipH, 64u << 16);
     k.method(mthd::kSurfaceClipV, 64u << 16);
     k.method(mthd::kSurfacePitch, (256u << 16) | 256u);
-    k.method(mthd::kSurfaceColorOffset, 0x10000);
+    k.method(mthd::kSurfaceColorOffset, color_offset);
     k.method(mthd::kSurfaceZetaOffset, 0x20000);
     load_passthrough_program(k);
     load_passthrough_combiners(k);
@@ -215,4 +215,49 @@ TEST(Vulkan, AG8B8TargetHasTwoBytesAPixel) {
     EXPECT_EQ(ram[0x10000 + 8 * 256 + 63 * 2 + 1], 0x80) << "the line's last pixel ends at byte 128";
     EXPECT_EQ(ram[0x10000 + 8 * 256 + 128], 0xEE) << "nothing written past the line's 64 pixels";
     EXPECT_EQ(ram[0x10000 + 8 * 256 + 255], 0xEE);
+}
+
+TEST(Vulkan, ClearsDecodeTheValuePerFormatAndWriteOnlyTheChosenChannels) {
+    vk::Device device;
+    std::string error;
+    if (!device.init(error)) GTEST_SKIP() << "no Vulkan device: " << error;
+    std::vector<u8> ram(4u << 20, 0);
+    RamResolver handles;
+    handles.size = static_cast<u32>(ram.size());
+    VulkanRenderer renderer(device, handles, ram.data(), static_cast<u32>(ram.size()));
+    ASSERT_TRUE(renderer.init(error)) << error;
+    Kelvin k;
+    k.set_sink(&renderer);
+    auto clear = [&](u32 format, u32 offset, u32 value, u32 bits) {
+        setup_target(k, format, offset);
+        k.method(mthd::kColorClear, value);
+        k.method(mthd::kClearRectH, 63u << 16);
+        k.method(mthd::kClearRectV, 63u << 16);
+        k.method(mthd::kClearSurface, bits);
+    };
+    auto word16 = [&](u32 offset) {
+        u16 v;
+        std::memcpy(&v, &ram[offset + 8 * 256 + 8 * 2], 2);
+        return v;
+    };
+    auto word32 = [&](u32 offset) {
+        u32 v;
+        std::memcpy(&v, &ram[offset + 8 * 256 + 8 * 4], 4);
+        return v;
+    };
+    clear(3, 0x100000, 0x0000F81F, 0xF0);  // R5G6B5: the 5-6-5 fields of the low half, magenta
+    clear(1, 0x110000, 0xFFFF7C00, 0xF0);  // X1R5G5B5_Z1R5G5B5: the 5-5-5 fields, its top bit zero
+    clear(2, 0x120000, 0x000003E0, 0xF0);  // X1R5G5B5_O1R5G5B5: its top bit one
+    clear(4, 0x130000, 0xFF102030, 0xF0);  // X8R8G8B8_Z8R8G8B8: the unused byte zero
+    clear(7, 0x140000, 0x00405060, 0xF0);  // X1A7R8G8B8_O1A7R8G8B8: the alpha's top bit one
+    clear(8, 0x150000, 0x11223344, 0xF0);  // A8R8G8B8, then only red and alpha
+    clear(8, 0x150000, 0xAABBCCDD, 0x90);
+    renderer.end_frame();
+    for (const auto& e : renderer.stats().errors) ADD_FAILURE() << "renderer: " << e;
+    EXPECT_EQ(word16(0x100000), 0xF81Fu);
+    EXPECT_EQ(word16(0x110000), 0x7C00u);
+    EXPECT_EQ(word16(0x120000), 0x83E0u);
+    EXPECT_EQ(word32(0x130000), 0x00102030u);
+    EXPECT_EQ(word32(0x140000), 0x80405060u);
+    EXPECT_EQ(word32(0x150000), 0xAABB3344u) << "green and blue keep the first clear";
 }

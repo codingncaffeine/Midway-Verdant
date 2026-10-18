@@ -27,6 +27,38 @@ VkFormat color_vk_format(u32 nv_format) {
     }
 }
 
+// SET_COLOR_CLEAR_VALUE as the target's colour format reads it. The 16-bit formats take their fields from the low
+// half: R5G6B5's 5-6-5, X1R5G5B5's 5-5-5. The 32-bit ones take R G B from bits 23-0. The alpha follows the format's
+// name: the Z variants of the X formats write their unused bits as zero, the O variants as one, X1A7 keeps seven
+// bits of the value's alpha below that bit, and only A8R8G8B8 takes all eight. B8 and G8B8 are read as 8888.
+void clear_color_rgba(u32 nv_format, u32 c, float rgba[4]) {
+    auto unorm = [](u32 v, u32 max) { return static_cast<float>(v) / static_cast<float>(max); };
+    switch (nv_format) {
+        case 1: case 2:
+            rgba[0] = unorm((c >> 10) & 31u, 31);
+            rgba[1] = unorm((c >> 5) & 31u, 31);
+            rgba[2] = unorm(c & 31u, 31);
+            break;
+        case 3:
+            rgba[0] = unorm((c >> 11) & 31u, 31);
+            rgba[1] = unorm((c >> 5) & 63u, 63);
+            rgba[2] = unorm(c & 31u, 31);
+            break;
+        default:
+            rgba[0] = unorm((c >> 16) & 0xFFu, 255);
+            rgba[1] = unorm((c >> 8) & 0xFFu, 255);
+            rgba[2] = unorm(c & 0xFFu, 255);
+            break;
+    }
+    switch (nv_format) {
+        case 1: case 4: rgba[3] = 0.0f; break;
+        case 6: rgba[3] = unorm((c >> 24) & 0x7Fu, 255); break;
+        case 7: rgba[3] = unorm(0x80u | ((c >> 24) & 0x7Fu), 255); break;
+        case 8: case 9: case 10: rgba[3] = unorm(c >> 24, 255); break;
+        default: rgba[3] = 1.0f; break;
+    }
+}
+
 VkBlendFactor blend_factor(u32 gl) {
     switch (gl) {
         case 0x0000: return VK_BLEND_FACTOR_ZERO;
@@ -148,6 +180,9 @@ VulkanRenderer::~VulkanRenderer() {
     for (auto& [k, m] : vs_cache_) f.vkDestroyShaderModule(dev_.device(), m, nullptr);
     for (auto& [k, m] : fs_cache_) f.vkDestroyShaderModule(dev_.device(), m, nullptr);
     for (auto& [k, p] : pipelines_) f.vkDestroyPipeline(dev_.device(), p, nullptr);
+    for (auto& [k, p] : clear_pipelines_) f.vkDestroyPipeline(dev_.device(), p, nullptr);
+    if (clear_vs_) f.vkDestroyShaderModule(dev_.device(), clear_vs_, nullptr);
+    if (clear_fs_) f.vkDestroyShaderModule(dev_.device(), clear_fs_, nullptr);
     for (auto& [k, t] : textures_) dev_.destroy_image(t->image);
     for (auto& [k, s] : samplers_) f.vkDestroySampler(dev_.device(), s, nullptr);
     if (dummy_sampler_) f.vkDestroySampler(dev_.device(), dummy_sampler_, nullptr);
@@ -1134,14 +1169,15 @@ void VulkanRenderer::clear(const KelvinState& s, u32 bits) {
     }
     x1 = std::min(x1, t->width - 1);
     y1 = std::min(y1, t->height - 1);
-    if (bits & 0xF0u) {
-        const u32 c = s.clear_color();
+    float color[4];
+    clear_color_rgba(t->color_format, s.clear_color(), color);
+    // CLEAR_SURFACE bits 4-7 select R, G, B and A. All four is an attachment clear; fewer is a full-screen
+    // triangle that writes only those channels (an attachment clear ignores the write mask).
+    const u32 channels = (bits >> 4) & 0xFu;
+    if (channels == 0xFu) {
         att[n].aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
         att[n].colorAttachment = 0;
-        att[n].clearValue.color.float32[0] = static_cast<float>((c >> 16) & 0xFFu) / 255.0f;
-        att[n].clearValue.color.float32[1] = static_cast<float>((c >> 8) & 0xFFu) / 255.0f;
-        att[n].clearValue.color.float32[2] = static_cast<float>(c & 0xFFu) / 255.0f;
-        att[n].clearValue.color.float32[3] = static_cast<float>(c >> 24) / 255.0f;
+        std::memcpy(att[n].clearValue.color.float32, color, sizeof color);
         ++n;
     }
     if (bits & 3u) {
@@ -1153,11 +1189,110 @@ void VulkanRenderer::clear(const KelvinState& s, u32 bits) {
             ++n;
         }
     }
-    if (n == 0) return;
     VkClearRect rect{};
     rect.rect = {{static_cast<i32>(x0), static_cast<i32>(y0)}, {x1 - x0 + 1, y1 - y0 + 1}};
     rect.layerCount = 1;
-    fn_->vkCmdClearAttachments(cb_, n, att, 1, &rect);
+    if (n) fn_->vkCmdClearAttachments(cb_, n, att, 1, &rect);
+    if (channels != 0 && channels != 0xFu) {
+        const VkColorComponentFlags mask = ((channels & 1u) ? static_cast<u32>(VK_COLOR_COMPONENT_R_BIT) : 0u) |
+                                           ((channels & 2u) ? static_cast<u32>(VK_COLOR_COMPONENT_G_BIT) : 0u) |
+                                           ((channels & 4u) ? static_cast<u32>(VK_COLOR_COMPONENT_B_BIT) : 0u) |
+                                           ((channels & 8u) ? static_cast<u32>(VK_COLOR_COMPONENT_A_BIT) : 0u);
+        std::string error;
+        VkPipeline p = clear_pipeline(t->pass, mask, error);
+        if (!p) {
+            note(error);
+            return;
+        }
+        fn_->vkCmdBindPipeline(cb_, VK_PIPELINE_BIND_POINT_GRAPHICS, p);
+        VkViewport viewport{0.0f, 0.0f, static_cast<float>(t->width), static_cast<float>(t->height), 0.0f, 1.0f};
+        fn_->vkCmdSetViewport(cb_, 0, 1, &viewport);
+        fn_->vkCmdSetScissor(cb_, 0, 1, &rect.rect);
+        fn_->vkCmdSetBlendConstants(cb_, color);
+        fn_->vkCmdDraw(cb_, 3, 1, 0, 0);
+    }
+}
+
+VkPipeline VulkanRenderer::clear_pipeline(VkRenderPass pass, VkColorComponentFlags mask, std::string& error) {
+    const u64 key = (reinterpret_cast<u64>(pass) << 4) ^ mask;
+    if (auto it = clear_pipelines_.find(key); it != clear_pipelines_.end()) return it->second;
+    if (!clear_vs_) {
+        // A triangle over the whole viewport, and a fragment of 1.0 that the blend scales by the clear colour.
+        const CompiledShader vs = compile_glsl(ShaderStage::Vertex,
+                                               "#version 450\n"
+                                               "void main() {\n"
+                                               "    vec2 p = vec2((gl_VertexIndex << 1) & 2, gl_VertexIndex & 2);\n"
+                                               "    gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);\n"
+                                               "}\n",
+                                               "clear-vs");
+        const CompiledShader fs = compile_glsl(ShaderStage::Fragment,
+                                               "#version 450\n"
+                                               "layout(location = 0) out vec4 frag_color;\n"
+                                               "void main() { frag_color = vec4(1.0); }\n",
+                                               "clear-fs");
+        if (!vs.ok() || !fs.ok()) {
+            error = "clear shaders: " + vs.log + fs.log;
+            return VK_NULL_HANDLE;
+        }
+        clear_vs_ = module(vs.spirv);
+        clear_fs_ = module(fs.spirv);
+    }
+    VkPipelineShaderStageCreateInfo stages[2]{};
+    stages[0].sType = stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+    stages[0].module = clear_vs_;
+    stages[0].pName = "main";
+    stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+    stages[1].module = clear_fs_;
+    stages[1].pName = "main";
+    VkPipelineVertexInputStateCreateInfo vi{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+    ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    VkPipelineViewportStateCreateInfo vp{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+    vp.viewportCount = 1;
+    vp.scissorCount = 1;
+    VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+    rs.polygonMode = VK_POLYGON_MODE_FILL;
+    rs.lineWidth = 1.0f;
+    VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    VkPipelineDepthStencilStateCreateInfo ds{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+    // The colour is the blend constant times one: exact in every unsigned normalised format.
+    VkPipelineColorBlendAttachmentState cb{};
+    cb.blendEnable = VK_TRUE;
+    cb.srcColorBlendFactor = VK_BLEND_FACTOR_CONSTANT_COLOR;
+    cb.srcAlphaBlendFactor = VK_BLEND_FACTOR_CONSTANT_ALPHA;
+    cb.dstColorBlendFactor = cb.dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
+    cb.colorBlendOp = cb.alphaBlendOp = VK_BLEND_OP_ADD;
+    cb.colorWriteMask = mask;
+    VkPipelineColorBlendStateCreateInfo blend{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+    blend.attachmentCount = 1;
+    blend.pAttachments = &cb;
+    const VkDynamicState dynamics[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_BLEND_CONSTANTS};
+    VkPipelineDynamicStateCreateInfo dyn{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+    dyn.dynamicStateCount = 3;
+    dyn.pDynamicStates = dynamics;
+    VkGraphicsPipelineCreateInfo gpi{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+    gpi.stageCount = 2;
+    gpi.pStages = stages;
+    gpi.pVertexInputState = &vi;
+    gpi.pInputAssemblyState = &ia;
+    gpi.pViewportState = &vp;
+    gpi.pRasterizationState = &rs;
+    gpi.pMultisampleState = &ms;
+    gpi.pDepthStencilState = &ds;
+    gpi.pColorBlendState = &blend;
+    gpi.pDynamicState = &dyn;
+    gpi.layout = pipeline_layout_;
+    gpi.renderPass = pass;
+    VkPipeline p = VK_NULL_HANDLE;
+    if (VkResult r = fn_->vkCreateGraphicsPipelines(dev_.device(), VK_NULL_HANDLE, 1, &gpi, nullptr, &p); r != VK_SUCCESS) {
+        error = std::format("clear pipeline: vkCreateGraphicsPipelines: {}", vk::result_name(r));
+        return VK_NULL_HANDLE;
+    }
+    ++stats_.pipelines;
+    clear_pipelines_[key] = p;
+    return p;
 }
 
 void VulkanRenderer::draw(const KelvinState& s, const DrawBatch& batch) {
