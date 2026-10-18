@@ -53,6 +53,7 @@ void print_usage() {
         "  --snapshots DIR    with --window: save what the window shows as DIR/shot-SSS.bmp every 2 seconds\n"
         "  --luma-log FILE    write the scanout's guest time and mean luma (BT.601, 0-255) at every vblank\n"
         "  --scanout-pngs DIR save the scanout as DIR/scan-MMMMMM.png (guest milliseconds) every 15th vblank\n"
+        "  --press B@F-T     hold button B on pad 1 from vblank F to vblank T (a b x y black white lt rt start back up down left right)\n"
         "  --cpu kvm|p6       the CPU: the hardware-virtualized fast mode (default) or our cycle-counted interpreter\n"
         "  --oracle           with --cpu p6: check every instruction against a KVM vCPU and report divergences\n"
         "  --version, --help\n");
@@ -75,10 +76,25 @@ std::string ms(std::optional<mv::Cycles> c) {
 
 }  // namespace
 
+// --press: a button held over a range of vblanks. Buttons 0-7 are the analog ones (PadState::Analog), 8 and up the
+// digital bits.
+struct Press {
+    int button;
+    unsigned long long from, to;
+};
+int press_button(const std::string& name) {
+    static const std::pair<const char*, int> kNames[] = {{"a", 0}, {"b", 1}, {"x", 2}, {"y", 3}, {"black", 4}, {"white", 5}, {"lt", 6}, {"rt", 7},
+                                                         {"up", 8}, {"down", 9}, {"left", 10}, {"right", 11}, {"start", 12}, {"back", 13}};
+    for (const auto& [n, b] : kNames)
+        if (name == n) return b;
+    return -1;
+}
+
 int main(int argc, char** argv) {
     mv::MachineConfig cfg;
     double seconds = 5.0;
     std::string until;
+    std::vector<Press> presses;
     std::FILE* trace_file = nullptr;
     std::string dump_ram;
     bool want_window = false;
@@ -144,6 +160,15 @@ int main(int argc, char** argv) {
             mv::trace::set_sink(trace_file);
         } else if (a == "--dump-ram") {
             dump_ram = need("--dump-ram");
+        } else if (a == "--press") {
+            const std::string spec = need("--press");
+            const auto at = spec.find('@'), dash = spec.find('-', at == std::string::npos ? 0 : at);
+            const int b = at == std::string::npos ? -1 : press_button(spec.substr(0, at));
+            if (b < 0 || dash == std::string::npos) {
+                std::fprintf(stderr, "midway-verdant: bad --press %s\n", spec.c_str());
+                return 2;
+            }
+            presses.push_back({b, std::strtoull(spec.c_str() + at + 1, nullptr, 10), std::strtoull(spec.c_str() + dash + 1, nullptr, 10)});
         } else if (a == "--capture") {
             cfg.capture_path = need("--capture");
         } else if (a == "--watch") {
@@ -233,13 +258,25 @@ int main(int argc, char** argv) {
         return 2;
     }
 
-    if (luma_log || !scanout_png_dir.empty()) {
+    if (luma_log || !scanout_png_dir.empty() || !presses.empty()) {
         // Instruments on the scanout at every vblank, in guest time: the picture's mean luma (every fourth pixel of
         // every fourth line) to line the boot animation up with a recording of the real console, and a picture of
         // every fifteenth frame for looking at what a headless run showed.
         if (!scanout_png_dir.empty()) std::filesystem::create_directories(scanout_png_dir);
-        machine.nv2a().set_vblank_hook([&machine, luma_log, scanout_png_dir](mv::Cycles now) {
+        machine.nv2a().set_vblank_hook([&machine, luma_log, scanout_png_dir, presses](mv::Cycles now) {
             mv::Nv2aStub& gpu = machine.nv2a();
+            if (!presses.empty()) {
+                // Scripted input: the buttons held at this vblank, on pad 1.
+                mv::usb::PadState s;
+                const mv::u64 v = gpu.vblanks();
+                for (const Press& p : presses)
+                    if (v >= p.from && v <= p.to) {
+                        if (p.button < 8) s.analog[static_cast<std::size_t>(p.button)] = 255;
+                        else s.buttons = static_cast<mv::u16>(s.buttons | (1u << (p.button - 8)));
+                    }
+                machine.pad(0).set_state(s);
+            }
+            if (!luma_log && scanout_png_dir.empty()) return;
             const mv::u32 start = gpu.framebuffer_start();
             const mv::u32 w = gpu.scanout_programmed() ? gpu.scanout_width() : 640u;
             const mv::u32 h = gpu.scanout_programmed() ? gpu.scanout_height() : 480u;
