@@ -53,6 +53,7 @@ add_library(mvcore STATIC
   apu/apu.cpp
   apu/setup_engine.cpp
   aci/aci.cpp
+  mcpx/nvnet.cpp
   nv2a/shaders/glsl_compiler.cpp
   nv2a/vulkan/vk_loader.cpp
   nv2a/vulkan/vk_device.cpp

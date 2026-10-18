@@ -41,7 +41,8 @@ Machine::Machine(const MachineConfig& config)
       aci_(bus_, sched_, [this](bool level) { pic_.set_irq(6, level); }),
       usb0_("ohci0", bus_, sched_, 1, [this](bool level) { pic_.set_irq(1, level); }),
       usb1_("ohci1", bus_, sched_, 9, [this](bool level) { pic_.set_irq(9, level); }),
-      ide_(bus_, sched_, [this](bool level) { pic_.set_irq(14, level); }) {
+      ide_(bus_, sched_, [this](bool level) { pic_.set_irq(14, level); }),
+      nvnet_(bus_, [this](bool level) { pic_.set_irq(4, level); }) {
     trace::set_clock_source(&trace_now_);
     smc_.set_av_pack(config.av_pack);
     smc_.set_scratch(config.smc_scratch);
@@ -69,10 +70,7 @@ Machine::Machine(const MachineConfig& config)
     usb0_.attach(usb::FrontPanel::kRootPort, &front_panel_.hub);
     for (unsigned i = 0; i < std::min(config.pads, 4u); ++i)
         front_panel_.hub.attach(usb::FrontPanel::kHubPortOfFrontPort[i], &pads_[i].hub);
-    PciDevice* nic = placeholder({0, 4, 0}, "nvnet", 0x01C3, 0x020000, 0xB1);
-    nic->define_bar(0, PciDevice::BarKind::Memory, 1024);
-    nic->define_bar(1, PciDevice::BarKind::Io, 16);
-    nic->set_cfg8(0x3C, 4);
+    pci_.add({0, 4, 0}, nvnet_);
     PciDevice* bridge = placeholder({0, 8, 0}, "pci-bridge", 0x01B8, 0x060400, 0xB1, 1);
     bridge->set_cfg8(0x19, 2);  // secondary bus
     bridge->set_cfg8(0x1A, 2);
@@ -357,6 +355,7 @@ void Machine::perform_reset(std::unique_lock<std::mutex>& lk) {
     usb0_.reset();
     usb1_.reset();
     ide_.reset();
+    nvnet_.reset();
     milestones_ = {};
     cpu_->reset();
     pace_wall_ = std::chrono::steady_clock::now();

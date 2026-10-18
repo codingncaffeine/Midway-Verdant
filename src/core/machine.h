@@ -26,6 +26,7 @@
 #include "nv2a/capture.h"
 #include "nv2a/nv2a_stub.h"
 #include "aci/aci.h"
+#include "mcpx/nvnet.h"
 #include "apu/apu.h"
 #include "pci/pci.h"
 #include "smbus/smbus.h"
@@ -231,6 +232,7 @@ private:
     usb::FrontPanel front_panel_;
     std::array<usb::XboxPad, 4> pads_;
     IdeController ide_;
+    NvNet nvnet_;
     DiskImage hdd_image_;
     AtaDisk* hdd_{nullptr};
     std::vector<std::unique_ptr<PciDevice>> placeholders_;
