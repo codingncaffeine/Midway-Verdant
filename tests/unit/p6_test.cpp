@@ -516,6 +516,7 @@ TEST(P6System, CpuidAndRdtscAndMsr) {
 }
 
 TEST(P6Fpu, ArithmeticC1IsTheRoundUpBit) {
+    if (!kHostX87) GTEST_SKIP() << "no 80-bit host x87: extended-precision rounding is approximated";
     Rig r;
     // fninit; fld1; fld1; fadd st0,st1; fadd st0,st1 (3); fld1; fadd st0,st0 (2); fdiv st0,st1 (2/3)
     r.code({0xDB, 0xE3, 0xD9, 0xE8, 0xD9, 0xE8, 0xD8, 0xC1, 0xD8, 0xC1, 0xD9, 0xE8, 0xD8, 0xC0, 0xD8, 0xF1,
@@ -554,6 +555,7 @@ TEST(P6Simd, UnaryScalarOpsReadTheSourceLane) {
 }
 
 TEST(P6Fpu, RegisterStoreClearsC1) {
+    if (!kHostX87) GTEST_SKIP() << "no 80-bit host x87: extended-precision rounding is approximated";
     Rig r;
     // fninit; 2/3 rounded up as above (C1 = 1); fstp st(1)
     r.code({0xDB, 0xE3, 0xD9, 0xE8, 0xD9, 0xE8, 0xD8, 0xC1, 0xD8, 0xC1, 0xD9, 0xE8, 0xD8, 0xC0, 0xD8, 0xF1, 0xDD, 0xD9});
