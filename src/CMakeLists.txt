@@ -90,3 +90,16 @@ target_link_libraries(midway-verdant PRIVATE mvcore SDL3::SDL3)
 # mv-pbcap: the pushbuffer capture reader (summaries and dumps of what --capture wrote).
 add_executable(mv-pbcap tools/mv-pbcap.cpp)
 target_link_libraries(mv-pbcap PRIVATE mvcore)
+
+# midway_verdant_libretro: the core for libretro frontends (Emutastic, RetroArch). No SDL: the frontend owns the
+# window, the audio device and the controllers.
+add_library(midway_verdant_libretro SHARED libretro/libretro_core.cpp)
+target_link_libraries(midway_verdant_libretro PRIVATE mvcore)
+set_target_properties(midway_verdant_libretro PROPERTIES PREFIX "" CXX_VISIBILITY_PRESET hidden)
+target_compile_definitions(midway_verdant_libretro PRIVATE RETRO_IMPORT_SYMBOLS=0)
+
+# mv-retro-host: a headless libretro frontend that drives the core frame by frame for tests (POSIX dlopen).
+if(NOT WIN32)
+  add_executable(mv-retro-host tools/mv-retro-host.cpp)
+  target_link_libraries(mv-retro-host PRIVATE mvcore ${CMAKE_DL_LIBS})
+endif()

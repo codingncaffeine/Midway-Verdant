@@ -327,9 +327,23 @@ void Machine::check_memory_milestones() {
 }
 
 Machine::StopReason Machine::run(std::chrono::nanoseconds host_duration, std::function<bool(Machine&)> until) {
+    start();
+    const StopReason reason = pump(start_ + host_duration, until);
+    finish();
+    return reason;
+}
+
+void Machine::start() {
     start_ = std::chrono::steady_clock::now();
-    const auto deadline = start_ + host_duration;
     cpu_->start();
+}
+
+void Machine::finish() {
+    cpu_->stop();
+    cpu_->join();
+}
+
+Machine::StopReason Machine::pump(std::chrono::steady_clock::time_point deadline, const std::function<bool(Machine&)>& until) {
     StopReason reason = StopReason::Duration;
     for (;;) {
         std::unique_lock lk(lock_);
@@ -375,8 +389,6 @@ Machine::StopReason Machine::run(std::chrono::nanoseconds host_duration, std::fu
             if (pic_.intr_asserted()) cpu_->kick();
         }
     }
-    cpu_->stop();
-    cpu_->join();
     return reason;
 }
 

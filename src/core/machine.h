@@ -90,6 +90,12 @@ public:
     // (checked on every timer tick) or the CPU stops. The caller's thread becomes the io thread.
     enum class StopReason { Duration, Condition, CpuStopped, PowerOff };
     StopReason run(std::chrono::nanoseconds host_duration, std::function<bool(Machine&)> until = {});
+    // The same in steps, for a host that drives the machine frame by frame (the libretro core): start the CPU,
+    // pump the io thread's work until `until` holds or the wall clock reaches `deadline` (the CPU keeps running
+    // between pumps), and finish when done.
+    void start();
+    StopReason pump(std::chrono::steady_clock::time_point deadline, const std::function<bool(Machine&)>& until);
+    void finish();
 
     Bus& bus() { return bus_; }
     Scheduler& scheduler() { return sched_; }
