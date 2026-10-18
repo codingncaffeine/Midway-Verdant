@@ -1,4 +1,5 @@
 #pragma once
+#include <algorithm>
 #include <array>
 #include <memory>
 #include <optional>
@@ -155,7 +156,14 @@ private:
     Scheduler& sched_;
     std::function<void(bool)> irq_;
     u32 mapped_at_{0};
-    std::unordered_map<u32, u32> regs_;
+    // The 16 MiB register window as a flat array of words (indexed by byte offset), PRAMIN included: every method,
+    // handle lookup and register access goes through it.
+    struct RegisterFile {
+        std::vector<u32> words = std::vector<u32>(kMmioSize / 4);
+        u32& operator[](u32 offset) { return words[(offset & (kMmioSize - 1)) >> 2]; }
+        u32 operator[](u32 offset) const { return words[(offset & (kMmioSize - 1)) >> 2]; }
+        void clear() { std::fill(words.begin(), words.end(), 0u); }
+    } regs_;
     std::array<u8, 256> crtc_{};
     u8 crtc_index_{0};
     std::array<u8, 768> dac_{};

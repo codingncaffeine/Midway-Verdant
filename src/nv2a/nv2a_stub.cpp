@@ -155,10 +155,7 @@ void Nv2aStub::on_bar_changed(int index, u32 old_base, u32 new_base) {
     }
 }
 
-u32 Nv2aStub::reg(u32 offset) const {
-    auto it = regs_.find(offset & ~3u);
-    return it == regs_.end() ? 0 : it->second;
-}
+u32 Nv2aStub::reg(u32 offset) const { return regs_[offset]; }
 
 u32 Nv2aStub::lookup_handle(u32 handle) const {
     // RAMHT: base and size from PFIFO_RAMHT; the hash folds the handle in slices of the table's index width
