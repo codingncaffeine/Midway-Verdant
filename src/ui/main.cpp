@@ -5,14 +5,17 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <format>
 #include <functional>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include "core/clock.h"
 #include "core/machine.h"
 #include "core/version.h"
+#include "debug/png.h"
 #include "debug/trace.h"
 #include "nv2a/vulkan/vk_renderer.h"
 #include "ui/window.h"
@@ -43,6 +46,7 @@ void print_usage() {
         "  --gpu              render the console's graphics live on the host's Vulkan device (frames land in guest RAM)\n"
         "  --snapshots DIR    with --window: save what the window shows as DIR/shot-SSS.bmp every 2 seconds\n"
         "  --luma-log FILE    write the scanout's guest time and mean luma (BT.601, 0-255) at every vblank\n"
+        "  --scanout-pngs DIR save the scanout as DIR/scan-MMMMMM.png (guest milliseconds) every 15th vblank\n"
         "  --cpu kvm|p6       the CPU: the hardware-virtualized fast mode (default) or our cycle-counted interpreter\n"
         "  --oracle           with --cpu p6: check every instruction against a KVM vCPU and report divergences\n"
         "  --version, --help\n");
@@ -74,6 +78,7 @@ int main(int argc, char** argv) {
     bool want_window = false;
     std::string snapshot_dir;
     std::FILE* luma_log = nullptr;
+    std::string scanout_png_dir;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto need = [&](const char* what) -> const char* {
@@ -147,6 +152,8 @@ int main(int argc, char** argv) {
             want_window = true;
         } else if (a == "--gpu") {
             cfg.gpu = true;
+        } else if (a == "--scanout-pngs") {
+            scanout_png_dir = need("--scanout-pngs");
         } else if (a == "--luma-log") {
             luma_log = std::fopen(need("--luma-log"), "w");
             if (!luma_log) {
@@ -188,10 +195,12 @@ int main(int argc, char** argv) {
         return 2;
     }
 
-    if (luma_log) {
-        // The picture's brightness over guest time, to line the boot animation up with a recording of the real
-        // console: every fourth pixel of every fourth line of the frame buffer the scanout shows.
-        machine.nv2a().set_vblank_hook([&machine, luma_log](mv::Cycles now) {
+    if (luma_log || !scanout_png_dir.empty()) {
+        // Instruments on the scanout at every vblank, in guest time: the picture's mean luma (every fourth pixel of
+        // every fourth line) to line the boot animation up with a recording of the real console, and a picture of
+        // every fifteenth frame for looking at what a headless run showed.
+        if (!scanout_png_dir.empty()) std::filesystem::create_directories(scanout_png_dir);
+        machine.nv2a().set_vblank_hook([&machine, luma_log, scanout_png_dir](mv::Cycles now) {
             mv::Nv2aStub& gpu = machine.nv2a();
             const mv::u32 start = gpu.framebuffer_start();
             const mv::u32 w = gpu.scanout_programmed() ? gpu.scanout_width() : 640u;
@@ -199,17 +208,35 @@ int main(int argc, char** argv) {
             const mv::u32 pitch = gpu.scanout_programmed() ? gpu.scanout_pitch() : 640u * 4u;
             const double t = static_cast<double>(now) / mv::clk::kCpuHz;
             if (start == 0 || w < 64 || h < 64 || pitch < w * 4 || static_cast<mv::u64>(start) + static_cast<mv::u64>(pitch) * h > machine.bus().ram_size()) {
-                std::fprintf(luma_log, "%.4f -\n", t);
+                if (luma_log) std::fprintf(luma_log, "%.4f - %08x\n", t, start);
                 return;
             }
             const mv::u8* fb = machine.bus().ram() + start;
-            double sum = 0;
-            mv::u64 n = 0;
-            for (mv::u32 y = 0; y < h; y += 4) {
-                const mv::u8* row = fb + static_cast<std::size_t>(y) * pitch;
-                for (mv::u32 x = 0; x < w; x += 4, ++n) sum += 0.114 * row[x * 4] + 0.587 * row[x * 4 + 1] + 0.299 * row[x * 4 + 2];
+            if (luma_log) {
+                double sum = 0;
+                mv::u64 n = 0;
+                for (mv::u32 y = 0; y < h; y += 4) {
+                    const mv::u8* row = fb + static_cast<std::size_t>(y) * pitch;
+                    for (mv::u32 x = 0; x < w; x += 4, ++n) sum += 0.114 * row[x * 4] + 0.587 * row[x * 4 + 1] + 0.299 * row[x * 4 + 2];
+                }
+                std::fprintf(luma_log, "%.4f %.1f %08x\n", t, sum / static_cast<double>(n), start);
             }
-            std::fprintf(luma_log, "%.4f %.1f\n", t, sum / static_cast<double>(n));
+            if (!scanout_png_dir.empty() && gpu.vblanks() % 15 == 0) {
+                std::vector<mv::u8> rgba(static_cast<std::size_t>(w) * h * 4);
+                for (mv::u32 y = 0; y < h; ++y) {
+                    const mv::u8* row = fb + static_cast<std::size_t>(y) * pitch;
+                    mv::u8* out = rgba.data() + static_cast<std::size_t>(y) * w * 4;
+                    for (mv::u32 x = 0; x < w; ++x) {
+                        out[x * 4] = row[x * 4 + 2];
+                        out[x * 4 + 1] = row[x * 4 + 1];
+                        out[x * 4 + 2] = row[x * 4];
+                        out[x * 4 + 3] = 255;
+                    }
+                }
+                std::string png_error;
+                const auto path = std::filesystem::path(scanout_png_dir) / std::format("scan-{:06}.png", static_cast<unsigned>(t * 1000.0));
+                if (!mv::png::write(path, w, h, rgba.data(), w * 4, png_error)) std::fprintf(stderr, "midway-verdant: %s\n", png_error.c_str());
+            }
         });
     }
     const auto t0 = std::chrono::steady_clock::now();

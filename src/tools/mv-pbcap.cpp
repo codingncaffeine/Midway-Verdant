@@ -350,6 +350,17 @@ struct TextureDumpSink : mv::pgraph::RenderSink {
             std::printf("texture %u: format %02x at %08x: %ux%u levels %u faces %u; mean r %.3f g %.3f b %.3f a %.3f; %.1f%% texels with alpha\n", t,
                         ts.color_format(), phys, d.width, d.height, d.levels, d.faces, sum[0] / npx / 255.0, sum[1] / npx / 255.0, sum[2] / npx / 255.0,
                         sum[3] / npx / 255.0, 100.0 * opaque / npx);
+            // A cube map: every face's mean (the line above is face 0's), each face's picture beside the first.
+            for (mv::u32 face = 1; face < d.faces; ++face) {
+                const auto& fimg = d.image(face, 0);
+                double fs[3]{};
+                for (mv::u32 i = 0; i < npx; ++i)
+                    for (int c = 0; c < 3; ++c) fs[c] += fimg[i * 4 + static_cast<mv::u32>(c)];
+                std::printf("   face %u: mean r %.3f g %.3f b %.3f\n", face, fs[0] / npx / 255.0, fs[1] / npx / 255.0, fs[2] / npx / 255.0);
+                std::string face_error;
+                const auto face_path = dir / std::format("f{:02}_d{:03}_t{}_{:08x}_face{}.png", want_frame, want_draw, t, phys, face);
+                if (!mv::png::write(face_path, d.width, d.height, fimg.data(), d.width * 4, face_error)) std::fprintf(stderr, "mv-pbcap: %s\n", face_error.c_str());
+            }
             std::string error;
             const auto path = dir / std::format("f{:02}_d{:03}_t{}_{:08x}.png", want_frame, want_draw, t, phys);
             if (!mv::png::write(path, d.width, d.height, img.data(), d.width * 4, error)) std::fprintf(stderr, "mv-pbcap: %s\n", error.c_str());
@@ -401,6 +412,7 @@ struct RenderObserver : mv::pgraph::Replay::Observer {
     const mv::pgraph::Replay* replay{nullptr};
     mv::u32 scanout{0};
     mv::u32 first_png{0};  // frames before this render but write no picture (a long capture's late frames)
+    mv::u32 stride{1};     // from first_png on, a picture every stride-th frame
     void register_write(mv::u32 offset, mv::u32 value) override {
         if (offset == 0x600800) scanout = value;
     }
@@ -411,7 +423,7 @@ struct RenderObserver : mv::pgraph::Replay::Observer {
             std::printf("   surface %08x %ux%u %s format %x: %llu draws, %llu clears%s\n", s.phys, s.width, s.height, s.swizzled ? "swizzled" : "pitch",
                         s.color_format, static_cast<unsigned long long>(s.draws_this_frame), static_cast<unsigned long long>(s.clears_this_frame),
                         s.rendered_this_frame ? "" : " (untouched)");
-            if (!s.rendered_this_frame || index < first_png) continue;
+            if (!s.rendered_this_frame || index < first_png || (index - first_png) % stride != 0) continue;
             std::vector<mv::u8> rgba;
             if (!renderer->surface_rgba(s, rgba)) continue;
             const auto path = dir / std::format("frame{:02}_{:08x}.png", index, s.phys);
@@ -434,7 +446,7 @@ struct RenderObserver : mv::pgraph::Replay::Observer {
     }
 };
 
-int render(const char* path, const char* dir, mv::u32 frames, mv::u32 first_png) {
+int render(const char* path, const char* dir, mv::u32 frames, mv::u32 first_png, mv::u32 stride) {
     mv::vk::Device device;
     std::string error;
     if (!device.init(error)) {
@@ -458,6 +470,7 @@ int render(const char* path, const char* dir, mv::u32 frames, mv::u32 first_png)
     RenderObserver observer;
     observer.renderer = &renderer;
     observer.first_png = first_png;
+    observer.stride = stride;
     observer.dir = dir;
     observer.replay = &r;
     r.set_page_observer([&](mv::u32 first_page, mv::u32 count) { renderer.invalidate(first_page * 4096, count * 4096); });
@@ -473,7 +486,7 @@ int render(const char* path, const char* dir, mv::u32 frames, mv::u32 first_png)
 
 int main(int argc, char** argv) {
     if (argc < 3) {
-        std::fprintf(stderr, "usage: mv-pbcap summary|methods|replay FILE [FRAMES] | draws FILE FRAME | shaders FILE FRAME DRAW | render FILE DIR [FRAMES]\n");
+        std::fprintf(stderr, "usage: mv-pbcap summary|methods|replay FILE [FRAMES] | draws FILE FRAME | shaders FILE FRAME DRAW | render FILE DIR [FRAMES [FIRST_PNG [STRIDE]]]\n");
         return 2;
     }
     if (std::strcmp(argv[1], "draws") == 0 && argc >= 4) return draws(argv[2], static_cast<mv::u32>(std::atoi(argv[3])));
@@ -484,7 +497,8 @@ int main(int argc, char** argv) {
     if (std::strcmp(argv[1], "replay") == 0) return replay(argv[2], argc > 3 ? static_cast<mv::u32>(std::atoi(argv[3])) : 0u);
     if (std::strcmp(argv[1], "shaders") == 0 && argc >= 5) return shaders(argv[2], static_cast<mv::u32>(std::atoi(argv[3])), static_cast<mv::u32>(std::atoi(argv[4])));
     if (std::strcmp(argv[1], "render") == 0 && argc >= 4)
-        return render(argv[2], argv[3], argc > 4 ? static_cast<mv::u32>(std::atoi(argv[4])) : 0u, argc > 5 ? static_cast<mv::u32>(std::atoi(argv[5])) : 0u);
+        return render(argv[2], argv[3], argc > 4 ? static_cast<mv::u32>(std::atoi(argv[4])) : 0u, argc > 5 ? static_cast<mv::u32>(std::atoi(argv[5])) : 0u,
+                      argc > 6 ? std::max(1u, static_cast<mv::u32>(std::atoi(argv[6]))) : 1u);
     std::fprintf(stderr, "mv-pbcap: unknown command %s\n", argv[1]);
     return 2;
 }

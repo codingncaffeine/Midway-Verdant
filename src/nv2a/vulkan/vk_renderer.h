@@ -162,7 +162,7 @@ private:
     VkFormat depth24_{VK_FORMAT_D24_UNORM_S8_UINT};
     Stats stats_;
     // Debug overrides from MV_RENDER_DEBUG (comma separated): flat (white fragments), nodepth, nocull, noblend.
-    bool debug_flat_{false}, debug_nodepth_{false}, debug_nocull_{false}, debug_noblend_{false};
+    bool debug_flat_{false}, debug_nodepth_{false}, debug_nocull_{false}, debug_noblend_{false}, debug_shadow_pass_{false};
 };
 
 }  // namespace mv::pgraph

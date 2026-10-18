@@ -110,6 +110,7 @@ VulkanRenderer::VulkanRenderer(vk::Device& device, const HandleResolver& handles
         debug_nodepth_ = s.find("nodepth") != std::string::npos;
         debug_nocull_ = s.find("nocull") != std::string::npos;
         debug_noblend_ = s.find("noblend") != std::string::npos;
+        debug_shadow_pass_ = s.find("shadow1") != std::string::npos;
     }
 }
 
@@ -981,7 +982,8 @@ void VulkanRenderer::draw(const KelvinState& s, const DrawBatch& batch) {
         ++stats_.skipped;
         return;
     }
-    const psh::Key pkey = psh::key_from_state(s);
+    psh::Key pkey = psh::key_from_state(s);
+    if (debug_shadow_pass_) pkey.shadow_compare_func = 7;  // every shadow lookup lit
     std::array<psh::SamplerKind, 4> kinds{};
     VkShaderModule fs = fragment_shader(pkey, kinds, error);
     if (!fs) {
