@@ -190,7 +190,7 @@ void Cpu::ret_far(unsigned size, u32 pop_bytes) {
         const u16 new_ss = static_cast<u16>(mem_.read(linear(kSs, (sp + 3 * size + pop_bytes) & smask, size, Access::Read), size));
         if ((new_ss & 0xFFFC) == 0) raise_gp(0);
         const Descriptor sd = read_descriptor(new_ss);
-        if ((new_ss & 3) != rpl || sd.system() || !sd.writable() || sd.dpl() != rpl) raise_gp(new_ss & 0xFFFC);
+        if ((new_ss & 3u) != rpl || sd.system() || !sd.writable() || sd.dpl() != rpl) raise_gp(new_ss & 0xFFFC);
         if (!sd.present()) raise(kSS, new_ss & 0xFFFC);
         if (off > d.limit()) raise_gp(0);
         load_cs(sel, d);
@@ -261,7 +261,7 @@ void Cpu::iret(unsigned size) {
         const u16 new_ss = static_cast<u16>(mem_.read(linear(kSs, (sp + 4 * size) & smask, size, Access::Read), size));
         if ((new_ss & 0xFFFC) == 0) raise_gp(0);
         const Descriptor sd = read_descriptor(new_ss);
-        if ((new_ss & 3) != rpl || sd.system() || !sd.writable() || sd.dpl() != rpl) raise_gp(new_ss & 0xFFFC);
+        if ((new_ss & 3u) != rpl || sd.system() || !sd.writable() || sd.dpl() != rpl) raise_gp(new_ss & 0xFFFC);
         if (!sd.present()) raise(kSS, new_ss & 0xFFFC);
         load_cs(sel, d);
         st_.eip = off;
@@ -348,7 +348,7 @@ void Cpu::deliver(u8 vector, bool external, bool software, bool has_error, u32 e
         const u16 new_ss = static_cast<u16>(mem_.read(tr.base + sp_off + (tss32 ? 4 : 2), 2));
         if ((new_ss & 0xFFFC) == 0) raise(kTS, ext);
         const Descriptor sd = read_descriptor(new_ss, kTS);
-        if ((new_ss & 3) != d.dpl() || sd.system() || !sd.writable() || sd.dpl() != d.dpl()) raise(kTS, (new_ss & 0xFFFC) | ext);
+        if ((new_ss & 3u) != d.dpl() || sd.system() || !sd.writable() || sd.dpl() != d.dpl()) raise(kTS, (new_ss & 0xFFFC) | ext);
         if (!sd.present()) raise(kSS, (new_ss & 0xFFFC) | ext);
         const Segment old_ss = st_.seg[kSs];
         const u32 old_sp = st_.gpr[kEsp];
@@ -714,7 +714,7 @@ void Cpu::exec_system(const Insn& in) {
                     else if (in.op == Op::Verr) ok = d.readable();
                     else ok = d.writable();
                     if (ok && !(d.code() && d.conforming())) {
-                        if (d.dpl() < st_.cpl() || d.dpl() < (sel & 3)) ok = false;
+                        if (d.dpl() < st_.cpl() || d.dpl() < (sel & 3u)) ok = false;
                     }
                 }
             }
