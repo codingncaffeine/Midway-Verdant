@@ -468,6 +468,7 @@ int render(const char* path, const char* dir, mv::u32 frames, mv::u32 first_png,
     }
     mv::pgraph::Kelvin kelvin;
     kelvin.set_sink(&renderer);
+    kelvin.set_vertex_memory(&r, r.memory());
     RenderObserver observer;
     observer.renderer = &renderer;
     observer.first_png = first_png;

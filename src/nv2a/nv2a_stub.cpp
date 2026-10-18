@@ -39,6 +39,7 @@ Nv2aStub::Nv2aStub(Bus& bus, Scheduler& sched, std::function<void(bool)> irq)
     };
     schedule_vblank();
     for (u32 i = 0; i < 768; ++i) dac_[i] = static_cast<u8>(i / 3);  // the colour table powers up as the identity
+    kelvin_.set_vertex_memory(this, {bus_.ram(), static_cast<u32>(bus_.ram_size())});
     twod_ = std::make_unique<pgraph::TwoD>(bus_.ram(), bus_.ram_size(), *this);
     twod_->set_hooks([this](u32 phys, u32 len) { if (renderer_) renderer_->write_back_range(phys, len); },
                      [this](u32 phys, u32 len) { if (renderer_) renderer_->invalidate(phys, len); });
@@ -62,6 +63,7 @@ void Nv2aStub::reset() {
     report_handle_ = 0;
     kelvin_ = pgraph::Kelvin();
     kelvin_.set_sink(renderer_);
+    kelvin_.set_vertex_memory(this, {bus_.ram(), static_cast<u32>(bus_.ram_size())});
     update_irq();
 }
 

@@ -1260,7 +1260,7 @@ void VulkanRenderer::draw(const KelvinState& s, const DrawBatch& batch) {
         return;
     }
 
-    // Vertex data: every attribute as a vec4, disabled ones at their default.
+    // Vertex data: every attribute as a vec4; one without per-vertex data reads its constant value.
     t_part = std::chrono::steady_clock::now();
     VkDeviceSize vbytes = static_cast<VkDeviceSize>(v.count) * kVertexStride, voffset = 0;
     // The rings and the descriptor pool hold one batch of draws. A draw that no longer fits submits the batch so far
@@ -1279,12 +1279,8 @@ void VulkanRenderer::draw(const KelvinState& s, const DrawBatch& batch) {
     for (u32 n = 0; n < v.count; ++n) {
         for (u32 a = 0; a < kAttributes; ++a) {
             float* d = vdst + (static_cast<std::size_t>(n) * kAttributes + a) * 4;
-            if (v.enabled & (1u << a)) {
-                std::memcpy(d, &v.attribute[a][static_cast<std::size_t>(n) * 4], 16);
-            } else {
-                d[0] = d[1] = d[2] = 0.0f;
-                d[3] = 1.0f;
-            }
+            if (v.enabled & (1u << a)) std::memcpy(d, &v.attribute[a][static_cast<std::size_t>(n) * 4], 16);
+            else std::memcpy(d, v.constant[a].data(), 16);
         }
     }
     VkDeviceSize ioffset = 0;

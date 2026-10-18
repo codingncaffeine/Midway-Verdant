@@ -96,6 +96,7 @@ void Kelvin::begin_end(u32 value) {
     }
     in_begin_ = false;
     if (sink_ && !batch_.empty()) sink_->draw(state_, batch_);
+    if (!batch_.empty()) latch_current_values(state_, vertex_handles_, vertex_memory_, batch_);
     batch_ = DrawBatch{};
 }
 
@@ -322,10 +323,14 @@ bool fetch_vertices(const KelvinState& state, const HandleResolver& handles, con
     out.primitive = batch.primitive;
 
     if (batch.immediate_count) {
+        // An attribute no vertex of the batch set keeps the value it had before BEGIN for all of them.
         out.count = batch.immediate_count;
         out.enabled = static_cast<u16>(batch.immediate_mask | 1u);
         for (u32 a = 0; a < kAttributes; ++a) {
-            if (!(out.enabled & (1u << a))) continue;
+            if (!(out.enabled & (1u << a))) {
+                out.constant[a] = state.immediate[a];
+                continue;
+            }
             auto& dst = out.attribute[a];
             dst.resize(static_cast<std::size_t>(out.count) * 4);
             for (u32 v = 0; v < out.count; ++v)
@@ -349,7 +354,10 @@ bool fetch_vertices(const KelvinState& state, const HandleResolver& handles, con
         u32 offset = 0;
         for (u32 a = 0; a < kAttributes; ++a) {
             const VertexAttribute& fmt = state.attributes[a];
-            if (!fmt.size) continue;
+            if (!fmt.size) {
+                out.constant[a] = state.immediate[a];
+                continue;
+            }
             out.enabled = static_cast<u16>(out.enabled | (1u << a));
             auto& dst = out.attribute[a];
             dst.resize(static_cast<std::size_t>(out.count) * 4);
@@ -376,13 +384,32 @@ bool fetch_vertices(const KelvinState& state, const HandleResolver& handles, con
     const DmaObject dma_b = handles.resolve(state.dma_handle(mthd::kDmaVertexB));
     for (u32 a = 0; a < kAttributes; ++a) {
         const VertexAttribute& fmt = state.attributes[a];
-        if (!fmt.size) continue;
+        // A disabled attribute reads its current value for every vertex.
+        if (!fmt.size) {
+            out.constant[a] = state.immediate[a];
+            continue;
+        }
         const DmaObject& dma = fmt.dma_b ? dma_b : dma_a;
         if (!dma.valid) {
             out.error = std::format("attribute {} names an unresolved vertex DMA object", a);
             return false;
         }
-        const u32 stride = fmt.stride ? fmt.stride : fmt.bytes();
+        // A stride of 0 makes the attribute a constant: every vertex reads the array's first element.
+        if (fmt.stride == 0) {
+            if (fmt.offset + static_cast<u64>(fmt.bytes()) > static_cast<u64>(dma.limit) + 1) {
+                out.error = std::format("attribute {} runs past the vertex DMA object's limit", a);
+                return false;
+            }
+            const u64 at = static_cast<u64>(dma.base) + fmt.offset;
+            const u8* p = at + fmt.bytes() <= 0xFFFFFFFFull ? memory.at(static_cast<u32>(at), fmt.bytes()) : nullptr;
+            if (!p) {
+                out.error = std::format("attribute {} at {:08x} is outside RAM", a, at);
+                return false;
+            }
+            decode_attribute(fmt, p, out.constant[a].data());
+            continue;
+        }
+        const u32 stride = fmt.stride;
         const u64 first = static_cast<u64>(dma.base) + fmt.offset + static_cast<u64>(lo) * stride;
         const u64 span = static_cast<u64>(out.count - 1) * stride + fmt.bytes();
         if (fmt.offset + static_cast<u64>(lo) * stride + span > static_cast<u64>(dma.limit) + 1) {
@@ -405,6 +432,50 @@ bool fetch_vertices(const KelvinState& state, const HandleResolver& handles, con
         for (u32 v = 0; v < out.count; ++v) decode_attribute(fmt, p + static_cast<std::size_t>(v) * stride, &dst[static_cast<std::size_t>(v) * 4]);
     }
     return true;
+}
+
+void latch_current_values(KelvinState& state, const HandleResolver* handles, const MemoryView& memory, const DrawBatch& batch) {
+    if (batch.immediate_count) return;  // the immediate methods wrote the current values as they went
+    if (!batch.inline_words.empty()) {
+        // The last whole vertex of the interleaved data, laid out as fetch_vertices reads it.
+        u32 stride = 0;
+        for (const auto& a : state.attributes)
+            if (a.size) stride += (a.bytes() + 3) & ~3u;
+        const std::size_t bytes = batch.inline_words.size() * 4;
+        if (stride == 0 || bytes < stride) return;
+        const u8* last = reinterpret_cast<const u8*>(batch.inline_words.data()) + (bytes / stride - 1) * stride;
+        u32 offset = 0;
+        for (u32 a = 0; a < kAttributes; ++a) {
+            const VertexAttribute& fmt = state.attributes[a];
+            if (!fmt.size) continue;
+            float v[4];
+            decode_attribute(fmt, last + offset, v);
+            std::memcpy(state.immediate[a].data(), v, sizeof v);
+            offset += (fmt.bytes() + 3) & ~3u;
+        }
+        return;
+    }
+    if (!handles) return;
+    // The batch's last vertex as fetch_vertices orders them: the indices, then the DRAW_ARRAYS ranges.
+    u32 index;
+    if (!batch.ranges.empty()) index = batch.ranges.back().first + batch.ranges.back().second - 1;
+    else if (!batch.indices.empty()) index = batch.indices.back();
+    else return;
+    const DmaObject dma_a = handles->resolve(state.dma_handle(mthd::kDmaVertexA));
+    const DmaObject dma_b = handles->resolve(state.dma_handle(mthd::kDmaVertexB));
+    for (u32 a = 0; a < kAttributes; ++a) {
+        const VertexAttribute& fmt = state.attributes[a];
+        if (!fmt.size) continue;
+        const DmaObject& dma = fmt.dma_b ? dma_b : dma_a;
+        if (!dma.valid) continue;
+        const u64 rel = fmt.offset + static_cast<u64>(index) * fmt.stride;  // a stride of 0 reads the first element
+        if (rel + fmt.bytes() > static_cast<u64>(dma.limit) + 1 || dma.base + rel + fmt.bytes() > 0xFFFFFFFFull) continue;
+        const u8* p = memory.at(static_cast<u32>(dma.base + rel), fmt.bytes());
+        if (!p) continue;
+        float v[4];
+        decode_attribute(fmt, p, v);
+        std::memcpy(state.immediate[a].data(), v, sizeof v);
+    }
 }
 
 }  // namespace mv::pgraph

@@ -51,6 +51,12 @@ class Kelvin {
 public:
     Kelvin();
     void set_sink(RenderSink* sink) { sink_ = sink; }
+    // Where vertex arrays are read from, for the current values an array draw leaves behind (see
+    // latch_current_values); without it only immediate and inline vertices update them.
+    void set_vertex_memory(const HandleResolver* handles, MemoryView memory) {
+        vertex_handles_ = handles;
+        vertex_memory_ = memory;
+    }
     void method(u32 method, u32 value);
 
     const KelvinState& state() const { return state_; }
@@ -69,6 +75,8 @@ private:
     DrawBatch batch_;
     bool in_begin_{false};
     RenderSink* sink_{nullptr};
+    const HandleResolver* vertex_handles_{nullptr};
+    MemoryView vertex_memory_;
     u64 methods_{0};
     std::array<u64, 0x800> histogram_{};
 };
@@ -79,12 +87,21 @@ struct FetchedVertices {
     u32 count{0};
     u16 enabled{0};  // attributes with data
     std::array<std::vector<float>, kAttributes> attribute;  // count * 4 floats each, for enabled attributes
+    // The one value every vertex reads for each attribute that is not enabled: its current value, or the first
+    // element of an array with a stride of 0.
+    std::array<std::array<float, 4>, kAttributes> constant{};
     std::vector<u32> indices;  // into 0..count-1; empty = sequential
     std::string error;  // non-empty when memory could not be read; the batch is then unusable
 };
 
 bool fetch_vertices(const KelvinState& state, const HandleResolver& handles, const MemoryView& memory, const DrawBatch& batch,
                     FetchedVertices& out);
+
+// After an array or inline draw, each attribute the batch read from data takes the batch's last vertex as its
+// current value (an array with a stride of 0 its first element): a later draw with that attribute disabled, or an
+// immediate batch that does not set it, reads that value. Arrays need `handles`; without them only inline data
+// latches. Immediate batches already leave their values in the state.
+void latch_current_values(KelvinState& state, const HandleResolver* handles, const MemoryView& memory, const DrawBatch& batch);
 
 // Decodes one attribute element at `p` by its array format into x y z w (defaults 0 0 0 1).
 void decode_attribute(const VertexAttribute& a, const u8* p, float out[4]);

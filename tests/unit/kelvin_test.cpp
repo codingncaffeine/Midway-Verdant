@@ -256,3 +256,73 @@ TEST(Kelvin, ShortNamedSettersFillTheComponentsTheyLeaveOut) {
     k.method(mthd::kFogCoord, bits(3.0f));
     EXPECT_EQ(k.state().immediate[5], (std::array<float, 4>{3.0f, 3.0f, 3.0f, 3.0f})) << "attribute 5 is the fog coordinate, in every lane";
 }
+
+TEST(Kelvin, ConstantAttributesReadTheirOneValue) {
+    Kelvin k;
+    RecordingSink sink;
+    k.set_sink(&sink);
+    std::vector<u8> ram(0x2000, 0);
+    TableResolver handles;
+    handles.obj = {0, 0x1FFF, 0x3D, true};
+    const MemoryView memory{ram.data(), static_cast<u32>(ram.size())};
+    k.set_vertex_memory(&handles, memory);
+    for (u32 v = 0; v < 4; ++v) {
+        const float xyz[3] = {static_cast<float>(v), 0.0f, 0.0f};
+        std::memcpy(&ram[0x1000 + v * 12], xyz, 12);
+    }
+    const u8 colours[8] = {10, 20, 30, 40, 50, 60, 70, 80};  // the second element must never be read
+    std::memcpy(&ram[0x1800], colours, 8);
+    k.method(mthd::kDmaVertexA, 3);
+    k.method(mthd::kVertexDataArrayFormat + 0, (12u << 8) | (3u << 4) | 2u);
+    k.method(mthd::kVertexDataArrayOffset + 0, 0x1000);
+    k.method(mthd::kVertexDataArrayFormat + 12, (0u << 8) | (4u << 4) | 4u);  // diffuse: 4 OpenGL bytes, stride 0
+    k.method(mthd::kVertexDataArrayOffset + 12, 0x1800);
+    k.method(mthd::kVertexDataArrayFormat + 16, 2u);                           // specular: disabled
+    k.method(mthd::kSpecular4ub, 0xFF000080);  // its current value (A B G R from the top): red 0x80, alpha 1
+    k.method(mthd::kBeginEnd, 5);
+    k.method(mthd::kDrawArrays, (2u << 24) | 1u);  // vertices 1..3
+    k.method(mthd::kBeginEnd, 0);
+    ASSERT_EQ(sink.draws.size(), 1u);
+    FetchedVertices out;
+    ASSERT_TRUE(fetch_vertices(k.state(), handles, memory, sink.draws[0], out)) << out.error;
+    EXPECT_EQ(out.count, 3u);
+    EXPECT_EQ(out.enabled, 1u) << "the stride-0 and the disabled attribute carry no per-vertex data";
+    EXPECT_FLOAT_EQ(out.constant[3][0], 10.0f / 255.0f) << "a stride of 0 reads element 0 for every vertex";
+    EXPECT_FLOAT_EQ(out.constant[3][3], 40.0f / 255.0f);
+    EXPECT_FLOAT_EQ(out.constant[4][0], 128.0f / 255.0f) << "a disabled attribute reads its current value";
+    EXPECT_FLOAT_EQ(out.constant[4][3], 1.0f);
+    EXPECT_FLOAT_EQ(out.constant[5][3], 1.0f) << "an attribute never set reads (0, 0, 0, 1)";
+    EXPECT_FLOAT_EQ(k.state().immediate[0][0], 3.0f) << "the draw left its last vertex as the current position";
+    EXPECT_FLOAT_EQ(k.state().immediate[3][1], 20.0f / 255.0f) << "and the stride-0 element as the current diffuse";
+
+    // The next draw disables the diffuse array: it reads what the last draw left. An immediate batch that sets
+    // only positions reads the same.
+    k.method(mthd::kVertexDataArrayFormat + 12, 2u);
+    k.method(mthd::kVertexDataArrayFormat + 16, (12u << 8) | (3u << 4) | 2u);  // specular from the position array
+    k.method(mthd::kVertexDataArrayOffset + 16, 0x1000);
+    k.method(mthd::kBeginEnd, 5);
+    k.method(mthd::kArrayElement16, (2u << 16) | 0u);
+    k.method(mthd::kArrayElement32, 1);
+    k.method(mthd::kBeginEnd, 0);
+    ASSERT_EQ(sink.draws.size(), 2u);
+    ASSERT_TRUE(fetch_vertices(k.state(), handles, memory, sink.draws[1], out)) << out.error;
+    EXPECT_FLOAT_EQ(out.constant[3][2], 30.0f / 255.0f);
+    EXPECT_FLOAT_EQ(k.state().immediate[4][0], 1.0f) << "the last index (1), not the largest (2), is the last vertex";
+    k.method(mthd::kBeginEnd, 5);
+    for (u32 v = 0; v < 3; ++v)
+        for (u32 c = 0; c < 3; ++c) k.method(mthd::kVertex3f + 4 * c, bits(static_cast<float>(v)));
+    k.method(mthd::kBeginEnd, 0);
+    ASSERT_EQ(sink.draws.size(), 3u);
+    ASSERT_TRUE(fetch_vertices(k.state(), handles, memory, sink.draws[2], out)) << out.error;
+    EXPECT_EQ(out.enabled, 1u);
+    EXPECT_FLOAT_EQ(out.constant[3][0], 10.0f / 255.0f) << "an immediate batch keeps the colour set before it";
+    EXPECT_FLOAT_EQ(out.constant[4][0], 1.0f);
+
+    // Inline data latches too: its last vertex.
+    k.method(mthd::kVertexDataArrayFormat + 16, 2u);
+    k.method(mthd::kBeginEnd, 2);
+    for (float x : {7.0f, 8.0f})
+        for (float c : {x, 0.0f, 0.0f}) k.method(mthd::kInlineArray, bits(c));
+    k.method(mthd::kBeginEnd, 0);
+    EXPECT_FLOAT_EQ(k.state().immediate[0][0], 8.0f);
+}

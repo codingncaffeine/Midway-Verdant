@@ -141,7 +141,9 @@ struct KelvinState {
     u32 constant_load{0};  // constant slot the next SET_TRANSFORM_CONSTANT word goes to
     u32 constant_word{0};
     std::array<VertexAttribute, kAttributes> attributes{};
-    // The current value of each attribute for immediate-mode vertices (SET_VERTEX_DATA*), as floats.
+    // The current value of each attribute, as floats: the last immediate value written (SET_VERTEX_DATA* and the
+    // named setters), or what the last array draw left (latch_current_values). A disabled array attribute and an
+    // immediate vertex that does not set the attribute read it.
     std::array<std::array<float, 4>, kAttributes> immediate{};
 
     u32 reg(u32 method) const { return r[(method >> 2) & 0x7FFu]; }

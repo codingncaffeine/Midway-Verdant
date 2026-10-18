@@ -58,6 +58,43 @@ void load_passthrough_combiners(Kelvin& k) {
     k.method(mthd::kCombinerSpecFogCw1, (12u | 0x10u) << 8);              // G = r0.a
 }
 
+// A 64x64 linear target at 0x10000 (pitch 256) with a Z24S8 buffer at 0x20000, the pass-through program and
+// combiners, no depth test, no culling.
+void setup_target(Kelvin& k, u32 color_format = 8) {
+    k.method(mthd::kDmaColor, 9);
+    k.method(mthd::kDmaZeta, 10);
+    k.method(mthd::kDmaVertexA, 3);
+    k.method(mthd::kSurfaceFormat, 0x00000120 | color_format);
+    k.method(mthd::kSurfaceClipH, 64u << 16);
+    k.method(mthd::kSurfaceClipV, 64u << 16);
+    k.method(mthd::kSurfacePitch, (256u << 16) | 256u);
+    k.method(mthd::kSurfaceColorOffset, 0x10000);
+    k.method(mthd::kSurfaceZetaOffset, 0x20000);
+    load_passthrough_program(k);
+    load_passthrough_combiners(k);
+    k.method(mthd::kColorMask, 0x01010101);
+    k.method(mthd::kDepthTestEnable, 0);
+    k.method(mthd::kCullFaceEnable, 0);
+    k.method(mthd::kShadeModel, 0x1D01);
+}
+
+// One triangle over the whole 64x64 target, from a position array of four floats per vertex at 0x30000.
+void draw_full_triangle(Kelvin& k, std::vector<u8>& ram) {
+    const float verts[3][4] = {{0.0f, 0.0f, 0.0f, 1.0f}, {128.0f, 0.0f, 0.0f, 1.0f}, {0.0f, 128.0f, 0.0f, 1.0f}};
+    std::memcpy(&ram[0x30000], verts, sizeof verts);
+    k.method(mthd::kVertexDataArrayFormat + 0, (16u << 8) | (4u << 4) | 2u);
+    k.method(mthd::kVertexDataArrayOffset + 0, 0x30000);
+    k.method(mthd::kBeginEnd, 5);
+    k.method(mthd::kDrawArrays, (2u << 24) | 0u);
+    k.method(mthd::kBeginEnd, 0);
+}
+
+u32 pixel_at(const std::vector<u8>& ram, u32 x, u32 y) {
+    u32 v;
+    std::memcpy(&v, &ram[0x10000 + y * 256 + x * 4], 4);
+    return v;
+}
+
 }  // namespace
 
 TEST(Vulkan, RendersATriangleIntoGuestRam) {
@@ -133,4 +170,25 @@ TEST(Vulkan, RendersATriangleIntoGuestRam) {
     EXPECT_EQ(surfaces[0].phys, 0x10000u);
     EXPECT_EQ(surfaces[0].width, 64u);
     std::printf("rendered on %s\n", device.name().c_str());
+}
+
+TEST(Vulkan, ADisabledAttributeReadsItsCurrentValue) {
+    vk::Device device;
+    std::string error;
+    if (!device.init(error)) GTEST_SKIP() << "no Vulkan device: " << error;
+    std::vector<u8> ram(4u << 20, 0);
+    RamResolver handles;
+    handles.size = static_cast<u32>(ram.size());
+    VulkanRenderer renderer(device, handles, ram.data(), static_cast<u32>(ram.size()));
+    ASSERT_TRUE(renderer.init(error)) << error;
+    Kelvin k;
+    k.set_sink(&renderer);
+    setup_target(k);
+    // The diffuse array is disabled; its current value (set outside any batch) is what every vertex reads.
+    k.method(mthd::kVertexDataArrayFormat + 12, 2u);
+    k.method(mthd::kDiffuse4ub, 0xFF00FF00);  // A B G R from the top: opaque green
+    draw_full_triangle(k, ram);
+    renderer.end_frame();
+    for (const auto& e : renderer.stats().errors) ADD_FAILURE() << "renderer: " << e;
+    EXPECT_EQ(pixel_at(ram, 8, 8), 0xFF00FF00u) << "not the (0, 0, 0, 1) of an attribute without data";
 }
