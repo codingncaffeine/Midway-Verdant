@@ -514,3 +514,52 @@ TEST(P6System, CpuidAndRdtscAndMsr) {
     EXPECT_LT(r.s().gpr[kEax], 1000u);
     EXPECT_EQ(r.s().gpr[kEdx], 0u);
 }
+
+TEST(P6Fpu, ArithmeticC1IsTheRoundUpBit) {
+    Rig r;
+    // fninit; fld1; fld1; fadd st0,st1; fadd st0,st1 (3); fld1; fadd st0,st0 (2); fdiv st0,st1 (2/3)
+    r.code({0xDB, 0xE3, 0xD9, 0xE8, 0xD9, 0xE8, 0xD8, 0xC1, 0xD8, 0xC1, 0xD9, 0xE8, 0xD8, 0xC0, 0xD8, 0xF1,
+            // fldcw [0x2000] (round down); fld1; fadd st0,st0 (2); fdiv st0,st2 (2/3 again)
+            0xD9, 0x2D, 0x00, 0x20, 0x00, 0x00, 0xD9, 0xE8, 0xD8, 0xC0, 0xD8, 0xF2});
+    r.bus.ram()[0x2000] = 0x7F;
+    r.bus.ram()[0x2001] = 0x07;
+    constexpr u16 kC1 = 1u << 9;
+    r.run(8);
+    // 2/3's 64-bit significand is 1010...10 followed by 1010...: round to nearest goes up, C1 = 1.
+    EXPECT_EQ(r.s().fpu.fsw & kC1, kC1);
+    r.run(2);
+    EXPECT_EQ(r.s().fpu.fsw & kC1, 0u);  // a push clears it
+    r.run(2);
+    // The same quotient rounded down: inexact, but not rounded up, C1 = 0.
+    EXPECT_EQ(r.s().fpu.fsw & kC1, 0u);
+    EXPECT_NE(r.s().fpu.fsw & 0x20u, 0u);  // PE
+}
+
+TEST(P6Simd, UnaryScalarOpsReadTheSourceLane) {
+    Rig r;
+    r.s().cr4 |= cr4::OSFXSR;
+    // sqrtss xmm0, xmm1; rcpss xmm2, xmm3
+    r.code({0xF3, 0x0F, 0x51, 0xC1, 0xF3, 0x0F, 0x53, 0xD3});
+    const float nine = 9.0f, four = 4.0f, two = 2.0f, eight = 8.0f;
+    std::memcpy(r.s().fpu.xmm[0].data(), &nine, 4);
+    std::memcpy(r.s().fpu.xmm[1].data(), &four, 4);
+    std::memcpy(r.s().fpu.xmm[2].data(), &eight, 4);
+    std::memcpy(r.s().fpu.xmm[3].data(), &two, 4);
+    r.run(2);
+    float root = 0, recip = 0;
+    std::memcpy(&root, r.s().fpu.xmm[0].data(), 4);
+    std::memcpy(&recip, r.s().fpu.xmm[2].data(), 4);
+    EXPECT_EQ(root, 2.0f);   // sqrt of the source (4), not of the destination (9)
+    EXPECT_EQ(recip, 0.5f);  // 1/2 is exact in 12 bits
+}
+
+TEST(P6Fpu, RegisterStoreClearsC1) {
+    Rig r;
+    // fninit; 2/3 rounded up as above (C1 = 1); fstp st(1)
+    r.code({0xDB, 0xE3, 0xD9, 0xE8, 0xD9, 0xE8, 0xD8, 0xC1, 0xD8, 0xC1, 0xD9, 0xE8, 0xD8, 0xC0, 0xD8, 0xF1, 0xDD, 0xD9});
+    constexpr u16 kC1 = 1u << 9;
+    r.run(8);
+    ASSERT_EQ(r.s().fpu.fsw & kC1, kC1);
+    r.run(1);
+    EXPECT_EQ(r.s().fpu.fsw & kC1, 0u);
+}

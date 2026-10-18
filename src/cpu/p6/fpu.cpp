@@ -248,6 +248,19 @@ struct X87 {
         long double r = 0;
         if (!nan_result(a, b, true, r)) {
             HostFpu host(f.fcw);
+            u16 status = 0;
+#if MV_HOST_X87
+            // The operation and FNSTSW in one block: the compiler's store of the result (FSTP m80) would
+            // otherwise run between them and clear C1, the round-up bit.
+            switch (op) {
+                case Arith::Add: asm volatile("fadd %%st(1), %%st\n\tfnstsw %1" : "=t"(r), "=m"(status) : "0"(a), "u"(b)); break;
+                case Arith::Sub: asm volatile("fsub %%st(1), %%st\n\tfnstsw %1" : "=t"(r), "=m"(status) : "0"(a), "u"(b)); break;
+                case Arith::SubR: asm volatile("fsubr %%st(1), %%st\n\tfnstsw %1" : "=t"(r), "=m"(status) : "0"(a), "u"(b)); break;
+                case Arith::Mul: asm volatile("fmul %%st(1), %%st\n\tfnstsw %1" : "=t"(r), "=m"(status) : "0"(a), "u"(b)); break;
+                case Arith::Div: asm volatile("fdiv %%st(1), %%st\n\tfnstsw %1" : "=t"(r), "=m"(status) : "0"(a), "u"(b)); break;
+                case Arith::DivR: asm volatile("fdivr %%st(1), %%st\n\tfnstsw %1" : "=t"(r), "=m"(status) : "0"(a), "u"(b)); break;
+            }
+#else
             volatile long double va = a, vb = b;
             switch (op) {
                 case Arith::Add: r = va + vb; break;
@@ -257,10 +270,9 @@ struct X87 {
                 case Arith::Div: r = va / vb; break;
                 case Arith::DivR: r = vb / va; break;
             }
-            volatile long double vr = r;
-            const u16 status = host.status();
+            status = host.status();
+#endif
             const u16 flags = static_cast<u16>(status & kSwExceptions);
-            r = vr;
             raise_flags(flags);
             // A masked zero divide gives the infinity, a masked overflow the infinity or max per rounding (the
             // host did that); an unmasked one leaves the destination alone.
@@ -347,7 +359,7 @@ struct X87 {
     void store_int(long double v, unsigned size, bool truncate) {
         const u32 lin = mem_addr(size, Access::Write);
         mem.probe_write(lin, size);
-        i64 out;
+        i64 out = 0;
         bool invalid = false;
         const Class c = classify(v);
         if (c.nan || c.inf || c.unsupported) {
@@ -1129,6 +1141,7 @@ void X87::run_dd() {
                 set(i, indefinite());
             } else {
                 set(i, get(0));
+                clear_c1();  // a register copy never rounds
             }
             if (in.reg == 3) pop();
             return;

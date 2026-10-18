@@ -11,6 +11,7 @@
 #include <unistd.h>
 
 #include <cerrno>
+#include <cmath>
 #include <cstring>
 
 #include "core/machine.h"
@@ -277,8 +278,22 @@ struct Oracle::Impl {
         if (ioctl(vcpu_fd, KVM_GET_XSAVE, &xs) == 0) k.mxcsr = xs.region[6];
         return true;
     }
+    // RCPPS/RCPSS/RSQRTPS/RSQRTSS are approximations whose tables differ between processor models (the hypervisor
+    // runs on the host's): two results that each lie within the architectural bound of the exact value
+    // (1.5 x 2^-12 relative) agree.
+    static bool approximately_equal(const u8* a, const u8* b) {
+        for (unsigned lane = 0; lane < 4; ++lane) {
+            float x, y;
+            std::memcpy(&x, a + 4 * lane, 4);
+            std::memcpy(&y, b + 4 * lane, 4);
+            if (std::memcmp(&x, &y, 4) == 0) continue;
+            if (!std::isfinite(x) || !std::isfinite(y) || std::fabs(x - y) > 3.0f * 0x1p-12f * std::fabs(y)) return false;
+        }
+        return true;
+    }
     // Compare the interpreter's FPU state with the hypervisor's; the pointers (FIP/FDP/FOP) are reported apart.
-    static void compare_fpu(const FpuState& f, const kvm_fpu& k, std::vector<std::string>& diffs, u64& pointer_diffs) {
+    static void compare_fpu(const FpuState& f, const kvm_fpu& k, bool approximation, std::vector<std::string>& diffs, u64& pointer_diffs,
+                            u64& approximation_diffs) {
         if (f.fcw != k.fcw) diffs.push_back(std::format("fcw ours {:04x} kvm {:04x}", f.fcw, k.fcw));
         if (f.fsw != k.fsw) diffs.push_back(std::format("fsw ours {:04x} kvm {:04x}", f.fsw, k.fsw));
         u8 abridged = 0;
@@ -300,6 +315,10 @@ struct Oracle::Impl {
         }
         for (unsigned i = 0; i < 8; ++i) {
             if (std::memcmp(f.xmm[i].data(), k.xmm[i], 16) != 0) {
+                if (approximation && approximately_equal(f.xmm[i].data(), k.xmm[i])) {
+                    ++approximation_diffs;
+                    continue;
+                }
                 std::string a, b;
                 for (int j = 15; j >= 0; --j) {
                     a += std::format("{:02x}", f.xmm[i][static_cast<std::size_t>(j)]);
@@ -346,9 +365,9 @@ bool Oracle::init(Machine& machine, Cpu& cpu, std::string& error) { return impl_
 void Oracle::reset() {}
 
 std::string Oracle::summary() const {
-    return std::format("oracle: {} steps, {} compared, {} divergences ({} resyncs), {} skipped, {} lock-step breaks, {} device-log mismatches, {} memory mismatches, {} undefined-flag differences, {} x87 pointer differences",
+    return std::format("oracle: {} steps, {} compared, {} divergences ({} resyncs), {} skipped, {} lock-step breaks, {} device-log mismatches, {} memory mismatches, {} undefined-flag differences, {} x87 pointer differences, {} RCP/RSQRT approximation differences",
                        counts_.steps, counts_.compared, counts_.divergences, counts_.resyncs, counts_.skipped, counts_.lockstep_breaks, counts_.io_mismatches,
-                       counts_.memory_mismatches, counts_.undefined_flag_differences, counts_.fpu_pointer_differences);
+                       counts_.memory_mismatches, counts_.undefined_flag_differences, counts_.fpu_pointer_differences, counts_.approximation_differences);
 }
 
 bool Oracle::step(Cpu& cpu) {
@@ -397,6 +416,8 @@ bool Oracle::step(Cpu& cpu) {
     const auto& io = mem.io_log();
     std::size_t io_next = 0;
     bool halted = false, shutdown = false;
+    bool rep_ins_retired = false;
+run_again:
     for (;;) {
         im.run->immediate_exit = 0;
         const int rc = ioctl(im.vcpu_fd, KVM_RUN, 0);
@@ -501,6 +522,13 @@ bool Oracle::step(Cpu& cpu) {
         error_ = im.error;
         return false;
     }
+    // A batched REP INS: KVM copies the data in on the entry after the exit but skips the RIP write-back, leaving
+    // ECX at zero; the zero-count repetition that retires the instruction runs on the next entry.
+    if (in.op == Op::Ins && in.rep && !rep_ins_retired && !halted && !shutdown && r.rip == before.eip &&
+        (r.rcx & (in.adsize == 2 ? 0xFFFFu : 0xFFFFFFFFu)) == 0) {
+        rep_ins_retired = true;
+        goto run_again;
+    }
     ++counts_.compared;
 
     // Compare.
@@ -556,7 +584,8 @@ bool Oracle::step(Cpu& cpu) {
             error_ = im.error;
             return false;
         }
-        Impl::compare_fpu(after.fpu, kf, diffs, counts_.fpu_pointer_differences);
+        const bool approximation = in.op == Op::Simd && in.two_byte && (in.opcode == 0x52 || in.opcode == 0x53);
+        Impl::compare_fpu(after.fpu, kf, approximation, diffs, counts_.fpu_pointer_differences, counts_.approximation_differences);
     }
     if (io_next != io.size()) {
         ++counts_.io_mismatches;

@@ -32,6 +32,7 @@ public:
         u64 steps{0}, compared{0}, divergences{0}, resyncs{0}, skipped{0}, lockstep_breaks{0}, io_mismatches{0}, memory_mismatches{0};
         u64 undefined_flag_differences{0};
         u64 fpu_pointer_differences{0};
+        u64 approximation_differences{0};  // RCP/RSQRT results that differ within the architectural bound
     };
     const Counts& counts() const { return counts_; }
 
