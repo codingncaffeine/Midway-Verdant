@@ -203,6 +203,13 @@ bool Machine::init(std::string& error) {
         return false;
     }
     if (!config_.break_eips.empty()) cpu_->set_break_eips(config_.break_eips);
+    if (!cpu_->owns_timeline()) {
+        // The fast mode: late timer ticks are delivered, not merged (see Pit::set_lost_tick_policy).
+        pit_.set_lost_tick_policy([this] { return pic_.request_pending(0); });
+        pic_.set_on_acknowledge([this](unsigned irq) {
+            if (irq == 0) pit_.on_irq0_acknowledged();
+        });
+    }
     if (config_.capture_path) {
         capture_ = std::make_unique<capture::Writer>();
         if (!capture_->open(*config_.capture_path, static_cast<u32>(bus_.ram_size()), error)) return false;

@@ -44,6 +44,17 @@ public:
         u8 latched_status{0};
         bool null_count{true};
     };
+    // The fast mode's lost-tick policy (what KVM's in-kernel PIT and QEMU's lost_tick_policy=delay do): the vCPU
+    // and the timeline are not in lockstep, so an IRQ0 edge can arrive while the previous one is still latched and
+    // the 8259 would merge them; the guest's tick count (its clock) would then run slow. With a policy set, such an
+    // edge is kept in a backlog and raised again each time the PIC acknowledges IRQ0. `still_pending` says whether
+    // the previous edge is still latched. Not used by the accurate mode, whose timing is the hardware's.
+    void set_lost_tick_policy(std::function<bool()> still_pending) { still_pending_ = std::move(still_pending); }
+    void on_irq0_acknowledged();
+    static constexpr u32 kMaxTickBacklog = 200;  // ticks; beyond this (a host stall) the oldest are dropped
+    u64 ticks_delayed() const { return delayed_; }
+    u64 ticks_dropped() const { return dropped_; }
+    u32 tick_backlog() const { return backlog_; }
     const Channel& channel(int i) const { return channels_[static_cast<std::size_t>(i)]; }
     u16 current_count(int channel) const;
 
@@ -53,6 +64,7 @@ private:
     bool out_at(const Channel& c, Cycles now) const;
     Cycles next_irq_edge(const Channel& c) const;  // channel 0 only
     void schedule_irq();
+    void pulse_irq0();
     void load_count(int index, u16 value);
     u8 status_byte(const Channel& c) const;
 
@@ -60,6 +72,9 @@ private:
     std::function<void(bool)> irq0_;
     std::array<Channel, 3> channels_{};
     TimerEvent irq_event_;
+    std::function<bool()> still_pending_;
+    u32 backlog_{0};
+    u64 delayed_{0}, dropped_{0};
 };
 
 }  // namespace mv

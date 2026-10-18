@@ -215,3 +215,69 @@ TEST(Pic, TheResetLineDropsPendingRequestsAndMasksEverything) {
     pic.set_irq(5, true);
     EXPECT_EQ(pic.pending_vector(), 0x35);
 }
+
+namespace {
+// The PIT on the PIC's IRQ0 as the machine wires it; with `policy` the fast mode's lost-tick policy is on.
+struct TickRig {
+    Bus bus{4096};
+    Scheduler sched;
+    Pic pic{bus};
+    Pit pit{bus, sched, [this](bool level) { pic.set_irq(0, level); }};
+    explicit TickRig(bool policy) {
+        init_pics(bus, 0x30, 0x38);
+        if (policy) {
+            pit.set_lost_tick_policy([this] { return pic.request_pending(0); });
+            pic.set_on_acknowledge([this](unsigned irq) {
+                if (irq == 0) pit.on_irq0_acknowledged();
+            });
+        }
+        bus.pio_write(0x43, 1, 0x34);  // 1 ms ticks
+        bus.pio_write(0x40, 1, 0x65);
+        bus.pio_write(0x40, 1, 0x04);
+    }
+    // The guest's ISR: take every timer interrupt on offer (acknowledge + EOI); returns how many it took.
+    int drain() {
+        int taken = 0;
+        while (pic.pending_vector() == 0x30) {
+            EXPECT_EQ(pic.acknowledge(), 0x30);
+            bus.pio_write(0x20, 1, 0x20);
+            ++taken;
+        }
+        return taken;
+    }
+};
+}  // namespace
+
+TEST(Pit, LostTickPolicyDeliversEveryTickTheGuestWasLateFor) {
+    // Ten edges arrive while the guest cannot take interrupts (a vCPU that was not running).
+    TickRig hw(false), fast(true);
+    hw.sched.advance_to(cycles_from_ns(10'500'000));
+    fast.sched.advance_to(cycles_from_ns(10'500'000));
+    // The bare 8259 merges them: one interrupt for ten ticks (the guest's clock loses nine milliseconds).
+    EXPECT_EQ(hw.drain(), 1);
+    // The policy keeps the nine it could not latch and raises one per acknowledge.
+    EXPECT_EQ(fast.pit.tick_backlog(), 9u);
+    EXPECT_EQ(fast.drain(), 10);
+    EXPECT_EQ(fast.pit.ticks_delayed(), 9u);
+    EXPECT_EQ(fast.pit.tick_backlog(), 0u);
+    // A guest that keeps up never builds a backlog: one tick, one interrupt.
+    for (int ms = 11; ms <= 20; ++ms) {
+        fast.sched.advance_to(cycles_from_ns(static_cast<u64>(ms) * 1'000'000 + 500'000));
+        EXPECT_EQ(fast.drain(), 1) << "at " << ms << " ms";
+    }
+    EXPECT_EQ(fast.pit.ticks_delayed(), 9u);
+}
+
+TEST(Pit, LostTickBacklogIsBoundedAndVoidedByANewRate) {
+    TickRig fast(true);
+    // A long host stall: 300 ticks pass untaken; the backlog keeps the newest bound and drops the rest.
+    fast.sched.advance_to(cycles_from_ns(300'500'000));
+    EXPECT_EQ(fast.pit.tick_backlog(), Pit::kMaxTickBacklog);
+    EXPECT_EQ(fast.pit.ticks_dropped(), 300u - 1u - Pit::kMaxTickBacklog);
+    // Reprogramming channel 0 voids the late ticks of the old rate.
+    fast.bus.pio_write(0x43, 1, 0x34);
+    fast.bus.pio_write(0x40, 1, 0x65);
+    fast.bus.pio_write(0x40, 1, 0x04);
+    EXPECT_EQ(fast.pit.tick_backlog(), 0u);
+    EXPECT_EQ(fast.drain(), 1);  // the one latched in the 8259 is still there
+}

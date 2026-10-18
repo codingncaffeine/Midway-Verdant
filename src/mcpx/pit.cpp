@@ -8,10 +8,13 @@ Pit::Pit(Bus& bus, Scheduler& sched, std::function<void(bool)> irq0) : sched_(sc
     bus.map_pio(0x40, 4, this);
     irq_event_.name = "pit.irq0";
     irq_event_.fire = [this](Cycles) {
-        // A rising edge on IRQ0: pulse the line (the PIC latches the edge).
-        if (irq0_) {
-            irq0_(true);
-            irq0_(false);
+        // A rising edge on IRQ0: pulse the line (the PIC latches the edge), or keep it for later when the policy
+        // says the previous one has not been taken yet.
+        if (still_pending_ && still_pending_()) {
+            if (backlog_ < kMaxTickBacklog) ++backlog_;
+            else ++dropped_;
+        } else {
+            pulse_irq0();
         }
         schedule_irq();
     };
@@ -19,8 +22,23 @@ Pit::Pit(Bus& bus, Scheduler& sched, std::function<void(bool)> irq0) : sched_(sc
     channels_[2].gate = false;
 }
 
+void Pit::pulse_irq0() {
+    if (irq0_) {
+        irq0_(true);
+        irq0_(false);
+    }
+}
+
+void Pit::on_irq0_acknowledged() {
+    if (backlog_ == 0) return;
+    --backlog_;
+    ++delayed_;
+    pulse_irq0();
+}
+
 void Pit::reset() {
     sched_.cancel(irq_event_);
+    backlog_ = 0;
     channels_ = {};
     for (auto& c : channels_) c.gate = true;
     channels_[2].gate = false;
@@ -114,6 +132,7 @@ void Pit::schedule_irq() {
 void Pit::load_count(int index, u16 value) {
     Channel& c = channels_[static_cast<std::size_t>(index)];
     c.reload = value == 0 ? 0x10000u : value;
+    if (index == 0) backlog_ = 0;  // a new rate: late ticks of the old one are void
     c.load_time = sched_.now() + cycles_from_ticks(1, clk::kPitHz);  // the new count takes effect on the next clock
     c.counting = true;
     c.null_count = false;

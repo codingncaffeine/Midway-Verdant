@@ -117,6 +117,7 @@ int Pic::acknowledge() {
     }
     update_output();
     trace::log(trace::Cat::Irq, "acknowledge irq {} -> vector {:02x}", irq == 2 ? 8 + highest_pending(units_[1]) : irq, vector);
+    if (irq != 2 && on_ack_) on_ack_(static_cast<unsigned>(irq));
     return vector;
 }
 

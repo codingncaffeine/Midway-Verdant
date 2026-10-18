@@ -442,8 +442,9 @@ int main(int argc, char** argv) {
                 machine.pic().master().irr, machine.pic().master().isr, machine.pic().master().imr, machine.pic().master().elcr,
                 machine.pic().slave().irr, machine.pic().slave().isr, machine.pic().slave().imr, machine.pic().slave().elcr,
                 machine.pic().intr_asserted() ? 1 : 0);
-    std::printf("pit: ch0 mode %u reload %u counting %d\n", machine.pit().channel(0).mode, machine.pit().channel(0).reload,
-                machine.pit().channel(0).counting ? 1 : 0);
+    std::printf("pit: ch0 mode %u reload %u counting %d; late ticks delivered %llu, dropped %llu, backlog %u\n", machine.pit().channel(0).mode,
+                machine.pit().channel(0).reload, machine.pit().channel(0).counting ? 1 : 0, static_cast<unsigned long long>(machine.pit().ticks_delayed()),
+                static_cast<unsigned long long>(machine.pit().ticks_dropped()), machine.pit().tick_backlog());
     if (machine.capture())
         std::printf("capture: %llu methods, %llu pages, %llu bytes to %s\n", static_cast<unsigned long long>(machine.capture()->methods_written()),
                     static_cast<unsigned long long>(machine.capture()->pages_written()),

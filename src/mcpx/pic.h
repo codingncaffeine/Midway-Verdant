@@ -28,6 +28,10 @@ public:
     // Called whenever the INTR output changes level.
     void set_on_intr(std::function<void(bool asserted)> cb) { on_intr_ = std::move(cb); }
     bool intr_asserted() const { return intr_; }
+    // Whether a master-unit request (IRQ 0-7) is latched and not yet acknowledged.
+    bool request_pending(unsigned irq) const { return irq < 8 && (units_[0].irr & (1u << irq)) != 0; }
+    // Called after the INTA cycle with the acknowledged master IRQ (not for the cascade or a spurious vector).
+    void set_on_acknowledge(std::function<void(unsigned irq)> cb) { on_ack_ = std::move(cb); }
 
     u32 pio_read(u16 port, unsigned size) override;
     void pio_write(u16 port, unsigned size, u32 value) override;
@@ -62,6 +66,7 @@ private:
     std::array<Unit, 2> units_{};
     bool intr_{false};
     std::function<void(bool)> on_intr_;
+    std::function<void(unsigned)> on_ack_;
 };
 
 }  // namespace mv
