@@ -1,6 +1,9 @@
 #include "apu/apu.h"
 
 #include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <format>
 
@@ -11,7 +14,11 @@ namespace mv {
 
 namespace {
 // GP: 4096 words of X plus the 1024-word MIXBUF at X:$1400, 2048 of Y, 4096 of P. EP: 3072 X, 256 Y, 4096 P.
-constexpr dsp::Core::Config kGpConfig{0x1800, 0x800, 0x1000};
+// The GP's mix buffer (the voice processor's 32 bins) is X:0x1400-0x17FF, and the same words answer at X:0xC00-0xFFF:
+// the GP has 3K words of its own X RAM, as the EP does. Inferred from the kernel's boot program, which adds its reverb
+// into X:0xC00/0xC20/0xC80/0xCA0 (bins 0, 1, 4 and 5 from 0xC00: the front and rear speaker bins) and outputs
+// X:0xC00/0xC20, while it reads its effects send, bin 11, at X:0x1560 [verify on hardware].
+constexpr dsp::Core::Config kGpConfig{0x1800, 0x800, 0x1000, 0xC00, 0x1400};
 constexpr dsp::Core::Config kEpConfig{0xC00, 0x100, 0x1000};
 constexpr u32 kWord = 0xFFFFFFu;
 }  // namespace
@@ -231,10 +238,36 @@ void Apu::on_frame(Cycles now) {
         trap_queue_.pop_front();
         deliver_trap(method, parameter);
     }
-    // The voice processor is not modelled yet: the mix buffer the GP reads holds silence.
+    // The voice processor's 32 bins land in the GP's MIXBUF as 24-bit samples: full scale is 2^23, clamped, so a
+    // 16-bit source sample arrives exactly as itself shifted left by 8.
     auto& x = gp_.core().x_memory();
-    if (x.size() >= kMixBufWord + kMixBufWords) std::fill(x.begin() + kMixBufWord, x.begin() + kMixBufWord + kMixBufWords, 0u);
+    if (x.size() >= kMixBufWord + kMixBufWords) {
+        const auto& mix = se_.mix();
+        for (u32 bin = 0; bin < apu::SetupEngine::kBins; ++bin)
+            for (u32 i = 0; i < apu::SetupEngine::kSamplesPerFrame; ++i) {
+                const i32 s = static_cast<i32>(std::clamp(std::lround(static_cast<double>(mix[bin][i]) * 8388608.0), -8388608L, 8388607L));
+                x[kMixBufWord + bin * apu::SetupEngine::kSamplesPerFrame + i] = static_cast<u32>(s) & 0xFFFFFFu;
+            }
+    }
+    // Instrument: MV_DEBUG_GP_FRAME=N writes the GP's instructions during frame N to scratch/gp-frame-N.trace.
+    static const long debug_frame = std::getenv("MV_DEBUG_GP_FRAME") ? std::atol(std::getenv("MV_DEBUG_GP_FRAME")) : -1;
+    std::FILE* gp_trace = nullptr;
+    if (debug_frame >= 0 && frames_ == static_cast<u64>(debug_frame)) {
+        gp_trace = std::fopen(std::format("scratch/gp-frame-{}.trace", debug_frame).c_str(), "w");
+        gp_.core().set_trace(gp_trace);
+        gp_.dma().set_trace(gp_trace);
+        if (gp_trace) {
+            const auto& xm = gp_.core().x_memory();
+            for (u32 a = 0; a < 0x200 && a < xm.size(); a += 8)
+                std::fprintf(gp_trace, "X:%04x %06x %06x %06x %06x %06x %06x %06x %06x\n", a, xm[a], xm[a + 1], xm[a + 2], xm[a + 3], xm[a + 4], xm[a + 5], xm[a + 6], xm[a + 7]);
+        }
+    }
     run_frame(gp_, gp_stats_, "gp");
+    if (gp_trace) {
+        gp_.core().set_trace(nullptr);
+        gp_.dma().set_trace(nullptr);
+        std::fclose(gp_trace);
+    }
     run_frame(ep_, ep_stats_, "ep");
     sched_.schedule(frame_, cycles_from_ticks(frames_ + 1, clk::kApuFramesPerSecond));
 }

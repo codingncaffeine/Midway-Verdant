@@ -78,22 +78,17 @@ TEST(Aci, PcmOutWalksItsDescriptorsAtTheSampleClockAndInterruptsOnCompletion) {
     const u32 sr = r.rd(Rig::kPo + Aci::kSr, 2);
     EXPECT_TRUE(sr & Aci::kSrBcis);
     EXPECT_TRUE(sr & Aci::kSrLvbci) << "the last valid buffer completed";
-    EXPECT_TRUE(sr & Aci::kSrDch) << "and the channel halted";
-    EXPECT_TRUE(sr & Aci::kSrCelv);
-    EXPECT_EQ(r.rd(Rig::kPo + Aci::kCiv, 1), 1u) << "stays on the last buffer";
-    EXPECT_EQ(r.rd(Rig::kPo + Aci::kPicb, 2), 0u);
+    EXPECT_FALSE(sr & Aci::kSrDch) << "the MCPX does not halt there: it carries on through the list";
+    r.sched.advance_to(Rig::samples(64) + Rig::samples(32) + 64);
+    EXPECT_EQ(r.rd(Rig::kPo + Aci::kCiv, 1), 0u) << "the 30 empty descriptors completed at once and the list wrapped";
+    EXPECT_EQ(r.rd(Rig::kPo + Aci::kPicb, 2), 64u) << "the first buffer plays again";
     ASSERT_EQ(r.played.size(), 192u);
     EXPECT_EQ(r.played[128], 0x80u);
-    EXPECT_EQ(r.aci.channel(Aci::PcmOut).buffers_completed, 2u);
     r.wr(Rig::kPo + Aci::kSr, 2, Aci::kSrBcis | Aci::kSrLvbci);
     EXPECT_FALSE(r.irq);
-
-    // Naming a further buffer resumes the halted channel from the prefetched index.
-    r.descriptor(0x1000, 2, 0x4000, 16, false);
-    r.wr(Rig::kPo + Aci::kLvi, 1, 2);
-    EXPECT_EQ(r.rd(Rig::kPo + Aci::kSr, 2) & Aci::kSrDch, 0u);
-    EXPECT_EQ(r.rd(Rig::kPo + Aci::kCiv, 1), 2u);
-    EXPECT_EQ(r.rd(Rig::kPo + Aci::kPicb, 2), 16u);
+    r.sched.advance_to(Rig::samples(64) + Rig::samples(32) + 64 + Rig::samples(64));
+    ASSERT_EQ(r.played.size(), 320u);
+    EXPECT_EQ(r.played[192 + 5], 5u) << "the first buffer's bytes, a second time";
 }
 
 TEST(Aci, ChannelResetHaltsAndClearsAndTheGlobalStatusShowsTheCodecReady) {
@@ -137,7 +132,7 @@ TEST(Aci, AnEightKibBufferPlaysOutInTheBandOfItsSampleCount) {
     EXPECT_LE(ms, 42.8);
 }
 
-TEST(Aci, ReArmingTheSameLastValidIndexReplaysTheSingleBufferAndTheSpdifMirrorStaysSilent) {
+TEST(Aci, TheKernelsSingleBufferRingPlaysOnWithoutReArmingAndTheSpdifMirrorStaysSilent) {
     Rig r;
     // The kernel's shape: one 8 KiB buffer, last valid index 0, on both PCM out and the S/PDIF mirror.
     r.descriptor(0x1000, 0, 0x4000, 0x1000, true);
@@ -152,21 +147,19 @@ TEST(Aci, ReArmingTheSameLastValidIndexReplaysTheSingleBufferAndTheSpdifMirrorSt
     const Cycles first = Rig::samples(0x1000);
     r.sched.advance_to(first);
     EXPECT_TRUE(r.irq);
-    EXPECT_EQ(r.rd(Rig::kPo + Aci::kSr, 2), Aci::kSrBcis | Aci::kSrLvbci | Aci::kSrDch | Aci::kSrCelv);
+    EXPECT_EQ(r.rd(Rig::kPo + Aci::kSr, 2), Aci::kSrBcis | Aci::kSrLvbci) << "reported, and still running";
     EXPECT_EQ(r.rd(Aci::kBusMasterBase + Aci::kGlobSta, 4), Aci::kGlobStaPcr | Aci::kGlobStaChannelInt[Aci::PcmOut])
         << "only the PCM out channel shows; the S/PDIF mirror completed too but reports nothing";
-    EXPECT_EQ(r.aci.channel(Aci::Spdif).buffers_completed, 1u);
-    // The kernel's service: clear the status, write the same last valid index.
+    EXPECT_GE(r.aci.channel(Aci::Spdif).buffers_completed, 1u);
+    // The kernel's service: clear the status and nothing more; the last valid index is never written again.
     r.wr(Rig::kPo + Aci::kSr, 2, 0xF);
     EXPECT_FALSE(r.irq);
-    r.wr(Rig::kPo + Aci::kLvi, 1, 0);
-    EXPECT_EQ(r.rd(Rig::kPo + Aci::kSr, 2) & Aci::kSrDch, 0u) << "running again";
     r.sched.advance_to(first + 64);
     EXPECT_EQ(r.rd(Rig::kPo + Aci::kCiv, 1), 0u) << "the 31 empty descriptors completed at once and the list wrapped";
     EXPECT_EQ(r.rd(Rig::kPo + Aci::kPicb, 2), 0x1000u);
     EXPECT_FALSE(r.irq) << "empty descriptors do not interrupt";
     r.sched.advance_to(first + 64 + Rig::samples(0x1000));
     EXPECT_TRUE(r.irq) << "the buffer played again, one period later";
-    EXPECT_EQ(r.aci.channel(Aci::PcmOut).buffers_completed, 33u);
+    EXPECT_EQ(r.aci.channel(Aci::PcmOut).buffers_completed, 64u) << "two periods: the buffer and the 31 empty descriptors each";
     EXPECT_EQ(r.aci.channel(Aci::PcmOut).bytes_played, 2u * 0x2000u);
 }

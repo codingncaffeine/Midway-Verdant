@@ -270,14 +270,14 @@ void Aci::buffer_done(Channel c) {
     s.bytes_played += static_cast<u64>(s.buffer_samples) * 2;
     ++s.buffers_completed;
     if (s.buffer_ioc) s.sr |= kSrBcis;
-    if (s.civ == s.lvi) {
-        // The last valid buffer finished: the channel halts until software names more buffers.
-        s.sr |= kSrLvbci | kSrDch | kSrCelv;
-        s.buffer_samples = 0;
-    } else {
-        s.civ = s.piv;
-        start_buffer(c);
-    }
+    // Finishing the last valid buffer is reported (LVBCI), but the MCPX's controller does not halt there as the
+    // AMD-768 and Intel controllers do (datasheet 24467, ACx6 BMCH): it carries on through the list, the empty
+    // descriptors completing at once, back round to the first. The kernel depends on it: it programs one descriptor
+    // over the APU's 8 KiB output ring, never advances the last valid index while the boot sound plays, and only
+    // acknowledges the status [inferred from the kernel; verify on hardware].
+    if (s.civ == s.lvi) s.sr |= kSrLvbci;
+    s.civ = s.piv;
+    start_buffer(c);
     update_irq();
 }
 

@@ -1,5 +1,6 @@
 #pragma once
 #include <array>
+#include <cstdio>
 #include <string>
 #include <vector>
 
@@ -25,6 +26,8 @@ class Core {
 public:
     struct Config {
         u32 x_words{4096}, y_words{2048}, p_words{4096};
+        // A second view of X memory: X:mix_alias .. +0x400 reaches X:mix_target .. +0x400 (0 = none). See apu.cpp.
+        u32 mix_alias{0}, mix_target{0};
     };
     Core(const Config& config, Peripherals* peripherals);
 
@@ -49,6 +52,11 @@ public:
     void write_x(u32 address, u32 value);
     void write_y(u32 address, u32 value);
     void write_p(u32 address, u32 value);
+    // The X-memory index an address reaches (the mix-buffer alias applied); x_memory().size() when out of range.
+    std::size_t x_index(u32 address) const {
+        if (cfg_.mix_alias && address >= cfg_.mix_alias && address < cfg_.mix_alias + 0x400u) address = address - cfg_.mix_alias + cfg_.mix_target;
+        return address < x_.size() ? address : x_.size();
+    }
     std::vector<u32>& x_memory() { return x_; }
     std::vector<u32>& y_memory() { return y_; }
     std::vector<u32>& p_memory() { return p_; }
@@ -62,6 +70,9 @@ public:
         std::array<u32, 16> ssh{}, ssl{};
     };
     Regs& regs() { return r_; }
+    // Instrument: while set, every instruction is written there before it runs (address, text, the data ALU
+    // registers and R0-R7).
+    void set_trace(std::FILE* f) { trace_ = f; }
     const Regs& regs() const { return r_; }
 
     // The Status Register bits (chapter 5).
@@ -115,6 +126,7 @@ private:
     Config cfg_;
     Peripherals* periph_;
     std::vector<u32> x_, y_, p_;
+    std::FILE* trace_{nullptr};
     std::vector<Cached> cache_;
     Regs r_;
     u64 cycles_{0}, instructions_{0};

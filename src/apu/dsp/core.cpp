@@ -204,7 +204,8 @@ void Core::fail(const std::string& why) {
 u32 Core::read_x(u32 address) {
     address &= kWord;
     if (address >= 0xFFFF80u) return periph_ ? periph_->peripheral_read(address) & kWord : 0;
-    return address < x_.size() ? x_[address] : 0;
+    const std::size_t i = x_index(address);
+    return i < x_.size() ? x_[i] : 0;
 }
 
 u32 Core::read_y(u32 address) {
@@ -224,7 +225,7 @@ void Core::write_x(u32 address, u32 value) {
         if (periph_) periph_->peripheral_write(address, value & kWord);
         return;
     }
-    if (address < x_.size()) x_[address] = value & kWord;
+    if (const std::size_t i = x_index(address); i < x_.size()) x_[i] = value & kWord;
 }
 
 void Core::write_y(u32 address, u32 value) {
@@ -1327,6 +1328,10 @@ u32 Core::step() {
 u64 Core::run(u64 cycles) {
     u64 done = 0;
     while (done < cycles && error_.empty() && !halted_) {
+        if (trace_)
+            std::fprintf(trace_, "%04x %-40s a=%014llx b=%014llx x=%06x:%06x y=%06x:%06x r=%x,%x,%x,%x,%x,%x,%x,%x\n", r_.pc, disassemble_at(r_.pc).c_str(),
+                         static_cast<unsigned long long>(r_.a) & 0xFFFFFFFFFFFFFFull, static_cast<unsigned long long>(r_.b) & 0xFFFFFFFFFFFFFFull, r_.x1, r_.x0, r_.y1, r_.y0,
+                         r_.r[0], r_.r[1], r_.r[2], r_.r[3], r_.r[4], r_.r[5], r_.r[6], r_.r[7]);
         const u32 c = step();
         if (c == 0) break;
         done += c;

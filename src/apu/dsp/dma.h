@@ -1,5 +1,6 @@
 #pragma once
 #include <string>
+#include <cstdio>
 #include <vector>
 
 #include "apu/dsp/core.h"
@@ -25,6 +26,8 @@ public:
 
 class Dma {
 public:
+    // Instrument: while set, every block run is written there (the same one-frame trace as the core's).
+    void set_trace(std::FILE* f) { trace_ = f; }
     enum Reg : u32 { NextBlock = 0, StartBlock = 1, Control = 2, Configuration = 3 };
     static constexpr u32 kEol = 1u << 14;
     static constexpr u32 kControlRunning = 1u << 4, kControlStopped = 1u << 5, kControlFrozen = 1u << 3;
@@ -38,12 +41,13 @@ public:
     const std::string& last_error() const { return error_; }
     u64 transfers() const { return transfers_; }
     u64 bytes_moved() const { return bytes_; }
+    // A word of the DSP's memories as the engine addresses them (0x0000-0x17FF X, 0x1800-0x27FF Y, 0x2800-0x37FF P).
+    u32 read_dsp(u32 address) const;
 
 private:
     void run();
     void settle();
     bool run_block(u32 block_address);
-    u32 read_dsp(u32 address) const;
     void write_dsp(u32 address, u32 value);
 
     Core& core_;
@@ -57,6 +61,7 @@ private:
     std::string error_;
     u64 transfers_{0}, bytes_{0};
     std::vector<u8> buffer_;
+    std::FILE* trace_{nullptr};
 };
 
 }  // namespace mv::dsp

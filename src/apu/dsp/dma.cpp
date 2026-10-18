@@ -24,7 +24,10 @@ u32 bytes_per_sample(u32 format) {
 
 u32 Dma::read_dsp(u32 address) const {
     // DSP addresses: 0x0000-0x17FF X, 0x1800-0x27FF Y, 0x2800-0x37FF P.
-    if (address < 0x1800) return address < core_.x_memory().size() ? core_.x_memory()[address] : 0;
+    if (address < 0x1800) {
+        const std::size_t i = core_.x_index(address);
+        return i < core_.x_memory().size() ? core_.x_memory()[i] : 0;
+    }
     if (address < 0x2800) return (address - 0x1800) < core_.y_memory().size() ? core_.y_memory()[address - 0x1800] : 0;
     if (address < 0x3800) return core_.read_p(address - 0x2800);
     return 0;
@@ -33,7 +36,7 @@ u32 Dma::read_dsp(u32 address) const {
 void Dma::write_dsp(u32 address, u32 value) {
     value &= kWord;
     if (address < 0x1800) {
-        if (address < core_.x_memory().size()) core_.x_memory()[address] = value;
+        if (const std::size_t i = core_.x_index(address); i < core_.x_memory().size()) core_.x_memory()[i] = value;
     } else if (address < 0x2800) {
         if (address - 0x1800 < core_.y_memory().size()) core_.y_memory()[address - 0x1800] = value;
     } else if (address < 0x3800) {
@@ -114,6 +117,9 @@ bool Dma::run_block(u32 block) {
     const u32 scratch_base = read_dsp(block + 5), scratch_size = read_dsp(block + 6) + 1;
     next_block_ = next;
     const bool interleave = control & 1u, to_buffer = (control >> 1) & 1u, writeback = (control >> 4) & 1u;
+    if (trace_)
+        std::fprintf(trace_, "DMA block %04x: control %06x (%s buffer %u) count %06x dsp %06x scratch off %06x base %06x size %06x\n", block, control,
+                     to_buffer ? "dsp->" : "dsp<-", (control >> 5) & 0xFu, count, dsp_offset, scratch_offset, scratch_base, scratch_size);
     const u32 buffer_id = (control >> 5) & 0xFu, format = (control >> 10) & 7u, step = (control >> 14) & 0x3FFu;
     const u32 sample_bytes = bytes_per_sample(format);
     if (sample_bytes == 0) {
