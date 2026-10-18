@@ -267,6 +267,116 @@ struct ShaderDumpSink : mv::pgraph::RenderSink {
     }
 };
 
+// One line per draw of a frame: where it lands, how it is transformed and shaded, what it samples. The instrument
+// for "which draw painted (or failed to paint) that surface".
+struct DrawListSink : mv::pgraph::RenderSink {
+    const mv::pgraph::Replay* replay{nullptr};
+    mv::u32 want_frame{0}, frame{0}, n{0};
+    void clear(const mv::pgraph::KelvinState& s, mv::u32 what) override {
+        if (frame != want_frame) return;
+        const mv::pgraph::SurfaceState d = s.surface();
+        std::printf("clear  -> %08x %ux%u (%s) what %x colour %08x\n", d.color_offset, d.clip_width(), d.clip_height(), d.swizzled() ? "swizzled" : "pitch", what, s.clear_color());
+    }
+    void semaphore_release(const mv::pgraph::KelvinState&, mv::u32) override { ++frame; n = 0; }
+    void draw(const mv::pgraph::KelvinState& s, const mv::pgraph::DrawBatch& b) override {
+        if (frame != want_frame) return;
+        using namespace mv::pgraph;
+        const SurfaceState d = s.surface();
+        std::string tex;
+        for (mv::u32 t = 0; t < 4; ++t) {
+            const TextureStage ts = s.texture(t);
+            if (!ts.enabled() || s.shader_stage_program(t) == 0) continue;
+            const DmaObject dma = replay->resolve(s.dma_handle(ts.dma_select() == 2 ? mthd::kDmaB : mthd::kDmaA));
+            tex += std::format(" t{}:{:02x}@{:08x}/{}x{}{}", t, ts.color_format(), dma.base + ts.offset, 1u << ts.log_width(), 1u << ts.log_height(), ts.cubemap() ? "cube" : "");
+        }
+        std::printf("draw %3u -> %08x %ux%u %s; %s x%zu/%zu; mode %u lit %u; stages %05x combiners %u; blend %d %x/%x; depth %d; alpha %d;%s\n", n++,
+                    d.color_offset, d.clip_width(), d.clip_height(), d.swizzled() ? "swizzled" : "pitch", primitive_name(b.primitive), b.indices.size(),
+                    b.immediate_vertices.size() / 16, s.transform_mode(), s.reg(mthd::kLightingEnable) & 1u, s.reg(mthd::kShaderStageProgram),
+                    s.combiner_stages(), s.blend(), s.reg(mthd::kBlendSfactor), s.reg(mthd::kBlendDfactor), s.depth_test(), s.alpha_test(), tex.c_str());
+    }
+};
+
+int draws(const char* path, mv::u32 frame) {
+    mv::pgraph::Replay r;
+    std::string error;
+    if (!r.open(path, error)) {
+        std::fprintf(stderr, "mv-pbcap: %s\n", error.c_str());
+        return 1;
+    }
+    mv::pgraph::Kelvin kelvin;
+    DrawListSink sink;
+    sink.replay = &r;
+    sink.want_frame = frame;
+    kelvin.set_sink(&sink);
+    r.run(kelvin, nullptr, error, frame + 1);
+    return 0;
+}
+
+// The textures one draw samples, decoded from the capture's memory: their means per channel (the alpha is what
+// an additive blend or an alpha test lives on) and a PNG of level 0.
+struct TextureDumpSink : mv::pgraph::RenderSink {
+    const mv::pgraph::Replay* replay{nullptr};
+    mv::u32 want_frame{0}, want_draw{0}, frame{0}, n{0};
+    std::filesystem::path dir;
+    bool done{false};
+    void clear(const mv::pgraph::KelvinState&, mv::u32) override {}
+    void semaphore_release(const mv::pgraph::KelvinState&, mv::u32) override { ++frame; n = 0; }
+    void draw(const mv::pgraph::KelvinState& s, const mv::pgraph::DrawBatch&) override {
+        if (frame != want_frame || n++ != want_draw || done) return;
+        done = true;
+        using namespace mv::pgraph;
+        for (mv::u32 t = 0; t < 4; ++t) {
+            const TextureStage ts = s.texture(t);
+            if (!ts.enabled() || s.shader_stage_program(t) == 0) continue;
+            const DmaObject dma = replay->resolve(s.dma_handle(ts.dma_select() == 2 ? mthd::kDmaB : mthd::kDmaA));
+            const mv::u32 phys = dma.base + ts.offset;
+            DecodedTexture d;
+            if (!decode_texture(ts, phys, replay->memory(), nullptr, d)) {
+                std::printf("texture %u: format %02x at %08x: %s\n", t, ts.color_format(), phys, d.error.c_str());
+                continue;
+            }
+            const auto& img = d.image(0, 0);
+            if (d.pixel != HostPixel::Rgba8) {
+                std::printf("texture %u: format %02x at %08x: %ux%u, %s texels\n", t, ts.color_format(), phys, d.width, d.height, d.pixel == HostPixel::R16 ? "16-bit" : "float");
+                continue;
+            }
+            double sum[4]{};
+            mv::u32 opaque = 0;
+            const mv::u32 npx = d.width * d.height;
+            for (mv::u32 i = 0; i < npx; ++i) {
+                for (int c = 0; c < 4; ++c) sum[c] += img[i * 4 + static_cast<mv::u32>(c)];
+                if (img[i * 4 + 3] != 0) ++opaque;
+            }
+            std::printf("texture %u: format %02x at %08x: %ux%u levels %u faces %u; mean r %.3f g %.3f b %.3f a %.3f; %.1f%% texels with alpha\n", t,
+                        ts.color_format(), phys, d.width, d.height, d.levels, d.faces, sum[0] / npx / 255.0, sum[1] / npx / 255.0, sum[2] / npx / 255.0,
+                        sum[3] / npx / 255.0, 100.0 * opaque / npx);
+            std::string error;
+            const auto path = dir / std::format("f{:02}_d{:03}_t{}_{:08x}.png", want_frame, want_draw, t, phys);
+            if (!mv::png::write(path, d.width, d.height, img.data(), d.width * 4, error)) std::fprintf(stderr, "mv-pbcap: %s\n", error.c_str());
+        }
+    }
+};
+
+int textures(const char* path, mv::u32 frame, mv::u32 draw_index, const char* dir) {
+    mv::pgraph::Replay r;
+    std::string error;
+    if (!r.open(path, error)) {
+        std::fprintf(stderr, "mv-pbcap: %s\n", error.c_str());
+        return 1;
+    }
+    std::filesystem::create_directories(dir);
+    mv::pgraph::Kelvin kelvin;
+    TextureDumpSink sink;
+    sink.replay = &r;
+    sink.want_frame = frame;
+    sink.want_draw = draw_index;
+    sink.dir = dir;
+    kelvin.set_sink(&sink);
+    r.run(kelvin, nullptr, error, frame + 1);
+    if (!sink.done) std::printf("no draw %u in frame %u\n", draw_index, frame);
+    return 0;
+}
+
 int shaders(const char* path, mv::u32 frame, mv::u32 draw_index) {
     mv::pgraph::Replay r;
     std::string error;
@@ -290,6 +400,7 @@ struct RenderObserver : mv::pgraph::Replay::Observer {
     std::filesystem::path dir;
     const mv::pgraph::Replay* replay{nullptr};
     mv::u32 scanout{0};
+    mv::u32 first_png{0};  // frames before this render but write no picture (a long capture's late frames)
     void register_write(mv::u32 offset, mv::u32 value) override {
         if (offset == 0x600800) scanout = value;
     }
@@ -300,7 +411,7 @@ struct RenderObserver : mv::pgraph::Replay::Observer {
             std::printf("   surface %08x %ux%u %s format %x: %llu draws, %llu clears%s\n", s.phys, s.width, s.height, s.swizzled ? "swizzled" : "pitch",
                         s.color_format, static_cast<unsigned long long>(s.draws_this_frame), static_cast<unsigned long long>(s.clears_this_frame),
                         s.rendered_this_frame ? "" : " (untouched)");
-            if (!s.rendered_this_frame) continue;
+            if (!s.rendered_this_frame || index < first_png) continue;
             std::vector<mv::u8> rgba;
             if (!renderer->surface_rgba(s, rgba)) continue;
             const auto path = dir / std::format("frame{:02}_{:08x}.png", index, s.phys);
@@ -315,7 +426,7 @@ struct RenderObserver : mv::pgraph::Replay::Observer {
     }
 };
 
-int render(const char* path, const char* dir, mv::u32 frames) {
+int render(const char* path, const char* dir, mv::u32 frames, mv::u32 first_png) {
     mv::vk::Device device;
     std::string error;
     if (!device.init(error)) {
@@ -338,6 +449,7 @@ int render(const char* path, const char* dir, mv::u32 frames) {
     kelvin.set_sink(&renderer);
     RenderObserver observer;
     observer.renderer = &renderer;
+    observer.first_png = first_png;
     observer.dir = dir;
     observer.replay = &r;
     r.set_page_observer([&](mv::u32 first_page, mv::u32 count) { renderer.invalidate(first_page * 4096, count * 4096); });
@@ -353,14 +465,18 @@ int render(const char* path, const char* dir, mv::u32 frames) {
 
 int main(int argc, char** argv) {
     if (argc < 3) {
-        std::fprintf(stderr, "usage: mv-pbcap summary|methods|replay FILE [FRAMES] | render FILE DIR [FRAMES]\n");
+        std::fprintf(stderr, "usage: mv-pbcap summary|methods|replay FILE [FRAMES] | draws FILE FRAME | shaders FILE FRAME DRAW | render FILE DIR [FRAMES]\n");
         return 2;
     }
+    if (std::strcmp(argv[1], "draws") == 0 && argc >= 4) return draws(argv[2], static_cast<mv::u32>(std::atoi(argv[3])));
+    if (std::strcmp(argv[1], "textures") == 0 && argc >= 6)
+        return textures(argv[2], static_cast<mv::u32>(std::atoi(argv[3])), static_cast<mv::u32>(std::atoi(argv[4])), argv[5]);
     if (std::strcmp(argv[1], "summary") == 0) return summary(argv[2]);
     if (std::strcmp(argv[1], "methods") == 0) return methods(argv[2]);
     if (std::strcmp(argv[1], "replay") == 0) return replay(argv[2], argc > 3 ? static_cast<mv::u32>(std::atoi(argv[3])) : 0u);
     if (std::strcmp(argv[1], "shaders") == 0 && argc >= 5) return shaders(argv[2], static_cast<mv::u32>(std::atoi(argv[3])), static_cast<mv::u32>(std::atoi(argv[4])));
-    if (std::strcmp(argv[1], "render") == 0 && argc >= 4) return render(argv[2], argv[3], argc > 4 ? static_cast<mv::u32>(std::atoi(argv[4])) : 0u);
+    if (std::strcmp(argv[1], "render") == 0 && argc >= 4)
+        return render(argv[2], argv[3], argc > 4 ? static_cast<mv::u32>(std::atoi(argv[4])) : 0u, argc > 5 ? static_cast<mv::u32>(std::atoi(argv[5])) : 0u);
     std::fprintf(stderr, "mv-pbcap: unknown command %s\n", argv[1]);
     return 2;
 }
