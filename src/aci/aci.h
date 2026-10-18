@@ -34,6 +34,9 @@ public:
     static constexpr u32 kDescriptors = 32;
     // 48 kHz, two 16-bit channels: a descriptor's length counts 16-bit samples.
     static constexpr u64 kSamplesPerSecond = 96'000;
+    // The bus master reads a buffer as it plays it, a FIFO's worth at a time; the sink receives each burst at the
+    // moment it is read, so the samples are whatever the APU had written there by then. 32 samples = 16 stereo frames.
+    static constexpr u32 kFetchSamples = 32;
     // Mixer (codec) registers that read back a fixed value.
     static constexpr u32 kMixPowerdown = 0x26, kMixPowerdownReady = 0x000F;
 
@@ -59,7 +62,8 @@ public:
         u32 buffer_address{0}, buffer_samples{0};
         bool buffer_ioc{false};
         Cycles buffer_started{0};
-        TimerEvent done;
+        u32 buffer_fetched{0};  // samples of the buffer already read and handed to the sink
+        TimerEvent done, fetch;
         u64 buffers_completed{0}, bytes_played{0};
     };
     const ChannelState& channel(Channel c) const { return ch_[c]; }
@@ -84,6 +88,9 @@ private:
     void channel_reset(Channel c);
     void start_buffer(Channel c);
     void buffer_done(Channel c);
+    void fetch(Channel c);
+    void deliver(Channel c, u32 upto);
+    void schedule_fetch(Channel c);
     bool channel_interrupting(const ChannelState& s) const;
     void update_irq();
 

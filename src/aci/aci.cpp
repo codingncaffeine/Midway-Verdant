@@ -19,6 +19,8 @@ Aci::Aci(Bus& bus, Scheduler& sched, std::function<void(bool)> irq)
     for (u32 c = 0; c < kChannels; ++c) {
         ch_[c].done.name = "aci.buffer";
         ch_[c].done.fire = [this, c](Cycles) { buffer_done(static_cast<Channel>(c)); };
+        ch_[c].fetch.name = "aci.fetch";
+        ch_[c].fetch.fire = [this, c](Cycles) { fetch(static_cast<Channel>(c)); };
     }
 }
 
@@ -184,6 +186,7 @@ u32 Aci::channel_read_byte(Channel c, u32 rel) {
 void Aci::channel_reset(Channel c) {
     ChannelState& s = ch_[c];
     sched_.cancel(s.done);
+    sched_.cancel(s.fetch);
     s.civ = s.lvi = s.piv = 0;
     s.cr = 0;
     s.sr = kSrDch;
@@ -232,6 +235,7 @@ void Aci::channel_write_byte(Channel c, u32 rel, u8 value) {
             } else if (!(s.cr & kCrRpbm) && (old & kCrRpbm)) {
                 // Pause: the buffer in flight is dropped and restarts on the next run [verify: hardware resumes mid-buffer].
                 sched_.cancel(s.done);
+                sched_.cancel(s.fetch);
                 s.sr |= kSrDch;
             }
             update_irq();
@@ -254,19 +258,19 @@ void Aci::start_buffer(Channel c) {
     s.buffer_ioc = (desc[1] & kDescIoc) != 0;
     s.piv = static_cast<u8>((s.civ + 1) & 0x1Fu);
     s.buffer_started = sched_.now();
+    s.buffer_fetched = 0;
     // The buffer plays out at the sample clock; an empty buffer completes on the next cycle.
     const Cycles length = s.buffer_samples ? cycles_from_ticks_ceil(s.buffer_samples, kSamplesPerSecond) : 1;
     sched_.schedule(s.done, s.buffer_started + length);
+    schedule_fetch(c);
     trace::log(trace::Cat::Aci, "aci channel {}: buffer {} at {:08x}, {} samples{}", static_cast<u32>(c), s.civ, s.buffer_address, s.buffer_samples,
                s.buffer_ioc ? ", interrupt on completion" : "");
 }
 
 void Aci::buffer_done(Channel c) {
     ChannelState& s = ch_[c];
-    if (s.buffer_samples && sink_) {
-        std::vector<u8> data(static_cast<std::size_t>(s.buffer_samples) * 2);
-        if (bus_.read_ram(s.buffer_address, data.data(), data.size())) sink_(c, data.data(), static_cast<u32>(data.size()));
-    }
+    sched_.cancel(s.fetch);
+    deliver(c, s.buffer_samples);
     s.bytes_played += static_cast<u64>(s.buffer_samples) * 2;
     ++s.buffers_completed;
     if (s.buffer_ioc) s.sr |= kSrBcis;
@@ -295,6 +299,36 @@ void Aci::update_irq() {
         irq_level_ = level;
         if (irq_) irq_(level);
     }
+}
+
+}  // namespace mv
+
+namespace mv {
+
+// ── the bus master's reads of the buffer in flight ──────────────────────────────────────────────────────────────
+
+void Aci::schedule_fetch(Channel c) {
+    ChannelState& s = ch_[c];
+    if (s.buffer_fetched >= s.buffer_samples) return;
+    const u32 next = std::min(s.buffer_fetched + kFetchSamples, s.buffer_samples);
+    sched_.schedule(s.fetch, s.buffer_started + cycles_from_ticks_ceil(next, kSamplesPerSecond));
+}
+
+void Aci::fetch(Channel c) {
+    ChannelState& s = ch_[c];
+    const u64 played = std::min<u64>(ticks_from_cycles(sched_.now() - s.buffer_started, kSamplesPerSecond), s.buffer_samples);
+    deliver(c, static_cast<u32>(played) & ~1u);  // whole stereo frames
+    schedule_fetch(c);
+}
+
+void Aci::deliver(Channel c, u32 upto) {
+    ChannelState& s = ch_[c];
+    if (upto <= s.buffer_fetched) return;
+    if (sink_) {
+        std::vector<u8> data(static_cast<std::size_t>(upto - s.buffer_fetched) * 2);
+        if (bus_.read_ram(s.buffer_address + s.buffer_fetched * 2u, data.data(), data.size())) sink_(c, data.data(), static_cast<u32>(data.size()));
+    }
+    s.buffer_fetched = upto;
 }
 
 }  // namespace mv

@@ -126,10 +126,11 @@ TEST(Aci, AnEightKibBufferPlaysOutInTheBandOfItsSampleCount) {
     r.wr(Rig::kPo + Aci::kBdbar, 4, 0x1000);
     r.wr(Rig::kPo + Aci::kLvi, 1, 0);
     r.wr(Rig::kPo + Aci::kCr, 1, Aci::kCrRpbm | Aci::kCrIoce);
-    ASSERT_TRUE(r.sched.has_pending());
-    const double ms = static_cast<double>(ns_from_cycles(r.sched.next_deadline())) / 1e6;
-    EXPECT_GE(ms, 42.6) << "4096 16-bit samples at 48 kHz stereo";
-    EXPECT_LE(ms, 42.8);
+    // 4096 16-bit samples at 48 kHz stereo = 42.67 ms: not complete at 42.6 ms, complete by 42.8 ms.
+    r.sched.advance_to(cycles_from_ns(42'600'000));
+    EXPECT_EQ(r.aci.channel(Aci::PcmOut).buffers_completed, 0u);
+    r.sched.advance_to(cycles_from_ns(42'800'000));
+    EXPECT_GE(r.aci.channel(Aci::PcmOut).buffers_completed, 1u);  // then the empty descriptors complete at once
 }
 
 TEST(Aci, TheKernelsSingleBufferRingPlaysOnWithoutReArmingAndTheSpdifMirrorStaysSilent) {
@@ -162,4 +163,25 @@ TEST(Aci, TheKernelsSingleBufferRingPlaysOnWithoutReArmingAndTheSpdifMirrorStays
     EXPECT_TRUE(r.irq) << "the buffer played again, one period later";
     EXPECT_EQ(r.aci.channel(Aci::PcmOut).buffers_completed, 64u) << "two periods: the buffer and the 31 empty descriptors each";
     EXPECT_EQ(r.aci.channel(Aci::PcmOut).bytes_played, 2u * 0x2000u);
+}
+
+TEST(Aci, TheBufferIsReadAsItPlaysSoSamplesWrittenAheadOfThePositionAreHeard) {
+    // The APU writes the ring the controller is playing: a sample written before the controller reaches it must be
+    // the one heard, and one written after it has been read must not be.
+    Rig r;
+    constexpr u32 kSamples = 256;
+    std::memset(r.bus.ram() + 0x4000, 0x11, kSamples * 2);
+    r.descriptor(0x1000, 0, 0x4000, kSamples, true);
+    r.wr(Rig::kPo + Aci::kBdbar, 4, 0x1000);
+    r.wr(Rig::kPo + Aci::kLvi, 1, 0);
+    r.wr(Rig::kPo + Aci::kCr, 1, Aci::kCrRpbm | Aci::kCrIoce);
+    r.sched.advance_to(Rig::samples(kSamples / 2));
+    EXPECT_EQ(r.played.size(), kSamples) << "the first half (in bytes) is read by the time it has played";
+    std::memset(r.bus.ram() + 0x4000, 0x22, kSamples * 2);  // rewrite the whole buffer half way through
+    r.sched.advance_to(Rig::samples(kSamples));
+    ASSERT_EQ(r.played.size(), kSamples * 2u);
+    EXPECT_EQ(r.played[0], 0x11u) << "already played: the old sample";
+    EXPECT_EQ(r.played[kSamples - 1], 0x11u);
+    EXPECT_EQ(r.played[kSamples], 0x22u) << "not yet read when it was written: the new sample";
+    EXPECT_EQ(r.played[kSamples * 2 - 1], 0x22u);
 }
