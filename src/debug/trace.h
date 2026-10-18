@@ -36,8 +36,10 @@ inline bool on(Cat c) { return (enabled() & static_cast<u32>(c)) != 0; }
 // Where lines go: stderr by default, or a file.
 void set_sink(std::FILE* f);
 
-// The current timeline position, supplied by the machine so every line carries a cycle stamp.
+// The current timeline position, supplied by the machine so every line carries a cycle stamp; `now` reads it (0
+// without a machine), for instruments that stamp events of their own.
 void set_clock_source(const Cycles* now);
+Cycles now();
 
 void emit(Cat c, std::string_view text);
 

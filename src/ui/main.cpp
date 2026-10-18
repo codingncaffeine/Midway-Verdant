@@ -36,7 +36,13 @@ void print_usage() {
         "  --dvd FILE         a game disc image (XISO or a full dump) in the DVD tray\n"
         "  --create-hdd FILE  write a blank 8 GB retail hard-disk image (sparse, five FATX partitions) and exit\n"
         "  --smc-scratch N    the SMC scratch flags the kernel reads at boot (4 = short animation, 8 = dashboard)\n"
-        "  --seconds N        run for N seconds of host time (default 5)\n"
+        "  --seconds N        run for at most N seconds of host time (default 5; 600 with --guest-seconds)\n"
+        "  --guest-seconds N  stop after N seconds of the console's own time\n"
+        "  --speed S          fast mode: keep the console's time to S times the host clock (default 1 = real time;\n"
+        "                     0 = as fast as the host allows, for tests and captures)\n"
+        "  --fast-cpu-scale K fast mode: guest time runs K times the host time the virtual CPU spent in the guest\n"
+        "                     (default 2: a host core is several times the console's Pentium III; its TSC runs as fast)\n"
+        "  --guest-clock C    fast mode's timeline: cputime (default, the virtual CPU's work) or wall (the host clock)\n"
         "  --until EVENT      stop early at a milestone: rom-hidden, bootloader, kernel\n"
         "  --trace LIST       comma-separated: post,pci,smbus,mmio,pio,irq,flash,cpu,boot,timer,gpu,apu,aci,all\n"
         "  --trace-file FILE  write the trace there instead of stderr\n"
@@ -92,7 +98,10 @@ int press_button(const std::string& name) {
 
 int main(int argc, char** argv) {
     mv::MachineConfig cfg;
+    cfg.speed = 1.0;
     double seconds = 5.0;
+    bool seconds_given = false;
+    double guest_seconds = 0.0;
     std::string until;
     std::vector<Press> presses;
     std::FILE* trace_file = nullptr;
@@ -141,6 +150,15 @@ int main(int argc, char** argv) {
             cfg.smc_scratch = static_cast<mv::u8>(std::strtoul(need("--smc-scratch"), nullptr, 0));
         } else if (a == "--seconds") {
             seconds = std::atof(need("--seconds"));
+            seconds_given = true;
+        } else if (a == "--guest-seconds") {
+            guest_seconds = std::atof(need("--guest-seconds"));
+        } else if (a == "--speed") {
+            cfg.speed = std::atof(need("--speed"));
+        } else if (a == "--fast-cpu-scale") {
+            cfg.fast_cpu_scale = std::atof(need("--fast-cpu-scale"));
+        } else if (a == "--guest-clock") {
+            cfg.guest_clock = need("--guest-clock");
         } else if (a == "--until") {
             until = need("--until");
         } else if (a == "--trace") {
@@ -257,6 +275,16 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "midway-verdant: unknown milestone %s\n", until.c_str());
         return 2;
     }
+    if (guest_seconds > 0) {
+        // The run ends on the console's own time; the host time limit stays as a cap.
+        const mv::Cycles end = mv::cycles_from_ns(static_cast<mv::u64>(guest_seconds * 1e9));
+        condition = [end, milestone = condition](mv::Machine& m) { return m.scheduler().now() >= end || (milestone && milestone(m)); };
+        if (!seconds_given) seconds = 600.0;
+    }
+    std::printf("cpu: %s, timeline: %s; pacing: %s\n", std::string(machine.cpu()->name()).c_str(), machine.cpu()->clock_name().c_str(),
+                !machine.cpu()->hardware_assisted() || !machine.cpu()->owns_timeline() ? "none (the CPU's own speed)"
+                : cfg.speed > 0                                                        ? std::format("{:g} x real time", cfg.speed).c_str()
+                                                                                       : "unthrottled");
 
     if (luma_log || !scanout_png_dir.empty() || !presses.empty()) {
         // Instruments on the scanout at every vblank, in guest time: the picture's mean luma (every fourth pixel of
@@ -353,7 +381,9 @@ int main(int argc, char** argv) {
     }
     const double wall = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
 
-    std::printf("stopped: %s after %.3f s host, %.3f ms guest\n", reason_name(reason), wall,
+    const bool guest_time_up = guest_seconds > 0 && static_cast<double>(machine.scheduler().now()) >= guest_seconds * mv::clk::kCpuHz;
+    std::printf("stopped: %s after %.3f s host, %.3f ms guest\n",
+                reason == mv::Machine::StopReason::Condition && guest_time_up ? "console time limit" : reason_name(reason), wall,
                 static_cast<double>(mv::ns_from_cycles(machine.scheduler().now())) / 1e6);
     if (machine.cpu()->stop_reason() != mv::CpuBackend::Stop::None)
         std::printf("cpu: %s\n", machine.cpu()->stop_detail().c_str());
@@ -460,6 +490,12 @@ int main(int argc, char** argv) {
                     static_cast<unsigned long long>(machine.apu().traps()), machine.apu().front_end_trapped() ? " (trapped now)" : "",
                     static_cast<unsigned long long>(machine.apu().setup_engine().notifications()),
                     machine.apu().reg(mv::Apu::kFectl), machine.apu().reg(mv::Apu::kIsts), machine.apu().reg(mv::Apu::kIen));
+        {
+            std::string started;
+            for (const auto& s : machine.apu().setup_engine().handles_started())
+                started += std::format(" {:x}@{:.3f}", s.handle, static_cast<double>(s.at) / mv::clk::kCpuHz);
+            std::printf("vp voices started (handle@guest seconds):%s\n", started.empty() ? " none" : started.c_str());
+        }
         std::printf("gp peripherals (reads/writes):");
         for (const auto& [addr, rw] : gp.peripheral_traffic())
             std::printf(" %06x %llu/%llu", addr, static_cast<unsigned long long>(rw.first), static_cast<unsigned long long>(rw.second));

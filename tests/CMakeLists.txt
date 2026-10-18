@@ -11,6 +11,7 @@ FetchContent_MakeAvailable(googletest)
 add_executable(mv_tests
   unit/version_test.cpp
   unit/clock_test.cpp
+  unit/guest_clock_test.cpp
   unit/bus_test.cpp
   unit/legacy_test.cpp
   unit/twod_test.cpp

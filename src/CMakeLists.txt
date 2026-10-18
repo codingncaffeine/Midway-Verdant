@@ -3,6 +3,7 @@
 add_library(mvcore STATIC
   core/version.cpp
   core/clock.cpp
+  core/guest_clock.cpp
   core/scheduler.cpp
   core/bus.cpp
   core/machine.cpp

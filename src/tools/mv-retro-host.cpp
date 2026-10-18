@@ -10,8 +10,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <algorithm>
 #include <filesystem>
 #include <format>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -28,6 +30,9 @@ std::size_t last_pitch = 0;
 unsigned long long frames_seen = 0, audio_frames = 0, audio_nonzero = 0;
 std::FILE* wav_out = nullptr;  // --wav FILE: the core's audio as raw interleaved stereo 16-bit (a WAV header is written at the end)
 unsigned long long wav_frames = 0;
+// Audio frames per retro_run: a core on the console's clock hands over 800 or 801 (48 kHz over 59.94 Hz).
+unsigned long long audio_this_call = 0;
+std::map<unsigned long long, unsigned long long> audio_per_call;
 
 struct Press {
     unsigned id;
@@ -87,6 +92,7 @@ void video(const void* data, unsigned w, unsigned h, size_t pitch) {
 
 size_t audio_batch(const int16_t* data, size_t frames) {
     audio_frames += frames;
+    audio_this_call += frames;
     for (size_t i = 0; i < frames * 2; ++i)
         if (data[i]) ++audio_nonzero;
     if (wav_out) {
@@ -211,13 +217,24 @@ int main(int argc, char** argv) {
     if (png_every) std::filesystem::create_directories(png_dir);
     auto run = sym<void (*)()>(lib, "retro_run");
     const auto t0 = std::chrono::steady_clock::now();
+    double call_ms_max = 0;
     for (current_frame = 0; current_frame < frames; ++current_frame) {
+        audio_this_call = 0;
+        const auto c0 = std::chrono::steady_clock::now();
         run();
+        call_ms_max = std::max(call_ms_max, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - c0).count());
+        ++audio_per_call[audio_this_call];
         if (png_every && (current_frame + 1) % png_every == 0) save_png(png_dir / std::format("frame-{:06}.png", current_frame + 1));
     }
     const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-    std::printf("ran %u frames in %.2f s (%.1f fps); %llu video callbacks, last %ux%u; %llu audio frames, %llu non-zero samples\n", frames, secs,
-                frames / secs, frames_seen, last_w, last_h, audio_frames, audio_nonzero);
+    std::printf("ran %u frames in %.2f s (%.1f fps, slowest call %.1f ms); %llu video callbacks, last %ux%u; %llu audio frames, %llu non-zero samples\n", frames,
+                secs, frames / secs, call_ms_max, frames_seen, last_w, last_h, audio_frames, audio_nonzero);
+    // The most common audio frame counts per call, most frequent first.
+    std::vector<std::pair<unsigned long long, unsigned long long>> hist(audio_per_call.begin(), audio_per_call.end());
+    std::sort(hist.begin(), hist.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+    std::string counts;
+    for (std::size_t i = 0; i < hist.size() && i < 8; ++i) counts += std::format(" {}x{}", hist[i].first, hist[i].second);
+    std::printf("audio frames per call (count x calls):%s%s\n", counts.c_str(), hist.size() > 8 ? " ..." : "");
     if (wav_out) {
         // RIFF header for 48 kHz stereo 16-bit PCM.
         auto le32 = [](unsigned char* p, unsigned v) { for (int k = 0; k < 4; ++k) p[k] = static_cast<unsigned char>(v >> (8 * k)); };

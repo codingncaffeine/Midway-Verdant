@@ -1,5 +1,7 @@
 #pragma once
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <filesystem>
 #include <functional>
@@ -83,6 +85,17 @@ struct MachineConfig {
     // interpreter is checked instruction by instruction against a KVM vCPU.
     std::string cpu{"kvm"};
     bool oracle{false};
+    // The fast mode's timeline (D16): "cputime" = the guest clock (the work the virtual CPU did), "wall" = the host
+    // clock (the old behaviour, a control). MV_GUEST_CLOCK overrides it.
+    std::string guest_clock{"cputime"};
+    // How much faster than the host time it took guest time runs inside the guest (a host core is many times a
+    // 733 MHz Pentium III); the guest's TSC runs as much faster. MV_FAST_CPU_SCALE overrides it.
+    double fast_cpu_scale{2.0};
+    // Pacing of a CPU that runs free (the fast mode with its guest clock): frame steps stop the CPU at every vblank
+    // until the front end asks for the next frame (the libretro core); otherwise guest time keeps to the host clock
+    // times `speed` (1 = real time), or runs as fast as it can with speed 0.
+    bool frame_step{false};
+    double speed{0.0};
 };
 
 // The console: every device on one bus and one timeline, a CPU backend running the firmware against them, and
@@ -133,18 +146,39 @@ public:
     const pgraph::VulkanRenderer* renderer() const { return renderer_.get(); }
     std::string gpu_name() const;  // the Vulkan device's name when --gpu is on, else empty
 
-    // The machine lock and the wake-up used by the CPU thread's HLT wait.
+    // The machine lock and the wake-ups: `wake_cpu` for the CPU thread's waits (HLT, pacing), `wake` for those and
+    // the io thread's (a paused frame, a reset or power-off request, the CPU stopping).
     std::mutex& lock() { return lock_; }
-    void wake() { wake_cv_.notify_all(); }
+    void wake_cpu() { wake_cv_.notify_all(); }
+    // The CPU is back in the guest after a stretch out of it (its clock stood still): the io thread re-plans its wake.
+    void wake_io() { io_cv_.notify_all(); }
+    void wake() {
+        wake_cv_.notify_all();
+        io_cv_.notify_all();
+    }
     template <class Pred>
     void wait_for_wake(Pred pred) {
         std::unique_lock<std::mutex> lk(lock_, std::adopt_lock);
         wake_cv_.wait(lk, pred);
         lk.release();
     }
-    // Fast mode: bring the timeline up to the host clock and fire what is due. Called with the lock held.
+    // Bring the timeline up to the CPU's clock (or, in the fast mode's wall-clock control, the host's) and fire what
+    // is due. Called with the lock held.
     void advance_time();
     Cycles wall_cycles() const;
+
+    // Pacing a free-running CPU (D16). The CPU thread calls this with the lock held before it enters the guest, at
+    // guest time `now`. When the CPU must not run on yet (the frame step's vblank came, or it is ahead of the host
+    // clock) it waits, releasing the lock, until it may, `stopping` turns true or the machine needs the io thread,
+    // and returns false so the caller loops. The io thread kicks the CPU out of the guest when it must come here.
+    bool pace_cpu(std::unique_lock<std::mutex>& lk, Cycles now, const std::atomic<bool>& stopping);
+    // Frame steps: let the CPU run until the vblank count reaches `vblanks`. With the lock held; wakes the CPU.
+    void set_frame_limit(u64 vblanks);
+    bool cpu_paused() const { return cpu_paused_; }
+    // Guest time at which the PIC last raised INTR (an instrument: interrupt latency).
+    Cycles intr_rose_at() const { return intr_rose_at_; }
+    // Host time the io thread spent firing device events (an instrument: device work off the CPU thread).
+    u64 io_event_ns() const { return io_event_ns_; }
 
     // Boot milestones recognised from behaviour (times on the master timeline, or nullopt).
     struct Milestones {
@@ -165,6 +199,10 @@ public:
 
 private:
     void check_memory_milestones();
+    // Pacing as the io thread sees it: whether the CPU must come back to pace_cpu now, and the guest time at which
+    // real-time pacing will want it back (or the end of time).
+    bool cpu_must_hold(Cycles now) const;
+    Cycles pace_horizon() const;
     void perform_reset(std::unique_lock<std::mutex>& lk);
 
     MachineConfig config_;
@@ -201,8 +239,16 @@ private:
     std::unique_ptr<pgraph::VulkanRenderer> renderer_;
 
     std::mutex lock_;
-    std::condition_variable wake_cv_;
+    std::condition_variable wake_cv_, io_cv_;
     std::chrono::steady_clock::time_point start_;
+    // Pacing (pace_cpu): the frame step's vblank limit, and real time's reference point (the guest time that
+    // matched a host time; moved forward when the host falls behind, so the guest never races to catch up).
+    u64 frame_limit_{0};
+    bool cpu_paused_{false};
+    Cycles intr_rose_at_{0};
+    u64 io_event_ns_{0};
+    std::chrono::steady_clock::time_point pace_wall_;
+    Cycles pace_guest_{0};
     bool power_off_{false};
     std::string power_off_reason_;
     bool reset_pending_{false};

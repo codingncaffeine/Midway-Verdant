@@ -69,7 +69,7 @@ void P6Backend::join() {
 
 void P6Backend::kick() {
     ++stats_.kicks;
-    if (machine_) machine_->wake();
+    if (machine_) machine_->wake_cpu();
 }
 
 // Bring the timeline up to the core's clock (called before every device access and when a deadline passes).

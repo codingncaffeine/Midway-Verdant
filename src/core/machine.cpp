@@ -1,5 +1,9 @@
 #include "core/machine.h"
 
+#if defined(__linux__)
+#include <sys/prctl.h>
+#endif
+
 #include <algorithm>
 #include <chrono>
 #include <cstring>
@@ -203,7 +207,7 @@ bool Machine::init(std::string& error) {
         return false;
     }
     if (!config_.break_eips.empty()) cpu_->set_break_eips(config_.break_eips);
-    if (!cpu_->owns_timeline()) {
+    if (cpu_->hardware_assisted()) {
         // The fast mode: late timer ticks are delivered, not merged (see Pit::set_lost_tick_policy).
         pit_.set_lost_tick_policy([this] { return pic_.request_pending(0); });
         pic_.set_on_acknowledge([this](unsigned irq) {
@@ -227,9 +231,12 @@ bool Machine::init(std::string& error) {
         trace::log(trace::Cat::Boot, "live GPU on {}", gpu_device_->name());
     }
     pic_.set_on_intr([this](bool asserted) {
-        if (asserted && cpu_) cpu_->kick();
+        if (!asserted) return;
+        intr_rose_at_ = sched_.now();
+        if (cpu_) cpu_->kick();
     });
-    if (cpu_->owns_timeline()) {
+    if (!cpu_->hardware_assisted()) {
+        // The interpreter: milestones on its own timeline, so their times are deterministic.
         milestone_poll_.name = "milestones";
         milestone_poll_.fire = [this](Cycles now) {
             check_memory_milestones();
@@ -247,13 +254,67 @@ Cycles Machine::wall_cycles() const {
 
 void Machine::advance_time() {
     if (cpu_ && cpu_->owns_timeline()) {
-        // The interpreter's clock is the timeline and it advances the scheduler itself at every deadline;
-        // here only what is already due fires.
+        // The CPU's clock is the timeline: the interpreter's cycles (it advances the scheduler at every deadline
+        // itself, so here only what is already due fires), or the fast mode's guest clock, read live on the io
+        // thread (with the vCPU's time in the guest so far) and at its exits on the CPU thread.
         sched_.advance_to(cpu_->timeline_cycles());
     } else {
         sched_.advance_to(wall_cycles());
     }
     trace_now_ = sched_.now();
+}
+
+namespace {
+// Real-time pacing: the CPU may run this far ahead of the host clock before it waits; a host that falls further
+// behind than kPaceMaxLag is forgiven the debt, so the guest never races to catch up after a stall.
+constexpr u64 kPaceSlackNs = 2'000'000;
+constexpr u64 kPaceMaxLagNs = 100'000'000;
+}  // namespace
+
+Cycles Machine::pace_horizon() const {
+    if (config_.speed <= 0) return ~Cycles{0};
+    const auto host_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - pace_wall_).count();
+    return pace_guest_ + cycles_from_ns(static_cast<u64>(static_cast<double>(std::max<i64>(host_ns, 0)) * config_.speed)) + cycles_from_ns(kPaceSlackNs);
+}
+
+bool Machine::cpu_must_hold(Cycles now) const {
+    if (config_.frame_step) return nv2a_.vblanks() >= frame_limit_;
+    return now > pace_horizon();
+}
+
+bool Machine::pace_cpu(std::unique_lock<std::mutex>& lk, Cycles now, const std::atomic<bool>& stopping) {
+    const auto released = [&] { return stopping.load() || reset_pending_ || power_off_; };
+    if (config_.frame_step) {
+        if (nv2a_.vblanks() < frame_limit_) return true;
+        // The frame the front end asked for is complete: hold the CPU (its guest clock stands still) until the next.
+        cpu_paused_ = true;
+        io_cv_.notify_all();
+        wake_cv_.wait(lk, [&] { return released() || nv2a_.vblanks() < frame_limit_; });
+        cpu_paused_ = false;
+        return false;
+    }
+    if (config_.speed <= 0) return true;
+    if (now > pace_horizon()) {
+        // Ahead of the host clock: wait until it reaches the guest's time.
+        const double ahead_ns = static_cast<double>(ns_from_cycles(now - pace_guest_)) / config_.speed;
+        cpu_paused_ = true;
+        wake_cv_.wait_until(lk, pace_wall_ + std::chrono::nanoseconds(static_cast<i64>(ahead_ns)), released);
+        cpu_paused_ = false;
+        return false;
+    }
+    if (pace_horizon() > now + cycles_from_ns(kPaceMaxLagNs)) {
+        // The host fell behind: forget the debt rather than race to catch up.
+        pace_guest_ = now;
+        pace_wall_ = std::chrono::steady_clock::now();
+    }
+    return true;
+}
+
+void Machine::set_frame_limit(u64 vblanks) {
+    frame_limit_ = vblanks;
+    // Released: the io thread plans its wakes on the running clock from now on, not on the paused one's tick.
+    if (nv2a_.vblanks() < frame_limit_) cpu_paused_ = false;
+    wake_cv_.notify_all();
 }
 
 void Machine::request_power_off(std::string why) {
@@ -298,6 +359,8 @@ void Machine::perform_reset(std::unique_lock<std::mutex>& lk) {
     ide_.reset();
     milestones_ = {};
     cpu_->reset();
+    pace_wall_ = std::chrono::steady_clock::now();
+    pace_guest_ = sched_.now();
     cpu_->start();
 }
 
@@ -343,6 +406,10 @@ Machine::StopReason Machine::run(std::chrono::nanoseconds host_duration, std::fu
 
 void Machine::start() {
     start_ = std::chrono::steady_clock::now();
+    pace_wall_ = start_;
+    pace_guest_ = sched_.now();
+    // Frame steps: the CPU waits for the front end's first frame.
+    frame_limit_ = nv2a_.vblanks();
     cpu_->start();
 }
 
@@ -352,10 +419,41 @@ void Machine::finish() {
 }
 
 Machine::StopReason Machine::pump(std::chrono::steady_clock::time_point deadline, const std::function<bool(Machine&)>& until) {
+    // The io thread fires device events while the CPU runs: on the guest clock read live (the fast mode, D16), the
+    // host clock (its wall-clock control) or the interpreter's count (which fires its own; this is redundant there).
+    const double rate = cpu_->timeline_rate();
+#if defined(__linux__)
+    // On the guest clock an interrupt reaches the guest as late as this thread wakes, times `rate`: sleep to the
+    // microsecond while pumping (the default 50 us of timer slack would be 0.2 ms of guest time at 4x).
+    const int old_slack = rate > 0 ? prctl(PR_GET_TIMERSLACK, 0, 0, 0, 0) : -1;
+    if (old_slack > 1) prctl(PR_SET_TIMERSLACK, 1, 0, 0, 0);
+    struct RestoreSlack {
+        int slack;
+        ~RestoreSlack() {
+            if (slack > 1) prctl(PR_SET_TIMERSLACK, static_cast<unsigned long>(slack), 0, 0, 0);
+        }
+    } restore_slack{old_slack};
+#endif
+    // While the guest clock stands still (the CPU outside the guest), the sleeps back off from 5 us to 1 ms.
+    Cycles last_seen = sched_.now();
+    i64 idle_backoff_ns = 5'000;
     StopReason reason = StopReason::Duration;
-    for (;;) {
-        std::unique_lock lk(lock_);
+    std::unique_lock lk(lock_);
+    const auto timed_advance = [this] {
+        const auto t0 = std::chrono::steady_clock::now();
         advance_time();
+        io_event_ns_ += static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
+    };
+    for (;;) {
+        // A timer may have become due: the CPU thread must see interrupts promptly.
+        timed_advance();
+        if (pic_.intr_asserted()) cpu_->kick();
+        if (rate > 0 && !cpu_paused_) {
+            // A free-running CPU that must stop (its frame is done, it is ahead of real time) leaves the guest now;
+            // otherwise its backstop moves to the next event.
+            if (cpu_must_hold(sched_.now())) cpu_->kick();
+            else cpu_->timeline_advanced();
+        }
         check_memory_milestones();
         if (config_.reset_at_seconds && !reset_at_done_ &&
             std::chrono::steady_clock::now() - start_ >= std::chrono::duration<double>(*config_.reset_at_seconds)) {
@@ -380,22 +478,26 @@ Machine::StopReason Machine::pump(std::chrono::steady_clock::time_point deadline
         }
         const auto now = std::chrono::steady_clock::now();
         if (now >= deadline) break;
-        // Sleep until the next timer or a short tick (milestones are polled), whichever is sooner.
+        // Wait for the next timer or a short tick (milestones are polled), whichever is sooner; the CPU thread wakes
+        // us at once when it pauses at a frame step's vblank, and so do a reset, a power-off and the CPU stopping.
         auto wake_at = now + std::chrono::milliseconds(2);
         if (sched_.has_pending() && !cpu_->owns_timeline()) {
             const u64 next_ns = ns_from_cycles(sched_.next_deadline());
             const auto next_tp = start_ + std::chrono::nanoseconds(static_cast<i64>(next_ns));
             if (next_tp < wake_at) wake_at = next_tp;
+        } else if (rate > 0 && !cpu_paused_) {
+            // The guest clock runs at most `rate` times the host clock: no deadline (an event, or the point where
+            // real-time pacing wants the CPU back) comes sooner than this.
+            const Cycles g = sched_.now();
+            idle_backoff_ns = g != last_seen ? 5'000 : std::min<i64>(idle_backoff_ns * 2, 1'000'000);
+            last_seen = g;
+            const Cycles next = std::min(sched_.next_deadline(), pace_horizon());
+            const double guest_ns = next > g ? static_cast<double>(ns_from_cycles(next - g)) : 0.0;
+            const auto at = now + std::chrono::nanoseconds(std::max<i64>(static_cast<i64>(guest_ns / rate), idle_backoff_ns));
+            if (at < wake_at) wake_at = at;
         }
         if (deadline < wake_at) wake_at = deadline;
-        lk.unlock();
-        std::this_thread::sleep_until(wake_at);
-        // A timer may have become due: the CPU thread must see interrupts promptly.
-        {
-            std::lock_guard g(lock_);
-            advance_time();
-            if (pic_.intr_asserted()) cpu_->kick();
-        }
+        io_cv_.wait_until(lk, wake_at);
     }
     return reason;
 }

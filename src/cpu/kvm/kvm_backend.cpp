@@ -9,14 +9,18 @@
 #include <signal.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <bit>
 #include <cerrno>
 #include <chrono>
+#include <cmath>
 #include <cstring>
 #include <format>
+
+#include "core/clock.h"
 
 #include "core/machine.h"
 #include "debug/guest_stack.h"
@@ -46,6 +50,15 @@ struct CpuidFour {
     kvm_cpuid2* header() { return reinterpret_cast<kvm_cpuid2*>(bytes); }
     kvm_cpuid_entry2* entries() { return reinterpret_cast<kvm_cpuid_entry2*>(bytes + sizeof(kvm_cpuid2)); }
 };
+
+u64 clock_ns(clockid_t id) {
+    timespec t{};
+    clock_gettime(id, &t);
+    return static_cast<u64>(t.tv_sec) * 1'000'000'000ull + static_cast<u64>(t.tv_nsec);
+}
+// The host's steady clock and this thread's CPU time.
+u64 mono_ns() { return clock_ns(CLOCK_MONOTONIC); }
+u64 thread_cpu_ns() { return clock_ns(CLOCK_THREAD_CPUTIME_ID); }
 }  // namespace
 
 KvmBackend::KvmBackend() {
@@ -168,10 +181,48 @@ bool KvmBackend::init(Machine& machine, std::string& error) {
     if (!setup_cpuid(error)) return false;
     arm_breakpoints();
 
+    // The timeline: the guest clock unless the configuration or MV_GUEST_CLOCK asks for the host clock.
+    std::string mode = machine.config().guest_clock;
+    if (const char* e = std::getenv("MV_GUEST_CLOCK"); e && *e) mode = e;
+    if (mode == "wall") {
+        guest_clock_on_ = false;
+    } else if (mode != "cputime") {
+        error = std::format("unknown guest clock '{}' (cputime or wall)", mode);
+        return false;
+    }
+    double scale = machine.config().fast_cpu_scale;
+    if (const char* e = std::getenv("MV_FAST_CPU_SCALE"); e && *e) scale = std::atof(e);
+    if (!(scale >= 0.25 && scale <= 64.0)) {
+        error = std::format("fast CPU scale {} out of range (0.25 to 64)", scale);
+        return false;
+    }
+    clock_.set_scale_milli(static_cast<u32>(std::lround(scale * 1000.0)));
+    // The TSC counts 733.333 MHz of guest time; with the guest clock, guest time inside the guest runs `scale` times
+    // faster than the host's, and so must the TSC.
     if (ioctl(kvm_fd_, KVM_CHECK_EXTENSION, KVM_CAP_TSC_CONTROL) > 0) {
-        if (ioctl(vcpu_fd_, KVM_SET_TSC_KHZ, 733333) == 0) tsc_scaled_ = true;
+        if (ioctl(vcpu_fd_, KVM_SET_TSC_KHZ, guest_clock_on_ ? clock_.tsc_khz() : 733333u) == 0) tsc_scaled_ = true;
     }
     if (!tsc_scaled_) trace::log(trace::Cat::Cpu, "TSC scaling unavailable: the guest TSC runs at host rate");
+    {
+        kvm_device_attr a{};
+        a.group = KVM_VCPU_TSC_CTRL;
+        a.attr = KVM_VCPU_TSC_OFFSET;
+        tsc_offset_ctl_ = ioctl(vcpu_fd_, KVM_HAS_DEVICE_ATTR, &a) == 0;
+    }
+    if (guest_clock_on_ && tsc_offset_ctl_) {
+        // The guest's own writes of the TSC come out here, so the clock keeps its account of where the TSC should be.
+        kvm_enable_cap cap{};
+        cap.cap = KVM_CAP_X86_USER_SPACE_MSR;
+        cap.args[0] = KVM_MSR_EXIT_REASON_FILTER;
+        u8 deny = 0;  // the bitmap is copied: no bit set = the write leaves the guest
+        kvm_msr_filter filter{};
+        filter.flags = KVM_MSR_FILTER_DEFAULT_ALLOW;
+        filter.ranges[0].flags = KVM_MSR_FILTER_WRITE;
+        filter.ranges[0].base = 0x10;
+        filter.ranges[0].nmsrs = 1;
+        filter.ranges[0].bitmap = &deny;
+        tsc_writes_trapped_ = ioctl(vm_fd_, KVM_ENABLE_CAP, &cap) == 0 && ioctl(vm_fd_, KVM_X86_SET_MSR_FILTER, &filter) == 0;
+    }
 
     // The kick signal stays deliverable: its handler sets immediate_exit on the run area.
     g_kick_target.store(run_, std::memory_order_relaxed);
@@ -246,13 +297,132 @@ void KvmBackend::reset() {
     regs.rdx = cpuid_signature_;
     ioctl(vcpu_fd_, KVM_SET_REGS, &regs);
 
-    // TSC starts at zero at power-on.
+    // TSC starts at zero at power-on; the time until the first entry is not guest time.
+    set_tsc(0);
+    tsc_epoch_ = clock_.now();
+    clock_.mark_out(mono_ns());
+    halted_ = false;
+    trace::log(trace::Cat::Cpu, "reset: real mode, CS f000:fff0, signature {:08x}", cpuid_signature_);
+}
+
+u64 KvmBackend::read_tsc() {
     MsrsOne msrs{};
     msrs.header()->nmsrs = 1;
     msrs.entry()->index = 0x10;  // IA32_TIME_STAMP_COUNTER
-    msrs.entry()->data = 0;
+    return ioctl(vcpu_fd_, KVM_GET_MSRS, msrs.header()) == 1 ? msrs.entry()->data : 0;
+}
+
+bool KvmBackend::tsc_offset_add(i64 delta) {
+    if (!tsc_offset_ctl_) return false;
+    u64 offset = 0;
+    kvm_device_attr a{};
+    a.group = KVM_VCPU_TSC_CTRL;
+    a.attr = KVM_VCPU_TSC_OFFSET;
+    a.addr = reinterpret_cast<u64>(&offset);
+    if (ioctl(vcpu_fd_, KVM_GET_DEVICE_ATTR, &a) < 0) {
+        ++tsc_adjust_failures_;
+        return false;
+    }
+    offset += static_cast<u64>(delta);
+    if (ioctl(vcpu_fd_, KVM_SET_DEVICE_ATTR, &a) < 0) {
+        ++tsc_adjust_failures_;
+        return false;
+    }
+    return true;
+}
+
+void KvmBackend::set_tsc(u64 value) {
+    // Through the offset when the host has it: KVM takes a host write of the MSR within a second of the value it
+    // expects as a synchronization and keeps the old offset, so a warm reset's zero would be ignored.
+    if (tsc_offset_add(static_cast<i64>(value - read_tsc()))) return;
+    MsrsOne msrs{};
+    msrs.header()->nmsrs = 1;
+    msrs.entry()->index = 0x10;
+    msrs.entry()->data = value;
     ioctl(vcpu_fd_, KVM_SET_MSRS, msrs.header());
-    trace::log(trace::Cat::Cpu, "reset: real mode, CS f000:fff0, signature {:08x}", cpuid_signature_);
+}
+
+Cycles KvmBackend::timeline_cycles() const {
+    // On the vCPU thread (at an exit) the bracket is closed and this is the clock's own count; another thread adds
+    // the vCPU's CPU time in the guest so far.
+    return clock_.estimate([this] { return vcpu_clock_known_.load(std::memory_order_acquire) ? clock_ns(vcpu_cpu_clock_.load()) : 0; });
+}
+
+double KvmBackend::timeline_rate() const { return guest_clock_on_ ? static_cast<double>(clock_.scale_milli()) / 1000.0 : 0.0; }
+
+void KvmBackend::timeline_advanced() { arm_backstop(true); }
+
+void KvmBackend::arm_backstop(bool always) {
+    if (!backstop_ok_) return;
+    // Due this long after the event: the io thread fires it first whenever it runs on time.
+    // 250 us: measured against 100 us (the same frames, 7% slower) and 500 us (frames lost, 0.9 ms latency).
+    constexpr Cycles kSlack = 183'333;
+    const Scheduler& sched = machine_->scheduler();
+    if (!sched.has_pending()) return;
+    const Cycles due = sched.next_deadline() + kSlack, now = sched.now();
+    const u64 now_ns = mono_ns();
+    const u64 at = now_ns + std::max<u64>(due > now ? ns_from_cycles(due - now) * 1000u / clock_.scale_milli() : 0, 1);
+    if (!always && backstop_at_ns_ > now_ns && backstop_at_ns_ <= at) return;  // an earlier one is on its way
+    itimerspec its{};
+    its.it_value.tv_sec = static_cast<time_t>(at / 1'000'000'000ull);
+    its.it_value.tv_nsec = static_cast<long>(at % 1'000'000'000ull);
+    if (timer_settime(backstop_, TIMER_ABSTIME, &its, nullptr) == 0) {
+        backstop_at_ns_ = at;
+        ++backstop_shots_;
+    }
+}
+
+void KvmBackend::note_frame_tsc() {
+    // The TSC against the guest clock at a frame's end: ahead by the time the host ran something else while the
+    // vCPU was in the guest (the one stretch a rewind cannot take back: the guest may have read the TSC after it).
+    const i64 lead = static_cast<i64>(read_tsc()) - static_cast<i64>(clock_.now() - tsc_epoch_);
+    tsc_lead_last_ = lead;
+    if (tsc_lead_samples_ == 0 || lead > tsc_lead_max_) tsc_lead_max_ = lead;
+    if (tsc_lead_samples_ == 0 || lead < tsc_lead_min_) tsc_lead_min_ = lead;
+    tsc_lead_sum_ += static_cast<double>(lead);
+    ++tsc_lead_samples_;
+}
+
+std::string KvmBackend::clock_name() const {
+    if (!guest_clock_on_) return "the host wall clock (MV_GUEST_CLOCK=wall)";
+    return std::format("the guest clock: the vCPU's time in the guest x{:g}", static_cast<double>(clock_.scale_milli()) / 1000.0);
+}
+
+std::string KvmBackend::report() const {
+    const GuestClock::Stats& s = clock_.stats();
+    const double scale = static_cast<double>(clock_.scale_milli()) / 1000.0;
+    const auto sec = [](u64 ns) { return static_cast<double>(ns) / 1e9; };
+    const auto us = [](i64 cycles) { return static_cast<double>(cycles) / 733.333; };
+    std::string r = !guest_clock_on_ ? std::string("guest clock: off, the host wall clock drives the timeline (MV_GUEST_CLOCK=wall)") : std::format(
+        "guest clock: x{:g}, {:.3f} s of guest time = {:.3f} s in the guest + {:.3f} s of {} short exits (host time x{:g}); not counted: "
+        "{:.3f} s in {} long exits (longest {:.1f} ms), {:.3f} s preempted in the guest, {} cycles skipped at HLT",
+        scale, static_cast<double>(clock_.now()) / 733'333'333.0, sec(s.in_guest_ns), sec(s.out_counted_ns), s.short_exits, scale, sec(s.long_ns),
+        s.long_exits, static_cast<double>(s.longest_exit_ns) / 1e6, sec(s.preempted_ns), s.warped_cycles);
+    r += std::format("\nkvm: {} exits (mmio {}, pio {}, hlt {}, irq window {}, interrupted {}), {} kicks, {} interrupts injected",
+                     stats_.exits, stats_.mmio_exits, stats_.pio_exits, stats_.hlt_exits, stats_.irq_window_exits, stats_.intr_exits, stats_.kicks,
+                     stats_.irq_injections);
+    r += std::format("\nkvm: host time on the vCPU thread: firing device events {:.3f} s, exit handlers {:.3f} s, held by pacing {:.3f} s; backstop timer armed {} times",
+                     sec(event_ns_), sec(handler_ns_), sec(pause_ns_), backstop_shots_);
+    r += std::format("\nkvm: interrupt latency (guest us) <10 {}, <50 {}, <100 {}, <250 {}, <500 {}, <1000 {}, more {}; max {:.0f}", irq_latency_buckets_[0],
+                     irq_latency_buckets_[1], irq_latency_buckets_[2], irq_latency_buckets_[3], irq_latency_buckets_[4], irq_latency_buckets_[5],
+                     irq_latency_buckets_[6], us(static_cast<i64>(irq_latency_max_)));
+    {
+        std::vector<std::pair<u32, u64>> top(exit_sources_.begin(), exit_sources_.end());
+        std::sort(top.begin(), top.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+        r += "\nkvm: busiest exits:";
+        for (std::size_t i = 0; i < top.size() && i < 8; ++i)
+            r += (top[i].first & 0x10000u) ? std::format(" port {:04x} x{}", top[i].first & 0xFFFFu, top[i].second)
+                                           : std::format(" mmio {:08x} x{}", top[i].first, top[i].second);
+    }
+    if (!guest_clock_on_) return r;
+    r += std::format("\nguest clock: TSC {} kHz on the host clock{}, {} rewinds ({:.3f} s of guest time), {} guest writes{}{}; TSC lead at frame ends (us): last {:.1f}, mean {:.1f}, min {:.1f}, max {:.1f} over {}",
+                     clock_.tsc_khz(), tsc_scaled_ ? "" : " (NOT SCALED: the host has no TSC control)", tsc_rewinds_,
+                     static_cast<double>(tsc_rewound_) / 733'333'333.0, guest_tsc_writes_,
+                     tsc_writes_trapped_ ? "" : " (not trapped)",
+                     tsc_offset_ctl_ ? (tsc_adjust_failures_ ? std::format(" ({} failed)", tsc_adjust_failures_) : std::string()) : std::string(" (no TSC offset control: rewinds off)"),
+                     us(tsc_lead_last_), tsc_lead_samples_ ? us(static_cast<i64>(tsc_lead_sum_ / static_cast<double>(tsc_lead_samples_))) : 0.0,
+                     us(tsc_lead_min_), us(tsc_lead_max_), tsc_lead_samples_);
+    return r;
 }
 
 void KvmBackend::start() {
@@ -285,7 +455,7 @@ void KvmBackend::kick() {
     ++stats_.kicks;
     if (run_) run_->immediate_exit = 1;
     if (thread_.joinable()) pthread_kill(thread_.native_handle(), kKickSignal);
-    machine_->wake();
+    machine_->wake_cpu();
 }
 
 void KvmBackend::inject_interrupt_if_possible() {
@@ -301,6 +471,13 @@ void KvmBackend::inject_interrupt_if_possible() {
             ++stats_.irq_injections;
             ++stats_.by_vector[irq.irq & 0xFF];
             trace::log(trace::Cat::Irq, "injected vector {:02x}", irq.irq);
+            const Cycles now = machine_->scheduler().now(), rose = machine_->intr_rose_at();
+            const Cycles late = now > rose ? now - rose : 0;
+            static constexpr Cycles kBounds[] = {7'333, 36'667, 73'333, 183'333, 366'667, 733'333};
+            unsigned b = 0;
+            while (b < 6 && late >= kBounds[b]) ++b;
+            ++irq_latency_buckets_[b];
+            irq_latency_max_ = std::max(irq_latency_max_, late);
         }
         run_->request_interrupt_window = pic.pending_vector() >= 0 ? 1 : 0;
     } else {
@@ -367,15 +544,90 @@ void KvmBackend::thread_main() {
     sigemptyset(&unblock);
     sigaddset(&unblock, kKickSignal);
     pthread_sigmask(SIG_UNBLOCK, &unblock, nullptr);
+    if (guest_clock_on_) {
+        // The io thread reads this thread's CPU clock to see guest time move while the guest runs.
+        clockid_t id{};
+        if (pthread_getcpuclockid(pthread_self(), &id) == 0) {
+            vcpu_cpu_clock_.store(id);
+            vcpu_clock_known_.store(true, std::memory_order_release);
+        }
+        // Guest time counts this thread's CPU time from here (the stretch since the reset is not guest time).
+        clock_.thread_started(thread_cpu_ns());
+        // The backstop timer signals this thread (the kick).
+        sigevent sev{};
+        sev.sigev_notify = SIGEV_THREAD_ID;
+        sev.sigev_signo = kKickSignal;
+        sev._sigev_un._tid = gettid();
+        std::lock_guard lock(machine_->lock());
+        backstop_ok_ = timer_create(CLOCK_MONOTONIC, &sev, &backstop_) == 0;
+        backstop_at_ns_ = 0;
+    }
 
     while (!stop_requested_) {
+        // From here a kick makes the coming KVM_RUN return at once (the check below runs after it, under the lock).
+        run_->immediate_exit = 0;
         {
-            std::lock_guard lock(machine_->lock());
+            std::unique_lock lock(machine_->lock());
+            const u64 t0 = mono_ns();
             machine_->advance_time();
+            const u64 t1 = mono_ns();
+            event_ns_ += t1 - t0;
+            if (guest_clock_on_) {
+                if (!machine_->pace_cpu(lock, clock_.now(), stop_requested_)) {
+                    pause_ns_ += mono_ns() - t1;
+                    continue;
+                }
+                Scheduler& sched = machine_->scheduler();
+                if (halted_) {
+                    // HLT: no guest time passes in the guest; it skips to each next event until one raises an
+                    // interrupt (the TSC moves as far), with the pacing above between the steps.
+                    if (machine_->pic().pending_vector() >= 0) {
+                        halted_ = false;
+                    } else if (sched.has_pending()) {
+                        if (const Cycles skipped = clock_.warp_to(sched.next_deadline())) tsc_offset_add(static_cast<i64>(skipped));
+                        continue;
+                    } else {
+                        wait_for_interrupt();
+                        continue;
+                    }
+                }
+                if (const u64 v = machine_->nv2a().vblanks(); v != vblank_seen_) {
+                    vblank_seen_ = v;
+                    frame_tsc_due_ = true;
+                }
+                arm_backstop(false);
+            }
             inject_interrupt_if_possible();
         }
-        run_->immediate_exit = 0;
+        if (guest_clock_on_) {
+            // The stretch since the exit: a short one is guest time, a long one is not and comes off the TSC. At every
+            // boundary the wall clock is read first and the CPU clock second, so the two accounts line up.
+            const GuestClock::Exit e = clock_.classify(mono_ns());
+            if (e.long_exit) {
+                clock_.excluded_until(thread_cpu_ns());
+                if (e.tsc_rewind && tsc_offset_add(-static_cast<i64>(e.tsc_rewind))) {
+                    ++tsc_rewinds_;
+                    tsc_rewound_ += e.tsc_rewind;
+                }
+            }
+            {
+                const u64 wall = mono_ns();
+                const u64 cpu = thread_cpu_ns();
+                clock_.entered(cpu, wall);
+            }
+            // The io thread may have backed off while this clock stood still: it re-plans on the running clock.
+            if (e.long_exit) machine_->wake_io();
+            if (frame_tsc_due_) {
+                frame_tsc_due_ = false;
+                note_frame_tsc();
+            }
+        }
         const int rc = ioctl(vcpu_fd_, KVM_RUN, 0);
+        if (guest_clock_on_) {
+            const u64 wall = mono_ns();
+            const u64 cpu = thread_cpu_ns();
+            clock_.left(cpu, wall);
+        }
         ++stats_.exits;
         if (rc < 0 && errno == EINTR) {
             ++stats_.intr_exits;
@@ -390,16 +642,39 @@ void KvmBackend::thread_main() {
             break;
         }
         std::unique_lock lock(machine_->lock());
+        const u64 h0 = mono_ns();
         machine_->advance_time();
+        const u64 h1 = mono_ns();
+        event_ns_ += h1 - h0;
+        struct HandlerTime {
+            u64& acc;
+            u64 t0;
+            ~HandlerTime() { acc += mono_ns() - t0; }
+        } handler_time{handler_ns_, h1};
         if (run_->exit_reason < 64) ++stats_.by_reason[run_->exit_reason];
+        if (run_->exit_reason == KVM_EXIT_IO) ++exit_sources_[0x10000u | run_->io.port];
+        else if (run_->exit_reason == KVM_EXIT_MMIO) ++exit_sources_[static_cast<u32>(run_->mmio.phys_addr) & ~0xFFFu];
         switch (run_->exit_reason) {
             case KVM_EXIT_IO: handle_io(); break;
             case KVM_EXIT_MMIO: handle_mmio(); break;
             case KVM_EXIT_HLT:
                 ++stats_.hlt_exits;
-                wait_for_interrupt();
+                // With the guest clock, an idle CPU skips guest time (the loop above); with interrupts off it has
+                // stopped for good, and only a device or a stop wakes it, as with the host clock.
+                if (guest_clock_on_ && run_->if_flag) halted_ = true;
+                else wait_for_interrupt();
                 break;
             case KVM_EXIT_IRQ_WINDOW_OPEN: ++stats_.irq_window_exits; break;
+            case KVM_EXIT_X86_WRMSR:
+                // The guest set its TSC (the only MSR filtered): do it, and count TSC time from here.
+                if (run_->msr.index == 0x10) {
+                    set_tsc(run_->msr.data);
+                    tsc_epoch_ = clock_.now() - std::min<Cycles>(clock_.now(), run_->msr.data);
+                    ++guest_tsc_writes_;
+                    trace::log(trace::Cat::Cpu, "guest wrote the TSC: {:#x}", static_cast<u64>(run_->msr.data));
+                }
+                run_->msr.error = 0;
+                break;
             case KVM_EXIT_INTR: break;
             case KVM_EXIT_DEBUG: {
                 // A --break-eip address: log where the guest is, then drop that breakpoint and keep the others.
@@ -432,6 +707,12 @@ void KvmBackend::thread_main() {
                 fail(Stop::InternalError, std::format("unhandled KVM exit {}", run_->exit_reason));
                 break;
         }
+    }
+    vcpu_clock_known_.store(false, std::memory_order_release);
+    {
+        std::lock_guard lock(machine_->lock());
+        if (backstop_ok_) timer_delete(backstop_);
+        backstop_ok_ = false;
     }
     running_ = false;
     machine_->wake();

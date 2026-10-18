@@ -41,6 +41,7 @@ void set_sink(std::FILE* f) {
     if (f) std::setvbuf(f, nullptr, _IOFBF, 4u << 20);
 }
 void set_clock_source(const Cycles* now) { g_now = now; }
+Cycles now() { return g_now ? *g_now : 0; }
 
 std::string_view name_of(Cat c) {
     for (const auto& n : kNames) {

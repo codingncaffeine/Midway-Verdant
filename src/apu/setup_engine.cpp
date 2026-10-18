@@ -114,7 +114,8 @@ bool SetupEngine::method(u32 offset, u32 value) {
             b.adpcm_key = ~0ull;
             b.svf = {};
             ++started_;
-            if (std::find(handles_started_.begin(), handles_started_.end(), handle) == handles_started_.end()) handles_started_.push_back(handle);
+            if (std::none_of(handles_started_.begin(), handles_started_.end(), [handle](const Started& s) { return s.handle == handle; }))
+                handles_started_.push_back({handle, trace::now()});
             if (trace::on(trace::Cat::Apu) && !(field(handle, kFieldFmt) & kFmtStream)) {
                 // What the voice will play: its buffer's level and peak over the first 4096 samples.
                 const u32 fmt = field(handle, kFieldFmt);

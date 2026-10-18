@@ -1,11 +1,13 @@
-// Midway Verdant as a libretro core: the machine runs on its own threads (the CPU free-running in the fast mode),
-// each retro_run pumps it to the next vblank and hands the frontend the scanout (with the video overlay), the
-// audio the AC'97 bus master played, and the pads' state from the RetroPads. The console's own files (the MCPX
-// boot ROM, the flash image, the EEPROM and the hard-disk image) come from <system>/midway-verdant/.
+// Midway Verdant as a libretro core: the machine runs on its own threads, and each retro_run lets the CPU run
+// exactly one frame of the console's time (frame steps on the guest clock, D16: it holds at every vblank until the
+// next call), then hands the frontend the scanout (with the video overlay), the audio the AC'97 bus master played
+// in that frame, and the pads' state from the RetroPads. The console's own files (the MCPX boot ROM, the flash
+// image, the EEPROM and the hard-disk image) come from <system>/midway-verdant/.
 #include <algorithm>
 #include <chrono>
 #include <cstdarg>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <filesystem>
@@ -16,6 +18,7 @@
 #include <vector>
 
 #include "core/machine.h"
+#include "debug/trace.h"
 #include "ide/hdd_format.h"
 #include "mv/version.h"
 #include "libretro/libretro.h"
@@ -39,6 +42,8 @@ std::vector<mv::u32> frame(640 * 480, 0);
 mv::u32 frame_w = 640, frame_h = 480;
 std::vector<mv::u8> composed;
 
+std::FILE* trace_file = nullptr;  // MV_TRACE_FILE
+
 std::mutex audio_lock;
 std::vector<mv::i16> audio;  // interleaved stereo at 48 kHz, filled on the machine's thread
 constexpr unsigned kPads = 4;
@@ -46,6 +51,10 @@ unsigned pads_plugged = 1;
 
 constexpr double kFps = 60000.0 / 1001.0;
 constexpr unsigned kSampleRate = 48000;
+
+// retro_run's host time: how long the frames took, for the unload report.
+unsigned long long frames_run = 0, frames_capped = 0;
+double frame_ms_sum = 0, frame_ms_max = 0;
 
 void log(retro_log_level level, const char* fmt, ...) {
     char buf[1024];
@@ -228,6 +237,21 @@ RETRO_API bool retro_load_game(const retro_game_info* game) {
     if (const char* p = option("midway_verdant_pads")) pads_plugged = std::clamp(static_cast<unsigned>(std::atoi(p)), 1u, kPads);
     have_rumble = env_cb(RETRO_ENVIRONMENT_GET_RUMBLE_INTERFACE, &rumble) && rumble.set_rumble_state;
 
+    // Instruments for a core run under a frontend: MV_TRACE=apu,boot,... (the shell's --trace list) into
+    // MV_TRACE_FILE (default stderr).
+    if (const char* t = std::getenv("MV_TRACE"); t && *t) {
+        mv::u32 mask = 0;
+        if (mv::trace::parse_list(t, mask)) {
+            mv::trace::enable(mask);
+            if (const char* f = std::getenv("MV_TRACE_FILE"); f && *f && !trace_file) {
+                trace_file = std::fopen(f, "w");
+                if (trace_file) mv::trace::set_sink(trace_file);
+            }
+            log(RETRO_LOG_INFO, "tracing %s to %s", t, trace_file ? std::getenv("MV_TRACE_FILE") : "stderr");
+        } else {
+            log(RETRO_LOG_WARN, "MV_TRACE: unknown category in %s", t);
+        }
+    }
     mv::MachineConfig cfg;
     cfg.mcpx_rom = files.mcpx;
     cfg.flash_image = files.flash;
@@ -235,6 +259,7 @@ RETRO_API bool retro_load_game(const retro_game_info* game) {
     cfg.hdd_image = files.hdd;
     cfg.gpu = true;
     cfg.cpu = "kvm";
+    cfg.frame_step = true;
     cfg.pads = pads_plugged;
     if (game && game->path && *game->path) cfg.dvd_image = game->path;
     machine = std::make_unique<mv::Machine>(cfg);
@@ -263,6 +288,9 @@ RETRO_API bool retro_load_game(const retro_game_info* game) {
     }
     log(RETRO_LOG_INFO, "booting %s with %u pad(s); files from %s", cfg.dvd_image ? cfg.dvd_image->string().c_str() : "no disc", pads_plugged,
         files.mcpx.parent_path().string().c_str());
+    log(RETRO_LOG_INFO, "timeline: %s; one console frame per retro_run", machine->cpu()->clock_name().c_str());
+    frames_run = frames_capped = 0;
+    frame_ms_sum = frame_ms_max = 0;
     machine->start();
     return true;
 }
@@ -283,11 +311,29 @@ RETRO_API void retro_unload_game(void) {
     {
         std::lock_guard g(machine->lock());
         std::string voices;
-        for (const mv::u32 h : machine->apu().setup_engine().handles_started()) voices += std::format(" {:x}", h);
+        for (const auto& s : machine->apu().setup_engine().handles_started())
+            voices += std::format(" {:x}@{:.3f}", s.handle, static_cast<double>(s.at) / mv::clk::kCpuHz);
         log(RETRO_LOG_INFO, "ran %.1f s of console time; %llu frames rendered; voices started:%s", static_cast<double>(machine->scheduler().now()) / mv::clk::kCpuHz,
             static_cast<unsigned long long>(machine->nv2a().semaphore_releases()), voices.empty() ? " none" : voices.c_str());
+        log(RETRO_LOG_INFO, "retro_run: %llu frames, host time mean %.2f ms, max %.1f ms%s; pit late ticks delivered %llu, dropped %llu", frames_run,
+            frames_run ? frame_ms_sum / static_cast<double>(frames_run) : 0.0, frame_ms_max,
+            frames_capped ? std::format(", {} cut at 1 s without a vblank", frames_capped).c_str() : "",
+            static_cast<unsigned long long>(machine->pit().ticks_delayed()), static_cast<unsigned long long>(machine->pit().ticks_dropped()));
+        log(RETRO_LOG_INFO, "device time: the frontend's thread fired events for %.3f s; the gpu pusher took %.3f s on the CPU thread",
+            static_cast<double>(machine->io_event_ns()) / 1e9, static_cast<double>(machine->nv2a().pusher_wall_ns()) / 1e9);
     }
     machine->finish();
+    if (trace_file) {
+        mv::trace::set_sink(nullptr);  // back to stderr, whose buffering a file sink's setvbuf must not touch
+        std::fclose(trace_file);
+        trace_file = nullptr;
+    }
+    // The CPU's own report (the guest clock's accounts), once its thread has stopped.
+    for (std::string r = machine->cpu()->report(); !r.empty();) {
+        const auto nl = r.find('\n');
+        log(RETRO_LOG_INFO, "%s", r.substr(0, nl).c_str());
+        r = nl == std::string::npos ? std::string() : r.substr(nl + 1);
+    }
     machine.reset();
 }
 
@@ -303,14 +349,23 @@ RETRO_API void retro_run(void) {
     input_poll_cb();
     for (unsigned p = 0; p < pads_plugged; ++p)
         machine->pad(p).set_state(mv::libretro::map_retropad([p](unsigned device, unsigned index, unsigned id) { return input_state_cb(p, device, index, id); }));
-    // One frame: until the next vblank, at most two frames of wall time.
+    // One frame of the console's time: the CPU runs to the next vblank and holds there, however long the host takes
+    // (a hung guest or a stalled host returns after a second without the vblank, and the report counts it).
     mv::u64 vblanks;
     {
         std::lock_guard g(machine->lock());
         vblanks = machine->nv2a().vblanks();
+        machine->set_frame_limit(vblanks + 1);
     }
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::microseconds(33'000);
-    machine->pump(deadline, [vblanks](mv::Machine& m) { return m.nv2a().vblanks() != vblanks; });
+    const auto t0 = std::chrono::steady_clock::now();
+    if (machine->pump(t0 + std::chrono::seconds(1), [vblanks](mv::Machine& m) { return m.nv2a().vblanks() != vblanks; }) ==
+        mv::Machine::StopReason::Duration) {
+        if (frames_capped++ == 0) log(RETRO_LOG_WARN, "a frame took over a second of host time; returned without its vblank");
+    }
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    ++frames_run;
+    frame_ms_sum += ms;
+    frame_ms_max = std::max(frame_ms_max, ms);
     grab_frame();
     video_cb(frame.data(), frame_w, frame_h, frame_w * 4);
     // The audio the console played since the last frame, as it played it: the AC'97 output runs on the console's

@@ -45,10 +45,21 @@ public:
     };
     virtual Stats stats() const = 0;
 
-    // The accurate mode owns the timeline: the machine advances the scheduler to its clock instead of the
-    // host's. The fast mode leaves it to the host clock.
+    // A backend that owns the timeline has the machine advance the scheduler to its clock instead of the host's:
+    // the interpreter's cycle count, or the fast mode's guest clock (the work its virtual CPU did, D16). The fast
+    // mode with MV_GUEST_CLOCK=wall leaves the timeline to the host clock (the old behaviour, kept as a control).
     virtual bool owns_timeline() const { return false; }
     virtual Cycles timeline_cycles() const { return 0; }
+    // For a timeline on the host's time (the fast mode's guest clock): the most guest seconds it can advance in a
+    // host second, so the io thread knows how soon a deadline can come. 0 = not tied to the host clock.
+    virtual double timeline_rate() const { return 0.0; }
+    // The io thread fired events on the CPU's timeline (with the machine lock held): the next deadline changed.
+    virtual void timeline_advanced() {}
+    // The hardware-assisted fast mode (KVM; WHPX later): the CPU runs free on its own thread at host speed, so the
+    // machine paces it (frame steps, real time) and keeps the PIT's late ticks.
+    virtual bool hardware_assisted() const { return false; }
+    // What drives the timeline, for the start-up line and the report.
+    virtual std::string clock_name() const { return "the interpreter's cycle count"; }
     // A line for the end-of-run report beyond the counters (the oracle's findings), or empty.
     virtual std::string report() const { return {}; }
 
