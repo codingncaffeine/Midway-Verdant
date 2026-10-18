@@ -65,6 +65,8 @@ struct MachineConfig {
     // Instrument: when software writes this SMBus (7-bit address, command) pair, log the CPU's registers and
     // stack under the boot trace — the call chain behind a device write.
     std::optional<std::pair<u8, u8>> break_smbus_write;
+    // Instrument: log the CPU's registers and stack the first time execution reaches each of these addresses.
+    std::vector<u32> break_eips;
     // Instrument: press the front-panel reset this many seconds of host time into the run.
     std::optional<double> reset_at_seconds;
     // The live GPU: a Vulkan renderer fed by the pushbuffer, writing frames back into guest RAM.

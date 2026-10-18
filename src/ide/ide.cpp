@@ -175,6 +175,7 @@ void IdeChannel::write_task(u16 reg, unsigned size, u32 value) {
         case 7: {
             if (tf.status & ata::kStatusBsy) return;  // commands written while busy are lost
             ++commands_;
+            last_command_[static_cast<std::size_t>(selected_)] = static_cast<u8>(value);
             trace::log(trace::Cat::Pio, "ide {} command {:02x} (count {} lba {:02x}{:02x}{:02x} dev {:02x} feat {:02x})", dev->name(),
                        static_cast<u8>(value), tf.sector_count, tf.lba_high, tf.lba_mid, tf.lba_low, tf.device, tf.features);
             if (irq_level_) {

@@ -35,6 +35,7 @@ public:
     bool read_regs(Regs& out) override;
     void set_dirty_tracking(bool on) override { dirty_tracking_ = on; }
     void take_dirty_pages(std::vector<u32>& pages) override;
+    void set_break_eips(const std::vector<u32>& eips) override { break_eips_ = eips; }
 
     // Replace the top page's backing when the MCPX ROM is hidden, and again when a reset shows it.
     void on_rom_hidden();
@@ -50,6 +51,7 @@ private:
     void inject_interrupt_if_possible();
     void wait_for_interrupt();
     void fail(Stop why, std::string detail);
+    void arm_breakpoints();
 
     Machine* machine_{nullptr};
     int kvm_fd_{-1}, vm_fd_{-1}, vcpu_fd_{-1};
@@ -69,6 +71,9 @@ private:
     bool dirty_tracking_{false};
     std::vector<u64> dirty_bitmap_;
     u32 cpuid_signature_{0x0000068A};
+    // --break-eip: hardware execution breakpoints, armed at init and dropped after the first debug exit.
+    std::vector<u32> break_eips_;
+    bool breakpoints_armed_{false};
 };
 
 }  // namespace mv

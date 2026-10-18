@@ -108,6 +108,10 @@ public:
     void hardware_reset();
 
     u64 commands() const { return commands_; }
+    // Instruments: the last command byte each device received, and the bus master's registers.
+    u8 last_command(int position) const { return last_command_[static_cast<std::size_t>(position)]; }
+    u8 bm_command() const { return bm_command_; }
+    u8 bm_status() const { return bm_status_; }
     u64 sectors_read() const { return sectors_read_; }
     u64 sectors_written() const { return sectors_written_; }
     void count_sectors(bool write, u64 n) { (write ? sectors_written_ : sectors_read_) += n; }
@@ -125,6 +129,7 @@ private:
     u32 bm_prdt_{0};
     TimerEvent events_[2];
     u64 commands_{0}, sectors_read_{0}, sectors_written_{0};
+    std::array<u8, 2> last_command_{};
     IdeDevice::TaskFile empty_tf_;
 };
 

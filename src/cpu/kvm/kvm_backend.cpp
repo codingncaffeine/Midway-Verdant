@@ -19,6 +19,7 @@
 #include <format>
 
 #include "core/machine.h"
+#include "debug/guest_stack.h"
 #include "debug/trace.h"
 
 namespace mv {
@@ -165,6 +166,7 @@ bool KvmBackend::init(Machine& machine, std::string& error) {
     }
     run_ = static_cast<kvm_run*>(p);
     if (!setup_cpuid(error)) return false;
+    arm_breakpoints();
 
     if (ioctl(kvm_fd_, KVM_CHECK_EXTENSION, KVM_CAP_TSC_CONTROL) > 0) {
         if (ioctl(vcpu_fd_, KVM_SET_TSC_KHZ, 733333) == 0) tsc_scaled_ = true;
@@ -393,6 +395,17 @@ void KvmBackend::thread_main() {
                 break;
             case KVM_EXIT_IRQ_WINDOW_OPEN: ++stats_.irq_window_exits; break;
             case KVM_EXIT_INTR: break;
+            case KVM_EXIT_DEBUG: {
+                // A --break-eip address: log where the guest is and drop every breakpoint so it runs on.
+                Regs r{};
+                lock.unlock();
+                read_regs(r);
+                trace::log(trace::Cat::Boot, "break: eip {:08x} reached\n{}", r.eip, debug::describe_stack(machine_->bus(), r));
+                kvm_guest_debug off{};
+                ioctl(vcpu_fd_, KVM_SET_GUEST_DEBUG, &off);
+                breakpoints_armed_ = false;
+                continue;
+            }
             case KVM_EXIT_SHUTDOWN: {
                 Regs r{};
                 lock.unlock();
@@ -414,6 +427,23 @@ void KvmBackend::thread_main() {
     }
     running_ = false;
     machine_->wake();
+}
+
+// Hardware execution breakpoints (DR0-DR3) on the --break-eip addresses; the debug exit logs and disarms them.
+void KvmBackend::arm_breakpoints() {
+    if (break_eips_.empty()) return;
+    kvm_guest_debug dbg{};
+    dbg.control = KVM_GUESTDBG_ENABLE | KVM_GUESTDBG_USE_HW_BP;
+    dbg.arch.debugreg[7] = 1u << 10;  // the bit that is always set in DR7
+    for (std::size_t i = 0; i < break_eips_.size() && i < 4; ++i) {
+        dbg.arch.debugreg[i] = break_eips_[i];
+        dbg.arch.debugreg[7] |= 1u << (i * 2);  // Li enabled; R/Wi 00 = execution, LENi 00 = one byte
+    }
+    if (ioctl(vcpu_fd_, KVM_SET_GUEST_DEBUG, &dbg) < 0) {
+        trace::log(trace::Cat::Boot, "break: KVM_SET_GUEST_DEBUG failed: {}", std::strerror(errno));
+        return;
+    }
+    breakpoints_armed_ = true;
 }
 
 void KvmBackend::take_dirty_pages(std::vector<u32>& pages) {

@@ -202,6 +202,7 @@ bool Machine::init(std::string& error) {
         error = "unknown CPU backend " + config_.cpu + " (kvm or p6)";
         return false;
     }
+    if (!config_.break_eips.empty()) cpu_->set_break_eips(config_.break_eips);
     if (config_.capture_path) {
         capture_ = std::make_unique<capture::Writer>();
         if (!capture_->open(*config_.capture_path, static_cast<u32>(bus_.ram_size()), error)) return false;

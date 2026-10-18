@@ -45,6 +45,7 @@ void print_usage() {
         "  --capture FILE     write a pushbuffer capture (GPU methods, RAM pages, objects) for offline replay\n"
         "  --watch HEX,...    log every change of these physical RAM words (polled each tick) under the boot trace\n"
         "  --break-smbus AA:CC  log the CPU registers and stack (boot trace) when SMBus address AA gets command CC written\n"
+        "  --break-eip HEX,...  log the CPU registers and stack (boot trace) the first time execution reaches each address (up to 4)\n"
         "  --reset-at S       press the front-panel reset S seconds into the run (a warm reboot)\n"
         "  --window           show the console's scanout in a window (Escape or closing it ends the run)\n"
         "  --gpu              render the console's graphics live on the host's Vulkan device (frames land in guest RAM)\n"
@@ -163,6 +164,16 @@ int main(int argc, char** argv) {
             }
             cfg.break_smbus_write = std::make_pair(static_cast<mv::u8>(std::strtoul(spec.substr(0, colon).c_str(), nullptr, 16)),
                                                    static_cast<mv::u8>(std::strtoul(spec.substr(colon + 1).c_str(), nullptr, 16)));
+        } else if (a == "--break-eip") {
+            const std::string list = need("--break-eip");
+            std::size_t pos = 0;
+            while (pos < list.size()) {
+                const auto comma = list.find(',', pos);
+                const std::string item = list.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
+                if (!item.empty()) cfg.break_eips.push_back(static_cast<mv::u32>(std::strtoul(item.c_str(), nullptr, 16)));
+                if (comma == std::string::npos) break;
+                pos = comma + 1;
+            }
         } else if (a == "--window") {
             want_window = true;
         } else if (a == "--gpu") {
@@ -380,6 +391,15 @@ int main(int argc, char** argv) {
                 machine.hdd() ? (machine.hdd()->locked() ? "locked" : "unlocked") : "absent",
                 static_cast<unsigned long long>(machine.hdd() ? machine.hdd()->unlock_attempts() : 0),
                 static_cast<unsigned long long>(static_cast<const mv::AtapiCdrom*>(machine.ide().primary().device(1)) ? static_cast<const mv::AtapiCdrom*>(machine.ide().primary().device(1))->packets() : 0));
+    // The drives at the end of the run: a command still in flight shows as BSY or DRQ set.
+    for (int d = 0; d < 2; ++d) {
+        if (const mv::IdeDevice* dev = machine.ide().primary().device(d)) {
+            std::printf("ide %s: status %02x error %02x last command %02x%s\n", d == 0 ? "hdd" : "dvd", dev->tf().status, dev->tf().error,
+                        machine.ide().primary().last_command(d), (dev->tf().status & (mv::ata::kStatusBsy | mv::ata::kStatusDrq)) ? "  <-- IN FLIGHT" : "");
+        }
+    }
+    std::printf("ide bus master: command %02x status %02x%s\n", machine.ide().primary().bm_command(), machine.ide().primary().bm_status(),
+                machine.ide().primary().dma_active() ? "  <-- DMA ACTIVE" : "");
     mv::CpuBackend::Regs regs{};
     if (machine.cpu()->read_regs(regs)) {
         std::printf("cpu: cs %04x eip %08x eflags %08x cr0 %08x cr3 %08x esp %08x tsc %llu\n", regs.cs, regs.eip, regs.eflags, regs.cr0,

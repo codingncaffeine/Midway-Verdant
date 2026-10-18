@@ -64,6 +64,10 @@ public:
     // pages the guest writes; `take_dirty_pages` appends their indices (4 KiB pages) and clears the record.
     virtual void set_dirty_tracking(bool on) { (void)on; }
     virtual void take_dirty_pages(std::vector<u32>& pages) { (void)pages; }
+
+    // Instrument: the first time execution reaches one of these linear addresses (up to four), log the registers
+    // and the stack under the boot trace. The fast mode uses the hardware debug registers.
+    virtual void set_break_eips(const std::vector<u32>& eips) { (void)eips; }
 };
 
 // The fast mode on this host, or nullptr with a reason when there is none.
