@@ -28,6 +28,7 @@ add_library(mvcore STATIC
   usb/ohci.cpp
   usb/usb_device.cpp
   usb/xbox_pad.cpp
+  libretro/retropad_map.cpp
   mcpx/isa_misc.cpp
   mcpx/lpc.cpp
   mcpx/pic.cpp

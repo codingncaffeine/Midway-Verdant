@@ -23,6 +23,7 @@ add_executable(mv_tests
   unit/psh_test.cpp
   unit/texture_test.cpp
   unit/overlay_test.cpp
+  unit/retropad_test.cpp
   unit/usb_test.cpp
   unit/vulkan_test.cpp
   unit/vsh_interpreter_test.cpp

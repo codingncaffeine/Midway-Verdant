@@ -16,6 +16,7 @@
 #include "core/machine.h"
 #include "mv/version.h"
 #include "libretro/libretro.h"
+#include "libretro/retropad_map.h"
 #include "nv2a/overlay.h"
 
 namespace {
@@ -93,48 +94,6 @@ bool find_console_files(const std::filesystem::path& dir, ConsoleFiles& out, std
     else if (out.flash.empty()) error = "No flash image (256 KiB, 512 KiB or 1 MiB) in " + dir.string();
     else if (out.hdd.empty()) error = "No hard-disk image (a raw image of 8 GB or more) in " + dir.string();
     return error.empty();
-}
-
-// RetroPad to the Xbox pad: B/A/Y/X (bottom, right, left, top) = A/B/X/Y, L/R = White/Black, L2/R2 the triggers
-// (analog when the frontend reports them), L3/R3 the stick clicks, Select = Back.
-mv::usb::PadState read_pad(unsigned port) {
-    mv::usb::PadState s;
-    auto pressed = [&](unsigned id) { return input_state_cb(port, RETRO_DEVICE_JOYPAD, 0, id) != 0; };
-    auto bit = [&](unsigned id, mv::u16 b) {
-        if (pressed(id)) s.buttons = static_cast<mv::u16>(s.buttons | b);
-    };
-    using P = mv::usb::PadState;
-    bit(RETRO_DEVICE_ID_JOYPAD_UP, P::Up);
-    bit(RETRO_DEVICE_ID_JOYPAD_DOWN, P::Down);
-    bit(RETRO_DEVICE_ID_JOYPAD_LEFT, P::Left);
-    bit(RETRO_DEVICE_ID_JOYPAD_RIGHT, P::Right);
-    bit(RETRO_DEVICE_ID_JOYPAD_START, P::Start);
-    bit(RETRO_DEVICE_ID_JOYPAD_SELECT, P::Back);
-    bit(RETRO_DEVICE_ID_JOYPAD_L3, P::LeftThumb);
-    bit(RETRO_DEVICE_ID_JOYPAD_R3, P::RightThumb);
-    auto analog_button = [&](unsigned id) -> mv::u8 {
-        const int a = input_state_cb(port, RETRO_DEVICE_ANALOG, RETRO_DEVICE_INDEX_ANALOG_BUTTON, id);
-        if (a > 0) return static_cast<mv::u8>(std::min(255, a / 128));
-        return pressed(id) ? 0xFF : 0x00;
-    };
-    s.analog[P::A] = analog_button(RETRO_DEVICE_ID_JOYPAD_B);
-    s.analog[P::B] = analog_button(RETRO_DEVICE_ID_JOYPAD_A);
-    s.analog[P::X] = analog_button(RETRO_DEVICE_ID_JOYPAD_Y);
-    s.analog[P::Y] = analog_button(RETRO_DEVICE_ID_JOYPAD_X);
-    s.analog[P::White] = analog_button(RETRO_DEVICE_ID_JOYPAD_L);
-    s.analog[P::Black] = analog_button(RETRO_DEVICE_ID_JOYPAD_R);
-    s.analog[P::LeftTrigger] = analog_button(RETRO_DEVICE_ID_JOYPAD_L2);
-    s.analog[P::RightTrigger] = analog_button(RETRO_DEVICE_ID_JOYPAD_R2);
-    // RetroPad Y axes point down; the pad's point up.
-    auto axis = [&](unsigned index, unsigned id, bool invert) {
-        const int v = input_state_cb(port, RETRO_DEVICE_ANALOG, index, id);
-        return static_cast<mv::i16>(std::clamp(invert ? -v : v, -32768, 32767));
-    };
-    s.left_x = axis(RETRO_DEVICE_INDEX_ANALOG_LEFT, RETRO_DEVICE_ID_ANALOG_X, false);
-    s.left_y = axis(RETRO_DEVICE_INDEX_ANALOG_LEFT, RETRO_DEVICE_ID_ANALOG_Y, true);
-    s.right_x = axis(RETRO_DEVICE_INDEX_ANALOG_RIGHT, RETRO_DEVICE_ID_ANALOG_X, false);
-    s.right_y = axis(RETRO_DEVICE_INDEX_ANALOG_RIGHT, RETRO_DEVICE_ID_ANALOG_Y, true);
-    return s;
 }
 
 // The scanout as the display shows it, with the video overlay, into `frame`.
@@ -290,7 +249,8 @@ RETRO_API void retro_reset(void) {
 RETRO_API void retro_run(void) {
     if (!machine) return;
     input_poll_cb();
-    for (unsigned p = 0; p < pads_plugged; ++p) machine->pad(p).set_state(read_pad(p));
+    for (unsigned p = 0; p < pads_plugged; ++p)
+        machine->pad(p).set_state(mv::libretro::map_retropad([p](unsigned device, unsigned index, unsigned id) { return input_state_cb(p, device, index, id); }));
     // One frame: until the next vblank, at most two frames of wall time.
     mv::u64 vblanks;
     {
