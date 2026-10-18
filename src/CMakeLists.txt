@@ -41,6 +41,7 @@ add_library(mvcore STATIC
   nv2a/pgraph/kelvin.cpp
   nv2a/pgraph/replay.cpp
   nv2a/pgraph/texture.cpp
+  nv2a/pgraph/twod.cpp
   nv2a/shaders/vsh_translate.cpp
   nv2a/shaders/psh_translate.cpp
   nv2a/shaders/vsh_interpreter.cpp

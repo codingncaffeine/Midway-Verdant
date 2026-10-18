@@ -1,5 +1,6 @@
 #pragma once
 #include <array>
+#include <memory>
 #include <optional>
 #include <functional>
 #include <unordered_map>
@@ -11,6 +12,7 @@
 #include "debug/trace.h"
 #include "nv2a/overlay.h"
 #include "nv2a/capture.h"
+#include "nv2a/pgraph/twod.h"
 #include "nv2a/pgraph/kelvin.h"
 #include "nv2a/pushbuffer.h"
 #include "pci/pci.h"
@@ -152,6 +154,7 @@ private:
     PushbufferWalker walker_;
     pgraph::Kelvin kelvin_;
     pgraph::VulkanRenderer* renderer_{nullptr};
+    std::unique_ptr<pgraph::TwoD> twod_;  // the 2D surfaces and image-blit classes
     u64 rendered_frames_{0};
     std::array<u32, 8> bound_{};
     std::array<u32, 8> bound_handles_{};

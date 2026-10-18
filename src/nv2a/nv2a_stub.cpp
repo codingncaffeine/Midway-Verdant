@@ -35,6 +35,9 @@ Nv2aStub::Nv2aStub(Bus& bus, Scheduler& sched, std::function<void(bool)> irq)
     };
     schedule_vblank();
     for (u32 i = 0; i < 768; ++i) dac_[i] = static_cast<u8>(i / 3);  // the colour table powers up as the identity
+    twod_ = std::make_unique<pgraph::TwoD>(bus_.ram(), bus_.ram_size(), *this);
+    twod_->set_hooks([this](u32 phys, u32 len) { if (renderer_) renderer_->write_back_range(phys, len); },
+                     [this](u32 phys, u32 len) { if (renderer_) renderer_->invalidate(phys, len); });
 }
 
 void Nv2aStub::reset() {
@@ -216,6 +219,9 @@ void Nv2aStub::on_method(const PushbufferMethod& m) {
             ++rendered_frames_;
         }
     }
+    // The 2D engine: the surfaces object and the image blit.
+    if (bound_[m.subchannel] == pgraph::TwoD::kClassSurfaces || bound_[m.subchannel] == pgraph::TwoD::kClassBlit)
+        twod_->method(bound_[m.subchannel], m.method, m.value);
     // The synchronisation methods every class shares, and Kelvin's semaphore: these are what the CPU waits on,
     // so they are executed here while every drawing method is only logged (the real engine arrives in Phase 4).
     SyncState& s = sync_[m.subchannel];

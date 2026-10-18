@@ -31,6 +31,8 @@ public:
     // device — they reach RAM when a texture samples them, and the scanout one at vblank (write_back_at).
     void flush_frame();
     bool write_back_at(u32 phys);
+    // Every render target overlapping [phys, phys + len) reaches RAM (colour and depth): the 2D engine reads there.
+    void write_back_range(u32 phys, u32 len);
     // Guest RAM in [phys, phys + len) was written: textures decoded from it are stale.
     void invalidate(u32 phys, u32 len);
 

@@ -1,5 +1,7 @@
 #include "nv2a/pgraph/replay.h"
 
+#include "nv2a/pgraph/twod.h"
+
 #include <cstring>
 
 namespace mv::pgraph {
@@ -29,6 +31,8 @@ DmaObject Replay::resolve(u32 handle) const {
 
 bool Replay::run(Kelvin& kelvin, Observer* observer, std::string& error, u32 until_frame) {
     capture::Record rec;
+    TwoD twod(ram_.data(), ram_.size(), *this);
+    twod.set_hooks(blit_before_read_, blit_after_write_);
     while (reader_.next(rec)) {
         switch (rec.type) {
             case capture::Rec::Pages: {
@@ -57,6 +61,7 @@ bool Replay::run(Kelvin& kelvin, Observer* observer, std::string& error, u32 unt
                         if (until_frame && frames_ >= until_frame) return true;
                     }
                 } else if (rec.cls != 0) {
+                    if (rec.cls == TwoD::kClassSurfaces || rec.cls == TwoD::kClassBlit) twod.method(rec.cls, rec.method, rec.value);
                     if (observer) observer->other_method(rec.cls, rec.subchannel, rec.method, rec.value);
                 }
                 break;

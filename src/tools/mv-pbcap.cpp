@@ -474,6 +474,7 @@ int render(const char* path, const char* dir, mv::u32 frames, mv::u32 first_png,
     observer.dir = dir;
     observer.replay = &r;
     r.set_page_observer([&](mv::u32 first_page, mv::u32 count) { renderer.invalidate(first_page * 4096, count * 4096); });
+    r.set_blit_hooks([&](mv::u32 phys, mv::u32 len) { renderer.write_back_range(phys, len); }, [&](mv::u32 phys, mv::u32 len) { renderer.invalidate(phys, len); });
     if (!r.run(kelvin, &observer, error, frames)) {
         std::fprintf(stderr, "mv-pbcap: %s\n", error.c_str());
         return 1;

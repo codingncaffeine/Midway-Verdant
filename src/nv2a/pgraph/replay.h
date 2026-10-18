@@ -42,6 +42,11 @@ public:
     u8* mutable_ram() { return ram_.data(); }
     // Called with every page record before it lands in RAM (first page, count).
     void set_page_observer(std::function<void(u32, u32)> f) { page_observer_ = std::move(f); }
+    // The 2D engine's blits run during the replay; these hear the RAM a blit reads and writes (see TwoD).
+    void set_blit_hooks(std::function<void(u32, u32)> before_read, std::function<void(u32, u32)> after_write) {
+        blit_before_read_ = std::move(before_read);
+        blit_after_write_ = std::move(after_write);
+    }
     DmaObject resolve(u32 handle) const override;
     u32 frames() const { return frames_; }
     u32 scanout_start() const { return scanout_start_; }
@@ -55,6 +60,7 @@ private:
     u32 scanout_start_{0};
     u64 methods_{0};
     std::function<void(u32, u32)> page_observer_;
+    std::function<void(u32, u32)> blit_before_read_, blit_after_write_;
 };
 
 }  // namespace mv::pgraph
