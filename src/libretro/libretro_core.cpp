@@ -141,6 +141,7 @@ void grab_frame() {
     frame.resize(static_cast<std::size_t>(w) * h);
     const mv::u8* fb = bus.ram() + start;
     for (mv::u32 y = 0; y < h; ++y) std::memcpy(frame.data() + static_cast<std::size_t>(y) * w, fb + static_cast<std::size_t>(y) * pitch, w * 4u);
+    if (const auto lut = gpu.gamma_lut()) mv::apply_gamma(*lut, reinterpret_cast<mv::u8*>(frame.data()), w * 4, w, h);
     if (const auto ov = gpu.overlay())
         mv::draw_overlay(*ov, bus.ram(), bus.ram_size(), reinterpret_cast<mv::u8*>(frame.data()), w * 4, w, h);
     // The scanout ignores the alpha byte; the frontend's XRGB8888 wants it clear of meaning too.

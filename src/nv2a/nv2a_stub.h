@@ -1,4 +1,5 @@
 #pragma once
+#include <array>
 #include <optional>
 #include <functional>
 #include <unordered_map>
@@ -97,6 +98,11 @@ public:
     u32 framebuffer_start() const { return reg(kPcrtcStart); }
     // The video overlay as it stands, when a buffer is in use (read under the machine lock).
     std::optional<Overlay> overlay() const;
+    // The RAMDAC's colour table, written through the VGA-style DAC ports (a write index, then red, green, blue
+    // bytes; the index advances after each triple). In the console's direct-colour modes it is the gamma ramp every
+    // scanout pixel goes through. Empty while it is the identity (the kernel's default), so callers skip the work.
+    std::optional<std::array<u8, 768>> gamma_lut() const;
+    static constexpr u32 kDacReadIndex = 0x6813C7, kDacWriteIndex = 0x6813C8, kDacData = 0x6813C9;
     const PushbufferWalker& pushbuffer() const { return walker_; }
     // Objects bound to the channel's eight subchannels (class numbers, 0 = none).
     std::array<u32, 8> bound_classes() const { return bound_; }
@@ -136,6 +142,9 @@ private:
     std::unordered_map<u32, u32> regs_;
     std::array<u8, 256> crtc_{};
     u8 crtc_index_{0};
+    std::array<u8, 768> dac_{};
+    u8 dac_write_index_{0}, dac_read_index_{0}, dac_write_component_{0}, dac_read_component_{0};
+    bool dac_identity_{true};
     u64 reads_{0}, writes_{0}, vblanks_{0};
     bool irq_level_{false};
     TimerEvent vblank_;

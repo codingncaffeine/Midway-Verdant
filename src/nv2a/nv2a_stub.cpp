@@ -34,6 +34,7 @@ Nv2aStub::Nv2aStub(Bus& bus, Scheduler& sched, std::function<void(bool)> irq)
         schedule_vblank();
     };
     schedule_vblank();
+    for (u32 i = 0; i < 768; ++i) dac_[i] = static_cast<u8>(i / 3);  // the colour table powers up as the identity
 }
 
 void Nv2aStub::reset() {
@@ -46,6 +47,9 @@ void Nv2aStub::reset() {
     sync_ = {};
     crtc_ = {};
     crtc_index_ = 0;
+    for (u32 i = 0; i < 768; ++i) dac_[i] = static_cast<u8>(i / 3);
+    dac_write_index_ = dac_read_index_ = dac_write_component_ = dac_read_component_ = 0;
+    dac_identity_ = true;
     pgraph_stalled_ = false;
     kelvin_ = pgraph::Kelvin();
     kelvin_.set_sink(renderer_);
@@ -317,6 +321,15 @@ u32 Nv2aStub::mmio_read(PhysAddr addr, unsigned size) {
         ++reads_;
         return crtc_[crtc_index_];
     }
+    if (size == 1 && off == kDacData) {
+        ++reads_;
+        const u8 v = dac_[dac_read_index_ * 3u + dac_read_component_];
+        if (++dac_read_component_ == 3) {
+            dac_read_component_ = 0;
+            ++dac_read_index_;
+        }
+        return v;
+    }
     u32 word;
     switch (key) {
         case kPtimerTime0: word = static_cast<u32>((ptimer_ticks() & 0x7FFFFFFu) << 5); break;
@@ -356,6 +369,24 @@ void Nv2aStub::mmio_write(PhysAddr addr, unsigned size, u32 value) {
     }
     if (size == 1 && off == kPrmcioCrtcData) {
         crtc_[crtc_index_] = static_cast<u8>(value);
+        return;
+    }
+    if (size == 1 && (off == kDacWriteIndex || off == kDacReadIndex || off == kDacData)) {
+        if (off == kDacWriteIndex) {
+            dac_write_index_ = static_cast<u8>(value);
+            dac_write_component_ = 0;
+        } else if (off == kDacReadIndex) {
+            dac_read_index_ = static_cast<u8>(value);
+            dac_read_component_ = 0;
+        } else {
+            dac_[dac_write_index_ * 3u + dac_write_component_] = static_cast<u8>(value);
+            if (++dac_write_component_ == 3) {
+                dac_write_component_ = 0;
+                ++dac_write_index_;  // wraps at 256
+            }
+            dac_identity_ = true;
+            for (u32 i = 0; i < 768 && dac_identity_; ++i) dac_identity_ = dac_[i] == static_cast<u8>(i / 3);
+        }
         return;
     }
     // The scanout blocks (PCRTC, PRAMDAC) go into the capture: a replay needs to know which surface is displayed.
@@ -521,4 +552,11 @@ std::optional<Overlay> Nv2aStub::overlay() const {
     return ov;
 }
 
+}  // namespace mv
+
+namespace mv {
+std::optional<std::array<u8, 768>> Nv2aStub::gamma_lut() const {
+    if (dac_identity_) return std::nullopt;
+    return dac_;
+}
 }  // namespace mv

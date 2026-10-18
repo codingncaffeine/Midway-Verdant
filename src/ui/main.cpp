@@ -240,10 +240,13 @@ int main(int argc, char** argv) {
             const mv::u8* fb = machine.bus().ram() + start;
             // The video overlay goes over a copy of the frame, as the display shows it.
             static std::vector<mv::u8> composed;
-            if (const auto ov = gpu.overlay()) {
+            const auto ov = gpu.overlay();
+            const auto lut = gpu.gamma_lut();
+            if (ov || lut) {
                 composed.resize(static_cast<std::size_t>(w) * h * 4);
                 for (mv::u32 y = 0; y < h; ++y) std::memcpy(composed.data() + static_cast<std::size_t>(y) * w * 4, fb + static_cast<std::size_t>(y) * pitch, static_cast<std::size_t>(w) * 4);
-                mv::draw_overlay(*ov, machine.bus().ram(), machine.bus().ram_size(), composed.data(), w * 4, w, h);
+                if (lut) mv::apply_gamma(*lut, composed.data(), w * 4, w, h);
+                if (ov) mv::draw_overlay(*ov, machine.bus().ram(), machine.bus().ram_size(), composed.data(), w * 4, w, h);
                 fb = composed.data();
                 pitch = w * 4;
             }

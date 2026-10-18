@@ -85,11 +85,13 @@ unsigned ScanoutWindow::run(Machine& machine, std::atomic<bool>& stop) {
         // is what a real display shows too).
         u32 start, width, height, pitch;
         std::optional<Overlay> overlay;
+        std::optional<std::array<u8, 768>> lut;
         {
             std::lock_guard g(machine.lock());
             Nv2aStub& gpu = machine.nv2a();
             start = gpu.framebuffer_start();
             overlay = gpu.overlay();
+            lut = gpu.gamma_lut();
             if (gpu.scanout_programmed()) {
                 width = gpu.scanout_width();
                 height = gpu.scanout_height();
@@ -128,12 +130,13 @@ unsigned ScanoutWindow::run(Machine& machine, std::atomic<bool>& stop) {
         if (showing) {
             const u8* pixels = bus.ram() + start;
             int stride = static_cast<int>(pitch);
-            if (overlay) {
+            if (overlay || lut) {
                 // The video overlay over a copy of the frame, as the console's display shows it.
                 impl_->composed.resize(static_cast<std::size_t>(width) * height * 4);
                 for (u32 y = 0; y < height; ++y)
                     std::memcpy(impl_->composed.data() + static_cast<std::size_t>(y) * width * 4, pixels + static_cast<std::size_t>(y) * pitch, static_cast<std::size_t>(width) * 4);
-                draw_overlay(*overlay, bus.ram(), bus.ram_size(), impl_->composed.data(), width * 4, width, height);
+                if (lut) apply_gamma(*lut, impl_->composed.data(), width * 4, width, height);
+                if (overlay) draw_overlay(*overlay, bus.ram(), bus.ram_size(), impl_->composed.data(), width * 4, width, height);
                 pixels = impl_->composed.data();
                 stride = static_cast<int>(width * 4);
             }

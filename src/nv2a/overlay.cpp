@@ -44,3 +44,16 @@ void draw_overlay(const Overlay& ov, const u8* ram, u64 ram_size, u8* xrgb, u32 
 }
 
 }  // namespace mv
+
+namespace mv {
+void apply_gamma(const std::array<u8, 768>& lut, u8* xrgb, u32 pitch, u32 w, u32 h) {
+    for (u32 y = 0; y < h; ++y) {
+        u8* p = xrgb + static_cast<std::size_t>(y) * pitch;
+        for (u32 x = 0; x < w; ++x, p += 4) {
+            p[0] = lut[p[0] * 3u + 2];  // blue
+            p[1] = lut[p[1] * 3u + 1];  // green
+            p[2] = lut[p[2] * 3u + 0];  // red
+        }
+    }
+}
+}  // namespace mv
