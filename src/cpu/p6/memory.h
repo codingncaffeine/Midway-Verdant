@@ -79,8 +79,20 @@ public:
     void begin_instruction() {
         writes_.clear();
         io_log_.clear();
+        naccesses_ = 0;
     }
     void commit_writes();
+
+    // The physical accesses of the current instruction, for the cycle model's caches (capped; a long string
+    // step is scaled by its element count instead).
+    struct AccessRecord {
+        PhysAddr phys;
+        u8 size;
+        u8 kind;  // 0 load, 1 store, 2 device load, 3 device store, 4 port in, 5 port out
+    };
+    static constexpr unsigned kMaxAccesses = 24;
+    const AccessRecord* accesses() const { return accesses_.data(); }
+    unsigned access_count() const { return naccesses_; }
 
     // Dirty-page tracking for the capture instruments (RAM pages the CPU wrote).
     void set_dirty_tracking(bool on);
@@ -124,6 +136,11 @@ private:
     PhysAddr rom_base_{0xFF000000u};
     u64 rom_size_{16u * 1024 * 1024};
     bool in_rom(PhysAddr phys) const { return phys >= rom_base_ && phys - rom_base_ < rom_size_; }
+    std::array<AccessRecord, kMaxAccesses> accesses_{};
+    unsigned naccesses_{0};
+    void note(PhysAddr phys, unsigned size, u8 kind) {
+        if (naccesses_ < kMaxAccesses) accesses_[naccesses_++] = AccessRecord{phys, static_cast<u8>(size), kind};
+    }
 };
 
 }  // namespace mv::p6

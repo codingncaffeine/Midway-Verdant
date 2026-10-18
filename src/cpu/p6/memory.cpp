@@ -132,10 +132,15 @@ u32 Memory::read_phys(PhysAddr phys, unsigned size) {
         u32 v = 0;
         std::memcpy(&v, p, size);
         if (logging_ && !writes_.empty()) read_from_log(phys, size, v);
+        note(phys, size, 0);
         return v;
     }
-    if (in_rom(phys)) return bus_.read(phys, size);
+    if (in_rom(phys)) {
+        note(phys, size, 0);
+        return bus_.read(phys, size);
+    }
     if (device_hook_) device_hook_();
+    note(phys, size, 2);
     const u32 v = bus_.read(phys, size);
     if (logging_) io_log_.push_back({false, true, phys, static_cast<u8>(size), v});
     return v;
@@ -152,6 +157,7 @@ void Memory::write_phys_logged(PhysAddr phys, unsigned size, u32 value, bool mmi
 
 void Memory::write_phys(PhysAddr phys, unsigned size, u32 value) {
     if (u8* p = ram_at(phys, size)) {
+        note(phys, size, 1);
         if (logging_) {
             write_phys_logged(phys, size, value, false);
             return;
@@ -161,6 +167,7 @@ void Memory::write_phys(PhysAddr phys, unsigned size, u32 value) {
         return;
     }
     if (device_hook_) device_hook_();
+    note(phys, size, 3);
     if (logging_) io_log_.push_back({true, true, phys, static_cast<u8>(size), value});
     bus_.write(phys, size, value);
 }
@@ -192,6 +199,7 @@ u32 Memory::read(u32 lin, unsigned size) {
     if (e.host && !(logging_ && !writes_.empty())) {
         u32 v = 0;
         std::memcpy(&v, e.host + (lin & kPageMask), size);
+        note(e.phys_page | (lin & kPageMask), size, 0);
         return v;
     }
     return read_phys(e.phys_page | (lin & kPageMask), size);
@@ -212,6 +220,7 @@ void Memory::write(u32 lin, unsigned size, u32 value) {
     if (e.host && !logging_) {
         std::memcpy(e.host + (lin & kPageMask), &value, size);
         if (dirty_tracking_) mark_dirty(e.phys_page, 1);
+        note(e.phys_page | (lin & kPageMask), size, 1);
         return;
     }
     write_phys(e.phys_page | (lin & kPageMask), size, value);
@@ -251,6 +260,7 @@ void Memory::probe_write(u32 lin, unsigned n) {
 
 u32 Memory::io_read(u16 port, unsigned size) {
     if (device_hook_) device_hook_();
+    note(port, size, 4);
     const u32 v = bus_.pio_read(port, size);
     if (logging_) io_log_.push_back({false, false, port, static_cast<u8>(size), v});
     return v;
@@ -258,6 +268,7 @@ u32 Memory::io_read(u16 port, unsigned size) {
 
 void Memory::io_write(u16 port, unsigned size, u32 value) {
     if (device_hook_) device_hook_();
+    note(port, size, 5);
     if (logging_) io_log_.push_back({true, false, port, static_cast<u8>(size), value});
     bus_.pio_write(port, size, value);
 }

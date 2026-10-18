@@ -39,6 +39,7 @@ public:
             const u32 off = cpu_.st_.eip + have_;
             const u32 lin = cpu_.linear(kCs, off, 1, Access::Fetch);
             if (have_ == 0) {
+                cpu_.fetch_phys_ = cpu_.mem_.translate(lin, Access::Fetch);
                 // Fast path: the rest of the page from RAM in one copy.
                 const unsigned to_page_end = 4096 - (lin & 0xFFFu);
                 if (const u8* host = cpu_.mem_.host_pointer(lin, Access::Fetch)) {
@@ -90,6 +91,199 @@ void Cpu::reset(u32 cpuid_signature) {
     st_.halted = false;
     triple_fault_ = false;
     mem_.flush_tlb(false);
+    timing_.reset();
+    timing_.skip_to(cycles_);
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// The cycle model's view of an instruction: the scoreboard registers it reads and writes.
+
+namespace {
+void regs_of(const Insn& in, unsigned top, u32& reads, u32& writes) {
+    reads = writes = 0;
+    auto gpr = [](unsigned r) { return 1u << (r & 7); };
+    auto opnd = [&](const Opnd& o, bool is_read, bool is_write) {
+        u32 bit = 0;
+        switch (o.kind) {
+            case OpndKind::Reg: bit = gpr(o.reg); break;
+            case OpndKind::Seg: bit = 1u << (kRegSeg + o.reg); break;
+            case OpndKind::Mmx: {
+                // SSE forms carry XMM numbers in the same operand slot.
+                const u8 op = in.opcode;
+                const bool sse = (op >= 0x10 && op <= 0x17) || (op >= 0x28 && op <= 0x2F) || (op >= 0x50 && op <= 0x5F) || op == 0xC2 || op == 0xC6;
+                bit = 1u << ((sse ? kRegXmm : kRegX87) + (o.reg & 7));
+                break;
+            }
+            case OpndKind::Xmm: bit = 1u << (kRegXmm + (o.reg & 7)); break;
+            default: break;
+        }
+        if (is_read) reads |= bit;
+        if (is_write) writes |= bit;
+    };
+    if (in.mem) {
+        if (in.base != Insn::kNoReg) reads |= gpr(in.base);
+        if (in.index != Insn::kNoReg) reads |= gpr(in.index);
+    }
+    const u32 flags = 1u << kRegFlags;
+    const u32 esp = gpr(kEsp), eax = gpr(kEax), ecx = gpr(kEcx), edx = gpr(kEdx), ebx = gpr(kEbx), esi = gpr(kEsi), edi = gpr(kEdi), ebp = gpr(kEbp);
+    switch (in.op) {
+        case Op::Mov: case Op::Movzx: case Op::Movsx: case Op::Lea: case Op::MovFromSeg: case Op::MovFromCr: case Op::MovFromDr:
+            opnd(in.dst, false, true);
+            opnd(in.src, true, false);
+            break;
+        case Op::MovSeg: case Op::MovToCr: case Op::MovToDr:
+            opnd(in.dst, false, true);
+            opnd(in.src, true, false);
+            break;
+        case Op::Cmovcc:
+            opnd(in.dst, true, true);
+            opnd(in.src, true, false);
+            reads |= flags;
+            break;
+        case Op::Setcc: opnd(in.dst, false, true); reads |= flags; break;
+        case Op::Lds: case Op::Les: case Op::Lfs: case Op::Lgs: case Op::Lss: opnd(in.dst, false, true); writes |= 1u << (kRegSeg + kDs); break;
+        case Op::Xchg: opnd(in.dst, true, true); opnd(in.src.kind == OpndKind::None ? Opnd{OpndKind::Reg, kEax} : in.src, true, true); break;
+        case Op::Xlat: reads |= eax | ebx; writes |= eax; break;
+        case Op::Cbw: reads |= eax; writes |= eax; break;
+        case Op::Cwd: reads |= eax; writes |= edx; break;
+        case Op::Bswap: opnd(in.dst, true, true); break;
+        case Op::Cmp: case Op::Test: opnd(in.dst, true, false); opnd(in.src, true, false); writes |= flags; break;
+        case Op::Adc: case Op::Sbb: opnd(in.dst, true, true); opnd(in.src, true, false); reads |= flags; writes |= flags; break;
+        case Op::Add: case Op::Or: case Op::And: case Op::Sub: case Op::Xor: case Op::Xadd:
+            opnd(in.dst, true, true);
+            opnd(in.src, true, in.op == Op::Xadd);
+            writes |= flags;
+            break;
+        case Op::Inc: case Op::Dec: opnd(in.dst, true, true); reads |= flags; writes |= flags; break;
+        case Op::Not: opnd(in.dst, true, true); break;
+        case Op::Neg: opnd(in.dst, true, true); writes |= flags; break;
+        case Op::Mul: case Op::Imul1: opnd(in.dst, true, false); reads |= eax; writes |= eax | edx | flags; break;
+        case Op::Div: case Op::Idiv: opnd(in.dst, true, false); reads |= eax | edx; writes |= eax | edx | flags; break;
+        case Op::Imul2: opnd(in.dst, true, true); opnd(in.src, true, false); writes |= flags; break;
+        case Op::Imul3: opnd(in.dst, false, true); opnd(in.src, true, false); writes |= flags; break;
+        case Op::Rol: case Op::Ror: case Op::Shl: case Op::Shr: case Op::Sar:
+            opnd(in.dst, true, true);
+            opnd(in.src, true, false);
+            writes |= flags;
+            break;
+        case Op::Rcl: case Op::Rcr: opnd(in.dst, true, true); opnd(in.src, true, false); reads |= flags; writes |= flags; break;
+        case Op::Shld: case Op::Shrd: opnd(in.dst, true, true); opnd(in.src, true, false); opnd(in.src2, true, false); writes |= flags; break;
+        case Op::Push: opnd(in.src.kind != OpndKind::None ? in.src : in.dst, true, false); reads |= esp; writes |= esp; break;
+        case Op::Pop: opnd(in.dst, false, true); reads |= esp; writes |= esp; break;
+        case Op::PushSeg: opnd(in.dst, true, false); reads |= esp; writes |= esp; break;
+        case Op::PopSeg: opnd(in.dst, false, true); reads |= esp; writes |= esp; break;
+        case Op::Pusha: reads |= 0xFF; writes |= esp; break;
+        case Op::Popa: reads |= esp; writes |= 0xFF; break;
+        case Op::Pushf: reads |= esp | flags; writes |= esp; break;
+        case Op::Popf: reads |= esp; writes |= esp | flags; break;
+        case Op::Enter: reads |= esp | ebp; writes |= esp | ebp; break;
+        case Op::Leave: reads |= ebp; writes |= esp | ebp; break;
+        case Op::Jcc: reads |= flags; break;
+        case Op::Jmp: case Op::JmpFar: break;
+        case Op::JmpRm: case Op::JmpFarRm: opnd(in.dst, true, false); break;
+        case Op::Call: case Op::CallFar: reads |= esp; writes |= esp; break;
+        case Op::CallRm: case Op::CallFarRm: opnd(in.dst, true, false); reads |= esp; writes |= esp; break;
+        case Op::Ret: case Op::Retf: reads |= esp; writes |= esp; break;
+        case Op::Iret: reads |= esp; writes |= esp | flags; break;
+        case Op::Loop: reads |= ecx; writes |= ecx; break;
+        case Op::Loope: case Op::Loopne: reads |= ecx | flags; writes |= ecx; break;
+        case Op::Jcxz: reads |= ecx; break;
+        case Op::Int: case Op::Int3: case Op::Int1: reads |= esp; writes |= esp | flags; break;
+        case Op::Into: reads |= esp | flags; writes |= esp | flags; break;
+        case Op::Cli: case Op::Sti: case Op::Cld: case Op::Std: case Op::Clc: case Op::Stc: case Op::Cmc: reads |= flags; writes |= flags; break;
+        case Op::Sahf: reads |= eax | flags; writes |= flags; break;
+        case Op::Lahf: reads |= flags; writes |= eax; break;
+        case Op::Salc: reads |= flags; writes |= eax; break;
+        case Op::Daa: case Op::Das: case Op::Aaa: case Op::Aas: case Op::Aam: case Op::Aad: reads |= eax | flags; writes |= eax | flags; break;
+        case Op::Bt: opnd(in.dst, true, false); opnd(in.src, true, false); writes |= flags; break;
+        case Op::Bts: case Op::Btr: case Op::Btc: opnd(in.dst, true, true); opnd(in.src, true, false); writes |= flags; break;
+        case Op::Bsf: case Op::Bsr: opnd(in.dst, false, true); opnd(in.src, true, false); writes |= flags; break;
+        case Op::Cmpxchg: opnd(in.dst, true, true); opnd(in.src, true, false); reads |= eax; writes |= eax | flags; break;
+        case Op::Cmpxchg8b: reads |= eax | ebx | ecx | edx; writes |= eax | edx | flags; break;
+        case Op::Movs: reads |= esi | edi | ecx; writes |= esi | edi | ecx; break;
+        case Op::Cmps: case Op::Scas: reads |= esi | edi | ecx | eax; writes |= esi | edi | ecx | flags; break;
+        case Op::Stos: reads |= edi | ecx | eax; writes |= edi | ecx; break;
+        case Op::Lods: reads |= esi | ecx; writes |= esi | ecx | eax; break;
+        case Op::Ins: reads |= edi | ecx | edx; writes |= edi | ecx; break;
+        case Op::Outs: reads |= esi | ecx | edx; writes |= esi | ecx; break;
+        case Op::In: reads |= edx; writes |= eax; break;
+        case Op::Out: reads |= edx | eax; break;
+        case Op::Cpuid: reads |= eax; writes |= eax | ebx | ecx | edx; break;
+        case Op::Rdtsc: case Op::Rdpmc: writes |= eax | edx; break;
+        case Op::Rdmsr: reads |= ecx; writes |= eax | edx; break;
+        case Op::Wrmsr: reads |= ecx | eax | edx; break;
+        case Op::Sysenter: writes |= esp; break;
+        case Op::Sysexit: reads |= ecx | edx; writes |= esp; break;
+        case Op::Arpl: opnd(in.dst, true, true); opnd(in.src, true, false); writes |= flags; break;
+        case Op::Lar: case Op::Lsl: opnd(in.dst, false, true); opnd(in.src, true, false); writes |= flags; break;
+        case Op::Verr: case Op::Verw: opnd(in.dst, true, false); writes |= flags; break;
+        case Op::Bound: opnd(in.dst, true, false); break;
+        case Op::X87: {
+            const u32 st0 = 1u << (kRegX87 + (top & 7));
+            reads |= st0;
+            writes |= st0;
+            if (!in.mem) {
+                const u32 sti = 1u << (kRegX87 + ((top + in.rm) & 7));
+                reads |= sti;
+                writes |= sti;
+            }
+            if (in.opcode == 0xDA || in.opcode == 0xDB) reads |= flags;  // FCMOVcc
+            if ((in.opcode == 0xDB || in.opcode == 0xDF) && !in.mem && in.reg >= 5) writes |= flags;  // FCOMI family
+            if (in.opcode == 0xDF && in.modrm == 0xE0) writes |= eax;
+            break;
+        }
+        case Op::Simd:
+            opnd(in.dst, true, true);
+            opnd(in.src, true, false);
+            if (in.opcode == 0x2E || in.opcode == 0x2F) writes |= flags;
+            if (in.opcode == 0x6E || in.opcode == 0xC4) opnd(Opnd{OpndKind::Reg, in.rm}, true, false);
+            if (in.opcode == 0x7E || in.opcode == 0xC5 || in.opcode == 0xD7 || in.opcode == 0x50) {
+                if (!in.mem) writes |= gpr(in.opcode == 0x7E ? in.rm : in.reg);
+            }
+            break;
+        default:
+            opnd(in.dst, true, true);
+            opnd(in.src, true, false);
+            break;
+    }
+}
+}  // namespace
+
+void Cpu::account(bool interrupt_delivery) {
+    InsnTiming t{};
+    t.in = &insn_;
+    t.interrupt_delivery = interrupt_delivery;
+    if (!interrupt_delivery) {
+        t.fetch_phys = fetch_phys_;
+        t.len = insn_.len;
+        regs_of(insn_, top_before_, t.reads, t.writes);
+        switch (insn_.op) {
+            case Op::Jmp: case Op::Jcc: case Op::JmpRm: case Op::JmpFar: case Op::JmpFarRm: case Op::Loop: case Op::Loope: case Op::Loopne: case Op::Jcxz:
+                t.is_branch = true;
+                break;
+            case Op::Call: case Op::CallRm: case Op::CallFar: case Op::CallFarRm:
+                t.is_branch = true;
+                t.is_call = true;
+                break;
+            case Op::Ret: case Op::Retf: case Op::Iret:
+                t.is_branch = true;
+                t.is_ret = true;
+                break;
+            default: break;
+        }
+        if (t.is_branch) {
+            const u32 fallthrough = (insn_eip_ + insn_.len) & (st_.code32() ? 0xFFFFFFFFu : 0xFFFFu);
+            t.taken = st_.eip != fallthrough || last_faulted_;
+            t.branch_eip = insn_eip_;
+            t.target = st_.eip;
+            t.is_indirect = insn_.op == Op::JmpRm || insn_.op == Op::CallRm || insn_.op == Op::JmpFarRm || insn_.op == Op::CallFarRm;
+        }
+        static_assert(sizeof(Memory::AccessRecord) == sizeof(MemAccess));
+        t.accesses = reinterpret_cast<const MemAccess*>(mem_.accesses());
+        t.naccesses = mem_.access_count();
+        t.rep_iterations = rep_iterations_;
+    }
+    cycles_ = timing_.retire(t);
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -215,6 +409,8 @@ void Cpu::step() {
     insn_eip_ = st_.eip;
     insn_cs_ = st_.seg[kCs].selector;
     mem_.begin_instruction();
+    rep_iterations_ = 0;
+    top_before_ = st_.fpu.top();
     try {
         Fetcher f(*this);
         decode(f, st_.code32(), insn_);
@@ -224,13 +420,14 @@ void Cpu::step() {
         if (!st_.code32()) st_.eip &= 0xFFFFu;
         execute(insn_);
         ++instructions_;
-        cycles_ += 1;
+        account(false);
     } catch (const Fault& fault) {
         st_.eip = insn_eip_;
         last_faulted_ = true;
         ++instructions_;
-        cycles_ += 1;
+        account(false);
         fault_entry(fault);
+        account(true);
     }
 }
 
@@ -270,6 +467,7 @@ void Cpu::deliver_external(u8 vector) {
         st_.eip = insn_eip_;
         fault_entry(f);
     }
+    account(true);
 }
 
 std::string Cpu::last_bytes() {
@@ -561,6 +759,7 @@ void Cpu::exec_string(const Insn& in) {
             }
             default: raise_ud();
         }
+        ++rep_iterations_;
         if (!in.rep) return;
         dec_cx();
         if (in.op == Op::Cmps || in.op == Op::Scas) {

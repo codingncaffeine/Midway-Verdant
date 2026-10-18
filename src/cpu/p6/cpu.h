@@ -9,6 +9,7 @@
 #include "cpu/p6/decode.h"
 #include "cpu/p6/memory.h"
 #include "cpu/p6/state.h"
+#include "cpu/p6/timing.h"
 
 namespace mv::p6 {
 
@@ -43,7 +44,12 @@ public:
     u64 cycles() const { return cycles_; }
     const u64* cycles_pointer() const { return &cycles_; }
     u64 instructions() const { return instructions_; }
-    void set_cycles(u64 c) { cycles_ = c; }
+    // The clock jumps forward (a HLT sleeping to the next event).
+    void set_cycles(u64 c) {
+        cycles_ = c;
+        timing_.skip_to(c);
+    }
+    const Timing& timing() const { return timing_; }
     // In single-iteration mode a REP string instruction executes one element per step (what a single-stepping
     // hardware oracle does).
     void set_single_iteration(bool on) { single_iteration_ = on; }
@@ -135,6 +141,7 @@ private:
     void exec_string(const Insn& in);
     void exec_system(const Insn& in);
     void fault_entry(const Fault& f);
+    void account(bool interrupt_delivery);
 
     Bus& bus_;
     CpuState st_;
@@ -148,6 +155,10 @@ private:
     bool single_iteration_{false};
     bool last_rdtsc_{false}, last_cpuid_{false}, last_faulted_{false}, last_rep_step_{false}, last_delivered_{false};
     u8 last_vector_{0};
+    Timing timing_;
+    PhysAddr fetch_phys_{0};
+    unsigned rep_iterations_{0};
+    unsigned top_before_{0};
     std::function<int()> irq_pending_, irq_ack_;
     u32 cpuid_signature_{0x0000068Au};
 };

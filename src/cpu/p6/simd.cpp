@@ -191,9 +191,9 @@ struct Simd {
 
     // One lane of an SSE arithmetic instruction with the host under the guest's MXCSR.
     u32 lane(FOp op, u32 a, u32 b, u32& flags) {
-        flags |= operand_flags(a, b, op != FOp::Sqrt && op != FOp::Rcp && op != FOp::Rsqrt);
-        u32 r;
         const bool unary = op == FOp::Sqrt || op == FOp::Rcp || op == FOp::Rsqrt;
+        flags |= operand_flags(unary ? b : a, b, !unary);
+        u32 r;
         if (op == FOp::Min || op == FOp::Max) {
             // MIN/MAX return the second operand when either is a NaN or both are zero.
             if (is_nan32(a) || is_nan32(b)) return b;
@@ -201,7 +201,7 @@ struct Simd {
             if (fa == fb) return b;
             return (op == FOp::Min ? fa < fb : fa > fb) ? a : b;
         }
-        if (nan_result(a, b, !unary, r)) return r;
+        if (nan_result(unary ? b : a, b, !unary, r)) return r;
         HostSse host(f.mxcsr);
         volatile float va = u2f(a), vb = u2f(b);
         volatile float vr;
@@ -210,15 +210,15 @@ struct Simd {
             case FOp::Sub: vr = va - vb; break;
             case FOp::Mul: vr = va * vb; break;
             case FOp::Div: vr = va / vb; break;
-            case FOp::Sqrt: vr = std::sqrt(static_cast<float>(va)); break;
+            case FOp::Sqrt: vr = std::sqrt(static_cast<float>(vb)); break;
             case FOp::Rcp: {
                 // The hardware's 12-bit approximation; here the exact reciprocal rounded to 12 significant bits.
-                const float exact = 1.0f / va;
+                const float exact = 1.0f / vb;
                 vr = round_to_bits(exact, 12);
                 break;
             }
             case FOp::Rsqrt: {
-                const float exact = 1.0f / std::sqrt(static_cast<float>(va));
+                const float exact = 1.0f / std::sqrt(static_cast<float>(vb));
                 vr = round_to_bits(exact, 12);
                 break;
             }

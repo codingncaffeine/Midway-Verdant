@@ -179,6 +179,13 @@ void P6Backend::take_dirty_pages(std::vector<u32>& pages) {
 
 std::string P6Backend::report() const {
     std::string r = std::format("cpu p6 memory: {} TLB misses, {} page walks", cpu_ ? cpu_->memory().tlb_misses() : 0, cpu_ ? cpu_->memory().page_walks() : 0);
+    if (cpu_) {
+        const p6::TimingStats& t = cpu_->timing().stats();
+        const double ipc = t.cycles ? static_cast<double>(t.instructions) / static_cast<double>(t.cycles) : 0.0;
+        r += std::format("\ncpu p6 pipeline: {:.3f} IPC, {} uops; L1I misses {}, L1D misses {}, L2 misses {}; branches {} mispredicted {}; device loads {} stores {}, port I/O {}; stalls: dependency {}, rob {}, fetch {}",
+                         ipc, t.uops, t.l1i_misses, t.l1d_misses, t.l2_misses, t.branches, t.mispredicts, t.device_loads, t.device_stores, t.port_ios,
+                         t.stall_dependency, t.stall_rob, t.stall_fetch);
+    }
     if (oracle_) r += "\n" + oracle_->summary();
     return r;
 }

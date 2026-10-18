@@ -180,6 +180,7 @@ struct X87 {
         return masked(kSwIE);
     }
     void push(long double v) {
+        clear_c1();  // C1 reports only a stack overflow here
         const unsigned t = (top() - 1) & 7;
         if (((f.ftw >> (2 * t)) & 3) != kTagEmpty) {
             // Stack overflow: IE + SF, C1 = 1; masked pushes the indefinite.

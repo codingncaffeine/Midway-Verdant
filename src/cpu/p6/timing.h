@@ -1,0 +1,108 @@
+#pragma once
+// The cycle model of the Pentium III (Coppermine) core: a P6 pipeline accounting — the three decoders (4-1-1),
+// register renaming into a 40-entry reorder buffer, issue to the five ports with the µop counts and latencies
+// of Agner Fog's Pentium II/III tables, in-order retirement three µops a cycle, the L1 instruction and data
+// caches and the on-die L2 as tag arrays with LRU, a branch target buffer with two-bit counters and a return
+// stack, and the uncached latencies of device and port accesses. A cycle COUNT whose observable orderings are
+// checked against hardware where ground truth exists; it does not claim exactness.
+#include <array>
+
+#include "core/types.h"
+#include "cpu/p6/decode.h"
+
+namespace mv::p6 {
+
+// Registers of the dependency scoreboard.
+inline constexpr unsigned kRegFlags = 8, kRegX87 = 9, kRegXmm = 17, kRegSeg = 25, kRegCount = 31;
+
+struct MemAccess {
+    PhysAddr phys;
+    u8 size;
+    u8 kind;  // 0 load, 1 store, 2 device load, 3 device store, 4 port in, 5 port out
+};
+
+struct InsnTiming {
+    const Insn* in;
+    PhysAddr fetch_phys;
+    u8 len;
+    u32 reads, writes;  // scoreboard register bitmasks
+    bool is_branch, taken, is_call, is_ret, is_indirect;
+    u32 branch_eip, target;
+    const MemAccess* accesses;
+    unsigned naccesses;
+    unsigned rep_iterations;  // string elements this step ran (0 for other instructions)
+    bool interrupt_delivery;  // an external interrupt was delivered instead of an instruction
+};
+
+struct TimingStats {
+    u64 instructions{0}, uops{0}, cycles{0};
+    u64 l1i_misses{0}, l1d_misses{0}, l2_misses{0};
+    u64 branches{0}, mispredicts{0};
+    u64 device_loads{0}, device_stores{0}, port_ios{0};
+    u64 stall_dependency{0}, stall_rob{0}, stall_fetch{0};
+};
+
+// Model parameters (cycles at 733 MHz). Marked [verify] in local-notes/hw/cpu-p6.md where guessed.
+namespace tp {
+inline constexpr unsigned kFetchToDecode = 3;    // IFU stages
+inline constexpr unsigned kDecodeToIssue = 3;    // ID2, RAT, RS
+inline constexpr unsigned kMispredictBubble = 9; // front-end restart after a resolved mispredict
+inline constexpr unsigned kLoadLatency = 3;      // L1 hit
+inline constexpr unsigned kL2Latency = 7;        // added on an L1 miss [verify]
+inline constexpr unsigned kDramLatency = 90;     // added on an L2 miss [verify]
+inline constexpr unsigned kDeviceLoad = 160;     // an uncached read from the chipset [verify]
+inline constexpr unsigned kDeviceStore = 8;      // posted
+inline constexpr unsigned kPortIo = 300;         // IN/OUT [verify]
+inline constexpr unsigned kInterruptDelivery = 40;
+inline constexpr unsigned kRobEntries = 40;
+inline constexpr unsigned kRetireWidth = 3;
+}  // namespace tp
+
+class Timing {
+public:
+    Timing();
+    void reset();
+    // Account for one retired instruction (or an interrupt delivery); returns its retirement cycle.
+    u64 retire(const InsnTiming& t);
+    // The core slept to `cycle` (HLT): every pipeline clock moves there.
+    void skip_to(u64 cycle);
+    u64 now() const { return retire_cycle_; }
+    const TimingStats& stats() const { return stats_; }
+
+private:
+    struct Cache {
+        Cache(unsigned sets, unsigned ways);
+        bool access(PhysAddr phys, u64 now);  // true on a hit; allocates on a miss
+        unsigned sets_, ways_;
+        std::array<u32, 4096> tags_{};
+        std::array<u64, 4096> last_use_{};
+        std::array<u8, 4096> valid_{};
+    };
+    struct Btb {
+        u32 tag{0};
+        u32 target{0};
+        u8 counter{0};
+    };
+
+    u64 alloc_port(unsigned port, u64 earliest);
+    unsigned memory_penalty(PhysAddr phys, u64 now, bool store);
+    u64 fetch_ready(PhysAddr phys, unsigned len, u64 now);
+
+    u64 decode_cycle_{0};
+    unsigned decode_slot_{0}, decode_bytes_{0};
+    u64 front_end_restart_{0};
+    std::array<u64, 5> port_free_{};
+    std::array<u64, kRegCount> reg_ready_{};
+    u64 retire_cycle_{0};
+    unsigned retire_slot_{0};
+    std::array<u64, tp::kRobEntries> rob_{};
+    unsigned rob_pos_{0};
+    u64 int_div_free_{0}, fp_div_free_{0};
+    Cache l1i_{128, 4}, l1d_{128, 4}, l2_{512, 8};
+    std::array<Btb, 512> btb_{};
+    std::array<u32, 16> rsb_{};
+    unsigned rsb_top_{0};
+    TimingStats stats_;
+};
+
+}  // namespace mv::p6
