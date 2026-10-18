@@ -25,6 +25,9 @@ Nv2aStub::Nv2aStub(Bus& bus, Scheduler& sched, std::function<void(bool)> irq)
         ++vblanks_;
         // The scanout reads the frame buffer now: a rendered one comes down from the device first.
         if (renderer_) renderer_->write_back_at(reg(kPcrtcStart));
+        // A whole frame without a method: the GPU is idle, so what it drew is in RAM on the hardware; put it there.
+        if (renderer_ && kelvin_.methods_seen() == methods_at_vblank_) renderer_->write_back_all();
+        methods_at_vblank_ = kelvin_.methods_seen();
         if (vblank_hook_) vblank_hook_(sched_.now());
         regs_[kPcrtcIntr0] |= 1u;
         // The mode latch acknowledges software's toggle at the frame boundary: bit 4 takes bit 0.

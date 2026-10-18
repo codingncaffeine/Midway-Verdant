@@ -581,6 +581,13 @@ void VulkanRenderer::write_back_zeta(Surface& s) {
     invalidate(s.zeta_phys, s.zeta_bytes());
 }
 
+void VulkanRenderer::write_back_all() {
+    for (auto& [k, s] : surfaces_) {
+        if (s->dirty) write_back(*s);
+        if (s->zeta_dirty) write_back_zeta(*s);
+    }
+}
+
 void VulkanRenderer::write_back_range(u32 phys, u32 len) {
     const u64 b0 = phys, b1 = static_cast<u64>(phys) + len;
     for (auto& [k, s] : surfaces_) {

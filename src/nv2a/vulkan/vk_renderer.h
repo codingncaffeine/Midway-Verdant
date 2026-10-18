@@ -33,6 +33,10 @@ public:
     bool write_back_at(u32 phys);
     // Every render target overlapping [phys, phys + len) reaches RAM (colour and depth): the 2D engine reads there.
     void write_back_range(u32 phys, u32 len);
+    // Every dirty render target reaches RAM (colour and depth). The live machine calls it when the GPU has been idle
+    // for a whole frame: the hardware wrote those pixels when it drew them, and RAM a program reuses later must not
+    // receive them then (a title launched after the boot animation got the animation's targets over its own data).
+    void write_back_all();
     // Guest RAM in [phys, phys + len) was written: textures decoded from it are stale.
     void invalidate(u32 phys, u32 len);
 

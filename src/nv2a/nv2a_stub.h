@@ -153,6 +153,7 @@ private:
     std::function<void(Cycles)> vblank_hook_;
     PushbufferWalker walker_;
     pgraph::Kelvin kelvin_;
+    u64 methods_at_vblank_{0};  // Kelvin methods seen at the last vblank (an idle frame writes the surfaces back)
     pgraph::VulkanRenderer* renderer_{nullptr};
     std::unique_ptr<pgraph::TwoD> twod_;  // the 2D surfaces and image-blit classes
     u64 rendered_frames_{0};
