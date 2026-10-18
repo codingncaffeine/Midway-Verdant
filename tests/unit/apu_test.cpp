@@ -219,7 +219,7 @@ struct VoiceRig : Rig {
 };
 }  // namespace
 
-TEST(ApuVoices, VoiceOnLinksAtTheTopOfItsListAndTheEngineRetiresItAtTheBufferEndWithATrap) {
+TEST(ApuVoices, VoiceOnLinksAtTheTopOfItsListAndAOneShotStaysThereSilentUntilVoiceOffRetiresItWithATrap) {
     using SE = apu::SetupEngine;
     VoiceRig r;
     r.vp(SE::kMethodSetCurrentVoice, 5);
@@ -237,10 +237,18 @@ TEST(ApuVoices, VoiceOnLinksAtTheTopOfItsListAndTheEngineRetiresItAtTheBufferEnd
     r.sched.advance_to(Rig::frame(1));
     EXPECT_EQ(r.cbo(5), 32u) << "32 samples per frame at unity pitch";
     EXPECT_EQ(r.rd(Apu::kIsts), 0u);
-    r.sched.advance_to(Rig::frame(2));
-    EXPECT_EQ(r.rd(SE::kRegListTop[0]), SE::kNoVoice) << "the voice ran off its end and left the list";
+    r.sched.advance_to(Rig::frame(3));
+    EXPECT_EQ(r.cbo(5), 63u) << "stopped at its last sample";
+    EXPECT_EQ(r.rd(SE::kRegListTop[0]), 5u) << "played to its end: silent, still on its list";
+    EXPECT_TRUE(r.field(5, SE::kFieldState) & SE::kStateActive);
+    EXPECT_EQ(r.rd(Apu::kIsts), 0u) << "no idle report for a buffer that ran out";
+    EXPECT_FALSE(r.irq);
+    EXPECT_EQ(r.apu.setup_engine().voices_retired(), 0u);
+
+    r.vp(SE::kMethodVoiceOff, 5);
+    r.sched.advance_to(Rig::frame(4));
+    EXPECT_EQ(r.rd(SE::kRegListTop[0]), SE::kNoVoice) << "turned off: retired and off the list";
     EXPECT_FALSE(r.field(5, SE::kFieldState) & SE::kStateActive);
-    EXPECT_EQ(r.cbo(5), 63u);
     EXPECT_EQ(r.rd(Apu::kFectl) & (Apu::kFectlMethodMode | Apu::kFectlTrapReason), Apu::kFectlTrapped | Apu::kFectlTrapRequested);
     EXPECT_EQ(r.rd(Apu::kFeDecMethod), SE::kSe2FeIdleVoice);
     EXPECT_EQ(r.rd(Apu::kFeDecParam), 5u);
@@ -259,7 +267,7 @@ TEST(ApuVoices, VoiceOnLinksAtTheTopOfItsListAndTheEngineRetiresItAtTheBufferEnd
     r.vp(0x37C, 4096u << 16);
     r.vp(SE::kMethodVoiceOn, 6);
     EXPECT_EQ(r.rd(SE::kRegListTop[0]), 6u);
-    r.sched.advance_to(Rig::frame(3));
+    r.sched.advance_to(Rig::frame(5));
     EXPECT_EQ(r.cbo(6), 64u);
 }
 
@@ -274,7 +282,7 @@ TEST(ApuVoices, ALoopingVoiceWrapsAndRetiresOnlyWhenTurnedOffAndQueuedTrapsWaitF
     r.vp(SE::kMethodSetAntecedentVoice, 0x1FFFFu);
     r.vp(SE::kMethodVoiceOn, 0x40);
     r.vp(SE::kMethodVoicePause, 0x40);
-    // A second, finite voice on the 3D list.
+    // A second, one-shot voice on the 3D list.
     r.vp(SE::kMethodSetCurrentVoice, 7);
     r.vp(0x304, 0x5000E0E6u);
     r.vp(SE::kMethodBufEbo, 31);
@@ -286,18 +294,22 @@ TEST(ApuVoices, ALoopingVoiceWrapsAndRetiresOnlyWhenTurnedOffAndQueuedTrapsWaitF
     EXPECT_EQ(r.cbo(0x40), 0u) << "wrapped to the loop start";
     EXPECT_TRUE(r.field(0x40, SE::kFieldState) & SE::kStateActive);
     EXPECT_EQ(r.rd(SE::kRegListTop[0]), 0x40u);
-    EXPECT_EQ(r.rd(Apu::kFeDecParam), 7u) << "the finite voice ended and trapped";
-    EXPECT_TRUE(r.irq);
+    EXPECT_EQ(r.rd(SE::kRegListTop[1]), 7u) << "the one-shot ran out and stays listed";
+    EXPECT_FALSE(r.irq);
 
+    // Both turned off in the same frame: the 2D list is walked first, so its report comes first.
     r.vp(SE::kMethodVoiceOff, 0x40);
+    r.vp(SE::kMethodVoiceOff, 7);
     r.sched.advance_to(Rig::frame(2));
     EXPECT_EQ(r.rd(SE::kRegListTop[0]), SE::kNoVoice) << "turned off: retired at the next frame";
-    EXPECT_EQ(r.rd(Apu::kFeDecParam), 7u) << "the front end is still trapped on the first report";
-    EXPECT_EQ(r.apu.traps(), 1u);
+    EXPECT_EQ(r.rd(SE::kRegListTop[1]), SE::kNoVoice);
+    EXPECT_EQ(r.rd(Apu::kFeDecParam), 0x40u);
+    EXPECT_TRUE(r.irq);
+    EXPECT_EQ(r.apu.traps(), 1u) << "the second report waits for the front end";
     r.service_trap();
     EXPECT_FALSE(r.irq);
     r.sched.advance_to(Rig::frame(3));
-    EXPECT_EQ(r.rd(Apu::kFeDecParam), 0x40u) << "the queued report is delivered once the front end is free";
+    EXPECT_EQ(r.rd(Apu::kFeDecParam), 7u) << "the queued report is delivered once the front end is free";
     EXPECT_TRUE(r.irq);
     EXPECT_EQ(r.apu.traps(), 2u);
     EXPECT_EQ(r.apu.setup_engine().voices_started(), 2u);
@@ -418,7 +430,42 @@ TEST(ApuSynthesis, ABufferVoicePlaysItsSamplesIntoItsBinAtItsVolumeAndHeadroom) 
     r.sched.advance_to(Rig::frame(2));
     const float g = std::pow(10.0f, -1.0f / 20.0f) / 2.0f;
     for (u32 i = 0; i < 32; ++i) EXPECT_NEAR(r.bin(0, i), SynthRig::pcm(32 + i) / 32768.0f * g, 1e-6f) << "sample " << (32 + i);
-    EXPECT_EQ(r.apu.setup_engine().voices_retired(), 1u) << "the voice played its last sample and ended";
+    r.sched.advance_to(Rig::frame(3));
+    for (u32 i = 0; i < 32; ++i) EXPECT_EQ(r.bin(0, i), 0.0f) << "past its end the voice is silent, sample " << i;
+    EXPECT_EQ(r.apu.setup_engine().voices_retired(), 0u) << "and it stays on its list";
+}
+
+TEST(ApuSynthesis, ProgrammingAOneShotsEndStartsItAgainAndAReplayedVoiceIsLinkedOnce) {
+    using SE = apu::SetupEngine;
+    SynthRig r;
+    r.fill_pcm(64);
+    r.start(kPcm16Mono, 31, 0, 0, 0);  // one frame of samples, no loop
+    r.sched.advance_to(Rig::frame(1));
+    EXPECT_FLOAT_EQ(r.bin(0, 5), SynthRig::pcm(5) / 32768.0f);
+    r.sched.advance_to(Rig::frame(2));
+    EXPECT_EQ(r.bin(0, 5), 0.0f) << "finished: silent";
+    // The kernel's replay of a voice it still counts as playing: the buffer's end and loop offsets, no VOICE_ON.
+    r.vp(SE::kMethodSetCurrentVoice, SynthRig::kVoice);
+    r.vp(SE::kMethodBufEbo, 31);
+    r.vp(SE::kMethodBufLbo, 0);
+    r.sched.advance_to(Rig::frame(3));
+    for (u32 i = 0; i < 32; ++i) EXPECT_FLOAT_EQ(r.bin(0, i), SynthRig::pcm(i) / 32768.0f) << "played again from its start, sample " << i;
+    // VOICE_ON for a voice still on its list starts it without linking it a second time.
+    r.vp(SE::kMethodSetAntecedentVoice, 0x1FFFFu);
+    r.vp(SE::kMethodVoiceOn, SynthRig::kVoice);
+    EXPECT_EQ(r.rd(SE::kRegListTop[0]), SynthRig::kVoice);
+    EXPECT_EQ(r.field(SynthRig::kVoice, SE::kFieldPitchLink) & 0xFFFFu, SE::kNoVoice) << "not linked to itself";
+    r.sched.advance_to(Rig::frame(4));
+    EXPECT_FLOAT_EQ(r.bin(0, 3), SynthRig::pcm(3) / 32768.0f);
+    // A looping voice keeps its place when its end is programmed again.
+    SynthRig l;
+    l.fill_pcm(64);
+    l.start(kPcm16Mono | SE::kFmtLoop, 63, 0, 0, 0);
+    l.sched.advance_to(Rig::frame(1));
+    l.vp(SE::kMethodSetCurrentVoice, SynthRig::kVoice);
+    l.vp(SE::kMethodBufEbo, 63);
+    l.sched.advance_to(Rig::frame(2));
+    EXPECT_FLOAT_EQ(l.bin(0, 0), SynthRig::pcm(32) / 32768.0f) << "a loop is not restarted";
 }
 
 TEST(ApuSynthesis, PitchStepsThroughTheBufferWithLinearInterpolation) {

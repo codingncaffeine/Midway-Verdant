@@ -103,6 +103,8 @@ private:
         u32 ssl_index{0}, ssl_segment{0};
         bool starved_reported{false};
         bool off_pending{false};
+        // Played to the end of a one-shot buffer: silent but still on its list, until VOICE_OFF or a restart.
+        bool finished{false};
         // The last ADPCM block decoded: its address and samples (left, right interleaved).
         u64 adpcm_key{~0ull};
         std::array<i16, kAdpcmSamplesPerBlock * 2> adpcm{};
@@ -119,6 +121,7 @@ private:
     };
     PhysAddr voice_address(u32 handle) const;
     void link_on(u32 handle);
+    bool on_a_list(u32 handle) const;  // whether the voice is on one of the three lists
     void walk(u32 list);
     void retire(u32 handle, u32 list, u32 prev, u32 next, u32 state);
     // A voice's frame of samples; false when the voice ends during it (the rest of the frame is silence).
