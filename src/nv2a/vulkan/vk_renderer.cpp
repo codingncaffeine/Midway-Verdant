@@ -923,6 +923,16 @@ VkSampler VulkanRenderer::sampler(const TextureStage& ts, u32 levels) {
     return sm;
 }
 
+bool VulkanRenderer::fits_in_batch(VkDeviceSize vertex_bytes, VkDeviceSize index_bytes) const {
+    auto fits = [](const vk::Buffer& ring, VkDeviceSize cursor, VkDeviceSize bytes, VkDeviceSize alignment) {
+        return (cursor + alignment - 1) / alignment * alignment + bytes <= ring.size;
+    };
+    const VkDeviceSize ualign = std::max<VkDeviceSize>(dev_.limits().minUniformBufferOffsetAlignment, 16);
+    const VkDeviceSize uniforms = (vsh::kUniformBytes + ualign - 1) / ualign * ualign + sizeof(psh::Uniforms);
+    return fits(vertex_ring_, vertex_cursor_, vertex_bytes, 16) && (index_bytes == 0 || fits(index_ring_, index_cursor_, index_bytes, 4)) &&
+           fits(uniform_ring_, uniform_cursor_, uniforms, ualign) && descriptor_sets_used_ < kMaxDescriptorSets;
+}
+
 bool VulkanRenderer::ring_alloc(vk::Buffer& ring, VkDeviceSize& cursor, VkDeviceSize bytes, VkDeviceSize alignment, VkDeviceSize& offset) {
     const VkDeviceSize start = (cursor + alignment - 1) / alignment * alignment;
     if (start + bytes > ring.size) return false;
@@ -1088,6 +1098,13 @@ void VulkanRenderer::draw(const KelvinState& s, const DrawBatch& batch) {
     // Vertex data: every attribute as a vec4, disabled ones at their default.
     t_part = std::chrono::steady_clock::now();
     VkDeviceSize vbytes = static_cast<VkDeviceSize>(v.count) * kVertexStride, voffset = 0;
+    // The rings and the descriptor pool hold one batch of draws. A draw that no longer fits submits the batch so far
+    // and starts the rings over, so a frame can hold any number of draws (only a single draw larger than a ring is
+    // refused below).
+    if (!fits_in_batch(vbytes, indices.size() * 4)) {
+        flush_frame();
+        ++stats_.batch_flushes;
+    }
     if (!ring_alloc(vertex_ring_, vertex_cursor_, vbytes, 16, voffset)) {
         note("vertex ring full for this frame");
         ++stats_.skipped;
@@ -1162,6 +1179,7 @@ void VulkanRenderer::draw(const KelvinState& s, const DrawBatch& batch) {
         ++stats_.skipped;
         return;
     }
+    ++descriptor_sets_used_;
     VkDescriptorBufferInfo bufs[2] = {{uniform_ring_.buffer, uoffset_vs, vsh::kUniformBytes}, {uniform_ring_.buffer, uoffset_ps, sizeof(psh::Uniforms)}};
     VkDescriptorImageInfo imgs[4]{};
     for (u32 i = 0; i < 4; ++i) {
@@ -1232,6 +1250,7 @@ void VulkanRenderer::flush_frame() {
     flush();
     vertex_cursor_ = index_cursor_ = uniform_cursor_ = 0;
     fn_->vkResetDescriptorPool(dev_.device(), descriptor_pool_, 0);
+    descriptor_sets_used_ = 0;
 }
 
 bool VulkanRenderer::write_back_at(u32 phys) {
@@ -1251,6 +1270,7 @@ void VulkanRenderer::end_frame() {
         if (s->dirty) write_back(*s);
     vertex_cursor_ = index_cursor_ = uniform_cursor_ = 0;
     fn_->vkResetDescriptorPool(dev_.device(), descriptor_pool_, 0);
+    descriptor_sets_used_ = 0;
 }
 
 std::vector<VulkanRenderer::SurfaceInfo> VulkanRenderer::surfaces() const {

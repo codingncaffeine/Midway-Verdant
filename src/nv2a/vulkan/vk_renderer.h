@@ -46,6 +46,7 @@ public:
 
     struct Stats {
         u64 draws{0}, clears{0}, skipped{0}, pipelines{0}, shaders{0}, textures_decoded{0}, writebacks{0}, flushes{0};
+        u64 batch_flushes{0};  // batches submitted mid-frame because the rings or the descriptor pool were full
         // Where the time goes, in nanoseconds: the whole draw and its parts (the texture part includes the
         // write-backs a sample forces; the shader parts are the compiles, a lookup costs nothing measurable); the
         // submits that wait; the copies back to RAM (and the device copy inside them).
@@ -106,6 +107,8 @@ private:
     const TextureEntry* texture(const KelvinState& s, u32 stage, std::string& error);
     VkSampler sampler(const TextureStage& ts, u32 levels);
     bool ring_alloc(vk::Buffer& ring, VkDeviceSize& cursor, VkDeviceSize bytes, VkDeviceSize alignment, VkDeviceSize& offset);
+    // Whether a draw with these vertex and index sizes still fits the rings and the descriptor pool of the batch.
+    bool fits_in_batch(VkDeviceSize vertex_bytes, VkDeviceSize index_bytes) const;
     u32 texture_phys(const KelvinState& s, const TextureStage& ts) const;
 
     vk::Device& dev_;
@@ -158,6 +161,7 @@ private:
     VkDescriptorPool descriptor_pool_{VK_NULL_HANDLE};
     vk::Buffer vertex_ring_, index_ring_, uniform_ring_, staging_, readback_;
     VkDeviceSize vertex_cursor_{0}, index_cursor_{0}, uniform_cursor_{0};
+    u32 descriptor_sets_used_{0};
     vk::Image dummy2d_, dummycube_, dummy3d_;
     VkSampler dummy_sampler_{VK_NULL_HANDLE};
     VkFormat depth24_{VK_FORMAT_D24_UNORM_S8_UINT};

@@ -318,6 +318,8 @@ int main(int argc, char** argv) {
                     static_cast<double>(st.ns_draw) / 1e6, static_cast<double>(st.ns_fetch) / 1e6, static_cast<double>(st.ns_texture) / 1e6,
                     static_cast<double>(st.ns_pipeline) / 1e6, static_cast<double>(st.ns_vs + st.ns_fs) / 1e6, static_cast<double>(st.ns_flush) / 1e6,
                     static_cast<double>(st.ns_write_back) / 1e6, static_cast<double>(st.ns_write_back_gpu) / 1e6);
+        if (st.batch_flushes) std::printf("gpu: %llu mid-frame batch submits (rings full)\n", static_cast<unsigned long long>(st.batch_flushes));
+        for (const auto& e : st.errors) std::printf("gpu skipped a draw: %s\n", e.c_str());
     }
     std::printf("milestones: rom hidden %s | smc challenge %s | bootloader %s | kernel %s | power off %s\n", ms(m.rom_hidden).c_str(),
                 ms(m.smc_challenge_answered).c_str(), ms(m.bootloader_magic).c_str(), ms(m.kernel_header).c_str(), ms(m.power_off).c_str());
