@@ -26,6 +26,8 @@ std::vector<unsigned char> last_frame;
 unsigned last_w = 0, last_h = 0;
 std::size_t last_pitch = 0;
 unsigned long long frames_seen = 0, audio_frames = 0, audio_nonzero = 0;
+std::FILE* wav_out = nullptr;  // --wav FILE: the core's audio as raw interleaved stereo 16-bit (a WAV header is written at the end)
+unsigned long long wav_frames = 0;
 
 struct Press {
     unsigned id;
@@ -87,6 +89,10 @@ size_t audio_batch(const int16_t* data, size_t frames) {
     audio_frames += frames;
     for (size_t i = 0; i < frames * 2; ++i)
         if (data[i]) ++audio_nonzero;
+    if (wav_out) {
+        std::fwrite(data, 4, frames, wav_out);
+        wav_frames += frames;
+    }
     return frames;
 }
 void audio_sample(int16_t, int16_t) {}
@@ -139,7 +145,7 @@ T sym(void* lib, const char* name) {
 
 int main(int argc, char** argv) {
     if (argc < 3) {
-        std::fprintf(stderr, "usage: mv-retro-host CORE.so SYSTEM_DIR [GAME] --frames N [--png-every K DIR] [--press BUTTON@FROM-TO ...] [--option KEY=VALUE ...]\n");
+        std::fprintf(stderr, "usage: mv-retro-host CORE.so SYSTEM_DIR [GAME] --frames N [--png-every K DIR] [--press BUTTON@FROM-TO ...] [--option KEY=VALUE ...] [--wav FILE]\n");
         return 2;
     }
     const char* core_path = argv[1];
@@ -162,6 +168,14 @@ int main(int argc, char** argv) {
             }
             presses.push_back({button_id(spec.substr(0, at)), static_cast<unsigned>(std::atoi(spec.c_str() + at + 1)),
                                static_cast<unsigned>(std::atoi(spec.c_str() + dash + 1))});
+        } else if (a == "--wav" && i + 1 < argc) {
+            wav_out = std::fopen(argv[++i], "wb");
+            if (!wav_out) {
+                std::fprintf(stderr, "mv-retro-host: cannot write %s\n", argv[i]);
+                return 2;
+            }
+            const unsigned char blank[44] = {};
+            std::fwrite(blank, 1, sizeof blank, wav_out);
         } else if (a == "--option" && i + 1 < argc) {
             const std::string kv = argv[++i];
             const auto eq = kv.find('=');
@@ -204,6 +218,22 @@ int main(int argc, char** argv) {
     const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     std::printf("ran %u frames in %.2f s (%.1f fps); %llu video callbacks, last %ux%u; %llu audio frames, %llu non-zero samples\n", frames, secs,
                 frames / secs, frames_seen, last_w, last_h, audio_frames, audio_nonzero);
+    if (wav_out) {
+        // RIFF header for 48 kHz stereo 16-bit PCM.
+        auto le32 = [](unsigned char* p, unsigned v) { for (int k = 0; k < 4; ++k) p[k] = static_cast<unsigned char>(v >> (8 * k)); };
+        unsigned char h[44] = {'R', 'I', 'F', 'F', 0, 0, 0, 0, 'W', 'A', 'V', 'E', 'f', 'm', 't', ' ', 16, 0, 0, 0, 1, 0, 2, 0};
+        const unsigned bytes = static_cast<unsigned>(wav_frames * 4);
+        le32(h + 4, 36 + bytes);
+        le32(h + 24, 48000);
+        le32(h + 28, 48000 * 4);
+        h[32] = 4;
+        h[34] = 16;
+        std::memcpy(h + 36, "data", 4);
+        le32(h + 40, bytes);
+        std::fseek(wav_out, 0, SEEK_SET);
+        std::fwrite(h, 1, sizeof h, wav_out);
+        std::fclose(wav_out);
+    }
     sym<void (*)()>(lib, "retro_unload_game")();
     sym<void (*)()>(lib, "retro_deinit")();
     dlclose(lib);
