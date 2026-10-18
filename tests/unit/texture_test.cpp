@@ -183,3 +183,15 @@ TEST(Texture, X8Y24DepthIsTheTopThreeBytes) {
         EXPECT_FLOAT_EQ(f[1], static_cast<float>(0x800000) / 16777215.0f) << "format " << format;
     }
 }
+
+TEST(Texture, A8IsWhiteWithAlpha) {
+    std::vector<u8> ram(4096, 0);
+    ram[0x100] = 0x40;
+    ram[0x101] = 0xC0;
+    for (const TextureStage& t : {stage_of(fmt(0x19, 1, 0)), stage_of(fmt(0x1F, 0, 0), 4u << 16, (2u << 16) | 1u)}) {
+        DecodedTexture d;
+        ASSERT_TRUE(decode_texture(t, 0x100, MemoryView{ram.data(), 4096}, nullptr, d)) << d.error;
+        const auto& img = d.image(0, 0);
+        EXPECT_EQ((std::vector<u8>(img.begin(), img.end())), (std::vector<u8>{255, 255, 255, 0x40, 255, 255, 255, 0xC0}));
+    }
+}

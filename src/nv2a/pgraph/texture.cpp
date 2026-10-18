@@ -70,8 +70,8 @@ void decode_texel(u32 format, const u8* p, const u8* palette, HostPixel pixel, u
         case 0x17: case 0x28:  // G8B8: bytes B G
             put(dst, 0, p[1], p[0], 255);
             return;
-        case 0x19: case 0x1F:  // A8
-            put(dst, 0, 0, 0, p[0]);
+        case 0x19: case 0x1F:  // A8: white with the byte as alpha, so a texture modulated by a colour keeps the colour
+            put(dst, 255, 255, 255, p[0]);
             return;
         case 0x1A: case 0x20:  // A8Y8: bytes Y A
             put(dst, p[0], p[0], p[0], p[1]);
