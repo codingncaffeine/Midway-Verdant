@@ -28,6 +28,8 @@ enum : u32 {
     kModeDotReflectSpecular = 0xC,    // DOT_PRODUCT_REFLECT_CUBE_MAP: texm3x3vspec, the eye from the three q
     kModeDotSTR3D = 0xD,              // DOT_PRODUCT_TEXTURE_3D (NV_texture_shader2): texm3x3tex on a volume
     kModeDotSTRCube = 0xE,            // DOT_PRODUCT_TEXTURE_CUBE_MAP: texm3x3tex
+    kModeDependentAR = 0xF,           // DEPENDENT_AR_TEXTURE_2D: texreg2ar
+    kModeDependentGB = 0x10,          // DEPENDENT_GB_TEXTURE_2D: texreg2gb
     kModeDotProduct = 0x11,           // DOT_PRODUCT: texm3x2pad, texm3x3pad
     kModeDotReflectSpecularConst = 0x12  // DOT_PRODUCT_CONST_EYE_REFLECT_CUBE_MAP: texm3x3spec, a constant eye
 };
@@ -133,6 +135,8 @@ SamplerKind sampler_kind(const Key& key, u32 stage) {
         // The dependent modes read the kind of texture they are made for; another kind makes the stage inconsistent
         // (NV_texture_shader), which reads as none. A 2D texture in the 3D mode is a volume one texel deep.
         case kModeDotST:
+        case kModeDependentAR:
+        case kModeDependentGB:
             if (cube) return SamplerKind::None;
             return dim == 3 ? SamplerKind::Sampler3D : SamplerKind::Sampler2D;
         case kModeDotSTR3D:
@@ -449,6 +453,16 @@ Translation translate(const Key& key) {
             case kModeDotSTRCube:
                 // (dot1, dot2, dot3) as a cube-map direction: texm3x3tex.
                 if (kind != SamplerKind::None) g += "    t3 = texture(tex3, vec3(dot1, dot2, dot3));\n";
+                break;
+            case kModeDependentAR:
+            case kModeDependentGB:
+                // The source's colour is the coordinate: (alpha, red) for texreg2ar, (green, blue) for texreg2gb, in
+                // the guest's ARGB channel names, which our channels carry.
+                if (kind != SamplerKind::None) {
+                    const std::string src = source_name(key, i);
+                    g += std::format("    t{} = {};\n", i,
+                                     lookup_2d(i, kind, mode == kModeDependentAR ? std::format("{0}.ar", src) : std::format("{0}.gb", src), "0.0"));
+                }
                 break;
             default:
                 if (t.error.empty()) t.error = std::format("texture stage {} mode {} is not supported yet", i, mode);

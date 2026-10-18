@@ -449,3 +449,27 @@ TEST(Vulkan, DotZWWritesTheRatioOfTheTwoDotProductsAsTheDepth) {
     EXPECT_NEAR(static_cast<double>(word >> 8), 0.25 * 16777215.0, 1.0) << std::hex << word;
     EXPECT_EQ(pixel_at(f.ram, 8, 8), 0xFF7F8100u) << "the colour still draws";
 }
+
+TEST(Vulkan, DependentGBLooksUpTheSourcesGreenAndBlue) {
+    TextureShaderFixture f;
+    std::string error;
+    if (!f.init(error)) GTEST_SKIP() << "no Vulkan device: " << error;
+    Kelvin& k = f.k;
+    // Stage 0: G = 0x60 (0.376), B = 0xA0 (0.627); A = 0x20, R = 0xE0 would pick another texel for AR.
+    load_texture(k, f.ram, 0, 0x200000, 0, [](u32, u32) { return 0x20E060A0u; });
+    load_texture(k, f.ram, 1, 0x210000, 2, [](u32 x, u32 y) { return 0xFF000011u | (0x40u * x) << 16 | (0x40u * y) << 8; });
+    k.method(mthd::kShaderStageProgram, 1u | (0x10u << 5));
+    output_texture_stage(k, 1);
+    texcoord(k, 0, 0.5f, 0.5f, 0.0f, 1.0f);
+    draw_full_triangle(k, f.ram);
+    // The same with alpha-red: (0.125, 0.878), texel (0, 3).
+    k.method(mthd::kShaderStageProgram, 1u | (0xFu << 5));
+    k.method(mthd::kSurfaceColorOffset, 0x100000);
+    draw_full_triangle(k, f.ram);
+    f.renderer->end_frame();
+    for (const auto& e : f.renderer->stats().errors) ADD_FAILURE() << "renderer: " << e;
+    EXPECT_EQ(pixel_at(f.ram, 8, 8), 0xFF408011u) << "texel (1, 2)";
+    u32 ar;
+    std::memcpy(&ar, &f.ram[0x100000 + 8 * 256 + 8 * 4], 4);
+    EXPECT_EQ(ar, 0xFF00C011u) << "texel (0, 3)";
+}

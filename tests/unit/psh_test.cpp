@@ -286,3 +286,18 @@ TEST(Psh, ADotModeOutsideItsStagesReadsAsNone) {
     EXPECT_EQ(t.glsl.find("dot1 ="), std::string::npos) << t.glsl;
     expect_compiles(t, "misplaced dot modes");
 }
+
+TEST(Psh, DependentModesLookUpTheSourcesChannels) {
+    KelvinState s = output_texture(2);
+    s.r[mthd::kShaderStageProgram >> 2] = 1u | (0xFu << 5) | (0x10u << 10);  // 2D, dependent AR, dependent GB
+    s.r[mthd::kShaderOtherStageInput >> 2] = 1u << 16;                       // stage 2 reads stage 1
+    enable_texture(s, 0, kFormat2D);
+    enable_texture(s, 1, kFormat2D);
+    enable_texture(s, 2, kFormat3D);
+    const Translation t = translate(key_from_state(s));
+    EXPECT_EQ(t.samplers[1], SamplerKind::Sampler2D);
+    EXPECT_EQ(t.samplers[2], SamplerKind::Sampler3D);
+    EXPECT_NE(t.glsl.find("t1 = texture(tex1, (t0.ar) * tex_scale[1].xy);"), std::string::npos) << t.glsl;
+    EXPECT_NE(t.glsl.find("t2 = texture(tex2, vec3(t1.gb, 0.0));"), std::string::npos) << t.glsl;
+    expect_compiles(t, "dependent");
+}
