@@ -152,6 +152,12 @@ private:
     };
     bool create_ring(Ring& ring, VkDeviceSize region, VkBufferUsageFlags usage, std::string& error);
     bool ring_alloc(Ring& ring, VkDeviceSize bytes, VkDeviceSize alignment, VkDeviceSize& offset);
+    // Staging space for an upload in the recording frame, submitting the frame first when its region is full.
+    bool staging_alloc(VkDeviceSize bytes, VkDeviceSize& offset);
+    // A new image enters GENERAL before its first use (nothing earlier uses it, so nothing is waited for).
+    void fresh_image(const vk::Image& image);
+    // The uploads recorded so far land before the draws that sample them and the copies that read them.
+    void upload_barrier();
     // Whether a draw with these vertex and index sizes still fits the rings and the descriptor pool of the batch.
     bool fits_in_batch(VkDeviceSize vertex_bytes, VkDeviceSize index_bytes) const;
     u32 texture_phys(const KelvinState& s, const TextureStage& ts) const;
@@ -220,8 +226,8 @@ private:
     std::unordered_map<u64, VkSampler> samplers_;
     VkDescriptorSetLayout set_layout_{VK_NULL_HANDLE};
     VkPipelineLayout pipeline_layout_{VK_NULL_HANDLE};
-    Ring vertex_ring_, index_ring_, uniform_ring_;
-    vk::Buffer staging_, readback_;
+    Ring vertex_ring_, index_ring_, uniform_ring_, staging_;
+    vk::Buffer readback_;
     u32 descriptor_sets_used_{0};  // from the recording frame's pool
     vk::Image dummy2d_, dummycube_, dummy3d_;
     VkSampler dummy_sampler_{VK_NULL_HANDLE};

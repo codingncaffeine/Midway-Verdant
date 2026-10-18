@@ -199,7 +199,7 @@ VulkanRenderer::~VulkanRenderer() {
     dev_.destroy_buffer(vertex_ring_.buffer);
     dev_.destroy_buffer(index_ring_.buffer);
     dev_.destroy_buffer(uniform_ring_.buffer);
-    dev_.destroy_buffer(staging_);
+    dev_.destroy_buffer(staging_.buffer);
     dev_.destroy_buffer(readback_);
     for (Frame& fr : frames_) {
         if (fr.pool) f.vkDestroyDescriptorPool(dev_.device(), fr.pool, nullptr);
@@ -225,7 +225,7 @@ bool VulkanRenderer::init(std::string& error) {
     if (!create_ring(vertex_ring_, kVertexRingBytes, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, error)) return false;
     if (!create_ring(index_ring_, kIndexRingBytes, VK_BUFFER_USAGE_INDEX_BUFFER_BIT, error)) return false;
     if (!create_ring(uniform_ring_, kUniformRingBytes, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, error)) return false;
-    if (!dev_.create_buffer(kStagingBytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, vk::BufferMemory::HostWrite, staging_, error)) return false;
+    if (!create_ring(staging_, kStagingBytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, error)) return false;
     if (!dev_.create_buffer(kStagingBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, vk::BufferMemory::HostRead, readback_, error)) return false;
 
     // Descriptor layout: the two uniform blocks and the four texture stages, in every pipeline.
@@ -278,13 +278,13 @@ bool VulkanRenderer::init(std::string& error) {
         for (vk::Image* img : {&dummy2d_, &dummycube_, &dummy3d_}) dev_.transition(cb, *img, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
         dev_.finish_once(cb);
         // white
-        std::memset(staging_.mapped, 0xFF, 64);
+        std::memset(staging_.buffer.mapped, 0xFF, 64);
         cb = dev_.begin_once();
         for (vk::Image* img : {&dummy2d_, &dummycube_, &dummy3d_}) {
             VkBufferImageCopy region{};
             region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, img->layers};
             region.imageExtent = {1, 1, img->depth};
-            f.vkCmdCopyBufferToImage(cb, staging_.buffer, img->image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+            f.vkCmdCopyBufferToImage(cb, staging_.buffer.buffer, img->image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
         }
         dev_.finish_once(cb);
     }
@@ -318,7 +318,7 @@ void VulkanRenderer::begin_frame(u32 slot) {
     fr.dead_framebuffers.clear();
     f.vkResetDescriptorPool(dev_.device(), fr.pool, 0);
     descriptor_sets_used_ = 0;
-    for (Ring* r : {&vertex_ring_, &index_ring_, &uniform_ring_}) r->begin = r->cursor = r->region * slot;
+    for (Ring* r : {&vertex_ring_, &index_ring_, &uniform_ring_, &staging_}) r->begin = r->cursor = r->region * slot;
     slot_ = slot;
     cb_ = fr.cb;
     f.vkResetCommandBuffer(cb_, 0);
@@ -516,14 +516,10 @@ VulkanRenderer::Surface* VulkanRenderer::target_for(const KelvinState& s) {
         return nullptr;
     }
     // Images start in GENERAL and stay there; the colour image starts with what RAM holds (the guest may draw over
-    // an existing picture).
-    submit();
-    {
-        VkCommandBuffer cb = dev_.begin_once();
-        dev_.transition(cb, t.color, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
-        dev_.transition(cb, t.depth, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
-        dev_.finish_once(cb);
-    }
+    // an existing picture). Both are recorded into the frame, ahead of the draws that follow.
+    end_pass();
+    fresh_image(t.color);
+    fresh_image(t.depth);
     {
         // Upload the current RAM contents as the starting picture.
         const u32 bpp = t.color_bytes();
@@ -534,14 +530,15 @@ VulkanRenderer::Surface* VulkanRenderer::target_for(const KelvinState& s) {
                 if (static_cast<u64>(phys) + off + bpp <= ram_size_) std::memcpy(&pixels[(static_cast<std::size_t>(y) * width + x) * bpp], ram_ + phys + off, bpp);
             }
         }
-        if (pixels.size() <= kStagingBytes) {
-            std::memcpy(staging_.mapped, pixels.data(), pixels.size());
-            VkCommandBuffer cb = dev_.begin_once();
+        VkDeviceSize offset = 0;
+        if (staging_alloc(pixels.size(), offset)) {
+            std::memcpy(static_cast<u8*>(staging_.buffer.mapped) + offset, pixels.data(), pixels.size());
             VkBufferImageCopy region{};
+            region.bufferOffset = offset;
             region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
             region.imageExtent = {width, height, 1};
-            fn_->vkCmdCopyBufferToImage(cb, staging_.buffer, t.color.image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
-            dev_.finish_once(cb);
+            fn_->vkCmdCopyBufferToImage(cb_, staging_.buffer.buffer, t.color.image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+            upload_barrier();
         }
     }
     t.pass = render_pass(cf, df);
@@ -1079,34 +1076,39 @@ const VulkanRenderer::TextureEntry* VulkanRenderer::texture(const KelvinState& s
         textures_.erase(it);
         retire(entry->image);  // draws recorded or in flight may still sample it
     }
+    for (u32 face = 0; face < d.faces; ++face) {
+        for (u32 level = 0; level < d.levels; ++level) {
+            if (d.image(face, level).size() > staging_.region) {
+                error = "texture level too large for the staging buffer";
+                return nullptr;
+            }
+        }
+    }
     if (!dev_.create_image(format, d.width, d.height, d.depth, d.levels, d.faces, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
                            VK_IMAGE_ASPECT_COLOR_BIT, d.faces == 6, entry->image, error))
         return nullptr;
-    submit();
-    VkCommandBuffer cb = dev_.begin_once();
-    dev_.transition(cb, entry->image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
-    dev_.finish_once(cb);
-    // Upload each face and level through the staging buffer.
+    // Upload each face and level through the staging ring, recorded into the frame ahead of the draw that samples
+    // the texture (copies cannot sit inside a render pass).
+    end_pass();
+    fresh_image(entry->image);
     for (u32 face = 0; face < d.faces; ++face) {
         u32 w = d.width, h = d.height, dp = d.depth;
         for (u32 level = 0; level < d.levels; ++level) {
             const auto& img = d.image(face, level);
-            if (img.size() > kStagingBytes) {
-                error = "texture level too large for the staging buffer";
-                return nullptr;
-            }
-            std::memcpy(staging_.mapped, img.data(), img.size());
-            cb = dev_.begin_once();
+            VkDeviceSize offset = 0;
+            staging_alloc(img.size(), offset);  // fits: checked above
+            std::memcpy(static_cast<u8*>(staging_.buffer.mapped) + offset, img.data(), img.size());
             VkBufferImageCopy region{};
+            region.bufferOffset = offset;
             region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, face, 1};
             region.imageExtent = {w, h, dp};
-            fn_->vkCmdCopyBufferToImage(cb, staging_.buffer, entry->image.image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
-            dev_.finish_once(cb);
+            fn_->vkCmdCopyBufferToImage(cb_, staging_.buffer.buffer, entry->image.image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
             w = std::max(w >> 1, 1u);
             h = std::max(h >> 1, 1u);
             if (d.depth > 1) dp = std::max(dp >> 1, 1u);
         }
     }
+    upload_barrier();
     entry->phys = phys;
     entry->length = length;
     entry->valid = true;
@@ -1240,6 +1242,37 @@ bool VulkanRenderer::ring_alloc(Ring& ring, VkDeviceSize bytes, VkDeviceSize ali
     offset = start;
     ring.cursor = start + bytes;
     return true;
+}
+
+bool VulkanRenderer::staging_alloc(VkDeviceSize bytes, VkDeviceSize& offset) {
+    // Sixteen bytes keep every copy's buffer offset a multiple of its texel size.
+    if (bytes > staging_.region) return false;
+    if (ring_alloc(staging_, bytes, 16, offset)) return true;
+    // The frame's region is full: the copies so far go with its submission (still ahead, in queue order, of the
+    // draws recorded after them), and the next frame's region is free once its last submission has run.
+    submit();
+    return ring_alloc(staging_, bytes, 16, offset);
+}
+
+void VulkanRenderer::fresh_image(const vk::Image& image) {
+    VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    b.srcAccessMask = 0;
+    b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+                      VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    b.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.image = image.image;
+    b.subresourceRange = {image.aspect, 0, image.levels, 0, image.layers};
+    fn_->vkCmdPipelineBarrier(cb_, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
+}
+
+void VulkanRenderer::upload_barrier() {
+    VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+                       VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT;
+    fn_->vkCmdPipelineBarrier(cb_, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
 }
 
 void VulkanRenderer::clear(const KelvinState& s, u32 bits) {
