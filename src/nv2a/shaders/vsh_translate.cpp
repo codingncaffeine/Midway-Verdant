@@ -371,9 +371,10 @@ Translation translate(const Program& program, const Options& options) {
     }
 
     if (options.fixed_function_lighting) {
-        // Lighting with no light enabled: what the material and the scene ambient give, and the material's alpha.
-        // Lights, colour-material and separate specular are refused before translation (fixed_function_supported).
-        g += "\n    oD0 = vec4(ff_emission_alpha.xyz + ff_scene_ambient.xyz, ff_emission_alpha.w);\n";
+        // Lighting with no light enabled and every colour source on the material: the scene ambient (into which
+        // the XDK folds the material emission) and the material's alpha. Lights and colour-material sources are
+        // refused before translation (fixed_function_supported); the emission uniform waits for them.
+        g += "\n    oD0 = vec4(ff_scene_ambient.xyz, ff_emission_alpha.w);\n";
         g += "    oD1 = vec4(0.0, 0.0, 0.0, 1.0);\n";
     }
     g +=
@@ -409,13 +410,34 @@ Program fixed_function_program(const KelvinState& state) {
     const bool lit = (state.reg(mthd::kLightingEnable) & 1u) != 0;
     Program p;
     const std::array<u8, 4> xyzw{0, 1, 2, 3};
+    // Position: the composite matrix (XF slots 0-3) carries the viewport scale; the hardware then divides by w and
+    // adds the viewport offset (XF slot 0x3B) — the epilogue the XDK's own programs run, minus the scale. R12 is
+    // the position register, so the rows land in oPos.
     for (u32 row = 0; row < 4; ++row) {
         Instruction i;
         i.mac = Mac::Dp4;
         i.a = Operand{Source::Input, 0, xyzw, false, false};
         i.b = Operand{Source::Constant, row, xyzw, false, false};
-        i.output_mask = 8u >> row;  // x, y, z, w
-        i.output_index = 0;         // oPos
+        i.mac_mask = 8u >> row;  // x, y, z, w
+        i.temp = 12;
+        p.instructions.push_back(i);
+    }
+    {
+        Instruction i;  // R1.x = 1 / w, clamped away from zero and infinity as the hardware does
+        i.ilu = Ilu::Rcc;
+        i.c = Operand{Source::Temp, 12, {3, 3, 3, 3}, false, false};
+        i.ilu_mask = 8;
+        i.temp = 1;
+        p.instructions.push_back(i);
+    }
+    {
+        Instruction i;  // oPos.xyz = R12.xyz / w + viewport offset
+        i.mac = Mac::Mad;
+        i.a = Operand{Source::Temp, 12, xyzw, false, false};
+        i.b = Operand{Source::Temp, 1, {0, 0, 0, 0}, false, false};
+        i.c = Operand{Source::Constant, 0x3B, xyzw, false, false};
+        i.output_mask = 0xE;
+        i.output_index = 0;
         p.instructions.push_back(i);
     }
     auto pass = [&](u32 input, u32 output) {
