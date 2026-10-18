@@ -182,3 +182,50 @@ TEST(Vsh, TranslatesTheBootAnimationsOwnProgram) {
     EXPECT_NE(listing.find("dp4"), std::string::npos) << listing;
     std::printf("boot animation program (%zu instructions):\n%s", p.instructions.size(), listing.c_str());
 }
+
+TEST(Vsh, SynthesisesTheFixedFunctionTransformAsAProgram) {
+    KelvinState s;  // execution mode 0, lighting off: what the console's firmware draws its animation with
+    std::string why;
+    ASSERT_TRUE(fixed_function_supported(s, why)) << why;
+    const Program p = fixed_function_program(s);
+    ASSERT_EQ(p.instructions.size(), 10u);
+    EXPECT_TRUE(p.instructions.back().final);
+    const Translation tr = translate(p, Options{});
+    EXPECT_TRUE(tr.error.empty()) << tr.error;
+    EXPECT_EQ(tr.disassembly.at(0), "dp4 oPos.x, v0, c[0]");
+    EXPECT_EQ(tr.disassembly.at(3), "dp4 oPos.w, v0, c[3]");
+    EXPECT_EQ(tr.disassembly.at(4), "mov oD0.xyzw, v3");
+    EXPECT_EQ(tr.disassembly.at(9), "mov oT3.xyzw, v12  ; final");
+    EXPECT_EQ(tr.inputs_read, static_cast<u16>((1u << 0) | (1u << 3) | (1u << 4) | (0xFu << 9)));
+    const CompiledShader c = compile_glsl(ShaderStage::Vertex, tr.glsl, "fixed-function");
+    EXPECT_TRUE(c.ok()) << c.log << "\n" << tr.glsl;
+    // A lit state with a light in the mask is refused with a reason rather than drawn wrong.
+    s.r[mthd::kLightEnableMask >> 2] = 2;
+    s.r[mthd::kLightingEnable >> 2] = 1;
+    EXPECT_FALSE(fixed_function_supported(s, why));
+    EXPECT_NE(why.find("light"), std::string::npos);
+}
+
+TEST(Vsh, FixedFunctionLightingWithoutLightsComesFromTheMaterial) {
+    KelvinState s;
+    s.r[mthd::kLightingEnable >> 2] = 1;  // the firmware's lit draws: lighting on, no light in the mask
+    std::string why;
+    ASSERT_TRUE(fixed_function_supported(s, why)) << why;
+    const Program p = fixed_function_program(s);
+    EXPECT_EQ(p.instructions.size(), 8u) << "the colours are not passed through when the material supplies them";
+    Options o;
+    o.fixed_function_lighting = true;
+    const Translation tr = translate(p, o);
+    EXPECT_TRUE(tr.error.empty()) << tr.error;
+    EXPECT_NE(tr.glsl.find("ff_emission_alpha"), std::string::npos);
+    EXPECT_NE(tr.glsl.find("ff_scene_ambient"), std::string::npos);
+    const CompiledShader c = compile_glsl(ShaderStage::Vertex, tr.glsl, "fixed-function-lit");
+    EXPECT_TRUE(c.ok()) << c.log << "\n" << tr.glsl;
+    // A light in the mask, or colours taken from the vertex, are refused with a reason.
+    s.r[mthd::kLightEnableMask >> 2] = 1;
+    EXPECT_FALSE(fixed_function_supported(s, why));
+    EXPECT_NE(why.find("light"), std::string::npos);
+    s.r[mthd::kLightEnableMask >> 2] = 0;
+    s.r[mthd::kColorMaterial >> 2] = 1;
+    EXPECT_FALSE(fixed_function_supported(s, why));
+}

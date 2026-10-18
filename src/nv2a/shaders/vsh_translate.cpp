@@ -235,15 +235,16 @@ Program extract_program(const KelvinState& state) {
 
 Translation translate(const Program& program, const Options& options) {
     Translation t;
-    (void)options;
     std::string g;
     g += "#version 450\n\n";
     for (u32 i = 0; i < kAttributes; ++i) g += std::format("layout(location = {}) in vec4 v{};\n", i, i);
     g += std::format(
         "\nlayout(std140, set = 0, binding = 0) uniform VshUniforms {{\n"
         "    vec4 c[{}];\n"
-        "    vec4 surface_size;  // width, height of the render target in pixels\n"
-        "    vec4 clip_range;    // z min, z max (depth units)\n"
+        "    vec4 surface_size;       // width, height of the render target in pixels\n"
+        "    vec4 clip_range;         // z min, z max (depth units)\n"
+        "    vec4 ff_emission_alpha;  // fixed function: material emission rgb, material alpha\n"
+        "    vec4 ff_scene_ambient;   // fixed function: scene ambient rgb\n"
         "}};\n\n",
         kConstantSlots);
     g += std::format("layout(location = {}) out vec4 vtx_d0;\n", kVaryingD0);
@@ -369,6 +370,12 @@ Translation translate(const Program& program, const Options& options) {
         }
     }
 
+    if (options.fixed_function_lighting) {
+        // Lighting with no light enabled: what the material and the scene ambient give, and the material's alpha.
+        // Lights, colour-material and separate specular are refused before translation (fixed_function_supported).
+        g += "\n    oD0 = vec4(ff_emission_alpha.xyz + ff_scene_ambient.xyz, ff_emission_alpha.w);\n";
+        g += "    oD1 = vec4(0.0, 0.0, 0.0, 1.0);\n";
+    }
     g +=
         "\n    // The program leaves oPos in screen space (x, y in pixels and z in depth units, all already divided by w,\n"
         "    // w kept for perspective-correct interpolation); the host rasteriser wants clip space, so undo that.\n"
@@ -393,6 +400,63 @@ Translation translate(const Program& program, const Options& options) {
         "}\n";
     t.glsl = std::move(g);
     return t;
+}
+
+
+// The hardware's own microcode for the fixed function does what this program does; the lit, fogged and texgen
+// paths are additions to it that come when a title needs them.
+Program fixed_function_program(const KelvinState& state) {
+    const bool lit = (state.reg(mthd::kLightingEnable) & 1u) != 0;
+    Program p;
+    const std::array<u8, 4> xyzw{0, 1, 2, 3};
+    for (u32 row = 0; row < 4; ++row) {
+        Instruction i;
+        i.mac = Mac::Dp4;
+        i.a = Operand{Source::Input, 0, xyzw, false, false};
+        i.b = Operand{Source::Constant, row, xyzw, false, false};
+        i.output_mask = 8u >> row;  // x, y, z, w
+        i.output_index = 0;         // oPos
+        p.instructions.push_back(i);
+    }
+    auto pass = [&](u32 input, u32 output) {
+        Instruction i;
+        i.mac = Mac::Mov;
+        i.a = Operand{Source::Input, input, xyzw, false, false};
+        i.output_mask = 0xF;
+        i.output_index = output;
+        p.instructions.push_back(i);
+    };
+    if (!lit) {
+        pass(3, 3);  // diffuse
+        pass(4, 4);  // specular
+    }
+    for (u32 t = 0; t < 4; ++t) pass(9 + t, 9 + t);
+    p.instructions.back().final = true;
+    return p;
+}
+
+bool fixed_function_supported(const KelvinState& state, std::string& why) {
+    if (state.reg(mthd::kLightingEnable) & 1u) {
+        if (state.reg(mthd::kLightEnableMask) != 0) {
+            why = "fixed-function lights are not implemented yet (only lighting with no light enabled)";
+            return false;
+        }
+        if (state.reg(mthd::kColorMaterial) != 0) {
+            why = "fixed-function colour material (colours from the vertex) is not implemented yet";
+            return false;
+        }
+    }
+    for (u32 t = 0; t < 4; ++t) {
+        if (state.reg(0x0420 + 4 * t) & 1u) {
+            why = std::format("fixed-function texture matrix {} is not implemented yet", t);
+            return false;
+        }
+        if (state.reg(0x03C0 + 16 * t) | state.reg(0x03C4 + 16 * t) | state.reg(0x03C8 + 16 * t) | state.reg(0x03CC + 16 * t)) {
+            why = std::format("fixed-function texgen on texture {} is not implemented yet", t);
+            return false;
+        }
+    }
+    return true;
 }
 
 }  // namespace mv::pgraph::vsh

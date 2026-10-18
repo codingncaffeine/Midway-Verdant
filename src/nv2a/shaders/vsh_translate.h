@@ -50,9 +50,20 @@ struct Program {
 };
 Program extract_program(const KelvinState& state);
 
+// The fixed-function transform (execution mode 0) as the program it amounts to: the position through the
+// composite matrix the XDK keeps in XF context slots 0-3 (world × view × projection × viewport, so the result
+// is screen space like a program's oPos), the colours and texture coordinates passed through. Lighting, fog,
+// texgen and texture matrices are not built yet (the console's firmware runs with them off); callers refuse a
+// state that needs them. Reads the state only for what it leaves out.
+Program fixed_function_program(const KelvinState& state);
+bool fixed_function_supported(const KelvinState& state, std::string& why);
+
 struct Options {
     bool smooth_shading{true};
     u32 texture_count{4};
+    // Fixed-function lighting: the colours come from the material and the lights, not from the vertex. With no
+    // light enabled (the console's firmware) that is emission + scene ambient and the material alpha.
+    bool fixed_function_lighting{false};
 };
 
 // GLSL (Vulkan 1.0, version 450) for the program: inputs v0..v15 at locations 0..15, one std140 uniform block
@@ -66,8 +77,9 @@ struct Translation {
 };
 Translation translate(const Program& program, const Options& options);
 
-// The uniform block layout shared with the backend.
+// The uniform block layout shared with the backend: the constant file, then surface_size, clip_range,
+// ff_emission_alpha (material emission rgb, material alpha) and ff_scene_ambient (rgb).
 constexpr u32 kConstantSlots = 192;
-constexpr u32 kUniformBytes = (kConstantSlots + 2) * 16;
+constexpr u32 kUniformBytes = (kConstantSlots + 4) * 16;
 
 }  // namespace mv::pgraph::vsh

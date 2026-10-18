@@ -21,7 +21,8 @@ constexpr u32 kSurfaceClipH = 0x0200, kSurfaceClipV = 0x0204, kSurfaceFormat = 0
               kSurfaceZetaOffset = 0x0214;
 constexpr u32 kCombinerAlphaIcw = 0x0260, kCombinerSpecFogCw0 = 0x0288, kCombinerSpecFogCw1 = 0x028C, kControl0 = 0x0290;
 constexpr u32 kAlphaTestEnable = 0x0300, kBlendEnable = 0x0304, kCullFaceEnable = 0x0308, kDepthTestEnable = 0x030C, kDitherEnable = 0x0310,
-              kLightingEnable = 0x0314, kStencilTestEnable = 0x032C, kAlphaFunc = 0x033C, kAlphaRef = 0x0340, kBlendSfactor = 0x0344,
+              kLightingEnable = 0x0314, kColorMaterial = 0x0298, kMaterialEmission = 0x03A8, kMaterialAlpha = 0x03B4,
+              kLightEnableMask = 0x03BC, kSceneAmbientColor = 0x0A10, kStencilTestEnable = 0x032C, kAlphaFunc = 0x033C, kAlphaRef = 0x0340, kBlendSfactor = 0x0344,
               kBlendDfactor = 0x0348, kBlendColor = 0x034C, kBlendEquation = 0x0350, kDepthFunc = 0x0354, kColorMask = 0x0358,
               kDepthMask = 0x035C, kStencilMask = 0x0360, kStencilFunc = 0x0364, kStencilRef = 0x0368, kStencilFuncMask = 0x036C,
               kStencilOpFail = 0x0370, kStencilOpZfail = 0x0374, kStencilOpZpass = 0x0378, kShadeModel = 0x037C, kClipMin = 0x0394,

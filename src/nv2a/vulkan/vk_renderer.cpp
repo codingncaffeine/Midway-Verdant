@@ -463,16 +463,21 @@ VkShaderModule VulkanRenderer::module(const std::vector<u32>& spirv) {
 }
 
 VkShaderModule VulkanRenderer::vertex_shader(const KelvinState& s, std::string& error) {
-    if (!s.vertex_program_mode()) {
-        error = "fixed-function transform (mode 0) is not implemented yet";
-        return VK_NULL_HANDLE;
+    vsh::Program program;
+    std::string key;
+    if (s.vertex_program_mode()) {
+        program = vsh::extract_program(s);
+        key.assign(reinterpret_cast<const char*>(&s.program[program.start]), program.instructions.size() * 16);
+    } else {
+        if (!vsh::fixed_function_supported(s, error)) return VK_NULL_HANDLE;
+        program = vsh::fixed_function_program(s);
+        key = (s.reg(mthd::kLightingEnable) & 1u) ? "fixed-function lit" : "fixed-function";
     }
-    const vsh::Program program = vsh::extract_program(s);
-    std::string key(reinterpret_cast<const char*>(&s.program[program.start]), program.instructions.size() * 16);
     key += s.reg(mthd::kShadeModel) == 0x1D00 ? 'f' : 's';
     if (auto it = vs_cache_.find(key); it != vs_cache_.end()) return it->second;
     vsh::Options options;
     options.smooth_shading = s.reg(mthd::kShadeModel) != 0x1D00;
+    options.fixed_function_lighting = !s.vertex_program_mode() && (s.reg(mthd::kLightingEnable) & 1u);
     const vsh::Translation t = vsh::translate(program, options);
     if (!t.error.empty()) {
         error = t.error;
@@ -899,6 +904,15 @@ void VulkanRenderer::draw(const KelvinState& s, const DrawBatch& batch) {
         u[kConstants * 4 + 5] = t->zeta_format == 1 ? 65535.0f : 16777215.0f;
         u[kConstants * 4 + 6] = 0.0f;
         u[kConstants * 4 + 7] = 0.0f;
+        // The fixed function's material inputs (three floats each, the alpha its own register).
+        u[kConstants * 4 + 8] = s.regf(mthd::kMaterialEmission);
+        u[kConstants * 4 + 9] = s.regf(mthd::kMaterialEmission + 4);
+        u[kConstants * 4 + 10] = s.regf(mthd::kMaterialEmission + 8);
+        u[kConstants * 4 + 11] = s.regf(mthd::kMaterialAlpha);
+        u[kConstants * 4 + 12] = s.regf(mthd::kSceneAmbientColor);
+        u[kConstants * 4 + 13] = s.regf(mthd::kSceneAmbientColor + 4);
+        u[kConstants * 4 + 14] = s.regf(mthd::kSceneAmbientColor + 8);
+        u[kConstants * 4 + 15] = 0.0f;
         psh::Uniforms pu{};
         psh::uniforms_from_state(s, scales, pu);
         std::memcpy(static_cast<u8*>(uniform_ring_.mapped) + uoffset_ps, &pu, sizeof pu);
