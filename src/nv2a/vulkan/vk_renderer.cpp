@@ -111,6 +111,8 @@ VulkanRenderer::VulkanRenderer(vk::Device& device, const HandleResolver& handles
         debug_nocull_ = s.find("nocull") != std::string::npos;
         debug_noblend_ = s.find("noblend") != std::string::npos;
         debug_shadow_pass_ = s.find("shadow1") != std::string::npos;
+        debug_show_v0_ = s.find("showv0") != std::string::npos;
+        debug_skip_blend_ = s.find("skipblend") != std::string::npos;
     }
 }
 
@@ -667,6 +669,10 @@ VkShaderModule VulkanRenderer::fragment_shader(const psh::Key& key, std::array<p
         return VK_NULL_HANDLE;
     }
     if (debug_flat_) t.glsl = "#version 450\nlayout(location = 0) out vec4 frag_color;\nvoid main() { frag_color = vec4(1.0); }\n";
+    if (debug_show_v0_) {
+        // The interpolated diffuse colour in place of the combiners' result (the last statement of main).
+        if (const auto end = t.glsl.rfind('}'); end != std::string::npos) t.glsl.insert(end, "    frag_color = vec4(clamp(vtx_d0.rgb, 0.0, 1.0), 1.0);\n");
+    }
     const CompiledShader c = compile_glsl(ShaderStage::Fragment, t.glsl, "kelvin-combiners");
     if (!c.ok()) {
         error = "combiner GLSL: " + c.log;
@@ -956,6 +962,7 @@ void VulkanRenderer::clear(const KelvinState& s, u32 bits) {
 void VulkanRenderer::draw(const KelvinState& s, const DrawBatch& batch) {
     Timed timed(stats_.ns_draw);
     ++stats_.draws;
+    if (debug_skip_blend_ && s.blend()) return;  // MV_RENDER_DEBUG=skipblend: the opaque passes alone
     std::string error;
     Surface* t = target_for(s);
     if (!t) {
