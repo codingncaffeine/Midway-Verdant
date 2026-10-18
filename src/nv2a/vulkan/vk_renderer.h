@@ -25,9 +25,10 @@ public:
 
     void clear(const KelvinState& state, u32 clear_bits) override;
     void draw(const KelvinState& state, const DrawBatch& batch) override;
-    // Submits the frame's work, waits, writes every rendered surface back into guest RAM.
+    // Submits the frame's work and writes every rendered surface back into guest RAM (waiting for the GPU only when
+    // one was drawn).
     void end_frame();
-    // The live machine's frame boundary: submit the work and recycle the rings, but leave the surfaces on the
+    // The live machine's frame boundary: submit the work without waiting for it, and leave the surfaces on the
     // device — they reach RAM when a texture samples them, and the scanout one at vblank (write_back_at).
     void flush_frame();
     bool write_back_at(u32 phys);
@@ -106,8 +107,18 @@ private:
         u32 zeta_bytes() const { return swizzled ? (zeta_format == 1 ? 2u : 4u) * width * height : zeta_pitch * height; }
     };
     void note(const std::string& message);
-    void begin_commands();
-    void flush();  // end the pass, submit, wait, begin again
+    // Ends the pass and submits the recording frame without waiting for it, then starts the next frame in flight
+    // (waiting only if that frame's previous submission has not finished).
+    void submit();
+    // Submits, then waits until the GPU has executed everything submitted so far.
+    void finish();
+    // Makes a frame the recording one: waits for its last submission, frees what it retired, resets its descriptor
+    // pool and ring regions, and begins its command buffer.
+    void begin_frame(u32 slot);
+    // Destroys an object once the GPU is done with the commands recorded so far (the recording frame's fence).
+    void retire(vk::Image& image);
+    void retire(VkImageView& view);
+    void retire(VkFramebuffer& framebuffer);
     void end_pass();
     Surface* target_for(const KelvinState& s);
     bool ensure_pass(Surface& t);
@@ -116,7 +127,7 @@ private:
     // shadow map the guest samples as a depth texture lives there.
     void write_back_zeta(Surface& s);
     // Copies one image into the read-back buffer and waits for it (depth and stencil together: the depth's words,
-    // then the stencil bytes).
+    // then the stencil bytes). The copy follows the frame's draws in its command buffer.
     void read_back(const vk::Image& image, VkImageAspectFlags aspect, u32 width, u32 height);
     VkRenderPass render_pass(VkFormat color, VkFormat depth);
     VkShaderModule module(const std::vector<u32>& spirv);
@@ -133,7 +144,14 @@ private:
     void destroy_surface_views(Surface& s);
     void invalidate_textures(u32 phys, u32 len);  // the decoded textures over a range (RAM now holds what a target wrote)
     VkSampler sampler(const TextureStage& ts, u32 levels);
-    bool ring_alloc(vk::Buffer& ring, VkDeviceSize& cursor, VkDeviceSize bytes, VkDeviceSize alignment, VkDeviceSize& offset);
+    // A host buffer with one region per frame in flight; the recording frame allocates from its own region only.
+    struct Ring {
+        vk::Buffer buffer;
+        VkDeviceSize region{0}, begin{0}, cursor{0};
+        VkDeviceSize end() const { return begin + region; }
+    };
+    bool create_ring(Ring& ring, VkDeviceSize region, VkBufferUsageFlags usage, std::string& error);
+    bool ring_alloc(Ring& ring, VkDeviceSize bytes, VkDeviceSize alignment, VkDeviceSize& offset);
     // Whether a draw with these vertex and index sizes still fits the rings and the descriptor pool of the batch.
     bool fits_in_batch(VkDeviceSize vertex_bytes, VkDeviceSize index_bytes) const;
     u32 texture_phys(const KelvinState& s, const TextureStage& ts) const;
@@ -144,8 +162,23 @@ private:
     u32 ram_size_;
     const vk::Functions* fn_{nullptr};
 
-    VkCommandBuffer cb_{VK_NULL_HANDLE};
-    VkFence fence_{VK_NULL_HANDLE};
+    // The frames in flight. Each owns a command buffer, the fence its submission signals, a descriptor pool and a
+    // region of every ring, so a submit does not wait: a frame's resources are reused only once its fence signals.
+    static constexpr u32 kFramesInFlight = 3;
+    struct Frame {
+        VkCommandBuffer cb{VK_NULL_HANDLE};
+        VkFence fence{VK_NULL_HANDLE};
+        VkDescriptorPool pool{VK_NULL_HANDLE};
+        u64 serial{0};  // the submission that last used it (0: never submitted)
+        // Objects retired while this frame recorded: commands already recorded (here or earlier) may use them.
+        std::vector<vk::Image> dead_images;
+        std::vector<VkImageView> dead_views;
+        std::vector<VkFramebuffer> dead_framebuffers;
+    };
+    std::array<Frame, kFramesInFlight> frames_{};
+    u32 slot_{0};                       // the recording frame
+    u64 submitted_{0}, completed_{0};  // submissions made, and the last one known to have finished
+    VkCommandBuffer cb_{VK_NULL_HANDLE};  // the recording frame's command buffer
     bool recording_{false};
     bool pass_open_{false};
     Surface* pass_target_{nullptr};
@@ -187,10 +220,9 @@ private:
     std::unordered_map<u64, VkSampler> samplers_;
     VkDescriptorSetLayout set_layout_{VK_NULL_HANDLE};
     VkPipelineLayout pipeline_layout_{VK_NULL_HANDLE};
-    VkDescriptorPool descriptor_pool_{VK_NULL_HANDLE};
-    vk::Buffer vertex_ring_, index_ring_, uniform_ring_, staging_, readback_;
-    VkDeviceSize vertex_cursor_{0}, index_cursor_{0}, uniform_cursor_{0};
-    u32 descriptor_sets_used_{0};
+    Ring vertex_ring_, index_ring_, uniform_ring_;
+    vk::Buffer staging_, readback_;
+    u32 descriptor_sets_used_{0};  // from the recording frame's pool
     vk::Image dummy2d_, dummycube_, dummy3d_;
     VkSampler dummy_sampler_{VK_NULL_HANDLE};
     VkFormat depth24_{VK_FORMAT_D24_UNORM_S8_UINT};

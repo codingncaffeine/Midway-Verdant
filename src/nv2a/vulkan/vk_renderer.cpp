@@ -170,6 +170,11 @@ VulkanRenderer::~VulkanRenderer() {
         recording_ = false;
     }
     f.vkDeviceWaitIdle(dev_.device());
+    for (Frame& fr : frames_) {
+        for (vk::Image& i : fr.dead_images) dev_.destroy_image(i);
+        for (VkImageView v : fr.dead_views) f.vkDestroyImageView(dev_.device(), v, nullptr);
+        for (VkFramebuffer b : fr.dead_framebuffers) f.vkDestroyFramebuffer(dev_.device(), b, nullptr);
+    }
     for (auto& [k, s] : surfaces_) {
         destroy_surface_views(*s);
         if (s->framebuffer) f.vkDestroyFramebuffer(dev_.device(), s->framebuffer, nullptr);
@@ -189,16 +194,18 @@ VulkanRenderer::~VulkanRenderer() {
     dev_.destroy_image(dummy2d_);
     dev_.destroy_image(dummycube_);
     dev_.destroy_image(dummy3d_);
-    if (descriptor_pool_) f.vkDestroyDescriptorPool(dev_.device(), descriptor_pool_, nullptr);
     if (pipeline_layout_) f.vkDestroyPipelineLayout(dev_.device(), pipeline_layout_, nullptr);
     if (set_layout_) f.vkDestroyDescriptorSetLayout(dev_.device(), set_layout_, nullptr);
-    dev_.destroy_buffer(vertex_ring_);
-    dev_.destroy_buffer(index_ring_);
-    dev_.destroy_buffer(uniform_ring_);
+    dev_.destroy_buffer(vertex_ring_.buffer);
+    dev_.destroy_buffer(index_ring_.buffer);
+    dev_.destroy_buffer(uniform_ring_.buffer);
     dev_.destroy_buffer(staging_);
     dev_.destroy_buffer(readback_);
-    if (fence_) f.vkDestroyFence(dev_.device(), fence_, nullptr);
-    if (cb_) f.vkFreeCommandBuffers(dev_.device(), dev_.pool(), 1, &cb_);
+    for (Frame& fr : frames_) {
+        if (fr.pool) f.vkDestroyDescriptorPool(dev_.device(), fr.pool, nullptr);
+        if (fr.fence) f.vkDestroyFence(dev_.device(), fr.fence, nullptr);
+        if (fr.cb) f.vkFreeCommandBuffers(dev_.device(), dev_.pool(), 1, &fr.cb);
+    }
 }
 
 void VulkanRenderer::note(const std::string& message) {
@@ -215,9 +222,9 @@ bool VulkanRenderer::init(std::string& error) {
     depth16_sampled_ = dev_.format_supports(VK_FORMAT_D16_UNORM, kSampledFiltered);
     depth24_sampled_ = dev_.format_supports(depth24_, kSampledFiltered);
 
-    if (!dev_.create_buffer(kVertexRingBytes, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, vk::BufferMemory::HostWrite, vertex_ring_, error)) return false;
-    if (!dev_.create_buffer(kIndexRingBytes, VK_BUFFER_USAGE_INDEX_BUFFER_BIT, vk::BufferMemory::HostWrite, index_ring_, error)) return false;
-    if (!dev_.create_buffer(kUniformRingBytes, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, vk::BufferMemory::HostWrite, uniform_ring_, error)) return false;
+    if (!create_ring(vertex_ring_, kVertexRingBytes, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, error)) return false;
+    if (!create_ring(index_ring_, kIndexRingBytes, VK_BUFFER_USAGE_INDEX_BUFFER_BIT, error)) return false;
+    if (!create_ring(uniform_ring_, kUniformRingBytes, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, error)) return false;
     if (!dev_.create_buffer(kStagingBytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, vk::BufferMemory::HostWrite, staging_, error)) return false;
     if (!dev_.create_buffer(kStagingBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, vk::BufferMemory::HostRead, readback_, error)) return false;
 
@@ -248,9 +255,17 @@ bool VulkanRenderer::init(std::string& error) {
     dpi.maxSets = kMaxDescriptorSets;
     dpi.poolSizeCount = 2;
     dpi.pPoolSizes = sizes;
-    if (f.vkCreateDescriptorPool(dev_.device(), &dpi, nullptr, &descriptor_pool_) != VK_SUCCESS) {
-        error = "vkCreateDescriptorPool failed";
-        return false;
+    VkCommandBufferAllocateInfo cai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    cai.commandPool = dev_.pool();
+    cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cai.commandBufferCount = 1;
+    VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    for (Frame& fr : frames_) {
+        if (f.vkCreateDescriptorPool(dev_.device(), &dpi, nullptr, &fr.pool) != VK_SUCCESS || f.vkAllocateCommandBuffers(dev_.device(), &cai, &fr.cb) != VK_SUCCESS ||
+            f.vkCreateFence(dev_.device(), &fci, nullptr, &fr.fence) != VK_SUCCESS) {
+            error = "frame in flight: descriptor pool, command buffer or fence creation failed";
+            return false;
+        }
     }
 
     // Placeholder textures for the stages a shader does not sample: 1x1 white.
@@ -278,23 +293,54 @@ bool VulkanRenderer::init(std::string& error) {
     sci.addressModeU = sci.addressModeV = sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
     sci.maxLod = 1.0f;
     f.vkCreateSampler(dev_.device(), &sci, nullptr, &dummy_sampler_);
-
-    VkCommandBufferAllocateInfo cai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-    cai.commandPool = dev_.pool();
-    cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    cai.commandBufferCount = 1;
-    f.vkAllocateCommandBuffers(dev_.device(), &cai, &cb_);
-    VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
-    f.vkCreateFence(dev_.device(), &fci, nullptr, &fence_);
-    begin_commands();
+    begin_frame(0);
     return true;
 }
 
-void VulkanRenderer::begin_commands() {
+bool VulkanRenderer::create_ring(Ring& ring, VkDeviceSize region, VkBufferUsageFlags usage, std::string& error) {
+    ring.region = region;
+    return dev_.create_buffer(region * kFramesInFlight, usage, vk::BufferMemory::HostWrite, ring.buffer, error);
+}
+
+void VulkanRenderer::begin_frame(u32 slot) {
+    const auto& f = *fn_;
+    Frame& fr = frames_[slot];
+    if (fr.serial > completed_) {
+        // The GPU may still be executing this frame's last submission (its rings and descriptor sets are in use).
+        f.vkWaitForFences(dev_.device(), 1, &fr.fence, VK_TRUE, ~0ull);
+        completed_ = fr.serial;
+    }
+    for (vk::Image& i : fr.dead_images) dev_.destroy_image(i);
+    for (VkImageView v : fr.dead_views) f.vkDestroyImageView(dev_.device(), v, nullptr);
+    for (VkFramebuffer b : fr.dead_framebuffers) f.vkDestroyFramebuffer(dev_.device(), b, nullptr);
+    fr.dead_images.clear();
+    fr.dead_views.clear();
+    fr.dead_framebuffers.clear();
+    f.vkResetDescriptorPool(dev_.device(), fr.pool, 0);
+    descriptor_sets_used_ = 0;
+    for (Ring* r : {&vertex_ring_, &index_ring_, &uniform_ring_}) r->begin = r->cursor = r->region * slot;
+    slot_ = slot;
+    cb_ = fr.cb;
+    f.vkResetCommandBuffer(cb_, 0);
     VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    fn_->vkBeginCommandBuffer(cb_, &bi);
+    f.vkBeginCommandBuffer(cb_, &bi);
     recording_ = true;
+}
+
+void VulkanRenderer::retire(vk::Image& image) {
+    if (image.image) frames_[slot_].dead_images.push_back(image);
+    image = vk::Image{};
+}
+
+void VulkanRenderer::retire(VkImageView& view) {
+    if (view) frames_[slot_].dead_views.push_back(view);
+    view = VK_NULL_HANDLE;
+}
+
+void VulkanRenderer::retire(VkFramebuffer& framebuffer) {
+    if (framebuffer) frames_[slot_].dead_framebuffers.push_back(framebuffer);
+    framebuffer = VK_NULL_HANDLE;
 }
 
 void VulkanRenderer::end_pass() {
@@ -318,21 +364,34 @@ u64 ns_since(std::chrono::steady_clock::time_point t0) {
 }
 }  // namespace
 
-void VulkanRenderer::flush() {
+void VulkanRenderer::submit() {
     const auto& f = *fn_;
     if (!recording_) return;
     Timed timed(stats_.ns_flush);
     end_pass();
     f.vkEndCommandBuffer(cb_);
+    recording_ = false;
+    Frame& fr = frames_[slot_];
     VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
     si.commandBufferCount = 1;
     si.pCommandBuffers = &cb_;
-    f.vkResetFences(dev_.device(), 1, &fence_);
-    f.vkQueueSubmit(dev_.queue(), 1, &si, fence_);
-    f.vkWaitForFences(dev_.device(), 1, &fence_, VK_TRUE, ~0ull);
+    f.vkResetFences(dev_.device(), 1, &fr.fence);
+    f.vkQueueSubmit(dev_.queue(), 1, &si, fr.fence);
+    fr.serial = ++submitted_;
     ++stats_.flushes;
-    f.vkResetCommandBuffer(cb_, 0);
-    begin_commands();
+    begin_frame((slot_ + 1) % kFramesInFlight);
+}
+
+void VulkanRenderer::finish() {
+    const u32 last = slot_;
+    submit();
+    Timed timed(stats_.ns_flush);
+    // A fence's signal covers every submission before its own on the queue, so the latest one is all it takes.
+    Frame& fr = frames_[last];
+    if (fr.serial > completed_) {
+        fn_->vkWaitForFences(dev_.device(), 1, &fr.fence, VK_TRUE, ~0ull);
+        completed_ = fr.serial;
+    }
 }
 
 VkRenderPass VulkanRenderer::render_pass(VkFormat color, VkFormat depth) {
@@ -358,11 +417,24 @@ VkRenderPass VulkanRenderer::render_pass(VkFormat color, VkFormat depth) {
     sub.colorAttachmentCount = 1;
     sub.pColorAttachments = &color_ref;
     sub.pDepthStencilAttachment = &depth_ref;
+    // A pass over a target can follow another over it in the same command buffer or an earlier submission still
+    // running (no wait separates them any more): its attachment reads and writes come after the earlier writes.
+    constexpr VkPipelineStageFlags kAttachmentStages =
+        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+    VkSubpassDependency dep{};
+    dep.srcSubpass = VK_SUBPASS_EXTERNAL;
+    dep.dstSubpass = 0;
+    dep.srcStageMask = dep.dstStageMask = kAttachmentStages;
+    dep.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    dep.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+                        VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
     VkRenderPassCreateInfo rpi{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
     rpi.attachmentCount = 2;
     rpi.pAttachments = att;
     rpi.subpassCount = 1;
     rpi.pSubpasses = &sub;
+    rpi.dependencyCount = 1;
+    rpi.pDependencies = &dep;
     VkRenderPass pass = VK_NULL_HANDLE;
     fn_->vkCreateRenderPass(dev_.device(), &rpi, nullptr, &pass);
     passes_[key] = pass;
@@ -405,10 +477,13 @@ VulkanRenderer::Surface* VulkanRenderer::target_for(const KelvinState& s) {
                          s0.color_format, width, height, d.swizzled() ? "swizzled" : "pitch", d.color_format()));
         if (pass_target_ == &s0) end_pass();
         if (s0.dirty) write_back(s0);
+        // Draws already recorded or still on the GPU may use the old images: they go once those are done.
+        retire(s0.x8_view);
+        retire(s0.depth_view);
         destroy_surface_views(s0);
-        if (s0.framebuffer) fn_->vkDestroyFramebuffer(dev_.device(), s0.framebuffer, nullptr);
-        dev_.destroy_image(s0.color);
-        dev_.destroy_image(s0.depth);
+        retire(s0.framebuffer);
+        retire(s0.color);
+        retire(s0.depth);
         surfaces_.erase(it);
         stage_cache_.fill({});  // a stage may point at the erased target's entries
     }
@@ -442,7 +517,7 @@ VulkanRenderer::Surface* VulkanRenderer::target_for(const KelvinState& s) {
     }
     // Images start in GENERAL and stay there; the colour image starts with what RAM holds (the guest may draw over
     // an existing picture).
-    flush();
+    submit();
     {
         VkCommandBuffer cb = dev_.begin_once();
         dev_.transition(cb, t.color, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
@@ -530,7 +605,12 @@ void scatter_swizzled(T* base, const T* rows, u32 width, u32 height, const std::
 
 void VulkanRenderer::read_back(const vk::Image& image, VkImageAspectFlags aspect, u32 width, u32 height) {
     Timed timed_gpu(stats_.ns_write_back_gpu);
-    VkCommandBuffer cb = dev_.begin_once();
+    end_pass();
+    // The frame's attachment writes (and uploads) land before the copy reads the image.
+    VkMemoryBarrier before{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    before.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+    before.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    fn_->vkCmdPipelineBarrier(cb_, VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &before, 0, nullptr, 0, nullptr);
     // Depth and stencil are two copies: the depth's words first, then one stencil byte per texel after them.
     const bool both = (aspect & VK_IMAGE_ASPECT_DEPTH_BIT) && (aspect & VK_IMAGE_ASPECT_STENCIL_BIT);
     VkBufferImageCopy regions[2]{};
@@ -539,15 +619,18 @@ void VulkanRenderer::read_back(const vk::Image& image, VkImageAspectFlags aspect
     regions[1] = regions[0];
     regions[1].imageSubresource.aspectMask = VK_IMAGE_ASPECT_STENCIL_BIT;
     regions[1].bufferOffset = static_cast<VkDeviceSize>(width) * height * 4;
-    fn_->vkCmdCopyImageToBuffer(cb, image.image, VK_IMAGE_LAYOUT_GENERAL, readback_.buffer, both ? 2 : 1, regions);
-    dev_.finish_once(cb);
+    fn_->vkCmdCopyImageToBuffer(cb_, image.image, VK_IMAGE_LAYOUT_GENERAL, readback_.buffer, both ? 2 : 1, regions);
+    // The copy is visible to the CPU once the fence signals.
+    VkMemoryBarrier after{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    after.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    after.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+    fn_->vkCmdPipelineBarrier(cb_, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &after, 0, nullptr, 0, nullptr);
+    finish();
 }
 
 void VulkanRenderer::write_back(Surface& s) {
     if (!s.dirty) return;
     Timed timed(stats_.ns_write_back);
-    if (pass_target_ == &s) end_pass();
-    flush();
     const u32 bpp = s.color_bytes();
     const std::size_t bytes = static_cast<std::size_t>(s.width) * s.height * bpp;
     if (bytes > kStagingBytes) {
@@ -587,8 +670,6 @@ void VulkanRenderer::write_back_zeta(Surface& s) {
     if (!s.zeta_dirty) return;
     s.zeta_dirty = false;
     if (s.zeta_format == 0 || s.zeta_phys == 0) return;  // no depth surface bound (an offset of zero is never a real one)
-    if (pass_target_ == &s) end_pass();
-    flush();
     const bool z16 = s.zeta_format == 1;
     // D16; a 24-bit or float depth copies as a 32-bit word, followed by the stencil bytes.
     const std::size_t bytes = static_cast<std::size_t>(s.width) * s.height * (z16 ? 2u : 5u);
@@ -996,12 +1077,12 @@ const VulkanRenderer::TextureEntry* VulkanRenderer::texture(const KelvinState& s
         flush();
         entry = std::move(it->second);
         textures_.erase(it);
-        dev_.destroy_image(entry->image);
+        retire(entry->image);  // draws recorded or in flight may still sample it
     }
     if (!dev_.create_image(format, d.width, d.height, d.depth, d.levels, d.faces, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
                            VK_IMAGE_ASPECT_COLOR_BIT, d.faces == 6, entry->image, error))
         return nullptr;
-    flush();
+    submit();
     VkCommandBuffer cb = dev_.begin_once();
     dev_.transition(cb, entry->image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
     dev_.finish_once(cb);
@@ -1144,20 +1225,20 @@ VkSampler VulkanRenderer::sampler(const TextureStage& ts, u32 levels) {
 }
 
 bool VulkanRenderer::fits_in_batch(VkDeviceSize vertex_bytes, VkDeviceSize index_bytes) const {
-    auto fits = [](const vk::Buffer& ring, VkDeviceSize cursor, VkDeviceSize bytes, VkDeviceSize alignment) {
-        return (cursor + alignment - 1) / alignment * alignment + bytes <= ring.size;
+    auto fits = [](const Ring& ring, VkDeviceSize bytes, VkDeviceSize alignment) {
+        return (ring.cursor + alignment - 1) / alignment * alignment + bytes <= ring.end();
     };
     const VkDeviceSize ualign = std::max<VkDeviceSize>(dev_.limits().minUniformBufferOffsetAlignment, 16);
     const VkDeviceSize uniforms = (vsh::kUniformBytes + ualign - 1) / ualign * ualign + sizeof(psh::Uniforms);
-    return fits(vertex_ring_, vertex_cursor_, vertex_bytes, 16) && (index_bytes == 0 || fits(index_ring_, index_cursor_, index_bytes, 4)) &&
-           fits(uniform_ring_, uniform_cursor_, uniforms, ualign) && descriptor_sets_used_ < kMaxDescriptorSets;
+    return fits(vertex_ring_, vertex_bytes, 16) && (index_bytes == 0 || fits(index_ring_, index_bytes, 4)) && fits(uniform_ring_, uniforms, ualign) &&
+           descriptor_sets_used_ < kMaxDescriptorSets;
 }
 
-bool VulkanRenderer::ring_alloc(vk::Buffer& ring, VkDeviceSize& cursor, VkDeviceSize bytes, VkDeviceSize alignment, VkDeviceSize& offset) {
-    const VkDeviceSize start = (cursor + alignment - 1) / alignment * alignment;
-    if (start + bytes > ring.size) return false;
+bool VulkanRenderer::ring_alloc(Ring& ring, VkDeviceSize bytes, VkDeviceSize alignment, VkDeviceSize& offset) {
+    const VkDeviceSize start = (ring.cursor + alignment - 1) / alignment * alignment;
+    if (start + bytes > ring.end()) return false;
     offset = start;
-    cursor = start + bytes;
+    ring.cursor = start + bytes;
     return true;
 }
 
@@ -1419,18 +1500,18 @@ void VulkanRenderer::draw(const KelvinState& s, const DrawBatch& batch) {
     t_part = std::chrono::steady_clock::now();
     VkDeviceSize vbytes = static_cast<VkDeviceSize>(v.count) * kVertexStride, voffset = 0;
     // The rings and the descriptor pool hold one batch of draws. A draw that no longer fits submits the batch so far
-    // and starts the rings over, so a frame can hold any number of draws (only a single draw larger than a ring is
-    // refused below).
+    // and moves to the next frame in flight's regions, so a frame can hold any number of draws (only a single draw
+    // larger than a ring region is refused below).
     if (!fits_in_batch(vbytes, indices.size() * 4)) {
-        flush_frame();
+        submit();
         ++stats_.batch_flushes;
     }
-    if (!ring_alloc(vertex_ring_, vertex_cursor_, vbytes, 16, voffset)) {
+    if (!ring_alloc(vertex_ring_, vbytes, 16, voffset)) {
         note("vertex ring full for this frame");
         ++stats_.skipped;
         return;
     }
-    float* vdst = reinterpret_cast<float*>(static_cast<u8*>(vertex_ring_.mapped) + voffset);
+    float* vdst = reinterpret_cast<float*>(static_cast<u8*>(vertex_ring_.buffer.mapped) + voffset);
     for (u32 n = 0; n < v.count; ++n) {
         for (u32 a = 0; a < kAttributes; ++a) {
             float* d = vdst + (static_cast<std::size_t>(n) * kAttributes + a) * 4;
@@ -1440,25 +1521,24 @@ void VulkanRenderer::draw(const KelvinState& s, const DrawBatch& batch) {
     }
     VkDeviceSize ioffset = 0;
     if (!indices.empty()) {
-        if (!ring_alloc(index_ring_, index_cursor_, indices.size() * 4, 4, ioffset)) {
+        if (!ring_alloc(index_ring_, indices.size() * 4, 4, ioffset)) {
             note("index ring full for this frame");
             ++stats_.skipped;
             return;
         }
-        std::memcpy(static_cast<u8*>(index_ring_.mapped) + ioffset, indices.data(), indices.size() * 4);
+        std::memcpy(static_cast<u8*>(index_ring_.buffer.mapped) + ioffset, indices.data(), indices.size() * 4);
     }
 
     // Uniforms.
     VkDeviceSize uoffset_vs = 0, uoffset_ps = 0;
     const VkDeviceSize ualign = std::max<VkDeviceSize>(dev_.limits().minUniformBufferOffsetAlignment, 16);
-    if (!ring_alloc(uniform_ring_, uniform_cursor_, vsh::kUniformBytes, ualign, uoffset_vs) ||
-        !ring_alloc(uniform_ring_, uniform_cursor_, sizeof(psh::Uniforms), ualign, uoffset_ps)) {
+    if (!ring_alloc(uniform_ring_, vsh::kUniformBytes, ualign, uoffset_vs) || !ring_alloc(uniform_ring_, sizeof(psh::Uniforms), ualign, uoffset_ps)) {
         note("uniform ring full for this frame");
         ++stats_.skipped;
         return;
     }
     {
-        float* u = reinterpret_cast<float*>(static_cast<u8*>(uniform_ring_.mapped) + uoffset_vs);
+        float* u = reinterpret_cast<float*>(static_cast<u8*>(uniform_ring_.buffer.mapped) + uoffset_vs);
         std::memcpy(u, s.constants.data(), kConstants * 16);
         u[kConstants * 4 + 0] = static_cast<float>(t->width / t->aa_x);  // the logical size the program maps to
         u[kConstants * 4 + 1] = static_cast<float>(t->height / t->aa_y);
@@ -1472,14 +1552,14 @@ void VulkanRenderer::draw(const KelvinState& s, const DrawBatch& batch) {
         vsh::fixed_function_uniforms(s, u + kConstants * 4 + 8);
         psh::Uniforms pu{};
         psh::uniforms_from_state(s, scales, pu);
-        std::memcpy(static_cast<u8*>(uniform_ring_.mapped) + uoffset_ps, &pu, sizeof pu);
+        std::memcpy(static_cast<u8*>(uniform_ring_.buffer.mapped) + uoffset_ps, &pu, sizeof pu);
     }
 
     stats_.ns_upload += ns_since(t_part);
     t_part = std::chrono::steady_clock::now();
     // Descriptors.
     VkDescriptorSetAllocateInfo dai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
-    dai.descriptorPool = descriptor_pool_;
+    dai.descriptorPool = frames_[slot_].pool;
     dai.descriptorSetCount = 1;
     dai.pSetLayouts = &set_layout_;
     VkDescriptorSet set = VK_NULL_HANDLE;
@@ -1489,7 +1569,7 @@ void VulkanRenderer::draw(const KelvinState& s, const DrawBatch& batch) {
         return;
     }
     ++descriptor_sets_used_;
-    VkDescriptorBufferInfo bufs[2] = {{uniform_ring_.buffer, uoffset_vs, vsh::kUniformBytes}, {uniform_ring_.buffer, uoffset_ps, sizeof(psh::Uniforms)}};
+    VkDescriptorBufferInfo bufs[2] = {{uniform_ring_.buffer.buffer, uoffset_vs, vsh::kUniformBytes}, {uniform_ring_.buffer.buffer, uoffset_ps, sizeof(psh::Uniforms)}};
     VkDescriptorImageInfo imgs[4]{};
     for (u32 i = 0; i < 4; ++i) {
         const TextureStage ts = s.texture(i);
@@ -1545,9 +1625,9 @@ void VulkanRenderer::draw(const KelvinState& s, const DrawBatch& batch) {
     fn_->vkCmdSetBlendConstants(cb_, constants);
     fn_->vkCmdSetStencilReference(cb_, VK_STENCIL_FACE_FRONT_AND_BACK, s.reg(mthd::kStencilRef) & 0xFFu);
     const VkDeviceSize vb_offset = voffset;
-    fn_->vkCmdBindVertexBuffers(cb_, 0, 1, &vertex_ring_.buffer, &vb_offset);
+    fn_->vkCmdBindVertexBuffers(cb_, 0, 1, &vertex_ring_.buffer.buffer, &vb_offset);
     if (!indices.empty()) {
-        fn_->vkCmdBindIndexBuffer(cb_, index_ring_.buffer, ioffset, VK_INDEX_TYPE_UINT32);
+        fn_->vkCmdBindIndexBuffer(cb_, index_ring_.buffer.buffer, ioffset, VK_INDEX_TYPE_UINT32);
         fn_->vkCmdDrawIndexed(cb_, static_cast<u32>(indices.size()), 1, 0, 0, 0);
     } else {
         fn_->vkCmdDraw(cb_, v.count, 1, 0, 0);
@@ -1555,12 +1635,9 @@ void VulkanRenderer::draw(const KelvinState& s, const DrawBatch& batch) {
     stats_.ns_record += ns_since(t_part);
 }
 
-void VulkanRenderer::flush_frame() {
-    flush();
-    vertex_cursor_ = index_cursor_ = uniform_cursor_ = 0;
-    fn_->vkResetDescriptorPool(dev_.device(), descriptor_pool_, 0);
-    descriptor_sets_used_ = 0;
-}
+// Nothing on the CPU reads the frame's results here: the semaphore's value is the guest's, and the pixels reach RAM
+// only through a write-back, which waits for the work it copies. So the frame is submitted and left to run.
+void VulkanRenderer::flush_frame() { submit(); }
 
 bool VulkanRenderer::write_back_at(u32 phys) {
     for (auto& [k, s] : surfaces_) {
@@ -1574,13 +1651,11 @@ bool VulkanRenderer::write_back_at(u32 phys) {
 void VulkanRenderer::end_frame() {
     frame_draws_ = 0;
     ++frame_index_;
-    flush();
     // Colour reaches RAM every frame (the scanout and the CPU read it); depth only when a texture samples it.
+    const u64 submits = stats_.flushes;
     for (auto& [k, s] : surfaces_)
         if (s->dirty) write_back(*s);
-    vertex_cursor_ = index_cursor_ = uniform_cursor_ = 0;
-    fn_->vkResetDescriptorPool(dev_.device(), descriptor_pool_, 0);
-    descriptor_sets_used_ = 0;
+    if (stats_.flushes == submits) submit();  // nothing to copy: the frame runs on without a wait
 }
 
 std::vector<VulkanRenderer::SurfaceInfo> VulkanRenderer::surfaces() const {
