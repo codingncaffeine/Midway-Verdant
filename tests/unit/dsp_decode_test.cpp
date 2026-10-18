@@ -94,3 +94,14 @@ TEST(DspDecode, EveryWordOfTheKernelsGpProgramDecodes) {
     for (const auto& [m, n] : histogram) std::printf("  %-8s x%u\n", m.c_str(), n);
     EXPECT_EQ(unknown, 0u);
 }
+
+// Two ordinary parallel-move multiplies that damaged lines of the manual's text once listed as fixed encodings of
+// their own; they must decode through the parallel-move tables like any other word.
+TEST(DspDecode, ParallelMultipliesAreNotShadowedByDamagedTableRows) {
+    const Decoded r = decode(0x98CA91);
+    EXPECT_EQ(r.alu, Alu::Mpyr) << mnemonic(r);
+    EXPECT_NE(r.move, Move::None);
+    const Decoded m = decode(0x654880);
+    EXPECT_EQ(m.alu, Alu::Mpy) << mnemonic(m);
+    EXPECT_NE(m.move, Move::None);
+}
