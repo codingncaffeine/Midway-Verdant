@@ -124,6 +124,7 @@ public:
     Apu& apu() { return apu_; }
     Aci& aci() { return aci_; }
     Ohci& usb0() { return usb0_; }
+    Ohci& usb1() { return usb1_; }
     // The gamepad on a front port (0-3); present whether or not it is plugged in.
     usb::XidGamepad& pad(unsigned front_port) { return pads_[front_port].gamepad; }
     PciBus& pci() { return pci_; }
@@ -189,6 +190,7 @@ private:
     Aci aci_;
     Ohci usb0_, usb1_;
     // The pads on the front ports, plugged into USB0 at power-on (front ports 1-4 = root ports 3, 4, 1, 2).
+    usb::FrontPanel front_panel_;
     std::array<usb::XboxPad, 4> pads_;
     IdeController ide_;
     DiskImage hdd_image_;

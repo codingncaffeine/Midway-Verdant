@@ -20,8 +20,9 @@ constexpr std::array<u8, 18> kHubDevice{18, 1, 0x10, 0x01, 9, 0, 0, 8, 0x5E, 0x0
 constexpr std::array<u8, 25> kHubConfiguration{9, 2, 25, 0, 1, 1, 0, 0xA0, 50,
                                                9, 4, 0, 0, 1, 9, 0, 0, 0,
                                                7, 5, 0x81, 3, 1, 0, 0xFF};
-// Three ports, compound + per-port power + per-port over-current, 100 ms power-good, 64 mA, port 1 fixed.
-constexpr std::array<u8, 9> kHubDescriptor{9, 0x29, Hub::kPorts, 0x0D, 0x00, 50, 64, 0x02, 0xFF};
+// The hub class descriptor is built per hub (see the constructor): per-port power + per-port over-current,
+// compound for a pad's hub, 100 ms power-good, 64 mA. The motherboard hub answers with the same device
+// descriptor; XAPI matches hubs by class (9), and the board's own IDs are not known here.
 
 enum : u16 { kPortConnection = 0x0001, kPortEnable = 0x0002, kPortSuspend = 0x0004, kPortReset = 0x0010, kPortPower = 0x0100 };
 enum : u16 { kFeatPortEnable = 1, kFeatPortSuspend = 2, kFeatPortReset = 4, kFeatPortPower = 8, kFeatCConnection = 16, kFeatCEnable = 17,
@@ -58,6 +59,7 @@ std::span<const u8> XidGamepad::device_descriptor() const { return kPadDevice; }
 std::span<const u8> XidGamepad::configuration_descriptor() const { return kPadConfiguration; }
 
 bool XidGamepad::class_request(const Setup& s, std::span<const u8> data, std::vector<u8>& reply) {
+    ++control_requests_;
     if (s.request_type == 0xC1 && s.request == 6 && s.value == 0x4200) {  // GET_DESCRIPTOR (XID)
         reply.assign(kXidDescriptor.begin(), kXidDescriptor.end());
         return true;
@@ -90,12 +92,14 @@ bool XidGamepad::class_request(const Setup& s, std::span<const u8> data, std::ve
 Status XidGamepad::endpoint_in(u8 endpoint, u8* data, u32 len, u32& actual) {
     if (endpoint != 1) return Status::Stall;
     const PadState s = current();
+    ++polls_;
     if (sent_once_ && s == last_sent_) return Status::Nak;  // nothing new since the last report
     const auto r = report(s);
     actual = std::min<u32>(len, static_cast<u32>(r.size()));
     std::memcpy(data, r.data(), actual);
     last_sent_ = s;
     sent_once_ = true;
+    ++reports_;
     return Status::Ack;
 }
 
@@ -107,7 +111,13 @@ Status XidGamepad::endpoint_out(u8 endpoint, const u8* data, u32 len) {
 
 // ---- the hub ----
 
+Hub::Hub(unsigned ports, u8 fixed_ports, bool compound)
+    : nports_(std::min(ports, kMaxPorts)),
+      hub_descriptor_{9, 0x29, static_cast<u8>(std::min(ports, kMaxPorts)), static_cast<u8>(compound ? 0x0D : 0x09), 0x00, 50, 64,
+                      fixed_ports, 0xFF} {}
+
 void Hub::attach(unsigned port, Device* device) {
+    if (port < 1 || port > nports_) return;
     Port& p = ports_[port - 1];
     p.device = device;
     if (p.status & kPortPower) {
@@ -138,7 +148,7 @@ std::span<const u8> Hub::configuration_descriptor() const { return kHubConfigura
 bool Hub::class_request(const Setup& s, std::span<const u8>, std::vector<u8>& reply) {
     const unsigned port = s.index;
     const bool to_port = s.recipient() == 3;
-    if (to_port && (port < 1 || port > kPorts)) return false;
+    if (to_port && (port < 1 || port > nports_)) return false;
     switch (s.request) {
         case 0:  // GET_STATUS: the hub's (no local power loss, no over-current) or a port's status and change bits
             if (!to_port) {
@@ -150,7 +160,7 @@ bool Hub::class_request(const Setup& s, std::span<const u8>, std::vector<u8>& re
             return true;
         case 6:  // GET_DESCRIPTOR (hub)
             if ((s.value >> 8) != 0x29) return false;
-            reply.assign(kHubDescriptor.begin(), kHubDescriptor.end());
+            reply.assign(hub_descriptor_.begin(), hub_descriptor_.end());
             return true;
         case 3:    // SET_FEATURE
         case 1: {  // CLEAR_FEATURE
@@ -200,7 +210,7 @@ bool Hub::class_request(const Setup& s, std::span<const u8>, std::vector<u8>& re
 Status Hub::endpoint_in(u8 endpoint, u8* data, u32 len, u32& actual) {
     if (endpoint != 1) return Status::Stall;
     u8 bitmap = 0;
-    for (unsigned i = 0; i < kPorts; ++i)
+    for (unsigned i = 0; i < nports_; ++i)
         if (ports_[i].change) bitmap = static_cast<u8>(bitmap | (1u << (i + 1)));
     if (!bitmap || len == 0) return Status::Nak;
     data[0] = bitmap;

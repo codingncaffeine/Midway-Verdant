@@ -230,6 +230,9 @@ void Ohci::port_write(unsigned port, u32 value) {
 u32 Ohci::mmio_read(PhysAddr addr, unsigned size) {
     const u32 offset = static_cast<u32>(addr - mmio_at_);
     const u32 v = read_reg(offset & ~3u);
+    // The root hub's registers and the interrupt status, as the driver sees them (not the frame-number polls).
+    if ((offset & ~3u) != 0x38 && (offset & ~3u) != 0x3C && trace::on(trace::Cat::Usb))
+        trace::log(trace::Cat::Usb, "{} read +{:02x} -> {:08x}", name(), offset & ~3u, v);
     const u32 shift = (offset & 3u) * 8;
     return size >= 4 ? v : (v >> shift) & ((1u << (size * 8)) - 1);
 }
@@ -352,6 +355,16 @@ Ohci::Visit Ohci::visit_ed(u32 ed_address, bool periodic) {
         if (short_in && !((td[0] >> 18) & 1u)) cc = kCcDataUnderrun;  // a short packet only passes with bufferRounding
         if (cc == kCcStall) ++stats_.stalls;
         const u32 next = td[2] & ~0xFu;
+        if (trace::on(trace::Cat::Usb)) {
+            std::string bytes;
+            for (u32 i = 0; i < std::min<u32>(moved, 18); ++i) {
+                u8 b = 0;
+                bus_.read_ram(buffer_address(cbp, be, i), &b, 1);
+                bytes += std::format(" {:02x}", b);
+            }
+            trace::log(trace::Cat::Usb, "{} td {:08x}: addr {} ep {} {} {} of {} bytes, cc {}{}{}", name(), head, function, endpoint,
+                       dir == 0 ? "SETUP" : dir == 1 ? "OUT" : "IN", moved, total, cc, bytes.empty() ? "" : " :", bytes);
+        }
         td[0] = (td[0] & 0x00FFFFFFu & ~(3u << 24)) | ((2u | toggle) << 24) | (cc << 28);
         td[1] = (moved >= total || cbp == 0) ? 0 : buffer_address(cbp, be, moved);
         td[2] = done_head_;
@@ -359,6 +372,9 @@ Ohci::Visit Ohci::visit_ed(u32 ed_address, bool periodic) {
         done_head_ = head;
         const u32 di = (td[0] >> 21) & 7u;
         if (di != 7) done_counter_ = std::min(done_counter_, di);
+        // A TD retired with an error interrupts at once, whatever its delay (OHCI 1.0a 4.3.1.3.6): the driver's
+        // remaining TDs sit behind a halted ED, and a later TD's interrupt would never come.
+        if (cc != kCcNoError) done_counter_ = 0;
         ++stats_.transfers;
         head = next;
         carry = toggle;
@@ -385,6 +401,7 @@ void Ohci::start_frame() {
     if (done_head_ && done_counter_ == 0 && !(int_status_ & kIntWdh)) {
         const u32 others = (int_status_ & int_enable_ & kIntAll & ~kIntWdh) ? 1u : 0u;
         wr32(hcca_ + 0x84, done_head_ | others);
+        trace::log(trace::Cat::Usb, "{} done queue {:08x}{} to the HCCA", name(), done_head_, others ? " (others pending)" : "");
         done_head_ = 0;
         done_counter_ = 7;
         int_status_ |= kIntWdh;

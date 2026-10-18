@@ -41,8 +41,8 @@ struct Rig {
     void frames(unsigned n) { sched.advance_to(sched.now() + n * cycles_from_ns(1'000'000) + 1); }
 
     // One TD: direction (0 SETUP, 1 OUT, 2 IN), the buffer, the toggle from the TD.
-    void td(u32 at, u32 dir, u32 toggle, u32 buf, u32 len, u32 next) {
-        w32(at + 0, (1u << 18) | (dir << 19) | (7u << 21) | ((2u | toggle) << 24) | (0xFu << 28));
+    void td(u32 at, u32 dir, u32 toggle, u32 buf, u32 len, u32 next, bool rounding = true, u32 delay = 7) {
+        w32(at + 0, (rounding ? 1u << 18 : 0u) | (dir << 19) | (delay << 21) | ((2u | toggle) << 24) | (0xFu << 28));
         w32(at + 4, len ? buf : 0);
         w32(at + 8, next);
         w32(at + 12, len ? buf + len - 1 : 0);
@@ -143,4 +143,80 @@ TEST(Ohci, EnumeratesThePadBehindItsHubAndReadsAReport) {
     r.ohci.mmio_write(kCommandStatus, 4, 4u);
     r.frames(2);
     EXPECT_EQ(r.r32(kTd + 0x50) >> 28, 0xFu) << "not accessed: NAKed and retried";
+}
+
+// XAPI reads the configuration descriptor with a long wLength, the data stage in 8-byte TDs without
+// bufferRounding, and only the status TD asks for an interrupt. The device's short packet ends the data stage with
+// DataUnderrun and halts the ED, so the status TD never runs: the errored TD must post the done queue itself.
+TEST(Ohci, AnErroredTransferPostsTheDoneQueueAtOnce) {
+    Rig r;
+    r.ohci.mmio_write(kPort1, 4, 1u << 4);
+    const std::array<u8, 8> setup{0x80, 6, 0, 2, 0, 0, 0x30, 0};
+    r.bus.write_ram(kBuf, setup.data(), 8);
+    const u32 tail = kTd + 0x100;
+    r.td(kTd, 0, 0, kBuf, 8, kTd + 0x10, true);
+    for (u32 i = 0; i < 6; ++i) r.td(kTd + 0x10 * (i + 1), 2, (i + 1) & 1u, kData + 8 * i, 8, kTd + 0x10 * (i + 2), false);
+    r.td(kTd + 0x70, 1, 1, 0, 0, tail, true, 0);  // the status stage: the only TD that interrupts
+    r.w32(kEd + 0, 0u | (8u << 16));
+    r.w32(kEd + 4, tail);
+    r.w32(kEd + 8, kTd);
+    r.w32(kEd + 12, 0);
+    r.ohci.mmio_write(kControlHead, 4, kEd);
+    r.ohci.mmio_write(kCommandStatus, 4, 2u);
+    r.frames(3);
+    EXPECT_EQ(r.r32(kTd + 0x40) >> 28, 9u) << "the hub's 25-byte descriptor ends in the fourth data TD: DataUnderrun";
+    EXPECT_EQ(r.r32(kEd + 8) & 1u, 1u) << "the ED halted";
+    EXPECT_EQ(r.r32(kTd + 0x70) >> 28, 0xFu) << "the status TD did not run";
+    EXPECT_EQ(r.r32(kHcca + 0x84) & ~0xFu, kTd + 0x40) << "the errored TD heads the done queue in the HCCA";
+    EXPECT_TRUE(r.ohci.mmio_read(0x0C, 4) & 2u) << "WritebackDoneHead";
+}
+
+TEST(UsbDevice, AReplyThatFillsItsLastPacketEndsWithAZeroLengthPacket) {
+    usb::XidGamepad pad;
+    u8 setup[8] = {0x80, 6, 0, 2, 0, 0, 0x50, 0};  // GET_DESCRIPTOR(configuration), wLength 80; the gamepad's is 32
+    u32 actual = 0;
+    ASSERT_EQ(pad.transact(usb::Pid::Setup, 0, setup, 8, actual), usb::Status::Ack);
+    u8 buf[8];
+    u32 total = 0;
+    for (int i = 0; i < 4; ++i) {
+        ASSERT_EQ(pad.transact(usb::Pid::In, 0, buf, 8, actual), usb::Status::Ack);
+        total += actual;
+    }
+    EXPECT_EQ(total, 32u);
+    ASSERT_EQ(pad.transact(usb::Pid::In, 0, buf, 8, actual), usb::Status::Ack) << "not a stall";
+    EXPECT_EQ(actual, 0u) << "the zero-length packet ends the data stage";
+    EXPECT_EQ(pad.transact(usb::Pid::Out, 0, buf, 0, actual), usb::Status::Ack) << "then the status stage";
+    // A reply of exactly wLength ends without one: the next IN is out of turn.
+    u8 setup8[8] = {0x80, 6, 0, 1, 0, 0, 8, 0};
+    ASSERT_EQ(pad.transact(usb::Pid::Setup, 0, setup8, 8, actual), usb::Status::Ack);
+    ASSERT_EQ(pad.transact(usb::Pid::In, 0, buf, 8, actual), usb::Status::Ack);
+    EXPECT_EQ(actual, 8u);
+    EXPECT_EQ(pad.transact(usb::Pid::Out, 0, buf, 0, actual), usb::Status::Ack);
+}
+
+// The 1.0-1.5 front panel: a four-port, non-compound hub with the controllers on its ports 3, 4, 1, 2.
+TEST(UsbHub, TheFrontPanelHubHasFourPortsAndFrontPortOneIsItsPortThree) {
+    usb::FrontPanel panel;
+    usb::XboxPad pad;
+    panel.hub.attach(usb::FrontPanel::kHubPortOfFrontPort[0], &pad.hub);
+    u32 actual = 0;
+    u8 get_hub[8] = {0xA0, 6, 0, 0x29, 0, 0, 9, 0};
+    ASSERT_EQ(panel.hub.transact(usb::Pid::Setup, 0, get_hub, 8, actual), usb::Status::Ack);
+    u8 d[9] = {};
+    ASSERT_EQ(panel.hub.transact(usb::Pid::In, 0, d, 8, actual), usb::Status::Ack);
+    ASSERT_EQ(panel.hub.transact(usb::Pid::In, 0, d + 8, 1, actual), usb::Status::Ack);
+    EXPECT_EQ(d[2], 4u) << "four downstream ports";
+    EXPECT_EQ(d[3] & 4u, 0u) << "not part of a compound device";
+    EXPECT_EQ(d[7], 0u) << "every port removable";
+    for (unsigned port = 1; port <= 4; ++port) {
+        u8 power[8] = {0x23, 3, 8, 0, static_cast<u8>(port), 0, 0, 0};
+        panel.hub.transact(usb::Pid::Setup, 0, power, 8, actual);
+        panel.hub.transact(usb::Pid::In, 0, d, 0, actual);
+        u8 status[8] = {0xA3, 0, 0, 0, static_cast<u8>(port), 0, 4, 0};
+        panel.hub.transact(usb::Pid::Setup, 0, status, 8, actual);
+        u8 st[4] = {};
+        ASSERT_EQ(panel.hub.transact(usb::Pid::In, 0, st, 4, actual), usb::Status::Ack);
+        EXPECT_EQ(st[0] & 1u, port == 3 ? 1u : 0u) << "port " << port;
+        panel.hub.transact(usb::Pid::Out, 0, d, 0, actual);
+    }
 }

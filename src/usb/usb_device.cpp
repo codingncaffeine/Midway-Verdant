@@ -123,7 +123,9 @@ Status Device::transact(Pid pid, u8 endpoint, u8* data, u32 len, u32& actual) {
                     if (n) std::memcpy(data, reply_.data() + reply_pos_, n);
                     reply_pos_ += n;
                     actual = static_cast<u32>(n);
-                    if (reply_pos_ >= reply_.size()) stage_ = Stage::StatusOut;
+                    // The data stage ends on a short packet or at wLength. A reply shorter than wLength that fills
+                    // its last packet exactly still owes the host a zero-length packet (USB 1.1 5.5.3).
+                    if (reply_pos_ >= reply_.size() && (n < len || reply_.size() >= setup_.length)) stage_ = Stage::StatusOut;
                     return Status::Ack;
                 }
                 case Stage::StatusIn:

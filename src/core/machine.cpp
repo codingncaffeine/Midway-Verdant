@@ -61,10 +61,10 @@ Machine::Machine(const MachineConfig& config)
     placeholder({0, 0, 3}, "dram", 0x02A6, 0x050000, 0xA1);
     pci_.add({0, 2, 0}, usb0_);
     pci_.add({0, 3, 0}, usb1_);
-    {
-        static constexpr unsigned kRootPortOfFrontPort[4] = {3, 4, 1, 2};
-        for (unsigned i = 0; i < std::min(config.pads, 4u); ++i) usb0_.attach(kRootPortOfFrontPort[i], &pads_[i].hub);
-    }
+    // The front panel hub on root port 1 of the first OHCI, the pads behind it (see usb::FrontPanel).
+    usb0_.attach(usb::FrontPanel::kRootPort, &front_panel_.hub);
+    for (unsigned i = 0; i < std::min(config.pads, 4u); ++i)
+        front_panel_.hub.attach(usb::FrontPanel::kHubPortOfFrontPort[i], &pads_[i].hub);
     PciDevice* nic = placeholder({0, 4, 0}, "nvnet", 0x01C3, 0x020000, 0xB1);
     nic->define_bar(0, PciDevice::BarKind::Memory, 1024);
     nic->define_bar(1, PciDevice::BarKind::Io, 16);

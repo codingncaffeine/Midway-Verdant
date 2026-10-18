@@ -269,6 +269,13 @@ RETRO_API bool retro_load_game_special(unsigned, const retro_game_info*, size_t)
 
 RETRO_API void retro_unload_game(void) {
     if (!machine) return;
+    // What the game did with the pads: polls of the report endpoint, reports delivered, class requests.
+    for (unsigned p = 0; p < pads_plugged; ++p)
+        log(RETRO_LOG_INFO, "pad %u: %llu polls, %llu reports, %llu class requests; usb frames %llu/%llu, transfers %llu/%llu", p + 1,
+            static_cast<unsigned long long>(machine->pad(p).polls()), static_cast<unsigned long long>(machine->pad(p).reports()),
+            static_cast<unsigned long long>(machine->pad(p).control_requests()), static_cast<unsigned long long>(machine->usb0().stats().frames),
+            static_cast<unsigned long long>(machine->usb1().stats().frames), static_cast<unsigned long long>(machine->usb0().stats().transfers),
+            static_cast<unsigned long long>(machine->usb1().stats().transfers));
     machine->finish();
     machine.reset();
 }

@@ -30,6 +30,10 @@ public:
     void set_rumble(Rumble r) { rumble_ = std::move(r); }
     // The 20-byte input report for a state.
     static std::array<u8, 20> report(const PadState& s);
+    // Instruments: interrupt-IN polls of the report endpoint, and the reports actually delivered (a NAK otherwise).
+    u64 polls() const { return polls_; }
+    u64 reports() const { return reports_; }
+    u64 control_requests() const { return control_requests_; }
 
 protected:
     std::span<const u8> device_descriptor() const override;
@@ -45,12 +49,17 @@ private:
     PadState state_{};
     PadState last_sent_{};
     bool sent_once_{false};
+    u64 polls_{0}, reports_{0}, control_requests_{0};
     Rumble rumble_;
 };
 
 class Hub : public Device {
 public:
-    static constexpr unsigned kPorts = 3;
+    static constexpr unsigned kMaxPorts = 4;
+    // A pad's hub has three downstream ports, the gamepad's fixed on port 1; the 1.0-1.5 motherboard's hub
+    // (the front-panel daughterboard on root port 1) has four, all removable.
+    explicit Hub(unsigned ports = 3, u8 fixed_ports = 0x02, bool compound = true);
+    unsigned ports() const { return nports_; }
     // Plugs a device into a downstream port (1-based); nullptr empties it.
     void attach(unsigned port, Device* device);
     void bus_reset() override;
@@ -67,7 +76,18 @@ private:
         Device* device{nullptr};
         u16 status{0}, change{0};
     };
-    std::array<Port, kPorts> ports_{};
+    unsigned nports_;
+    std::array<u8, 9> hub_descriptor_;
+    std::array<Port, kMaxPorts> ports_{};
+};
+
+// The front panel of a 1.0-1.5 board: a four-port hub on root port 1 of the first OHCI. The kernel sets
+// XboxHardwareInfo.Flags bit 0 for these boards (LPC bridge revision <= 0xB3), and XAPI then looks for the
+// controllers BEHIND this hub, front ports 1-4 on its ports 3, 4, 1, 2; a pad on a root port is disabled.
+struct FrontPanel {
+    static constexpr unsigned kRootPort = 1;
+    static constexpr unsigned kHubPortOfFrontPort[4] = {3, 4, 1, 2};
+    Hub hub{4, 0x00, false};
 };
 
 // One controller port's worth: the hub with the gamepad on its port 1.
