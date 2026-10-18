@@ -250,7 +250,9 @@ RETRO_API bool retro_load_game(const retro_game_info* game) {
         const std::size_t at = audio.size();
         audio.resize(at + n);
         std::memcpy(audio.data() + at, data, n * 2);
-        if (audio.size() > kSampleRate) audio.erase(audio.begin(), audio.begin() + static_cast<std::ptrdiff_t>(audio.size() - kSampleRate));
+        // A frontend that stops calling retro_run must not build up latency: keep at most a quarter second.
+        constexpr std::size_t kMaxBacklog = kSampleRate / 4 * 2;
+        if (audio.size() > kMaxBacklog) audio.erase(audio.begin(), audio.begin() + static_cast<std::ptrdiff_t>(audio.size() - kMaxBacklog));
     });
     if (have_rumble) {
         for (unsigned p = 0; p < pads_plugged; ++p)
@@ -302,16 +304,26 @@ RETRO_API void retro_run(void) {
     machine->pump(deadline, [vblanks](mv::Machine& m) { return m.nv2a().vblanks() != vblanks; });
     grab_frame();
     video_cb(frame.data(), frame_w, frame_h, frame_w * 4);
-    // A frame's worth of audio (800 stereo samples at 48 kHz / 59.94 Hz), silence where the console made none.
-    constexpr std::size_t kFrameSamples = kSampleRate * 1001 / 60000;
-    std::vector<mv::i16> out(kFrameSamples * 2, 0);
+    // The audio the console played since the last frame, as it played it: the AC'97 output runs on the console's
+    // own clock, so a frame carries about 800 stereo samples, a few more or fewer as the reads fall. Padding a short
+    // frame with silence would put a click in the sound, so the frontend's queue absorbs the jitter instead. While
+    // the console's PCM output is halted (before the kernel starts it) a frame of silence keeps the stream going.
+    std::vector<mv::i16> out;
     {
         std::lock_guard g(audio_lock);
-        const std::size_t n = std::min(out.size(), audio.size());
-        std::copy(audio.begin(), audio.begin() + static_cast<std::ptrdiff_t>(n), out.begin());
-        audio.erase(audio.begin(), audio.begin() + static_cast<std::ptrdiff_t>(n));
+        const auto whole = static_cast<std::ptrdiff_t>(audio.size() & ~std::size_t{1});  // whole stereo frames only
+        out.assign(audio.begin(), audio.begin() + whole);
+        audio.erase(audio.begin(), audio.begin() + whole);
     }
-    audio_batch_cb(out.data(), kFrameSamples);
+    if (out.empty()) {
+        bool halted;
+        {
+            std::lock_guard g(machine->lock());
+            halted = machine->aci().channel(mv::Aci::PcmOut).sr & mv::Aci::kSrDch;
+        }
+        if (halted) out.assign(static_cast<std::size_t>(kSampleRate * 1001 / 60000) * 2, 0);
+    }
+    if (!out.empty()) audio_batch_cb(out.data(), out.size() / 2);
 }
 
 RETRO_API size_t retro_serialize_size(void) { return 0; }
