@@ -19,8 +19,10 @@ inline constexpr u64 kGpuHzDen = 3;
 // 8254 timer input. xemu's model and the kernel's 1 ms divisor agree on 1.125 MHz; the wiki says "6% off a PC",
 // which is 1.193182 / 1.125. To be confirmed from the divisor the kernel writes (Phase 1 trace).
 inline constexpr u64 kPitHz = 1'125'000;
-// ACPI power-management timer (standard rate; to be confirmed).
-inline constexpr u64 kPmTimerHz = 3'579'545;
+// ACPI power-management timer: 3.375 MHz with all 32 bits counting, not the PC's 3.579545 MHz 24-bit timer. The
+// kernel's KeQueryPerformanceFrequency returns 3375000, and KeQueryPerformanceCounter reads the port as a 32-bit value
+// and carries on bit 31 into its high word, so a timer that wraps at 24 bits runs every performance counter backwards.
+inline constexpr u64 kPmTimerHz = 3'375'000;
 // Audio: 48 kHz, 32-sample frames.
 inline constexpr u64 kAudioHz = 48'000;
 inline constexpr u64 kApuFramesPerSecond = 1'500;

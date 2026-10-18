@@ -69,7 +69,7 @@ void IsaMisc::pio_write(u16 port, unsigned size, u32 value) {
 
 PmBlock::PmBlock(Scheduler& sched, std::function<void(u16)> on_sleep) : sched_(sched), on_sleep_(std::move(on_sleep)) {}
 
-u32 PmBlock::timer_value() const { return static_cast<u32>(ticks_from_cycles(sched_.now(), clk::kPmTimerHz) & 0xFFFFFFu); }
+u32 PmBlock::timer_value() const { return static_cast<u32>(ticks_from_cycles(sched_.now(), clk::kPmTimerHz)); }
 
 u32 PmBlock::pio_read(u16 port, unsigned size) {
     const u16 off = static_cast<u16>(port - base_);
