@@ -33,6 +33,7 @@ enum class Op : u8 {
     AslImm, AslReg, AsrImm, AsrReg, LslImm, LslReg, LsrImm, LsrReg,
     MulImm,  // MPYI MACI MPYRI MACRI
     Tcc1, Tcc2, Tcc3, Inc, Dec,
+    Cmpu, Div, MulShift, MulMixed, Dmac, Norm, Normf, Clb, Extract, Insert, Merge, Lra, Brkcc, Trapcc, Nop2,
 };
 
 struct OpInfo {
@@ -141,6 +142,26 @@ OpInfo classify(const char* mnemonic, const char* operands) {
     if (m == "MACRI") return {Op::MulImm, 3};
     if (m == "Tcc") return {o == "S1,D1" ? Op::Tcc1 : (o == "S2,D2" ? Op::Tcc3 : Op::Tcc2), 0};
     if (m == "INC") return {Op::Inc, 0};
+    if (m == "CMPU") return {Op::Cmpu, 0};
+    if (m == "DIV") return {Op::Div, 0};
+    if (m == "MPY" && has("#n")) return {Op::MulShift, 0};
+    if (m == "MAC" && has("#n")) return {Op::MulShift, 1};
+    if (m == "MPYR" && has("#n")) return {Op::MulShift, 2};
+    if (m == "MACR" && has("#n")) return {Op::MulShift, 3};
+    if (m == "MPY" && has("uu")) return {Op::MulMixed, 0};
+    if (m == "MACuu") return {Op::MulMixed, 1};
+    if (m == "DMAC") return {Op::Dmac, 0};
+    if (m == "NORM") return {Op::Norm, 0};
+    if (m == "NORMF") return {Op::Normf, 0};
+    if (m == "CLB") return {Op::Clb, 0};
+    if (m == "EXTRACT") return {Op::Extract, static_cast<u8>(has("#CO") ? 2 : 0)};
+    if (m == "EXTRACTU") return {Op::Extract, static_cast<u8>(has("#CO") ? 3 : 1)};
+    if (m == "INSERT") return {Op::Insert, static_cast<u8>(has("#CO") ? 2 : 0)};
+    if (m == "MERGE") return {Op::Merge, 0};
+    if (m == "LRA") return {Op::Lra, static_cast<u8>(has("xxxx") ? 1 : 0)};
+    if (m == "BRKcc") return {Op::Brkcc, 0};
+    if (m == "TRAPcc") return {Op::Trapcc, 0};
+    if (m == "DEBUGcc" || m == "PFLUSH" || m == "PFLUSHUN" || m == "PFREE" || m == "PLOCKR" || m == "PUNLOCKR" || m == "PUNLOCK") return {Op::Nop2, 0};
     if (m == "DEC") return {Op::Dec, 0};
     return {Op::Unknown, 0};
 }
@@ -1081,6 +1102,190 @@ void Core::execute(const Decoded& d, u32 ext, u32 at) {
             set_ccr_result(D, false, false, false);
             return;
         }
+        // ---- the non-parallel arithmetic (chapter 13; register tables 12-13 and 12-16) ----
+        case Op::Cmpu: {
+            // S2 - S1 on 48 unsigned bits: S1 a 24-bit register left-aligned, or the other accumulator's bits 47-0.
+            static constexpr u8 kGgg[8] = {0, 0, 0, 0, 4, 6, 5, 7};
+            constexpr u64 kMask48 = (u64{1} << 48) - 1;
+            const u32 g = d.f('g') & 7u;
+            const u64 s2 = static_cast<u64>(acc(d.f('d'))) & kMask48;
+            const u64 s1 = g == 0 ? static_cast<u64>(acc(d.f('d') ^ 1u)) & kMask48 : static_cast<u64>(read_reg5(kGgg[g], false)) << 24;
+            const u64 r = (s2 - s1) & kMask48;
+            u32 sr = r_.sr & ~(N | Z | V | C);
+            if ((r >> 47) & 1u) sr |= N;
+            if (r == 0) sr |= Z;
+            if (s2 < s1) sr |= C;
+            r_.sr = sr;
+            return;
+        }
+        case Op::Div: {
+            // One non-restoring step: shift D left with C in, then add or subtract the divisor in the MSP by sign.
+            static constexpr u8 kJj[4] = {4, 6, 5, 7};
+            i64& D = acc(d.f('d'));
+            const u32 s = read_reg5(kJj[d.f('J') & 3u], false);
+            const bool differ = ((D >> 55) & 1) != ((s >> 23) & 1u);
+            const i64 shifted = sext56((D << 1) | ((r_.sr & C) ? 1 : 0));
+            const bool v = ((D >> 55) & 1) != ((shifted >> 55) & 1);
+            const i64 r = sext56(differ ? shifted + (sext24(s) << 24) : shifted - (sext24(s) << 24));
+            D = r;
+            u32 sr = r_.sr & ~(V | C);
+            if (v) sr |= V | L;
+            if (!((r >> 55) & 1)) sr |= C;
+            r_.sr = sr;
+            return;
+        }
+        case Op::MulShift: {
+            // (±)(S * 2^-n): S [Y1,X0,Y0,X1] left-aligned and shifted right n; variant 0 MPY 1 MAC 2 MPYR 3 MACR.
+            static constexpr u8 kQq[4] = {7, 4, 6, 5};
+            const u32 n = d.f('s') & 31u;
+            i64 p = (sext24(read_reg5(kQq[d.f('Q') & 3u], false)) << 24) >> n;
+            if (d.f('k')) p = -p;
+            i64& D = acc(d.f('d'));
+            const bool accumulate = info.variant & 1u;
+            i64 r = accumulate ? sext56(D + p) : sext56(p);
+            const bool overflow = accumulate && ((D < 0) == (p < 0)) && ((r < 0) != (D < 0));
+            if (info.variant & 2u) r = round56(r);
+            D = r;
+            set_ccr_result(D, false, false, overflow);
+            return;
+        }
+        case Op::MulMixed: case Op::Dmac: {
+            // S1 * S2 with either operand unsigned (QQQQ pairs). MPY/MAC su|uu: s = 0 su, 1 uu. DMAC: ss 00, su 10,
+            // uu 11, the accumulator shifted right 24 before accumulating.
+            static constexpr u8 kQqqq[16][2] = {{4, 4}, {6, 6}, {5, 4}, {7, 6}, {4, 7}, {6, 4}, {5, 6}, {7, 5},
+                                                {5, 5}, {7, 7}, {4, 5}, {6, 7}, {7, 4}, {4, 6}, {6, 5}, {5, 7}};
+            const u32 q = d.f('Q') & 15u;
+            const u32 a = read_reg5(kQqqq[q][0], false), b = read_reg5(kQqqq[q][1], false);
+            u32 mode;  // 0 ss, 1 su, 2 uu
+            if (info.op == Op::Dmac) {
+                const u32 ss = d.f('s') & 3u;
+                mode = ss == 0 ? 0u : (ss == 3 ? 2u : 1u);
+            } else {
+                mode = (d.f('s') & 1u) ? 2u : 1u;
+            }
+            const i64 x = mode == 2 ? static_cast<i64>(a) : sext24(a);
+            const i64 y = mode == 0 ? sext24(b) : static_cast<i64>(b);
+            i64 p = (x * y) << 1;
+            if (d.f('k')) p = -p;
+            i64& D = acc(d.f('d'));
+            const i64 base = info.op == Op::Dmac ? (D >> 24) : D;
+            const bool accumulate = info.op == Op::Dmac || (info.variant & 1u);
+            const i64 r = accumulate ? sext56(base + p) : sext56(p);
+            const bool overflow = accumulate && ((base < 0) == (p < 0)) && ((r < 0) != (base < 0));
+            D = r;
+            set_ccr_result(D, false, false, overflow);
+            return;
+        }
+        case Op::Norm: {
+            // One normalisation step from the E, U and Z bits as they stand.
+            i64& D = acc(d.f('d'));
+            const u32 rn = d.f('R') & 7u;
+            bool v = false;
+            if (!(r_.sr & (E | U | Z))) {
+                const i64 r = sext56(D << 1);
+                v = ((D >> 55) & 1) != ((r >> 55) & 1);
+                D = r;
+                r_.r[rn] = agu_update(r_.r[rn], r_.m[rn], -1);
+            } else if (r_.sr & E) {
+                D >>= 1;
+                r_.r[rn] = agu_update(r_.r[rn], r_.m[rn], 1);
+            } else {
+                return;
+            }
+            set_ccr_result(D, false, false, v);
+            return;
+        }
+        case Op::Normf: {
+            // Shift D by the signed amount in S: right when positive, left when negative (CLB's count).
+            static constexpr u8 kSss[8] = {0, 0, 12, 13, 4, 6, 5, 7};
+            const i32 amount = sext_bits(read_reg5(kSss[d.f('s') & 7u], false), 24);
+            i64& D = acc(d.f('D'));
+            bool v = false;
+            if (amount >= 0) {
+                D = amount >= 56 ? (D < 0 ? -1 : 0) : (D >> amount);
+            } else {
+                const u32 n = static_cast<u32>(std::min(-amount, 56));
+                const i64 r = n >= 56 ? 0 : sext56(D << n);
+                const i64 top = n >= 56 ? D : (D >> (55 - n));  // the bits that pass through bit 55, and the sign
+                v = top != 0 && top != -1;
+                D = r;
+            }
+            set_ccr_result(D, false, false, v);
+            return;
+        }
+        case Op::Clb: {
+            // 9 minus the run of leading bits equal to bit 55 into the MSP, LSP cleared, EXP sign-extended.
+            const i64 s = acc(d.f('S'));
+            i32 result = 0;
+            if (s != 0) {
+                const i64 lead = (s >> 55) & 1;
+                i32 run = 0;
+                for (int bit = 55; bit >= 0 && ((s >> bit) & 1) == lead; --bit) ++run;
+                result = 9 - run;
+            }
+            i64& D = acc(d.f('D'));
+            D = static_cast<i64>(result) << 24;
+            u32 sr = r_.sr & ~(N | Z | V);
+            if (result < 0) sr |= N;
+            if (result == 0) sr |= Z;
+            r_.sr = sr;
+            return;
+        }
+        case Op::Extract: case Op::Insert: {
+            // Control word: offset in bits 5-0, width in bits 17-12, from S1 [A1,B1,X0,Y0,X1,Y1] or the extension word.
+            static constexpr u8 kSss[8] = {0, 0, 12, 13, 4, 6, 5, 7};
+            static constexpr u8 kQqq[8] = {0, 0, 8, 9, 4, 6, 5, 7};
+            const u32 control = (info.variant & 2u) ? (ext & kWord) : read_reg5(kSss[d.f('S') & 7u], false);
+            const u32 offset = control & 63u, width = (control >> 12) & 63u;
+            const u64 mask = width >= 64 ? ~u64{0} : ((u64{1} << width) - 1);
+            i64& D = acc(d.f('D'));
+            if (info.op == Op::Extract) {
+                const u64 src = static_cast<u64>(acc(d.f('s'))) & ((u64{1} << 56) - 1);
+                const u64 field = offset >= 56 ? 0 : (src >> offset) & mask;
+                i64 r = static_cast<i64>(field);
+                if (!(info.variant & 1u) && width > 0 && width < 56 && ((field >> (width - 1)) & 1u)) r = static_cast<i64>(field | ~mask);
+                D = sext56(r);
+            } else {
+                const u64 src = static_cast<u64>(read_reg5(kQqq[d.f('q') & 7u], false)) & mask;
+                const u64 hole = offset >= 56 ? 0 : (mask << offset);
+                D = sext56(static_cast<i64>((static_cast<u64>(D) & ~hole) | ((src << offset) & hole)));
+            }
+            set_ccr_result(D, true, false, false);
+            return;
+        }
+        case Op::Merge: {
+            // S[11:0] above D[35:24] in the MSP; the rest of D unchanged.
+            static constexpr u8 kSss[8] = {0, 0, 12, 13, 4, 6, 5, 7};
+            const u32 s = read_reg5(kSss[d.f('S') & 7u], false);
+            i64& D = acc(d.f('D'));
+            const u32 d1 = static_cast<u32>(D >> 24) & kWord;
+            const u32 m = ((s & 0xFFFu) << 12) | (d1 & 0xFFFu);
+            D = sext56((D & ~(i64{kWord} << 24)) | (static_cast<i64>(m) << 24));
+            set_ccr_logical(D);
+            return;
+        }
+        case Op::Lra:
+            write_reg5(d.f('d'), (at + (info.variant ? ext : r_.r[d.f('R') & 7u])) & kWord);
+            return;
+        case Op::Brkcc:
+            // Leave the current DO loop: the loop's stack entries go, execution continues after its last instruction.
+            if (condition(d.f('C'))) {
+                const u32 after = (r_.la + 1) & kWord;
+                u32 pc_value, sr_value;
+                pop(pc_value, sr_value);
+                r_.sr = (r_.sr & ~(LF | FV)) | (sr_value & (LF | FV));
+                u32 la, lc;
+                pop(la, lc);
+                r_.la = la;
+                r_.lc = lc;
+                jump_sub(after, false);
+            }
+            return;
+        case Op::Trapcc:
+            if (condition(d.f('C'))) fail(std::format("TRAPcc at P:{:04x} (software interrupts are not modelled)", at));
+            return;
+        case Op::Nop2:  // DEBUGcc and the instruction-cache controls: no debugger, no cache
+            return;
         case Op::Unknown:
             fail(std::format("{} {} at P:{:04x} is not implemented", kOpcodePatterns[d.pattern].mnemonic, kOpcodePatterns[d.pattern].operands, at));
             return;

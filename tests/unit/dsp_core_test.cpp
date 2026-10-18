@@ -174,3 +174,78 @@ TEST(DspCore, RegisterFormPeripheralMovesWriteWithWSetAndReadWithWClear) {
     EXPECT_EQ(m.periph.writes.size(), 1u) << "W = 0 does not write";
     EXPECT_EQ(m.core.regs().a, i64{0x00123456000000}) << "the peripheral word lands in A1";
 }
+
+TEST(DspCore, CountLeadingBitsThenNormaliseFastAsTheManualShows) {
+    Machine m;
+    m.core.regs().a = i64{0x20} << 48;  // A = $20:000000:000000
+    m.emit(0x0C1E01);                   // CLB A,B: two leading zeros -> 9 - 2 = 7 in B1
+    m.emit(0x0C1E26);                   // NORMF B1,A: positive count -> A shifted right 7
+    m.run(1);
+    EXPECT_EQ(m.core.regs().b, i64{7} << 24);
+    m.run(1);
+    EXPECT_EQ(m.core.regs().a, i64{0x400000} << 24);
+}
+
+TEST(DspCore, UnsignedCompareSeesTopBitAsMagnitude) {
+    Machine m;
+    m.core.regs().a = i64{0x800000} << 24;  // A1 = $800000: negative signed, large unsigned
+    m.core.regs().x0 = 0x7FFFFF;
+    m.emit(0x0C1FF8);  // CMPU X0,A
+    m.run(1);
+    EXPECT_EQ(m.core.regs().sr & (Core::C | Core::Z), 0u);  // $800000 > $7FFFFF unsigned
+    m.core.regs().x0 = 0x900000;
+    m.emit(0x0C1FF8);
+    m.run(1);
+    EXPECT_EQ(m.core.regs().sr & Core::C, static_cast<u32>(Core::C));  // borrow
+    m.core.regs().x0 = 0x800000;
+    m.emit(0x0C1FF8);
+    m.run(1);
+    EXPECT_EQ(m.core.regs().sr & Core::Z, static_cast<u32>(Core::Z));
+}
+
+TEST(DspCore, TwentyFourDivideStepsGiveTheFractionalQuotient) {
+    Machine m;
+    m.core.regs().a = i64{0x200000} << 24;  // 0.25
+    m.core.regs().x0 = 0x400000;            // 0.5
+    for (int i = 0; i < 24; ++i) m.emit(0x018040);  // DIV X0,A
+    m.run(24);
+    EXPECT_EQ(static_cast<u32>(m.core.regs().a) & 0xFFFFFFu, 0x400000u);  // 0.5 in A0
+}
+
+TEST(DspCore, BitSetAboveBitFifteenOnARegister) {
+    Machine m;
+    m.emit(0x0AC474);  // BSET #20,X0 (the 5-bit bit number)
+    m.run(1);
+    EXPECT_EQ(m.core.regs().x0, 0x100000u);
+}
+
+TEST(DspCore, ExtractSignExtendsExtractuDoesNotInsertPlaces) {
+    Machine m;
+    m.core.regs().a = i64{0xABCDEF} << 24;
+    m.emit(0x0C1881, 0x00801C);  // EXTRACTU #CO,A,B: width 8 offset 28 -> $DE
+    m.emit(0x0C1801, 0x00801C);  // EXTRACT  #CO,A,B: the same field sign-extended
+    m.run(1);
+    EXPECT_EQ(m.core.regs().b, i64{0xDE});
+    m.run(1);
+    EXPECT_EQ(m.core.regs().b, i64{0xDE} - 0x100);
+    m.core.regs().a = 0;
+    m.core.regs().x0 = 0x0000AB;
+    m.emit(0x0C1940, 0x008004);  // INSERT #CO,X0,A: width 8 offset 4
+    m.run(1);
+    EXPECT_EQ(m.core.regs().a, i64{0xAB0});
+}
+
+TEST(DspCore, MultiplyByPowerOfTwoAndUnsignedSquare) {
+    Machine m;
+    m.core.regs().x0 = 0x400000;  // 0.5
+    m.emit(0x0101D0);             // MPY X0,#1,A: 0.5 * 2^-1
+    m.emit(0x0110D0);             // MPY X0,#16,A: the fifth shift bit
+    m.run(1);
+    EXPECT_EQ(m.core.regs().a, i64{0x200000} << 24);
+    m.run(1);
+    EXPECT_EQ(m.core.regs().a, (i64{0x400000} << 24) >> 16);
+    m.core.regs().x0 = 0xFFFFFF;
+    m.emit(0x0127C0);  // MPY uu X0,X0,A: $FFFFFF unsigned squared (signed it would be -1 * -1)
+    m.run(1);
+    EXPECT_EQ(m.core.regs().a, (i64{0xFFFFFF} * 0xFFFFFF) << 1);
+}

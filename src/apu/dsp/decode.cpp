@@ -224,7 +224,7 @@ Decoded decode(u32 word) {
         const OpcodePattern& p = kOpcodePatterns[c.index];
         extract_fields(d, p.pattern, d.word);
         const std::string ops = p.operands;
-        if (ops.find("xxxx") != std::string::npos || ops.find("expr") != std::string::npos || ops.find("label") != std::string::npos ||
+        if (ops.find("xxxx") != std::string::npos || ops.find("expr") != std::string::npos || ops.find("label") != std::string::npos || ops.find("#CO") != std::string::npos ||
             ops.find("FOREVER") != std::string::npos)
             d.extension = true;
         if (d.w('M') == 3 && d.w('R') == 3 && ea_needs_extension((d.f('M') << 3) | d.f('R'))) d.extension = true;
