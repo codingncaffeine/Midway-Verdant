@@ -343,6 +343,12 @@ void KvmBackend::handle_mmio() {
             u32 v = 0;
             std::memcpy(&v, run_->mmio.data, len);
             bus.write(addr, len, v);
+            if (const auto& b = machine_->config().break_mmio_write; b && b->address == addr && (!b->value || *b->value == v) && mmio_breaks_ < b->count) {
+                ++mmio_breaks_;
+                Regs r{};
+                if (read_regs(r))
+                    trace::log(trace::Cat::Boot, "break: mmio write {:08x} <- {:08x} (size {})\n{}", addr, v, len, debug::describe_stack(bus, r));
+            }
         }
     } else {
         if (len == 8) {
@@ -396,14 +402,16 @@ void KvmBackend::thread_main() {
             case KVM_EXIT_IRQ_WINDOW_OPEN: ++stats_.irq_window_exits; break;
             case KVM_EXIT_INTR: break;
             case KVM_EXIT_DEBUG: {
-                // A --break-eip address: log where the guest is and drop every breakpoint so it runs on.
+                // A --break-eip address: log where the guest is, then drop that breakpoint and keep the others.
                 Regs r{};
                 lock.unlock();
                 read_regs(r);
                 trace::log(trace::Cat::Boot, "break: eip {:08x} reached\n{}", r.eip, debug::describe_stack(machine_->bus(), r));
+                std::erase(break_eips_, r.eip);
                 kvm_guest_debug off{};
                 ioctl(vcpu_fd_, KVM_SET_GUEST_DEBUG, &off);
                 breakpoints_armed_ = false;
+                arm_breakpoints();
                 continue;
             }
             case KVM_EXIT_SHUTDOWN: {

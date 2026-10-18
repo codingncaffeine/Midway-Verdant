@@ -74,6 +74,7 @@ private:
     // --break-eip: hardware execution breakpoints, armed at init and dropped after the first debug exit.
     std::vector<u32> break_eips_;
     bool breakpoints_armed_{false};
+    u32 mmio_breaks_{0};
 };
 
 }  // namespace mv

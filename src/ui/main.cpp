@@ -46,6 +46,7 @@ void print_usage() {
         "  --watch HEX,...    log every change of these physical RAM words (polled each tick) under the boot trace\n"
         "  --break-smbus AA:CC  log the CPU registers and stack (boot trace) when SMBus address AA gets command CC written\n"
         "  --break-eip HEX,...  log the CPU registers and stack (boot trace) the first time execution reaches each address (up to 4)\n"
+        "  --break-mmio ADDR[=VALUE][*N]  log the CPU registers and stack (boot trace) at a write to physical ADDR (hex), optionally only of VALUE, up to N times\n"
         "  --reset-at S       press the front-panel reset S seconds into the run (a warm reboot)\n"
         "  --window           show the console's scanout in a window (Escape or closing it ends the run)\n"
         "  --gpu              render the console's graphics live on the host's Vulkan device (frames land in guest RAM)\n"
@@ -164,6 +165,17 @@ int main(int argc, char** argv) {
             }
             cfg.break_smbus_write = std::make_pair(static_cast<mv::u8>(std::strtoul(spec.substr(0, colon).c_str(), nullptr, 16)),
                                                    static_cast<mv::u8>(std::strtoul(spec.substr(colon + 1).c_str(), nullptr, 16)));
+        } else if (a == "--break-mmio") {
+            std::string spec = need("--break-mmio");
+            mv::MachineConfig::MmioBreak b;
+            if (const auto star = spec.find('*'); star != std::string::npos) {
+                b.count = static_cast<mv::u32>(std::strtoul(spec.c_str() + star + 1, nullptr, 10));
+                spec.resize(star);
+            }
+            const auto eq = spec.find('=');
+            b.address = static_cast<mv::u32>(std::strtoul(spec.substr(0, eq).c_str(), nullptr, 16));
+            if (eq != std::string::npos) b.value = static_cast<mv::u32>(std::strtoul(spec.c_str() + eq + 1, nullptr, 16));
+            cfg.break_mmio_write = b;
         } else if (a == "--break-eip") {
             const std::string list = need("--break-eip");
             std::size_t pos = 0;

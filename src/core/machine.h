@@ -67,6 +67,14 @@ struct MachineConfig {
     std::optional<std::pair<u8, u8>> break_smbus_write;
     // Instrument: log the CPU's registers and stack the first time execution reaches each of these addresses.
     std::vector<u32> break_eips;
+    // Instrument: log the CPU's registers and stack at a guest write to this physical MMIO address (with `value`,
+    // only when the written value matches), up to `count` times. Fast mode only.
+    struct MmioBreak {
+        u32 address{0};
+        std::optional<u32> value;
+        u32 count{1};
+    };
+    std::optional<MmioBreak> break_mmio_write;
     // Instrument: press the front-panel reset this many seconds of host time into the run.
     std::optional<double> reset_at_seconds;
     // The live GPU: a Vulkan renderer fed by the pushbuffer, writing frames back into guest RAM.
@@ -82,6 +90,7 @@ struct MachineConfig {
 class Machine {
 public:
     explicit Machine(const MachineConfig& config);
+    const MachineConfig& config() const { return config_; }
     ~Machine();
     Machine(const Machine&) = delete;
     Machine& operator=(const Machine&) = delete;
