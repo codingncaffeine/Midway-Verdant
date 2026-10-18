@@ -49,7 +49,7 @@ bool xf_context_slot(u32 method, u32& slot_word) {
 }
 
 // Immediate-mode attribute numbers (the XDK's vertex declaration order).
-constexpr u32 kAttrPosition = 0, kAttrNormal = 2, kAttrDiffuse = 3, kAttrSpecular = 4, kAttrTexcoord0 = 9;
+constexpr u32 kAttrPosition = 0, kAttrWeight = 1, kAttrNormal = 2, kAttrDiffuse = 3, kAttrSpecular = 4, kAttrFog = 5, kAttrTexcoord0 = 9;
 
 }  // namespace
 
@@ -177,10 +177,13 @@ void Kelvin::method(u32 method, u32 value) {
         return;
     }
     // The named immediate methods.
+    // A short float form sets the components it leaves out as well, to those of (x, 0, 0, 1): a 2F texture
+    // coordinate after a 4F one has z = 0 and w = 1 again (a projective lookup divides by that w), a 3F colour has
+    // alpha 1, a 1F weight is (w, 0, 0, 1).
     auto named_float = [&](u32 base, u32 attr, u32 count) -> bool {
         if (method < base || method >= base + count * 4) return false;
         const u32 comp = (method - base) >> 2;
-        if (comp == 0 && count == 3) state_.immediate[attr][3] = 1.0f;
+        for (u32 c = count; c < 4; ++c) state_.immediate[attr][c] = c == 3 ? 1.0f : 0.0f;
         immediate_component(attr, comp, as_float(value), comp == count - 1);
         return true;
     };
@@ -206,8 +209,15 @@ void Kelvin::method(u32 method, u32 value) {
         named_float(mthd::kNormal3f, kAttrNormal, 3) || named_s16x2(mthd::kNormal3s, kAttrNormal, 2, true) ||
         named_float(mthd::kDiffuse4f, kAttrDiffuse, 4) || named_float(mthd::kDiffuse3f, kAttrDiffuse, 3) ||
         named_ub4(mthd::kDiffuse4ub, kAttrDiffuse) || named_float(mthd::kSpecular4f, kAttrSpecular, 4) ||
-        named_float(mthd::kSpecular3f, kAttrSpecular, 3) || named_ub4(mthd::kSpecular4ub, kAttrSpecular))
+        named_float(mthd::kSpecular3f, kAttrSpecular, 3) || named_ub4(mthd::kSpecular4ub, kAttrSpecular) ||
+        named_float(mthd::kWeight1f, kAttrWeight, 1) || named_float(mthd::kWeight2f, kAttrWeight, 2) ||
+        named_float(mthd::kWeight3f, kAttrWeight, 3) || named_float(mthd::kWeight4f, kAttrWeight, 4))
         return;
+    if (method == mthd::kFogCoord) {
+        // The fog coordinate fills all four components of its attribute.
+        for (u32 c = 0; c < 4; ++c) immediate_component(kAttrFog, c, as_float(value), false);
+        return;
+    }
     static constexpr u32 kTex2f[4] = {mthd::kTexcoord0_2f, mthd::kTexcoord1_2f, mthd::kTexcoord2_2f, mthd::kTexcoord3_2f};
     static constexpr u32 kTex2s[4] = {mthd::kTexcoord0_2s, mthd::kTexcoord1_2s, mthd::kTexcoord2_2s, mthd::kTexcoord3_2s};
     static constexpr u32 kTex4f[4] = {mthd::kTexcoord0_4f, mthd::kTexcoord1_4f, mthd::kTexcoord2_4f, mthd::kTexcoord3_4f};

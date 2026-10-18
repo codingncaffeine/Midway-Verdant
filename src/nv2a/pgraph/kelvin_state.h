@@ -38,6 +38,7 @@ constexpr u32 kVertex3f = 0x1500, kVertex4f = 0x1518, kNormal3f = 0x1530, kNorma
               kTexcoord0_2s = 0x1598, kTexcoord0_4f = 0x15A0, kTexcoord0_4s = 0x15B0, kTexcoord1_2f = 0x15B8, kTexcoord1_2s = 0x15C0,
               kTexcoord1_4f = 0x15C8, kTexcoord1_4s = 0x15D8, kTexcoord2_2f = 0x15E0, kTexcoord2_2s = 0x15E8, kTexcoord2_4f = 0x15F0,
               kTexcoord2_4s = 0x1600, kTexcoord3_2f = 0x1608, kTexcoord3_2s = 0x1610, kTexcoord3_4f = 0x1620, kTexcoord3_4s = 0x1630;
+constexpr u32 kFogCoord = 0x1698, kWeight1f = 0x169C, kWeight2f = 0x16A0, kWeight3f = 0x16B0, kWeight4f = 0x16C0;
 constexpr u32 kTextureBase = 0x1B00, kTextureStride = 0x40;  // offset, format, address, control0, control1, filter, rect, palette, border
 constexpr u32 kSemaphoreOffset = 0x1D6C, kSemaphoreRelease = 0x1D70, kZstencilClear = 0x1D8C, kColorClear = 0x1D90, kClearSurface = 0x1D94,
               kClearRectH = 0x1D98, kClearRectV = 0x1D9C;

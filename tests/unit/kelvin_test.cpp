@@ -228,3 +228,31 @@ TEST(Kelvin, ClearsAndSemaphoresReachTheSink) {
     EXPECT_EQ(k.methods_seen(), 3u);
     EXPECT_EQ(k.histogram()[mthd::kClearSurface >> 2], 1u);
 }
+
+TEST(Kelvin, ShortNamedSettersFillTheComponentsTheyLeaveOut) {
+    Kelvin k;
+    const u32 fours[4] = {mthd::kTexcoord0_4f, mthd::kTexcoord1_4f, mthd::kTexcoord2_4f, mthd::kTexcoord3_4f};
+    const u32 twos[4] = {mthd::kTexcoord0_2f, mthd::kTexcoord1_2f, mthd::kTexcoord2_2f, mthd::kTexcoord3_2f};
+    for (u32 t = 0; t < 4; ++t) {
+        const u32 four = fours[t], two = twos[t];
+        for (u32 c = 0; c < 4; ++c) k.method(four + 4 * c, bits(5.0f + static_cast<float>(c)));
+        EXPECT_FLOAT_EQ(k.state().immediate[9 + t][3], 8.0f) << "texcoord " << t;
+        k.method(two, bits(0.25f));
+        k.method(two + 4, bits(0.5f));
+        const auto& v = k.state().immediate[9 + t];
+        EXPECT_FLOAT_EQ(v[0], 0.25f) << "texcoord " << t;
+        EXPECT_FLOAT_EQ(v[1], 0.5f) << "texcoord " << t;
+        EXPECT_FLOAT_EQ(v[2], 0.0f) << "texcoord " << t << ": a 2F coordinate after a 4F one has z = 0";
+        EXPECT_FLOAT_EQ(v[3], 1.0f) << "texcoord " << t << ": and w = 1";
+    }
+    for (u32 c = 0; c < 4; ++c) k.method(mthd::kDiffuse4f + 4 * c, bits(0.5f));
+    for (u32 c = 0; c < 3; ++c) k.method(mthd::kDiffuse3f + 4 * c, bits(0.25f));
+    EXPECT_FLOAT_EQ(k.state().immediate[3][3], 1.0f) << "a 3F colour is opaque";
+    for (u32 c = 0; c < 4; ++c) k.method(mthd::kWeight4f + 4 * c, bits(0.75f));
+    k.method(mthd::kWeight1f, bits(0.125f));
+    EXPECT_EQ(k.state().immediate[1], (std::array<float, 4>{0.125f, 0.0f, 0.0f, 1.0f})) << "attribute 1 is the weight";
+    k.method(mthd::kWeight3f + 4, bits(0.5f));
+    EXPECT_FLOAT_EQ(k.state().immediate[1][1], 0.5f);
+    k.method(mthd::kFogCoord, bits(3.0f));
+    EXPECT_EQ(k.state().immediate[5], (std::array<float, 4>{3.0f, 3.0f, 3.0f, 3.0f})) << "attribute 5 is the fog coordinate, in every lane";
+}
