@@ -2,10 +2,12 @@
 
 #include <array>
 #include <cstring>
+#include <memory>
 #include <string>
 #include <vector>
 
 #include "nv2a/pgraph/kelvin.h"
+#include "nv2a/pgraph/texture.h"
 #include "nv2a/vulkan/vk_device.h"
 #include "nv2a/vulkan/vk_renderer.h"
 
@@ -311,4 +313,139 @@ TEST(Vulkan, AZ24S8WriteBackKeepsTheStencil) {
     u32 word;
     std::memcpy(&word, &ram[0x20000 + 8 * 256 + 8 * 4], 4);
     EXPECT_EQ(word, 0x80000042u) << "the zeta word holds the depth over the stencil byte";
+}
+
+namespace {
+
+// The vertex program: oPos = v0, oD0 = v3, oT0-oT3 = v9-v12.
+void load_texcoord_program(Kelvin& k) {
+    auto enc = [](u32 v, u32 out, bool fin) {
+        std::array<u32, 4> t{};
+        t[1] |= 1u << 21;
+        t[1] |= (v & 15) << 9;
+        t[1] |= (0u << 6) | (1u << 4) | (2u << 2) | 3u;
+        t[2] |= 2u << 26;
+        t[3] |= 1u << 11;
+        t[3] |= (out & 0xFF) << 3;
+        t[3] |= 15u << 12;
+        if (fin) t[3] |= 1u;
+        return t;
+    };
+    k.method(mthd::kTransformProgramLoad, 0);
+    for (const auto& t : {enc(0, 0, false), enc(3, 3, false), enc(9, 9, false), enc(10, 10, false), enc(11, 11, false), enc(12, 12, true)})
+        for (u32 w = 0; w < 4; ++w) k.method(mthd::kTransformProgram + 4 * w, t[w]);
+    k.method(mthd::kTransformProgramStart, 0);
+    k.method(mthd::kTransformExecutionMode, 2);
+}
+
+// Combiners whose output is texture stage `stage`: colour = t (A = t, B = one), alpha = t.a.
+void output_texture_stage(Kelvin& k, u32 stage) {
+    k.method(mthd::kCombinerControl, 1);
+    k.method(mthd::kCombinerColorIcw, ((8u + stage) << 24) | ((1u << 5) << 16));
+    k.method(mthd::kCombinerColorOcw, 12u << 4);
+    k.method(mthd::kCombinerAlphaIcw, (((8u + stage) | 0x10u) << 24) | ((1u << 5) << 16));
+    k.method(mthd::kCombinerAlphaOcw, 12u << 4);
+    k.method(mthd::kCombinerSpecFogCw0, (12u << 24) | ((1u << 5) << 16));
+    k.method(mthd::kCombinerSpecFogCw1, (12u | 0x10u) << 8);
+}
+
+// A swizzled A8R8G8B8 texture of 2^log x 2^log texels at `offset`, one level, nearest filtering, clamped to the
+// edge; texel (x, y) is texel(x, y).
+template <typename F>
+void load_texture(Kelvin& k, std::vector<u8>& ram, u32 stage, u32 offset, u32 log, F texel) {
+    for (u32 y = 0; y < (1u << log); ++y)
+        for (u32 x = 0; x < (1u << log); ++x) {
+            const u32 v = texel(x, y);
+            std::memcpy(&ram[offset + swizzled_offset(x, y, 0, log, log, 0) * 4], &v, 4);
+        }
+    const u32 b = mthd::kTextureBase + mthd::kTextureStride * stage;
+    k.method(b + 0x0, offset);
+    k.method(b + 0x4, (log << 24) | (log << 20) | (1u << 16) | (0x06u << 8) | (2u << 4) | 1u);
+    k.method(b + 0x8, 0x00030303);              // clamp to edge in u, v and p
+    k.method(b + 0xC, 0x40000000);              // enabled
+    k.method(b + 0x14, (1u << 24) | (1u << 16));  // nearest
+}
+
+void texcoord(Kelvin& k, u32 set, float s, float t, float r, float q) {
+    const u32 base = mthd::kTexcoord0_4f + 0x28 * set;
+    k.method(base + 0, bits(s));
+    k.method(base + 4, bits(t));
+    k.method(base + 8, bits(r));
+    k.method(base + 12, bits(q));
+}
+
+struct TextureShaderFixture {
+    vk::Device device;
+    std::vector<u8> ram = std::vector<u8>(4u << 20, 0);
+    RamResolver handles;
+    std::unique_ptr<VulkanRenderer> renderer;
+    Kelvin k;
+    bool init(std::string& error) {
+        if (!device.init(error)) return false;
+        handles.size = static_cast<u32>(ram.size());
+        renderer = std::make_unique<VulkanRenderer>(device, handles, ram.data(), static_cast<u32>(ram.size()));
+        if (!renderer->init(error)) return false;
+        k.set_sink(renderer.get());
+        setup_target(k);
+        load_texcoord_program(k);
+        k.method(mthd::kVertexDataArrayFormat + 12, 2u);  // diffuse, texcoords: their current values
+        return true;
+    }
+};
+
+}  // namespace
+
+TEST(Vulkan, DotSTLooksUpTheTwoDotProducts) {
+    TextureShaderFixture f;
+    std::string error;
+    if (!f.init(error)) GTEST_SKIP() << "no Vulkan device: " << error;
+    Kelvin& k = f.k;
+    // Stage 0: a 1x1 normal map, R 0x7F G 0x81 B 0x00 = (1, -1, 0) as two's complement / 127 (dot mapping 3).
+    load_texture(k, f.ram, 0, 0x200000, 0, [](u32, u32) { return 0xFF7F8100u; });
+    // Stage 2: a 4x4 texture whose texel (x, y) is R = 0x40 x, G = 0x40 y, B = 0x11.
+    load_texture(k, f.ram, 2, 0x210000, 2, [](u32 x, u32 y) { return 0xFF000011u | (0x40u * x) << 16 | (0x40u * y) << 8; });
+    k.method(mthd::kShaderStageProgram, 1u | (0x11u << 5) | (9u << 10));  // 2D, dot product, dot ST
+    k.method(mthd::kShaderOtherStageInput, 0);                              // stage 2 reads stage 0
+    k.method(mthd::kDotRgbMapping, 0x033);
+    output_texture_stage(k, 2);
+    texcoord(k, 0, 0.5f, 0.5f, 0.0f, 1.0f);
+    // dot1 = (0.875, 0.5, 7) . (1, -1, 0) = 0.375 and dot2 = (1.125, 0.5, 3) . (1, -1, 0) = 0.625: the centre of
+    // texel (1, 2) of the 4x4 texture. (Read as 0..1 instead, the normal would give texel (2, 3).)
+    texcoord(k, 1, 0.875f, 0.5f, 7.0f, 1.0f);
+    texcoord(k, 2, 1.125f, 0.5f, 3.0f, 1.0f);
+    draw_full_triangle(k, f.ram);
+    f.renderer->end_frame();
+    for (const auto& e : f.renderer->stats().errors) ADD_FAILURE() << "renderer: " << e;
+    EXPECT_EQ(f.renderer->stats().skipped, 0u);
+    EXPECT_EQ(pixel_at(f.ram, 8, 8), 0xFF408011u);
+    EXPECT_EQ(pixel_at(f.ram, 40, 20), 0xFF408011u);
+}
+
+TEST(Vulkan, DotZWWritesTheRatioOfTheTwoDotProductsAsTheDepth) {
+    TextureShaderFixture f;
+    std::string error;
+    if (!f.init(error)) GTEST_SKIP() << "no Vulkan device: " << error;
+    Kelvin& k = f.k;
+    k.method(mthd::kZstencilClear, 0xFFFFFF00);
+    k.method(mthd::kClearRectH, 63u << 16);
+    k.method(mthd::kClearRectV, 63u << 16);
+    k.method(mthd::kClearSurface, 0x03);
+    k.method(mthd::kDepthTestEnable, 1);
+    k.method(mthd::kDepthFunc, 0x207);  // always
+    k.method(mthd::kDepthMask, 1);
+    load_texture(k, f.ram, 0, 0x200000, 0, [](u32, u32) { return 0xFF7F8100u; });  // (1, -1, 0) under mapping 3
+    k.method(mthd::kShaderStageProgram, 1u | (0x11u << 5) | (0xAu << 10));
+    k.method(mthd::kDotRgbMapping, 0x033);
+    output_texture_stage(k, 0);
+    texcoord(k, 0, 0.5f, 0.5f, 0.0f, 1.0f);
+    texcoord(k, 1, 0.75f, 0.5f, 0.0f, 1.0f);  // dot1 = 0.25
+    texcoord(k, 2, 1.5f, 0.5f, 0.0f, 1.0f);   // dot2 = 1.0: depth 0.25 of the 24-bit range
+    draw_full_triangle(k, f.ram);
+    f.renderer->end_frame();
+    f.renderer->write_back_all();
+    for (const auto& e : f.renderer->stats().errors) ADD_FAILURE() << "renderer: " << e;
+    u32 word;
+    std::memcpy(&word, &f.ram[0x20000 + 8 * 256 + 8 * 4], 4);
+    EXPECT_NEAR(static_cast<double>(word >> 8), 0.25 * 16777215.0, 1.0) << std::hex << word;
+    EXPECT_EQ(pixel_at(f.ram, 8, 8), 0xFF7F8100u) << "the colour still draws";
 }

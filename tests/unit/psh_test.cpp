@@ -1,7 +1,9 @@
 #include <gtest/gtest.h>
 
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
+#include <format>
 #include <string>
 
 #include "nv2a/pgraph/kelvin.h"
@@ -179,4 +181,108 @@ TEST(Psh, ClipPlaneTakesEachComponentsSenseFromTheModeRegister) {
     s.r[mthd::kShaderClipPlaneMode >> 2] = 0x5u;  // stage 0's bits only
     const Translation t0 = translate(key_from_state(s));
     EXPECT_NE(t0.glsl.find("if (any(lessThan(vtx_t1, vec4(0.0)))) discard;"), std::string::npos) << t0.glsl;
+}
+
+namespace {
+u32 fbits(float f) {
+    u32 v;
+    std::memcpy(&v, &f, 4);
+    return v;
+}
+// Texture stage `stage` enabled with the given FORMAT word (only its shader-shaping fields matter here).
+void enable_texture(KelvinState& s, u32 stage, u32 format) {
+    s.r[(mthd::kTextureBase + mthd::kTextureStride * stage + 4) >> 2] = format;
+    s.r[(mthd::kTextureBase + mthd::kTextureStride * stage + 0xC) >> 2] = 0x40000000;
+}
+constexpr u32 kFormat2D = 0x00010620, kFormatCube = 0x00010624, kFormat3D = 0x00010630;  // A8R8G8B8, one level
+}  // namespace
+
+TEST(Psh, EveryDotModeAndMappingCompiles) {
+    struct Case {
+        const char* name;
+        u32 program;  // SET_SHADER_STAGE_PROGRAM
+        u32 out;      // the stage the combiners output
+        std::array<u32, 4> formats;
+        std::array<SamplerKind, 4> samplers;
+    };
+    using enum SamplerKind;
+    const Case cases[] = {
+        {"dot ST", 1u | (0x11u << 5) | (9u << 10), 2, {kFormat2D, 0, kFormat2D, 0}, {Sampler2D, None, Sampler2D, None}},
+        {"dot ST on a volume", 1u | (0x11u << 5) | (9u << 10), 2, {kFormat2D, 0, kFormat3D, 0}, {Sampler2D, None, Sampler3D, None}},
+        {"dot ZW", 1u | (0x11u << 5) | (0xAu << 10), 0, {kFormat2D, 0, 0, 0}, {Sampler2D, None, None, None}},
+        {"dot STR 3D", 1u | (0x11u << 5) | (0x11u << 10) | (0xDu << 15), 3, {kFormat2D, 0, 0, kFormat3D}, {Sampler2D, None, None, Sampler3D}},
+        {"dot STR cube", 1u | (0x11u << 5) | (0x11u << 10) | (0xEu << 15), 3, {kFormat2D, 0, 0, kFormatCube}, {Sampler2D, None, None, SamplerCube}},
+        {"dot reflect", 1u | (0x11u << 5) | (0xBu << 10) | (0xCu << 15), 3, {kFormat2D, 0, kFormatCube, kFormatCube},
+         {Sampler2D, None, SamplerCube, SamplerCube}},
+        {"dot reflect const", 1u | (0x11u << 5) | (0x11u << 10) | (0x12u << 15), 3, {kFormat2D, 0, 0, kFormatCube},
+         {Sampler2D, None, None, SamplerCube}},
+        {"dot STR cube on a 2D texture", 1u | (0x11u << 5) | (0x11u << 10) | (0xEu << 15), 3, {kFormat2D, 0, 0, kFormat2D},
+         {Sampler2D, None, None, None}},
+    };
+    for (const Case& c : cases) {
+        for (u32 mapping = 0; mapping < 8; ++mapping) {
+            KelvinState s = output_texture(c.out);
+            s.r[mthd::kShaderStageProgram >> 2] = c.program;
+            s.r[mthd::kDotRgbMapping >> 2] = mapping * 0x111u;
+            for (u32 i = 0; i < 4; ++i)
+                if (c.formats[i]) enable_texture(s, i, c.formats[i]);
+            const Key k = key_from_state(s);
+            EXPECT_EQ(k.dot_mapping, mapping * 0x111u);
+            const Translation t = translate(k);
+            SCOPED_TRACE(std::format("{}, mapping {}", c.name, mapping));
+            EXPECT_EQ(t.samplers, c.samplers);
+            expect_compiles(t, c.name);
+            EXPECT_NE(t.glsl.find(std::format("dot1 = dot(vtx_t1.xyz, psh_dotmap{}(t0));", mapping)), std::string::npos) << t.glsl;
+        }
+    }
+}
+
+TEST(Psh, DotModesReadTheirSourceStageAndTheEyeVector) {
+    KelvinState s = output_texture(3);
+    s.r[mthd::kShaderStageProgram >> 2] = 1u | (0x11u << 5) | (0x11u << 10) | (0x12u << 15);
+    s.r[mthd::kShaderOtherStageInput >> 2] = (1u << 16) | (2u << 20);  // stage 2 reads stage 1, stage 3 stage 2
+    s.r[mthd::kDotRgbMapping >> 2] = 0x321;
+    enable_texture(s, 0, kFormat2D);
+    enable_texture(s, 3, kFormatCube);
+    s.r[mthd::kEyeVector >> 2] = fbits(0.25f);
+    s.r[(mthd::kEyeVector + 4) >> 2] = fbits(-0.5f);
+    s.r[(mthd::kEyeVector + 8) >> 2] = fbits(2.0f);
+    const Translation t = translate(key_from_state(s));
+    EXPECT_NE(t.glsl.find("dot1 = dot(vtx_t1.xyz, psh_dotmap1(t0));"), std::string::npos) << t.glsl;
+    EXPECT_NE(t.glsl.find("dot2 = dot(vtx_t2.xyz, psh_dotmap2(t1));"), std::string::npos) << t.glsl;
+    EXPECT_NE(t.glsl.find("dot3 = dot(vtx_t3.xyz, psh_dotmap3(t2));"), std::string::npos) << t.glsl;
+    EXPECT_NE(t.glsl.find("vec3 e = eye.xyz;"), std::string::npos) << t.glsl;
+    expect_compiles(t, "dot sources");
+    // A source that is not an earlier stage has no result yet: zero.
+    s.r[mthd::kShaderOtherStageInput >> 2] = 3u << 20;
+    EXPECT_NE(translate(key_from_state(s)).glsl.find("dot3 = dot(vtx_t3.xyz, psh_dotmap3(vec4(0.0)));"), std::string::npos);
+    Uniforms u{};
+    uniforms_from_state(s, {{{1.0f, 1.0f}, {1.0f, 1.0f}, {1.0f, 1.0f}, {1.0f, 1.0f}}}, u);
+    EXPECT_FLOAT_EQ(u.eye[0], 0.25f);
+    EXPECT_FLOAT_EQ(u.eye[1], -0.5f);
+    EXPECT_FLOAT_EQ(u.eye[2], 2.0f);
+}
+
+TEST(Psh, DotZWReplacesTheDepth) {
+    KelvinState s = output_texture(0);
+    s.r[mthd::kShaderStageProgram >> 2] = 1u | (0x11u << 5) | (0xAu << 10);
+    enable_texture(s, 0, kFormat2D);
+    const Translation t = translate(key_from_state(s));
+    EXPECT_NE(t.glsl.find("float depth = dot1 / dot2;"), std::string::npos) << t.glsl;
+    EXPECT_NE(t.glsl.find("gl_FragDepth = depth;"), std::string::npos) << t.glsl;
+    expect_compiles(t, "dot ZW");
+}
+
+TEST(Psh, ADotModeOutsideItsStagesReadsAsNone) {
+    // Dot ST in stage 1 has no earlier dot product to pair with; dot reflect specular exists only in stage 3.
+    KelvinState s = output_texture(1);
+    s.r[mthd::kShaderStageProgram >> 2] = 1u | (9u << 5) | (0xCu << 10);
+    enable_texture(s, 0, kFormat2D);
+    enable_texture(s, 1, kFormat2D);
+    enable_texture(s, 2, kFormatCube);
+    const Translation t = translate(key_from_state(s));
+    EXPECT_EQ(t.samplers[1], SamplerKind::None);
+    EXPECT_EQ(t.samplers[2], SamplerKind::None);
+    EXPECT_EQ(t.glsl.find("dot1 ="), std::string::npos) << t.glsl;
+    expect_compiles(t, "misplaced dot modes");
 }

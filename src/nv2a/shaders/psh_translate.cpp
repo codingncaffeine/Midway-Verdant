@@ -21,10 +21,99 @@ bool depth_format(u32 color_format) {
 // shader's, as the public NV_texture_shader specification describes it (each mode below names its operation there),
 // and the Direct3D 8 ps.1.x texture instruction it implements.
 enum : u32 {
-    kModeNone = 0, kModeProject2D = 1, kModeProject3D = 2, kModeCube = 3, kModePassThrough = 4, kModeClipPlane = 5
+    kModeNone = 0, kModeProject2D = 1, kModeProject3D = 2, kModeCube = 3, kModePassThrough = 4, kModeClipPlane = 5,
+    kModeDotST = 9,                   // DOT_PRODUCT_TEXTURE_2D: texm3x2tex
+    kModeDotZW = 0xA,                 // DOT_PRODUCT_DEPTH_REPLACE: texm3x2depth
+    kModeDotReflectDiffuse = 0xB,     // DOT_PRODUCT_DIFFUSE_CUBE_MAP (the middle row of a 3x3 reflect)
+    kModeDotReflectSpecular = 0xC,    // DOT_PRODUCT_REFLECT_CUBE_MAP: texm3x3vspec, the eye from the three q
+    kModeDotSTR3D = 0xD,              // DOT_PRODUCT_TEXTURE_3D (NV_texture_shader2): texm3x3tex on a volume
+    kModeDotSTRCube = 0xE,            // DOT_PRODUCT_TEXTURE_CUBE_MAP: texm3x3tex
+    kModeDotProduct = 0x11,           // DOT_PRODUCT: texm3x2pad, texm3x3pad
+    kModeDotReflectSpecularConst = 0x12  // DOT_PRODUCT_CONST_EYE_REFLECT_CUBE_MAP: texm3x3spec, a constant eye
 };
 
 u32 stage_mode(const Key& key, u32 stage) { return (key.shader_stage_program >> (5 * stage)) & 0x1Fu; }
+
+// The stages each mode exists in (the public nxdk register header lists the values per stage): a mode that reads
+// earlier stages' dot products needs that many stages before it. Elsewhere it has no meaning; it is read as none,
+// as an inconsistent NV_texture_shader stage is.
+bool mode_valid_at(u32 mode, u32 stage) {
+    switch (mode) {
+        case kModeDotProduct: return stage == 1 || stage == 2;
+        case kModeDotST: case kModeDotZW: return stage >= 2;
+        case kModeDotReflectDiffuse: return stage == 2;
+        case kModeDotReflectSpecular: case kModeDotSTR3D: case kModeDotSTRCube: case kModeDotReflectSpecularConst: return stage == 3;
+        default: return true;
+    }
+}
+
+bool dot_mode(u32 mode) {
+    switch (mode) {
+        case kModeDotST: case kModeDotZW: case kModeDotReflectDiffuse: case kModeDotReflectSpecular: case kModeDotSTR3D:
+        case kModeDotSTRCube: case kModeDotProduct: case kModeDotReflectSpecularConst: return true;
+        default: return false;
+    }
+}
+
+// The earlier stage whose result a stage reads (SET_SHADER_OTHER_STAGE_INPUT): stage 1 always reads stage 0, stage 2
+// the stage in bits 19-16, stage 3 the one in bits 23-20.
+u32 source_stage(const Key& key, u32 stage) {
+    if (stage == 2) return (key.other_stage_input >> 16) & 0xFu;
+    if (stage == 3) return (key.other_stage_input >> 20) & 0xFu;
+    return 0;
+}
+
+// The source's colour as GLSL: a stage that is not earlier than this one has no result yet, so it reads zero.
+std::string source_name(const Key& key, u32 stage) {
+    const u32 src = source_stage(key, stage);
+    return src < stage ? std::format("t{}", src) : std::string("vec4(0.0)");
+}
+
+// This stage's dot product: its (s, t, r) with the source's colour as SET_DOT_RGBMAPPING maps it (bits 2-0 for
+// stage 1, 6-4 for stage 2, 10-8 for stage 3).
+std::string dot_expr(const Key& key, u32 stage) {
+    const u32 mapping = stage == 0 ? 0 : (key.dot_mapping >> (4 * (stage - 1))) & 7u;
+    return std::format("dot(vtx_t{}.xyz, psh_dotmap{}({}))", stage, mapping, source_name(key, stage));
+}
+
+// The dot mappings, written from the mapping names in the public register headers (zero to one; minus one to one in
+// the Microsoft, OpenGL and NVIDIA conventions; HILO; HILO hemisphere in the same three conventions). The colour
+// arrives as unsigned 0..1 channels in our R G B A order (the guest's ARGB names), so a signed byte is the channel's
+// byte read as two's complement. HILO takes the texel's 32 bits as two 16-bit halves, A R high and G B low; the
+// hemisphere forms add z = sqrt(1 - hi^2 - lo^2) as NV_texture_shader's signed HILO does. The reference emulator
+// passes mappings 5-7 through unchanged; ours follow the NV form, unconfirmed on hardware [verify]. The NVIDIA signed
+// 8-bit convention is byte / 127 here, as both behaviour references read it; NVIDIA's own table (NV_texture_shader,
+// signed fixed point) has 127 -> 0.992, which would be byte / 128 [verify].
+constexpr const char* kDotMapFunctions =
+    "float psh_s8(float x) {\n"
+    "    float b = x * 255.0;\n"
+    "    return b >= 127.5 ? b - 256.0 : b;\n"
+    "}\n"
+    "vec3 psh_s8v(vec3 c) { return vec3(psh_s8(c.r), psh_s8(c.g), psh_s8(c.b)); }\n"
+    "float psh_s16(float v) { return v >= 32767.5 ? v - 65536.0 : v; }\n"
+    "vec2 psh_hilo(vec4 c) { return vec2(c.a * 65280.0 + c.r * 255.0, c.g * 65280.0 + c.b * 255.0); }\n"
+    "vec3 psh_hemisphere(vec2 hl) { return vec3(hl, sqrt(max(0.0, 1.0 - dot(hl, hl)))); }\n"
+    "vec3 psh_dotmap0(vec4 c) { return c.rgb; }\n"
+    "vec3 psh_dotmap1(vec4 c) { return (c.rgb * 255.0 - 128.0) / 127.0; }\n"
+    "vec3 psh_dotmap2(vec4 c) { return (2.0 * psh_s8v(c.rgb) + 1.0) / 255.0; }\n"
+    "vec3 psh_dotmap3(vec4 c) { return psh_s8v(c.rgb) / 127.0; }\n"
+    "vec3 psh_dotmap4(vec4 c) { return vec3(psh_hilo(c) / 65535.0, 1.0); }\n"
+    "vec3 psh_dotmap5(vec4 c) { return psh_hemisphere((psh_hilo(c) - 32768.0) / 32767.0); }\n"
+    "vec3 psh_dotmap6(vec4 c) {\n"
+    "    vec2 h = psh_hilo(c);\n"
+    "    return psh_hemisphere((2.0 * vec2(psh_s16(h.x), psh_s16(h.y)) + 1.0) / 65535.0);\n"
+    "}\n"
+    "vec3 psh_dotmap7(vec4 c) {\n"
+    "    vec2 h = psh_hilo(c);\n"
+    "    return psh_hemisphere(vec2(psh_s16(h.x), psh_s16(h.y)) / 32767.0);\n"
+    "}\n";
+
+// A two-coordinate lookup into stage i's texture: a linear texture's coordinates are in texels (tex_scale holds
+// 1 / size), and a volume texture in a 2D mode takes `r` as its third coordinate [verify].
+std::string lookup_2d(u32 i, SamplerKind kind, const std::string& st, const std::string& r) {
+    if (kind == SamplerKind::Sampler3D) return std::format("texture(tex{}, vec3({}, {}))", i, st, r);
+    return std::format("texture(tex{0}, ({1}) * tex_scale[{0}].xy)", i, st);
+}
 
 // What each stage's texture binding must receive.
 SamplerKind sampler_kind(const Key& key, u32 stage) {
@@ -33,7 +122,7 @@ SamplerKind sampler_kind(const Key& key, u32 stage) {
     const bool cube = (fmt >> 2) & 1u;
     const u32 dim = (fmt >> 4) & 0xFu;
     const u32 color = (fmt >> 8) & 0xFFu;
-    if (!key.texture_enabled[stage]) return SamplerKind::None;
+    if (!key.texture_enabled[stage] || !mode_valid_at(mode, stage)) return SamplerKind::None;
     switch (mode) {
         case kModeProject2D:
         case kModeProject3D:
@@ -41,6 +130,18 @@ SamplerKind sampler_kind(const Key& key, u32 stage) {
             if (mode == kModeCube || cube) return SamplerKind::SamplerCube;
             if (mode == kModeProject3D && depth_format(color)) return SamplerKind::Shadow2D;
             return dim == 3 ? SamplerKind::Sampler3D : SamplerKind::Sampler2D;
+        // The dependent modes read the kind of texture they are made for; another kind makes the stage inconsistent
+        // (NV_texture_shader), which reads as none. A 2D texture in the 3D mode is a volume one texel deep.
+        case kModeDotST:
+            if (cube) return SamplerKind::None;
+            return dim == 3 ? SamplerKind::Sampler3D : SamplerKind::Sampler2D;
+        case kModeDotSTR3D:
+            if (cube) return SamplerKind::None;
+            return dim == 3 ? SamplerKind::Sampler3D : SamplerKind::Sampler2D;
+        case kModeDotReflectDiffuse:
+        case kModeDotReflectSpecular:
+        case kModeDotSTRCube:
+        case kModeDotReflectSpecularConst: return cube ? SamplerKind::SamplerCube : SamplerKind::None;
         default: return SamplerKind::None;
     }
 }
@@ -155,6 +256,7 @@ Key key_from_state(const KelvinState& s) {
     k.shader_stage_program = s.reg(mthd::kShaderStageProgram);
     k.other_stage_input = s.reg(mthd::kShaderOtherStageInput);
     k.clip_plane_mode = s.reg(mthd::kShaderClipPlaneMode) & 0xFFFFu;
+    k.dot_mapping = s.reg(mthd::kDotRgbMapping) & 0x777u;
     k.shadow_compare_func = s.reg(kShadowCompareFunc) & 7u;
     for (u32 t = 0; t < 4; ++t) {
         const TextureStage ts = s.texture(t);
@@ -199,6 +301,8 @@ void uniforms_from_state(const KelvinState& s, const std::array<std::array<float
         else out.tex_scale[t][2] = 65535.0f;
         out.tex_scale[t][3] = 0.0f;
     }
+    for (u32 c = 0; c < 3; ++c) out.eye[c] = s.regf(mthd::kEyeVector + 4 * c);
+    out.eye[3] = 0.0f;
 }
 
 Translation translate(const Key& key) {
@@ -220,6 +324,7 @@ Translation translate(const Key& key) {
         "    vec4 fog_color;\n"
         "    vec4 alpha_ref;\n"
         "    vec4 tex_scale[4];\n"
+        "    vec4 eye;\n"
         "};\n";
     // Texture stages: which sampler each needs.
     for (u32 i = 0; i < 4; ++i) {
@@ -228,15 +333,22 @@ Translation translate(const Key& key) {
         const char* type = kind == SamplerKind::SamplerCube ? "samplerCube" : (kind == SamplerKind::Sampler3D ? "sampler3D" : "sampler2D");
         if (kind != SamplerKind::None) g += std::format("layout(set = 0, binding = {}) uniform {} tex{};\n", kSamplerBindingBase + i, type, i);
     }
+    bool dots = false;
+    for (u32 i = 0; i < 4; ++i) dots |= dot_mode(stage_mode(key, i)) && mode_valid_at(stage_mode(key, i), i);
+    if (dots) g += kDotMapFunctions;
     g += "\nlayout(location = 0) out vec4 frag_color;\n\n";
     g += "void main() {\n";
     g += "    vec4 v0 = vtx_d0;\n    vec4 v1 = vtx_d1;\n";
     g += std::format("    vec4 fog = vec4(fog_color.rgb, {});\n", key.fog_enable ? "clamp(vtx_fog, 0.0, 1.0)" : "1.0");
     // A stage without a result (mode none, a disabled texture) reads (0, 0, 0, 0), as NV_texture_shader's NONE does.
     for (u32 i = 0; i < 4; ++i) g += std::format("    vec4 t{} = vec4(0.0);\n", i);
+    if (dots) g += "    float dot0 = 0.0, dot1 = 0.0, dot2 = 0.0, dot3 = 0.0;\n";
     for (u32 i = 0; i < 4; ++i) {
-        const u32 mode = stage_mode(key, i);
+        const u32 mode = mode_valid_at(stage_mode(key, i), i) ? stage_mode(key, i) : kModeNone;
         const SamplerKind kind = t.samplers[i];
+        // Every dot mode first takes this stage's dot product (NV_texture_shader: dotC); the lookups then read it
+        // with the earlier stages' ones.
+        if (dot_mode(mode)) g += std::format("    dot{} = {};\n", i, dot_expr(key, i));
         switch (mode) {
             case kModeNone: break;
             case kModeProject2D:
@@ -287,6 +399,57 @@ Translation translate(const Key& key) {
                 }
                 break;
             }
+            case kModeDotProduct:
+                // A dot product alone: its result feeds the stages after it and its colour is (0, 0, 0, 0)
+                // (NV_texture_shader DOT_PRODUCT; D3D's texm3x2pad / texm3x3pad results are not readable).
+                break;
+            case kModeDotST:
+                // (s, t) = (the previous stage's dot, this stage's dot): texm3x2tex.
+                if (kind != SamplerKind::None) g += std::format("    t{0} = {1};\n", i, lookup_2d(i, kind, std::format("vec2(dot{}, dot{})", i - 1, i), "0.0"));
+                break;
+            case kModeDotZW:
+                // The fragment's depth becomes the previous stage's dot over this stage's one, in the [0, 1] window
+                // range; a depth outside it rejects the fragment (NV_texture_shader DOT_PRODUCT_DEPTH_REPLACE; D3D's
+                // texm3x2depth text instead clamps it and makes a zero divisor 1.0 [verify]). The colour is zero.
+                g += std::format(
+                    "    {{\n"
+                    "        float depth = dot{0} / dot{1};\n"
+                    "        if (!(depth >= 0.0 && depth <= 1.0)) discard;\n"
+                    "        gl_FragDepth = depth;\n"
+                    "    }}\n",
+                    i - 1, i);
+                break;
+            case kModeDotReflectDiffuse:
+                // Stage 2 of a 3x3 reflection looks the normal itself up in its cube map: (dot1, dot2, dot3), with
+                // stage 3's dot taken here from stage 3's coordinates, source and mapping (NV_texture_shader
+                // DOT_PRODUCT_DIFFUSE_CUBE_MAP).
+                g += std::format("    dot3 = {};\n", dot_expr(key, 3));
+                if (kind != SamplerKind::None) g += "    t2 = texture(tex2, vec3(dot1, dot2, dot3));\n";
+                break;
+            case kModeDotReflectSpecular:
+            case kModeDotReflectSpecularConst:
+                // The normal N = (dot1, dot2, dot3) reflects the eye vector E: R = 2 N (N.E) / (N.N) - E, looked up in
+                // the cube map. E is the q coordinates of stages 1-3 in mode 0xC (texm3x3vspec) and SET_EYE_VECTOR
+                // in mode 0x12 (texm3x3spec's constant eye; NV_texture_shader's CONST_EYE) [verify: the register].
+                if (kind != SamplerKind::None) {
+                    g += std::format(
+                        "    {{\n"
+                        "        vec3 n = vec3(dot1, dot2, dot3);\n"
+                        "        vec3 e = {};\n"
+                        "        t3 = texture(tex3, 2.0 * dot(n, e) / dot(n, n) * n - e);\n"
+                        "    }}\n",
+                        mode == kModeDotReflectSpecular ? "vec3(vtx_t1.w, vtx_t2.w, vtx_t3.w)" : "eye.xyz");
+                }
+                break;
+            case kModeDotSTR3D:
+                // (s, t, r) = (dot1, dot2, dot3) into a volume texture: texm3x3tex.
+                if (kind == SamplerKind::Sampler3D) g += "    t3 = texture(tex3, vec3(dot1, dot2, dot3));\n";
+                else if (kind != SamplerKind::None) g += std::format("    t3 = {};\n", lookup_2d(3, kind, "vec2(dot1, dot2)", "dot3"));
+                break;
+            case kModeDotSTRCube:
+                // (dot1, dot2, dot3) as a cube-map direction: texm3x3tex.
+                if (kind != SamplerKind::None) g += "    t3 = texture(tex3, vec3(dot1, dot2, dot3));\n";
+                break;
             default:
                 if (t.error.empty()) t.error = std::format("texture stage {} mode {} is not supported yet", i, mode);
                 break;

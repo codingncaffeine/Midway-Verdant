@@ -18,6 +18,7 @@ struct Key {
     u32 shader_stage_program{0};
     u32 other_stage_input{0};
     u32 clip_plane_mode{0};  // SET_SHADER_CLIP_PLANE_MODE: four bits per stage, one per component
+    u32 dot_mapping{0};      // SET_DOT_RGBMAPPING: how stages 1-3 read their source's colour for a dot product
     u32 shadow_compare_func{0};
     std::array<u32, 4> texture_format{};  // only the fields that shape the shader (dimensionality, cube, colour)
     std::array<bool, 4> texture_enabled{};
@@ -36,8 +37,9 @@ struct Uniforms {
     float fog_color[4];
     float alpha_ref[4];   // x = reference 0..1
     float tex_scale[4][4];  // xy = 1 / texture size for linear textures (1 otherwise), z = depth compare scale, w = unused
+    float eye[4];           // xyz = SET_EYE_VECTOR, the constant eye of the dot-reflect-specular-constant mode
 };
-static_assert(sizeof(Uniforms) == 24 * 16);
+static_assert(sizeof(Uniforms) == 25 * 16);
 void uniforms_from_state(const KelvinState& state, const std::array<std::array<float, 2>, 4>& texture_scale, Uniforms& out);
 
 enum class SamplerKind : u8 { None, Sampler2D, SamplerCube, Sampler3D, Shadow2D };
