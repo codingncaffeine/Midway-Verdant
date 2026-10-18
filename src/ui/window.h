@@ -18,6 +18,9 @@ public:
     ScanoutWindow& operator=(const ScanoutWindow&) = delete;
 
     bool open(std::string& error);
+    // Saves what the window shows as a BMP in `dir` every `seconds` (shot-SSS.bmp, named by the run's second): a
+    // record of a run on a screen nobody else can see.
+    void set_snapshots(const std::string& dir, double seconds);
     // Pumps events and presents frames until `stop` is set (by the machine ending) or the window is closed or
     // Escape pressed, in which case it sets `stop` itself. Returns the number of frames presented.
     unsigned run(Machine& machine, std::atomic<bool>& stop);

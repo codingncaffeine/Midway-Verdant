@@ -99,6 +99,7 @@ public:
     Lpc& lpc() { return lpc_; }
     CpuBackend* cpu() { return cpu_.get(); }
     const pgraph::VulkanRenderer* renderer() const { return renderer_.get(); }
+    std::string gpu_name() const;  // the Vulkan device's name when --gpu is on, else empty
 
     // The machine lock and the wake-up used by the CPU thread's HLT wait.
     std::mutex& lock() { return lock_; }

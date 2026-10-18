@@ -41,6 +41,7 @@ void print_usage() {
         "  --reset-at S       press the front-panel reset S seconds into the run (a warm reboot)\n"
         "  --window           show the console's scanout in a window (Escape or closing it ends the run)\n"
         "  --gpu              render the console's graphics live on the host's Vulkan device (frames land in guest RAM)\n"
+        "  --snapshots DIR    with --window: save what the window shows as DIR/shot-SSS.bmp every 2 seconds\n"
         "  --version, --help\n");
 }
 
@@ -68,6 +69,7 @@ int main(int argc, char** argv) {
     std::FILE* trace_file = nullptr;
     std::string dump_ram;
     bool want_window = false;
+    std::string snapshot_dir;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto need = [&](const char* what) -> const char* {
@@ -141,6 +143,8 @@ int main(int argc, char** argv) {
             want_window = true;
         } else if (a == "--gpu") {
             cfg.gpu = true;
+        } else if (a == "--snapshots") {
+            snapshot_dir = need("--snapshots");
         } else if (a == "--reset-at") {
             cfg.reset_at_seconds = std::atof(need("--reset-at"));
         } else if (a == "--rtc-time") {
@@ -173,12 +177,16 @@ int main(int argc, char** argv) {
     const auto t0 = std::chrono::steady_clock::now();
     const auto duration = std::chrono::nanoseconds(static_cast<long long>(seconds * 1e9));
     mv::Machine::StopReason reason = mv::Machine::StopReason::Duration;
+    if (cfg.gpu) std::printf("gpu: live Vulkan renderer on %s\n", machine.gpu_name().c_str());
+    if (want_window && !cfg.gpu)
+        std::fprintf(stderr, "window: without --gpu the console's graphics are not rendered; the window shows only what the CPU writes into the frame buffer\n");
     if (want_window) {
         mv::ui::ScanoutWindow window;
         if (!window.open(error)) {
             std::fprintf(stderr, "midway-verdant: %s\n", error.c_str());
             return 1;
         }
+        if (!snapshot_dir.empty()) window.set_snapshots(snapshot_dir, 2.0);
         // The machine runs on its own io thread; this thread belongs to the window (SDL wants the main thread).
         std::atomic<bool> stop{false};
         std::thread io([&] {

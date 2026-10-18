@@ -17,6 +17,8 @@ struct ScanoutWindow::Impl {
     SDL_Texture* texture{nullptr};
     u32 width{0}, height{0};
     bool sdl_up{false};
+    std::string snapshot_dir;
+    double snapshot_seconds{0};
 };
 
 ScanoutWindow::ScanoutWindow() : impl_(new Impl) {}
@@ -54,9 +56,17 @@ bool ScanoutWindow::open(std::string& error) {
     return true;
 }
 
+void ScanoutWindow::set_snapshots(const std::string& dir, double seconds) {
+    impl_->snapshot_dir = dir;
+    impl_->snapshot_seconds = seconds;
+}
+
 unsigned ScanoutWindow::run(Machine& machine, std::atomic<bool>& stop) {
     unsigned presented = 0;
     Bus& bus = machine.bus();
+    const u64 t_start = SDL_GetTicks();
+    u64 next_snapshot = impl_->snapshot_seconds > 0 ? static_cast<u64>(impl_->snapshot_seconds * 1000.0) : 0;
+    if (next_snapshot) std::filesystem::create_directories(impl_->snapshot_dir);
     while (!stop.load()) {
         SDL_Event e;
         while (SDL_PollEvent(&e)) {
@@ -103,9 +113,22 @@ unsigned ScanoutWindow::run(Machine& machine, std::atomic<bool>& stop) {
         }
         SDL_SetRenderDrawColor(impl_->renderer, 0, 0, 0, 255);
         SDL_RenderClear(impl_->renderer);
-        if (impl_->texture && sane && start != 0 && static_cast<u64>(start) + static_cast<u64>(pitch) * height <= bus.ram_size()) {
+        const bool showing = impl_->texture && sane && start != 0 && static_cast<u64>(start) + static_cast<u64>(pitch) * height <= bus.ram_size();
+        if (showing) {
             SDL_UpdateTexture(impl_->texture, nullptr, bus.ram() + start, static_cast<int>(pitch));
             SDL_RenderTexture(impl_->renderer, impl_->texture, nullptr, nullptr);
+        }
+        if (next_snapshot && SDL_GetTicks() - t_start >= next_snapshot) {
+            const unsigned second = static_cast<unsigned>(next_snapshot / 1000);
+            const std::string path = impl_->snapshot_dir + "/shot-" + (second < 10 ? "00" : second < 100 ? "0" : "") + std::to_string(second) + ".bmp";
+            SDL_Surface* shot = showing ? SDL_CreateSurfaceFrom(static_cast<int>(width), static_cast<int>(height), SDL_PIXELFORMAT_XRGB8888, bus.ram() + start, static_cast<int>(pitch))
+                                        : SDL_CreateSurface(64, 64, SDL_PIXELFORMAT_XRGB8888);
+            if (shot) {
+                if (!SDL_SaveBMP(shot, path.c_str())) std::fprintf(stderr, "window: snapshot %s: %s\n", path.c_str(), SDL_GetError());
+                SDL_DestroySurface(shot);
+            }
+            std::fprintf(stderr, "window: snapshot at %u s: %s (frame buffer at %08x, %s)\n", second, path.c_str(), start, showing ? "shown" : "nothing to show");
+            next_snapshot += static_cast<u64>(impl_->snapshot_seconds * 1000.0);
         }
         SDL_RenderPresent(impl_->renderer);
         ++presented;

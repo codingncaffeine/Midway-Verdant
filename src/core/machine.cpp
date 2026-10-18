@@ -347,3 +347,7 @@ Machine::StopReason Machine::run(std::chrono::nanoseconds host_duration, std::fu
 }
 
 }  // namespace mv
+
+namespace mv {
+std::string Machine::gpu_name() const { return gpu_device_ ? gpu_device_->name() : std::string(); }
+}  // namespace mv
