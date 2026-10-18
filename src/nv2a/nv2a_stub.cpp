@@ -37,6 +37,12 @@ Nv2aStub::Nv2aStub(Bus& bus, Scheduler& sched, std::function<void(bool)> irq)
         update_irq();
         schedule_vblank();
     };
+    alarm_.name = "nv2a.ptimer-alarm";
+    alarm_.fire = [this](Cycles) {
+        regs_[kPtimerIntr0] |= 1u;
+        update_irq();
+        schedule_alarm();
+    };
     schedule_vblank();
     for (u32 i = 0; i < 768; ++i) dac_[i] = static_cast<u8>(i / 3);  // the colour table powers up as the identity
     kelvin_.set_vertex_memory(this, {bus_.ram(), static_cast<u32>(bus_.ram_size())});
@@ -61,6 +67,9 @@ void Nv2aStub::reset() {
     pgraph_stalled_ = false;
     flip_stalled_ = false;
     report_handle_ = 0;
+    ptimer_offset_ = 0;
+    ctx_switch_subchannel_ = 8;
+    sched_.cancel(alarm_);
     kelvin_ = pgraph::Kelvin();
     kelvin_.set_sink(renderer_);
     kelvin_.set_vertex_memory(this, {bus_.ram(), static_cast<u32>(bus_.ram_size())});
@@ -142,7 +151,22 @@ u64 Nv2aStub::ptimer_ticks() const {
     const u64 gpu_cycles = muldiv64(sched_.now(), clk::kGpuHzNum * clk::kCpuHzDen, clk::kCpuHzNum * clk::kGpuHzDen);
     const u32 num = reg(kPtimerNumerator) ? reg(kPtimerNumerator) : 1;
     const u32 den = reg(kPtimerDenominator) ? reg(kPtimerDenominator) : 1;
-    return muldiv64(gpu_cycles, den, num);
+    return muldiv64(gpu_cycles, den, num) + ptimer_offset_;
+}
+
+// PTIMER ALARM_0: an interrupt when TIME_0 (the tick count in bits 31:5) next reaches the alarm's bits 31:5 — a
+// comparator, so an alarm already passed when it is armed waits for the counter to wrap [verify on hardware].
+void Nv2aStub::schedule_alarm() {
+    sched_.cancel(alarm_);
+    if (!(reg(kPtimerIntrEn0) & 1u)) return;
+    const u32 now_low = static_cast<u32>(ptimer_ticks() << 5) & ~0x1Fu;
+    u64 distance = static_cast<u32>((reg(kPtimerAlarm0) & ~0x1Fu) - now_low);
+    if (distance == 0) distance = 1ull << 32;
+    const u32 num = reg(kPtimerNumerator) ? reg(kPtimerNumerator) : 1;
+    const u32 den = reg(kPtimerDenominator) ? reg(kPtimerDenominator) : 1;
+    const u64 gpu_cycles = muldiv64_ceil(distance >> 5, num, den);
+    const Cycles cycles = muldiv64_ceil(gpu_cycles, clk::kCpuHzNum * clk::kGpuHzDen, clk::kGpuHzNum * clk::kCpuHzDen);
+    sched_.schedule(alarm_, sched_.now() + std::max<Cycles>(cycles, 1));
 }
 
 void Nv2aStub::on_bar_changed(int index, u32 old_base, u32 new_base) {
@@ -225,8 +249,21 @@ void Nv2aStub::on_method(const PushbufferMethod& m) {
         const u32 instance = ctx & 0xFFFFu;
         // The class is the context's low byte; the bits above it are flags (endianness, the chid, a patch config).
         bound_[m.subchannel] = ramin32(instance * 16) & 0xFFu;
+        for (u32 w = 0; w < 4; ++w) regs_[kPgraphCtxCache1 + 0x20 * w + 4 * m.subchannel] = ramin32(instance * 16 + 4 * w);
+        regs_[kPgraphCtxCache1 + 0x80 + 4 * m.subchannel] = instance;
+        ctx_switch_subchannel_ = 8;  // the next method copies the new binding into CTX_SWITCH
         trace::log(trace::Cat::Gpu, "fifo: subchannel {} <- object {:08x} (class {:04x}, instance {:04x})", m.subchannel, m.value,
                    bound_[m.subchannel], instance);
+        return;
+    }
+    if (m.subchannel != ctx_switch_subchannel_) {
+        ctx_switch_subchannel_ = m.subchannel;
+        for (u32 w = 0; w < 5; ++w) regs_[kPgraphCtxSwitch1 + 4 * w] = regs_[kPgraphCtxCache1 + 0x20 * w + 4 * m.subchannel];
+    }
+    // SET_REFERENCE: the puller's reference counter, which software reads back through the USER window to see
+    // how far the GPU has come.
+    if (m.method == 0x0050) {
+        regs_[kCache1Ref] = m.value;
         return;
     }
     if (method_log_lines_ < 200000) {
@@ -414,6 +451,9 @@ u32 Nv2aStub::mmio_read(PhysAddr addr, unsigned size) {
         case kPfbCstatus: word = static_cast<u32>(bus_.ram_size()); break;  // the RAM size in bytes
         case kUser + 0x40: word = reg(kCache1DmaPut); break;
         case kUser + 0x44: word = reg(kCache1DmaGet); break;
+        case kUser + 0x48: word = reg(kCache1Ref); break;
+        case kCache1DmaCtl: word = reg(key) | (1u << 31); break;  // the pushbuffer translation is always valid
+        case kPramdacPllTestCounter: word = reg(key) | kPllLocked; break;  // the PLLs lock at once
         // The cache is always drained here: LOW_MARK (empty) set, HIGH_MARK (full) clear.
         case kCache1Status: word = 0x10; break;
         case kPfifoRunoutStatus: word = 0x10; break;  // runout buffer empty
@@ -515,9 +555,29 @@ void Nv2aStub::mmio_write(PhysAddr addr, unsigned size, u32 value) {
         case kPmcIntrEn0:
             regs_[key] = word;
             update_irq();
+            if (key == kPtimerIntrEn0) schedule_alarm();
             return;
         case kPmcIntr0:
             return;  // read-only aggregate
+        case kUser + 0x44:  // DMA_GET through the USER window: software rewinds the pusher
+            regs_[kCache1DmaGet] = word;
+            return;
+        case kPtimerAlarm0:
+        case kPtimerNumerator:
+        case kPtimerDenominator:
+            regs_[key] = word;
+            schedule_alarm();
+            return;
+        case kPtimerTime0:
+        case kPtimerTime1: {
+            // Writing the time moves the counter: TIME_0 holds tick bits 26:0 in its bits 31:5, TIME_1 bits 55:27.
+            const u64 now = ptimer_ticks();
+            const u64 target = key == kPtimerTime0 ? (now & ~0x7FFFFFFull) | (word >> 5)
+                                                   : (now & 0x7FFFFFFull) | (static_cast<u64>(word & 0x1FFFFFFFu) << 27);
+            ptimer_offset_ += target - now;
+            schedule_alarm();
+            return;
+        }
         case kUser + 0x40:  // channel 0 DMA_PUT through the USER window
         case kCache1DmaPut:
             regs_[kCache1DmaPut] = word;

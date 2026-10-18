@@ -149,3 +149,41 @@ TEST(Scanout, SixteenBitPixelsAreWidenedPerLayout) {
     EXPECT_EQ(out[2], 255);
     EXPECT_EQ(out[1], 0);
 }
+
+// SET_REFERENCE writes the puller's reference counter, which software reads back through the USER window; the
+// window's DMA_GET writes reach the pusher's GET.
+TEST(Nv2aFifo, TheUserWindowReadsTheReferenceAndWritesGet) {
+    Channel c;
+    c.method(0x0050, 0x1234);  // SET_REFERENCE
+    c.kick();
+    EXPECT_EQ(c.gpu.mmio_read(Nv2aStub::kUser + 0x48, 4), 0x1234u);
+    c.gpu.mmio_write(Nv2aStub::kUser + 0x44, 4, Channel::kPushbuffer);
+    EXPECT_EQ(c.gpu.reg(Nv2aStub::kCache1DmaGet), Channel::kPushbuffer);
+    EXPECT_NE(c.gpu.mmio_read(Nv2aStub::kCache1DmaCtl, 4) & (1u << 31), 0u);
+    EXPECT_EQ(c.gpu.mmio_read(Nv2aStub::kPramdacPllTestCounter, 4) & Nv2aStub::kPllLocked, Nv2aStub::kPllLocked);
+    // The bound object's class is mirrored where software-method handlers read it.
+    EXPECT_EQ(c.gpu.mmio_read(Nv2aStub::kPgraphCtxSwitch1, 4) & 0xFFu, 0x97u);
+}
+
+// PTIMER ALARM_0 raises PTIMER INTR bit 0 when TIME_0 reaches it, with the interrupt enabled.
+TEST(Nv2aTimer, TheAlarmRaisesItsInterruptWhenTheTimeReachesIt) {
+    Bus bus(4096);
+    Scheduler sched;
+    bool irq = false;
+    Nv2aStub gpu(bus, sched, [&](bool level) { irq = level; });
+    gpu.mmio_write(Nv2aStub::kPmcIntrEn0, 4, 1);
+    sched.advance_to(cycles_from_ns(1'000'000));
+    const u32 now = gpu.mmio_read(Nv2aStub::kPtimerTime0, 4);
+    const u32 ticks_per_ms = now;  // the counter has run for 1 ms
+    gpu.mmio_write(Nv2aStub::kPtimerAlarm0, 4, now + ticks_per_ms);  // one more millisecond
+    gpu.mmio_write(Nv2aStub::kPtimerIntrEn0, 4, 1);
+    while (sched.has_pending() && sched.next_deadline() < cycles_from_ns(1'900'000)) sched.advance_to(sched.next_deadline());
+    sched.advance_to(cycles_from_ns(1'900'000));
+    EXPECT_EQ(gpu.mmio_read(Nv2aStub::kPtimerIntr0, 4) & 1u, 0u) << "not yet";
+    while (sched.has_pending() && sched.next_deadline() <= cycles_from_ns(2'100'000)) sched.advance_to(sched.next_deadline());
+    sched.advance_to(cycles_from_ns(2'100'000));
+    EXPECT_EQ(gpu.mmio_read(Nv2aStub::kPtimerIntr0, 4) & 1u, 1u) << "reached";
+    EXPECT_TRUE(irq);
+    gpu.mmio_write(Nv2aStub::kPtimerIntr0, 4, 1);
+    EXPECT_FALSE(irq);
+}

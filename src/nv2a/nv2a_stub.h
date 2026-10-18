@@ -73,6 +73,11 @@ public:
                          kPvideoIntr = 0x008100, kPvideoIntrEn = 0x008140,
                          kPvideoBuffer = 0x008700, kPvideoStop = 0x008704, kPvideoBase = 0x008900, kPvideoColorKey = 0x008B00;
     static constexpr u32 kPfifoRamht = 0x002210, kPfifoRamfc = 0x002214;
+    static constexpr u32 kCache1DmaCtl = 0x003230, kCache1Ref = 0x003248, kPramdacPllTestCounter = 0x680514;
+    static constexpr u32 kPllLocked = (1u << 27) | (1u << 29) | (1u << 30) | (1u << 31);  // VPLL2, NVPLL, MPLL, VPLL
+    // The object a subchannel is bound to, as PGRAPH caches it (the instance's four words and the instance), and the
+    // current method's subchannel's copy in CTX_SWITCH1-5, where software-method handlers read the class.
+    static constexpr u32 kPgraphCtxSwitch1 = 0x40014C, kPgraphCtxCache1 = 0x400160;
     static constexpr u32 kPfifoRunoutStatus = 0x002400, kCache1Status = 0x003214, kCache1DmaPush = 0x003220, kCache1DmaInstance = 0x00322C, kCache1DmaPut = 0x003240,
                          kCache1DmaGet = 0x003244;
     static constexpr u32 kPramin = 0x700000, kUser = 0x800000;
@@ -147,6 +152,7 @@ private:
     void write_report(u32 parameter);
     void update_irq();
     void schedule_vblank();
+    void schedule_alarm();
     void run_pusher();
     void on_method(const PushbufferMethod& m);
     void capture_dirty_pages();
@@ -172,6 +178,9 @@ private:
     u64 reads_{0}, writes_{0}, vblanks_{0};
     bool irq_level_{false};
     TimerEvent vblank_;
+    TimerEvent alarm_;  // PTIMER ALARM_0: the next time TIME_0 reaches the alarm's bits 31:5
+    u64 ptimer_offset_{0};  // what software's TIME_0/TIME_1 writes added to the counter, in ticks
+    u32 ctx_switch_subchannel_{8};
     std::function<void(Cycles)> vblank_hook_;
     PushbufferWalker walker_;
     pgraph::Kelvin kelvin_;
