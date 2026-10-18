@@ -1,4 +1,5 @@
 #pragma once
+#include <vector>
 #include <array>
 #include <cstddef>
 
@@ -87,6 +88,8 @@ public:
 
     u32 current_voice() const { return current_; }
     u64 voices_started() const { return started_; }
+    // Instrument: every voice handle VOICE_ON has started since power-on, in order of first start.
+    const std::vector<u32>& handles_started() const { return handles_started_; }
     u64 voices_retired() const { return retired_; }
     u64 notifications() const { return notifications_; }
     u64 frames_mixed() const { return frames_mixed_; }  // voice-frames that reached the bins
@@ -154,6 +157,7 @@ private:
     std::array<u8, 4> hrtf_submix_{0, 1, 2, 3};
     Mix mix_{};
     u64 started_{0}, retired_{0}, frames_mixed_{0};
+    std::vector<u32> handles_started_;
     u64 frames_{0};
     float peak_{0.0f};
 };

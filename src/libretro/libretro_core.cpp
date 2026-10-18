@@ -278,6 +278,15 @@ RETRO_API void retro_unload_game(void) {
             static_cast<unsigned long long>(machine->pad(p).control_requests()), static_cast<unsigned long long>(machine->usb0().stats().frames),
             static_cast<unsigned long long>(machine->usb1().stats().frames), static_cast<unsigned long long>(machine->usb0().stats().transfers),
             static_cast<unsigned long long>(machine->usb1().stats().transfers));
+    // What the console did: its own time, the frames it rendered and the voices its sound started (a cue the console
+    // never reached shows as a missing voice).
+    {
+        std::lock_guard g(machine->lock());
+        std::string voices;
+        for (const mv::u32 h : machine->apu().setup_engine().handles_started()) voices += std::format(" {:x}", h);
+        log(RETRO_LOG_INFO, "ran %.1f s of console time; %llu frames rendered; voices started:%s", static_cast<double>(machine->scheduler().now()) / mv::clk::kCpuHz,
+            static_cast<unsigned long long>(machine->nv2a().semaphore_releases()), voices.empty() ? " none" : voices.c_str());
+    }
     machine->finish();
     machine.reset();
 }
