@@ -13,7 +13,7 @@ constexpr u32 kShaderClipPlaneMode = 0x17F8, kShadowCompareFunc = 0x1E6C, kFogEn
 
 bool depth_format(u32 color_format) {
     switch (color_format) {
-        case 0x2A: case 0x2B: case 0x2C: case 0x2D: case 0x2E: case 0x30: case 0x31: return true;
+        case 0x2A: case 0x2B: case 0x2C: case 0x2D: case 0x2E: case 0x2F: case 0x30: case 0x31: return true;
         default: return false;
     }
 }
@@ -164,7 +164,11 @@ void uniforms_from_state(const KelvinState& s, const std::array<std::array<float
         out.tex_scale[t][0] = texture_scale[t][0];
         out.tex_scale[t][1] = texture_scale[t][1];
         const u32 fmt = s.texture(t).color_format();
-        out.tex_scale[t][2] = (fmt == 0x2A || fmt == 0x2B || fmt == 0x2E) ? 16777215.0f : 65535.0f;
+        // The depth range a shadow compare works in: 24-bit fixed point, 16-bit fixed point, or the 16-bit float
+        // format's largest value (the 24-bit float forms are read as fixed point).
+        if (fmt == 0x2A || fmt == 0x2B || fmt == 0x2E || fmt == 0x2F) out.tex_scale[t][2] = 16777215.0f;
+        else if (fmt == 0x2D || fmt == 0x31) out.tex_scale[t][2] = 511.9375f;
+        else out.tex_scale[t][2] = 65535.0f;
         out.tex_scale[t][3] = 0.0f;
     }
 }

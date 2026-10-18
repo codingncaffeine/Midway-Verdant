@@ -164,3 +164,22 @@ TEST(Texture, DecodesLinearYuvPairsWithTheirOwnChroma) {
         EXPECT_EQ(px(0, 0), 0x008700FFu) << "format " << format << ": all-zero bytes are a dark green, not a placeholder";
     }
 }
+
+TEST(Texture, X8Y24DepthIsTheTopThreeBytes) {
+    // A Z24S8 word holds the depth in bits 31-8 above the stencil byte, as the depth surface writes it: a far depth
+    // with stencil 0x5A is 0xFFFFFF5A and reads 1.0; the middle depth with no stencil reads half.
+    std::vector<u8> ram(4096, 0);
+    const u32 words[2] = {0xFFFFFF5Au, 0x80000000u};
+    std::memcpy(&ram[0x100], words, 8);
+    for (u32 format : {0x2Eu, 0x2Fu}) {
+        const TextureStage t = stage_of(fmt(format, 0, 0), 8u << 16, (2u << 16) | 1u);
+        EXPECT_TRUE(format_info(format).depth) << "format " << format;
+        DecodedTexture d;
+        ASSERT_TRUE(decode_texture(t, 0x100, MemoryView{ram.data(), 4096}, nullptr, d)) << d.error;
+        EXPECT_EQ(d.pixel, HostPixel::R32f);
+        float f[2];
+        std::memcpy(f, d.image(0, 0).data(), 8);
+        EXPECT_FLOAT_EQ(f[0], 1.0f) << "format " << format;
+        EXPECT_FLOAT_EQ(f[1], static_cast<float>(0x800000) / 16777215.0f) << "format " << format;
+    }
+}

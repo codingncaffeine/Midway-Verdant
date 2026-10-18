@@ -88,9 +88,11 @@ void decode_texel(u32 format, const u8* p, const u8* palette, HostPixel pixel, u
         case 0x2C: case 0x2D: case 0x30: case 0x31: case 0x32: case 0x35:  // 16-bit depth and Y16
             std::memcpy(dst, p, 2);
             return;
-        case 0x2A: case 0x2B: case 0x2E: {  // X8 Y24 depth (fixed or float): the 24-bit value scaled to 0..1
+        case 0x2A: case 0x2B: case 0x2E: case 0x2F: {
+            // X8 Y24 depth: the 24-bit depth in bits 31-8 above the stencil byte (the Z24S8 surface's own word),
+            // scaled to 0..1. The float forms are read as fixed point.
             std::memcpy(&w, p, 4);
-            const float f = static_cast<float>(w & 0xFFFFFFu) / 16777215.0f;
+            const float f = static_cast<float>(w >> 8) / 16777215.0f;
             std::memcpy(dst, &f, 4);
             return;
         }
@@ -171,7 +173,7 @@ FormatInfo format_info(u32 f) {
         case 0x2C: case 0x2D: return {2, false, false, true};
         case 0x30: case 0x31: return {2, true, false, true};
         case 0x2A: case 0x2B: return {4, false, false, true};
-        case 0x2E: return {4, true, false, true};
+        case 0x2E: case 0x2F: return {4, true, false, true};
         default: return {};
     }
 }
@@ -267,7 +269,7 @@ bool decode_texture(const TextureStage& stage, u32 base, const MemoryView& memor
         out.error = std::format("texture format {:02x} is not supported yet", format);
         return false;
     }
-    out.pixel = (format == 0x2A || format == 0x2B || format == 0x2E) ? HostPixel::R32f
+    out.pixel = (format == 0x2A || format == 0x2B || format == 0x2E || format == 0x2F) ? HostPixel::R32f
               : (f.depth || format == 0x32 || format == 0x35) ? HostPixel::R16 : HostPixel::Rgba8;
     const u32 texel = out.bytes_per_texel();
 

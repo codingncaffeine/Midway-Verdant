@@ -66,6 +66,15 @@ TEST(Psh, UniformsDecodeFactorsFogAndAlphaReference) {
     EXPECT_FLOAT_EQ(u.alpha_ref[0], 127.0f / 255.0f);
     EXPECT_FLOAT_EQ(u.tex_scale[1][0], 0.5f);
     EXPECT_FLOAT_EQ(u.tex_scale[0][2], 65535.0f);
+    // The shadow compare's range per depth format: 24-bit (fixed, or float read as fixed) and the 16-bit float's
+    // largest value.
+    s.r[(mthd::kTextureBase + 0x40 + 4) >> 2] = 0x00002F00;
+    s.r[(mthd::kTextureBase + 0x80 + 4) >> 2] = 0x00003100;
+    s.r[(mthd::kTextureBase + 0xC0 + 4) >> 2] = 0x00002A00;
+    uniforms_from_state(s, {{{1.0f, 1.0f}, {1.0f, 1.0f}, {1.0f, 1.0f}, {1.0f, 1.0f}}}, u);
+    EXPECT_FLOAT_EQ(u.tex_scale[1][2], 16777215.0f);
+    EXPECT_FLOAT_EQ(u.tex_scale[2][2], 511.9375f);
+    EXPECT_FLOAT_EQ(u.tex_scale[3][2], 16777215.0f);
 }
 
 namespace {
