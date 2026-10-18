@@ -390,3 +390,14 @@ TEST(Ide, TheDvdDriveIsBecomingReadyWhileTheDiscSpinsUp) {
     }
     std::filesystem::remove(path);
 }
+
+// Both devices on the cable latch the command-block registers: a driver may load the LBA, then select the drive.
+TEST(Ide, TaskFileWritesReachBothDevices) {
+    Rig r;
+    r.bus.pio_write(0x1F6, 1, 0xB0);  // the slave
+    r.bus.pio_write(0x1F3, 1, 0x5A);  // LBA low
+    r.bus.pio_write(0x1F2, 1, 0x07);  // sector count
+    r.bus.pio_write(0x1F6, 1, 0xA0);  // the master
+    EXPECT_EQ(r.bus.pio_read(0x1F3, 1), 0x5Au);
+    EXPECT_EQ(r.bus.pio_read(0x1F2, 1), 0x07u);
+}

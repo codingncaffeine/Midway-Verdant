@@ -134,12 +134,32 @@ u32 IdeChannel::read_task(u16 reg, unsigned size) {
     }
 }
 
+// A task-file register write with its previous value kept as the high-order byte (48-bit addressing).
+void IdeChannel::latch_task(IdeDevice::TaskFile& tf, u16 reg, u8 v) {
+    switch (reg) {
+        case 1: tf.hob_features = tf.features; tf.features = v; break;
+        case 2: tf.hob_sector_count = tf.sector_count; tf.sector_count = v; break;
+        case 3: tf.hob_lba_low = tf.lba_low; tf.lba_low = v; break;
+        case 4: tf.hob_lba_mid = tf.lba_mid; tf.lba_mid = v; break;
+        case 5: tf.hob_lba_high = tf.lba_high; tf.lba_high = v; break;
+        default: break;
+    }
+}
+
 void IdeChannel::write_task(u16 reg, unsigned size, u32 value) {
     if (reg == 6) {
         selected_ = (value & 0x10) ? 1 : 0;
         for (auto& d : devices_) {
             if (d) d->tf().device = static_cast<u8>(value);
         }
+        return;
+    }
+    // Both devices on the cable latch the features, count and LBA registers (ATA: every command-block write but the
+    // command reaches both); only the selected one takes data and commands. A driver may load the task file before it
+    // selects the device.
+    if (reg >= 1 && reg <= 5) {
+        for (auto& d : devices_)
+            if (d) latch_task(d->tf(), reg, static_cast<u8>(value));
         return;
     }
     IdeDevice* dev = selected();
@@ -151,26 +171,6 @@ void IdeChannel::write_task(u16 reg, unsigned size, u32 value) {
                 dev->write_data(static_cast<u16>(value));
                 if (size == 4) dev->write_data(static_cast<u16>(value >> 16));
             }
-            break;
-        case 1:
-            tf.hob_features = tf.features;
-            tf.features = static_cast<u8>(value);
-            break;
-        case 2:
-            tf.hob_sector_count = tf.sector_count;
-            tf.sector_count = static_cast<u8>(value);
-            break;
-        case 3:
-            tf.hob_lba_low = tf.lba_low;
-            tf.lba_low = static_cast<u8>(value);
-            break;
-        case 4:
-            tf.hob_lba_mid = tf.lba_mid;
-            tf.lba_mid = static_cast<u8>(value);
-            break;
-        case 5:
-            tf.hob_lba_high = tf.lba_high;
-            tf.lba_high = static_cast<u8>(value);
             break;
         case 7: {
             if (tf.status & ata::kStatusBsy) return;  // commands written while busy are lost

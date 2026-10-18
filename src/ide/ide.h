@@ -89,6 +89,7 @@ public:
 
     u32 read_task(u16 reg, unsigned size);       // 0x1F0 + reg
     void write_task(u16 reg, unsigned size, u32 value);
+    static void latch_task(IdeDevice::TaskFile& tf, u16 reg, u8 v);
     u32 read_control(u16 reg);                   // 0x3F6 + reg
     void write_control(u16 reg, u32 value);
     u32 read_busmaster(u16 reg, unsigned size);  // BAR4 + reg
