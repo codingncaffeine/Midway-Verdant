@@ -42,7 +42,7 @@ bool xf_context_slot(u32 method, u32& slot_word) {
         if (range(0x06C0 + 0x40 * i, 16, 0x44 + 8 * i)) return true;  // texture matrix i
     }
     if (range(0x0A50, 4, 0x38)) return true;    // eye position
-    if (range(0x09C0, 3, 0x39)) return true;    // fog parameters
+    if (range(0x09D0, 4, 0x39)) return true;    // fog plane (SET_FOG_PARAMS are registers of their own)
     if (range(0x0AF0, 4, 0x3A)) return true;    // viewport scale
     if (range(0x0A20, 4, 0x3B)) return true;    // viewport offset
     return false;

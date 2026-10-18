@@ -117,6 +117,8 @@ VulkanRenderer::VulkanRenderer(vk::Device& device, const HandleResolver& handles
         // writes colour: a flat white shader blended by the constant colour.
         debug_draw_id_ = s.find("drawid") != std::string::npos;
         debug_flip_front_ = s.find("flipfront") != std::string::npos;
+        // ffdump: each new fixed-function shader's state words and lighting values, to stderr (the first 400).
+        debug_ff_dump_ = s.find("ffdump") != std::string::npos;
         if (debug_draw_id_) debug_flat_ = true;
     }
 }
@@ -612,13 +614,17 @@ VkShaderModule VulkanRenderer::vertex_shader(const KelvinState& s, std::string& 
     Timed timed(stats_.ns_vs);
     const bool vp = s.vertex_program_mode();
     const bool smooth = s.reg(mthd::kShadeModel) != 0x1D00;
-    const bool lit = !vp && (s.reg(mthd::kLightingEnable) & 1u);
     if (!vp && !vsh::fixed_function_supported(s, error)) return VK_NULL_HANDLE;
-    const u32 flags = (vp ? 1u : 0u) | (smooth ? 2u : 0u) | (lit ? 4u : 0u);
+    const bool fog = (s.reg(0x02A4) & 1u) != 0;
+    const u32 fog_mode = s.reg(0x029C);
+    // The fog mode shapes every shader's ending (the distance-to-factor curve).
+    const u32 flags = (vp ? 1u : 0u) | (smooth ? 2u : 0u) | (fog ? 4u : 0u) | (fog ? (fog_mode & 0xFFFFu) << 16 : 0u);
     const u32 start = vp ? s.program_start() : 0;
+    // The fixed function's shader follows from a handful of state words; a program's from its words.
+    const std::vector<u32> ff_key = vp ? std::vector<u32>{} : vsh::fixed_function_key(s);
     for (const VsMemo& m : vs_memo_) {
         if (m.module != VK_NULL_HANDLE && m.flags == flags && m.start == start &&
-            (!vp || std::memcmp(m.words.data(), &s.program[start][0], m.words.size() * 4) == 0)) {
+            (vp ? std::memcmp(m.words.data(), &s.program[start][0], m.words.size() * 4) == 0 : m.words == ff_key)) {
             ++stats_.vs_memo_hits;
             return m.module;
         }
@@ -629,10 +635,11 @@ VkShaderModule VulkanRenderer::vertex_shader(const KelvinState& s, std::string& 
         program = vsh::extract_program(s);
         key.assign(reinterpret_cast<const char*>(&s.program[program.start]), program.instructions.size() * 16);
     } else {
-        program = vsh::fixed_function_program(s);
-        key = lit ? "fixed-function lit" : "fixed-function";
+        key.assign("fixed-function:");
+        key.append(reinterpret_cast<const char*>(ff_key.data()), ff_key.size() * 4);
     }
     key += smooth ? 's' : 'f';
+    key += std::format(":fog{:x}", flags >> 2);
     auto remember = [&](VkShaderModule m) {
         VsMemo& e = vs_memo_[vs_memo_next_];
         vs_memo_next_ = (vs_memo_next_ + 1) % kMemoEntries;
@@ -641,6 +648,7 @@ VkShaderModule VulkanRenderer::vertex_shader(const KelvinState& s, std::string& 
         e.module = m;
         e.words.clear();
         if (vp) e.words.assign(&s.program[start][0], &s.program[start][0] + program.instructions.size() * 4);
+        else e.words = ff_key;
     };
     if (auto it = vs_cache_.find(key); it != vs_cache_.end()) {
         ++stats_.vs_cache_hits;
@@ -649,8 +657,26 @@ VkShaderModule VulkanRenderer::vertex_shader(const KelvinState& s, std::string& 
     }
     vsh::Options options;
     options.smooth_shading = s.reg(mthd::kShadeModel) != 0x1D00;
-    options.fixed_function_lighting = !s.vertex_program_mode() && (s.reg(mthd::kLightingEnable) & 1u);
-    const vsh::Translation t = vsh::translate(program, options);
+    options.fog = fog;
+    options.fog_mode = fog_mode;
+    const vsh::Translation t = vp ? vsh::translate(program, options) : vsh::fixed_function_translate(s, options);
+    if (debug_ff_dump_ && !vp) {
+        static int dumped = 0;
+        if (dumped++ < 400) {
+            std::string line = "ffdump: key";
+            for (u32 w : ff_key) line += std::format(" {:x}", w);
+            std::vector<float> u(vsh::kFixedFunctionVectors * 4);
+            vsh::fixed_function_uniforms(s, u.data());
+            line += std::format("\n  emission {:.3f} {:.3f} {:.3f} alpha {:.3f} | scene ambient {:.3f} {:.3f} {:.3f} | specular curve {:.3f} {:.3f} {:.3f}", u[0], u[1], u[2], u[3], u[4], u[5], u[6], u[8], u[9], u[10]);
+            for (u32 l = 0; l < vsh::kLights; ++l) {
+                if (!((s.reg(mthd::kLightEnableMask) >> (2 * l)) & 3u)) continue;
+                const float* v = u.data() + 16 + l * vsh::kLightVectors * 4;
+                line += std::format("\n  light {} type {}: amb {:.3f} {:.3f} {:.3f} dif {:.3f} {:.3f} {:.3f} spc {:.3f} {:.3f} {:.3f} pos {:.2f} {:.2f} {:.2f} range {:.3g} att {:.3g} {:.3g} {:.3g} dir {:.3f} {:.3f} {:.3f}", l,
+                                    (s.reg(mthd::kLightEnableMask) >> (2 * l)) & 3u, v[0], v[1], v[2], v[4], v[5], v[6], v[8], v[9], v[10], v[12], v[13], v[14], v[15], v[16], v[17], v[18], v[20], v[21], v[22]);
+            }
+            std::fprintf(stderr, "%s\n", line.c_str());
+        }
+    }
     if (!t.error.empty()) {
         error = t.error;
         return VK_NULL_HANDLE;
@@ -1162,15 +1188,8 @@ void VulkanRenderer::draw(const KelvinState& s, const DrawBatch& batch) {
         u[kConstants * 4 + 5] = t->zeta_format == 1 ? 65535.0f : 16777215.0f;
         u[kConstants * 4 + 6] = 0.0f;
         u[kConstants * 4 + 7] = 0.0f;
-        // The fixed function's material inputs (three floats each, the alpha its own register).
-        u[kConstants * 4 + 8] = s.regf(mthd::kMaterialEmission);
-        u[kConstants * 4 + 9] = s.regf(mthd::kMaterialEmission + 4);
-        u[kConstants * 4 + 10] = s.regf(mthd::kMaterialEmission + 8);
-        u[kConstants * 4 + 11] = s.regf(mthd::kMaterialAlpha);
-        u[kConstants * 4 + 12] = s.regf(mthd::kSceneAmbientColor);
-        u[kConstants * 4 + 13] = s.regf(mthd::kSceneAmbientColor + 4);
-        u[kConstants * 4 + 14] = s.regf(mthd::kSceneAmbientColor + 8);
-        u[kConstants * 4 + 15] = 0.0f;
+        // The fixed function's material, lights and planes.
+        vsh::fixed_function_uniforms(s, u + kConstants * 4 + 8);
         psh::Uniforms pu{};
         psh::uniforms_from_state(s, scales, pu);
         std::memcpy(static_cast<u8*>(uniform_ring_.mapped) + uoffset_ps, &pu, sizeof pu);

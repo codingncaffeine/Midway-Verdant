@@ -50,20 +50,14 @@ struct Program {
 };
 Program extract_program(const KelvinState& state);
 
-// The fixed-function transform (execution mode 0) as the program it amounts to: the position through the
-// composite matrix the XDK keeps in XF context slots 0-3 (world × view × projection × viewport, so the result
-// is screen space like a program's oPos), the colours and texture coordinates passed through. Lighting, fog,
-// texgen and texture matrices are not built yet (the console's firmware runs with them off); callers refuse a
-// state that needs them. Reads the state only for what it leaves out.
-Program fixed_function_program(const KelvinState& state);
-bool fixed_function_supported(const KelvinState& state, std::string& why);
 
 struct Options {
     bool smooth_shading{true};
     u32 texture_count{4};
-    // Fixed-function lighting: the colours come from the material and the lights, not from the vertex. With no
-    // light enabled (the console's firmware) that is emission + scene ambient and the material alpha.
-    bool fixed_function_lighting{false};
+    // SET_FOG_ENABLE and SET_FOG_MODE: with fog on, the shader ends by turning the fog distance in oFog.x into
+    // the factor the pixel side blends with.
+    bool fog{false};
+    u32 fog_mode{0x2601};
 };
 
 // GLSL (Vulkan 1.0, version 450) for the program: inputs v0..v15 at locations 0..15, one std140 uniform block
@@ -77,9 +71,29 @@ struct Translation {
 };
 Translation translate(const Program& program, const Options& options);
 
-// The uniform block layout shared with the backend: the constant file, then surface_size, clip_range,
-// ff_emission_alpha (material emission rgb, material alpha) and ff_scene_ambient (rgb).
-constexpr u32 kConstantSlots = 192;
-constexpr u32 kUniformBytes = (kConstantSlots + 4) * 16;
+// The uniform block layout shared with the backend: the constant file, then surface_size, clip_range and the
+// fixed function's block (fixed_function_uniforms).
+constexpr u32 kConstantSlots = 192, kLights = 8, kLightVectors = 9;
+constexpr u32 kFixedFunctionVectors = 4 + kLights * kLightVectors;
+constexpr u32 kUniformBytes = (kConstantSlots + 2 + kFixedFunctionVectors) * 16;
+
+// The fixed-function vertex pipeline (execution mode 0) as GLSL with the same interface as a translated program:
+// skinning through the model-view matrices (XF slots 8+8i, inverses 12+8i), the normal into eye space, the lights
+// of SET_LIGHT_ENABLE_MASK (infinite, local, spot) with the colour sources of SET_COLOR_MATERIAL, specular per
+// SET_LIGHT_CONTROL and SET_SPECULAR_ENABLE, texgen per coordinate and the texture matrices (XF 0x44+8i), the fog
+// coordinate per SET_FOG_GEN_MODE, and the position through the composite matrix (XF 0-3, viewport scale
+// included) then the viewport offset (XF 0x3B), as the XDK's own program epilogue leaves it. The light data are
+// uniforms (fixed_function_uniforms). Behaviour per the method definitions and the reference emulator's
+// generator (read, not copied); [verify] marks what neither settles.
+Translation fixed_function_translate(const KelvinState& state, const Options& options);
+// The state words the generated shader depends on (for caching): two states with equal keys get the same GLSL.
+std::vector<u32> fixed_function_key(const KelvinState& state);
+// A state the generator cannot express (an invalid enumerant), with the reason.
+bool fixed_function_supported(const KelvinState& state, std::string& why);
+// The fixed function's uniforms after the constant file: material emission + alpha, scene ambient, specular
+// curve, fog params (SET_FOG_PARAMS, for programs too), then nine per light: ambient, diffuse, specular, local position (w = range), attenuation,
+// infinite direction, infinite half vector, spot falloff, spot direction. Writes kUniformBytes - 16 * kConstantSlots
+// - 32 bytes (everything after surface_size and clip_range).
+void fixed_function_uniforms(const KelvinState& state, float* out);
 
 }  // namespace mv::pgraph::vsh
