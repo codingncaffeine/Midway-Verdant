@@ -63,6 +63,7 @@ private:
         u32 format_word{0};
         u32 width{0}, height{0};
         u32 log_w{0}, log_h{0};
+        u32 aa_x{1}, aa_y{1};  // the anti-aliasing scale from logical to stored pixels
         u32 pitch{0}, zeta_pitch{0};
         bool swizzled{false};
         u32 color_format{0}, zeta_format{0};

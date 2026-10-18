@@ -326,8 +326,12 @@ VulkanRenderer::Surface* VulkanRenderer::target_for(const KelvinState& s) {
     const DmaObject color_dma = handles_.resolve(s.dma_handle(mthd::kDmaColor));
     const DmaObject zeta_dma = handles_.resolve(s.dma_handle(mthd::kDmaZeta));
     const u32 phys = color_dma.base + d.color_offset;
-    const u32 width = d.swizzled() ? (1u << d.log_width()) : (d.clip_x() + d.clip_width());
-    const u32 height = d.swizzled() ? (1u << d.log_height()) : (d.clip_y() + d.clip_height());
+    // Anti-aliasing: the clip is in logical pixels and the hardware renders the surface 2x wide (CENTER_CORNER_2)
+    // or 2x2 (SQUARE_OFFSET_4) larger, positions scaled with it; a later pass reads it back down.
+    const u32 aa = d.anti_aliasing();
+    const u32 aa_x = (aa == 1 || aa == 2) ? 2u : 1u, aa_y = aa == 2 ? 2u : 1u;
+    const u32 width = d.swizzled() ? (1u << d.log_width()) : (d.clip_x() + d.clip_width()) * aa_x;
+    const u32 height = d.swizzled() ? (1u << d.log_height()) : (d.clip_y() + d.clip_height()) * aa_y;
     if (width == 0 || height == 0 || width > 4096 || height > 4096) {
         note(std::format("surface at {:08x} has an unusable size {}x{} (format {:08x})", phys, width, height, d.format));
         return nullptr;
@@ -343,6 +347,8 @@ VulkanRenderer::Surface* VulkanRenderer::target_for(const KelvinState& s) {
             s0.format_word = d.format;
             s0.pitch = d.color_pitch();
             s0.zeta_pitch = d.zeta_pitch();
+            s0.aa_x = d.swizzled() ? 1u : aa_x;
+            s0.aa_y = d.swizzled() ? 1u : aa_y;
             s0.zeta_phys = zeta_dma.base + d.zeta_offset;
             return &s0;
         }
@@ -363,6 +369,8 @@ VulkanRenderer::Surface* VulkanRenderer::target_for(const KelvinState& s) {
     t.format_word = d.format;
     t.width = width;
     t.height = height;
+    t.aa_x = d.swizzled() ? 1u : aa_x;
+    t.aa_y = d.swizzled() ? 1u : aa_y;
     t.log_w = d.log_width();
     t.log_h = d.log_height();
     t.pitch = d.color_pitch();
@@ -941,6 +949,12 @@ void VulkanRenderer::clear(const KelvinState& s, u32 bits) {
         x0 = y0 = 0;
         x1 = t->width - 1;
         y1 = t->height - 1;
+    } else {
+        // The clear rectangle is in logical pixels too.
+        x0 *= t->aa_x;
+        x1 = (x1 + 1) * t->aa_x - 1;
+        y0 *= t->aa_y;
+        y1 = (y1 + 1) * t->aa_y - 1;
     }
     x1 = std::min(x1, t->width - 1);
     y1 = std::min(y1, t->height - 1);
@@ -1113,8 +1127,8 @@ void VulkanRenderer::draw(const KelvinState& s, const DrawBatch& batch) {
     {
         float* u = reinterpret_cast<float*>(static_cast<u8*>(uniform_ring_.mapped) + uoffset_vs);
         std::memcpy(u, s.constants.data(), kConstants * 16);
-        u[kConstants * 4 + 0] = static_cast<float>(t->width);
-        u[kConstants * 4 + 1] = static_cast<float>(t->height);
+        u[kConstants * 4 + 0] = static_cast<float>(t->width / t->aa_x);  // the logical size the program maps to
+        u[kConstants * 4 + 1] = static_cast<float>(t->height / t->aa_y);
         u[kConstants * 4 + 2] = 0.0f;
         u[kConstants * 4 + 3] = 0.0f;
         u[kConstants * 4 + 4] = 0.0f;
@@ -1188,8 +1202,9 @@ void VulkanRenderer::draw(const KelvinState& s, const DrawBatch& batch) {
     VkViewport viewport{0.0f, 0.0f, static_cast<float>(t->width), static_cast<float>(t->height), 0.0f, 1.0f};
     fn_->vkCmdSetViewport(cb_, 0, 1, &viewport);
     const SurfaceState sd = s.surface();
-    VkRect2D scissor{{static_cast<i32>(std::min(sd.clip_x(), t->width - 1)), static_cast<i32>(std::min(sd.clip_y(), t->height - 1))},
-                     {std::max(1u, std::min(sd.clip_width(), t->width - sd.clip_x())), std::max(1u, std::min(sd.clip_height(), t->height - sd.clip_y()))}};
+    const u32 cx = sd.clip_x() * t->aa_x, cy = sd.clip_y() * t->aa_y, cw = sd.clip_width() * t->aa_x, ch = sd.clip_height() * t->aa_y;
+    VkRect2D scissor{{static_cast<i32>(std::min(cx, t->width - 1)), static_cast<i32>(std::min(cy, t->height - 1))},
+                     {std::max(1u, std::min(cw, t->width - std::min(cx, t->width - 1))), std::max(1u, std::min(ch, t->height - std::min(cy, t->height - 1)))}};
     if (sd.clip_width() == 0 || sd.clip_height() == 0) scissor = {{0, 0}, {t->width, t->height}};
     fn_->vkCmdSetScissor(cb_, 0, 1, &scissor);
     const u32 bc = s.reg(mthd::kBlendColor);
