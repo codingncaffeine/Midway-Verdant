@@ -129,6 +129,10 @@ TEST(Vsh, TranslatesAndCompilesAHandWrittenProgram) {
     EXPECT_TRUE(tr.error.empty()) << tr.error;
     EXPECT_EQ(tr.inputs_read, static_cast<u16>((1u << 0) | (1u << 3) | (1u << 9)));
     EXPECT_NE(tr.glsl.find("vp_rcc((oPos).wwww)"), std::string::npos) << tr.glsl;
+    // The host position is multiplied back by the SIGNED w, so geometry behind the eye clips at w = 0 instead of
+    // mirroring onto the screen (|w| drew the boot animation's black wedges).
+    EXPECT_NE(tr.glsl.find("gl_Position = vec4(ndc * wa, zndc * wa, wa);"), std::string::npos) << tr.glsl;
+    EXPECT_EQ(tr.glsl.find("abs(oPos.w)"), std::string::npos) << tr.glsl;
     const CompiledShader c = compile_glsl(ShaderStage::Vertex, tr.glsl, "hand-written");
     EXPECT_TRUE(c.ok()) << c.log << "\n" << tr.glsl;
 }
