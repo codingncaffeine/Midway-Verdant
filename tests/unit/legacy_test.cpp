@@ -281,3 +281,34 @@ TEST(Pit, LostTickBacklogIsBoundedAndVoidedByANewRate) {
     EXPECT_EQ(fast.pit.tick_backlog(), 0u);
     EXPECT_EQ(fast.drain(), 1);  // the one latched in the 8259 is still there
 }
+
+// IRQ 1 is the first USB controller on the console, a level-sensitive PCI line: the ELCR must take its bit, and a
+// request still asserted after the EOI is delivered again (on edge mode it would be lost until the line fell and rose).
+TEST(Pic, Irq1CanBeLevelTriggeredForTheUsbController) {
+    Bus bus(4096);
+    Pic pic(bus);
+    init_pics(bus, 0x30, 0x38);
+    bus.pio_write(0x4D0, 1, 0x6A);  // IRQ 1, 3, 5 and 6 level-triggered
+    EXPECT_EQ(bus.pio_read(0x4D0, 1), 0x6Au);
+    bus.pio_write(0x4D0, 1, 0xFF);
+    EXPECT_EQ(bus.pio_read(0x4D0, 1), 0xFAu) << "the timer and the cascade stay edge-triggered";
+    bus.pio_write(0x4D0, 1, 0x02);
+    pic.set_irq(1, true);
+    EXPECT_EQ(pic.acknowledge(), 0x31);
+    bus.pio_write(0x20, 1, 0x20);
+    EXPECT_EQ(pic.pending_vector(), 0x31) << "the line is still high: a level request comes back after the EOI";
+    EXPECT_EQ(pic.acknowledge(), 0x31);
+    pic.set_irq(1, false);
+    bus.pio_write(0x20, 1, 0x20);
+    EXPECT_EQ(pic.pending_vector(), -1);
+}
+
+// The kernel's KeQueryPerformanceFrequency is 3375000 and its counter reads all 32 bits of the PM timer.
+TEST(PmTimer, CountsAt3375MHzWithAll32Bits) {
+    Scheduler sched;
+    PmBlock pm(sched, [](u16) {});
+    sched.advance_to(cycles_from_ns_ceil(1'000'000'000));
+    EXPECT_EQ(pm.pio_read(0x8008, 4), 3'375'000u);
+    sched.advance_to(cycles_from_ns_ceil(10'000'000'000));  // past 2^24 ticks (4.97 s)
+    EXPECT_EQ(pm.pio_read(0x8008, 4), 33'750'000u) << "no 24-bit wrap";
+}

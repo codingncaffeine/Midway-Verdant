@@ -252,8 +252,12 @@ void Pic::pio_write(u16 port, unsigned size, u32 value) {
     (void)size;
     if (port == 0x4D0 || port == 0x4D1) {
         Unit& u = units_[port - 0x4D0];
-        u.elcr = static_cast<u8>(value & (port == 0x4D0 ? 0xF8 : 0xDE));  // IRQ 0,1,2 and 8,13 are always edge
-        trace::log(trace::Cat::Irq, "ELCR {} <- {:02x} (level-triggered lines)", port == 0x4D0 ? "master" : "slave", u.elcr);
+        // Only the timer (IRQ 0) and the cascade (IRQ 2) are fixed to edge mode. On the console IRQ 1 is the first USB
+        // controller, a level-sensitive PCI interrupt, not a keyboard: the PC rule that keeps IRQ 1, 8 and 13 on edge
+        // does not hold, and a level line held on edge mode loses every request that arrives while it is already high.
+        u.elcr = static_cast<u8>(value & (port == 0x4D0 ? 0xFA : 0xFF));
+        trace::log(trace::Cat::Irq, "ELCR {} <- {:02x}, level-triggered lines {:02x}", port == 0x4D0 ? "master" : "slave",
+                   value & 0xFF, u.elcr);
         update_output();
         return;
     }
