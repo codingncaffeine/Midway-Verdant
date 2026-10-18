@@ -276,9 +276,21 @@ u32 Core::limit24(i64 acc56) {
     return acc56 < 0 ? 0x800000u : 0x7FFFFFu;
 }
 
+namespace {
+constexpr u64 kMask56 = (u64{1} << 56) - 1;
+// Carry out of bit 55 of a 56-bit addition, and the borrow of a 56-bit subtraction (C after SUB and CMP).
+bool carry_out(i64 a, i64 b, i64 carry_in = 0) {
+    return ((static_cast<u64>(a) & kMask56) + (static_cast<u64>(b) & kMask56) + static_cast<u64>(carry_in)) >> 56;
+}
+bool borrow_out(i64 a, i64 b, i64 borrow_in = 0) { return (static_cast<u64>(a) & kMask56) < (static_cast<u64>(b) & kMask56) + static_cast<u64>(borrow_in); }
+bool add_overflows(i64 a, i64 b, i64 r) { return ((a < 0) == (b < 0)) && ((((r << 8) >> 8) < 0) != (a < 0)); }
+}  // namespace
+
+// The standard condition codes of an arithmetic result. C is written only where the instruction defines it
+// (carry_in_known); the multiplies, NEG, ABS, RND, CLR, TST and the normalisations leave it as it was (Chapter 13).
 void Core::set_ccr_result(i64 result, bool carry_in_known, bool carry, bool overflow) {
     const i64 v = sext56(result);
-    u32 sr = r_.sr & ~(E | U | N | Z | V | C);
+    u32 sr = r_.sr & ~(E | U | N | Z | V | (carry_in_known ? C : 0u));
     if (v < 0) sr |= N;
     if (v == 0) sr |= Z;
     const i64 ext = v >> 47;  // bits 55..47
@@ -287,6 +299,22 @@ void Core::set_ccr_result(i64 result, bool carry_in_known, bool carry, bool over
     if (overflow) sr |= V | L;
     if (carry_in_known && carry) sr |= C;
     r_.sr = sr;
+}
+
+// ASL/ASR by a count: C is the last bit shifted out (cleared for a count of 0); ASL sets V when bit 55 changed at
+// any point during the shift, ASR clears V.
+void Core::shift_flags(i64 before, i64 after, u32 count, bool left) {
+    const u64 s = static_cast<u64>(before) & kMask56;
+    bool c = false, v = false;
+    if (count && left) {
+        c = count <= 56 && ((s >> (56 - count)) & 1u);
+        const u32 n = std::min<u32>(count, 55);
+        const u64 top = s >> (55 - n);  // bits 55 down to 55 - n: all equal unless the sign changed on the way
+        v = top != 0 && top != ((u64{1} << (n + 1)) - 1);
+    } else if (count) {
+        c = count - 1 <= 55 ? ((s >> (count - 1)) & 1u) : ((s >> 55) & 1u);
+    }
+    set_ccr_result(after, true, c, v);
 }
 
 void Core::set_ccr_logical(i64 acc56) {
@@ -568,14 +596,22 @@ void Core::alu(const Decoded& d, u32 /*ext*/, i64 pre_a, i64 pre_b) {
             set_ccr_result(sext56(a - b), true, static_cast<u64>(a) < static_cast<u64>(b), false);
             return;
         }
-        case Alu::Tfr: D = src; set_ccr_result(D, false, false, false); return;
-        case Alu::Tst: set_ccr_result(src, true, false, false); return;
+        case Alu::Tfr: D = src; return;  // TFR changes no condition code
+        case Alu::Tst: set_ccr_result(D, false, false, false); return;  // the accumulator it names; V cleared, C kept
         case Alu::Rnd: D = round56(D); set_ccr_result(D, false, false, false); return;
         case Alu::Clr: D = 0; set_ccr_result(0, false, false, false); return;
-        case Alu::Addr: D = sext56((D >> 1) + src); set_ccr_result(D, false, false, false); return;
-        case Alu::Subr: D = sext56((D >> 1) - src); set_ccr_result(D, false, false, false); return;
-        case Alu::Addl: D = sext56((D << 1) + src); set_ccr_result(D, false, false, false); return;
-        case Alu::Subl: D = sext56((D << 1) - src); set_ccr_result(D, false, false, false); return;
+        case Alu::Addr: case Alu::Subr: case Alu::Addl: case Alu::Subl: {
+            // D/2 or 2D, then plus or minus S; C and V from the addition (ADDL/SUBL also flag a sign change by the shift).
+            const bool left = d.alu == Alu::Addl || d.alu == Alu::Subl, add = d.alu == Alu::Addr || d.alu == Alu::Addl;
+            const i64 shifted = left ? sext56(D << 1) : (D >> 1);
+            const i64 b = add ? src : -src;
+            const i64 r = shifted + b;
+            const bool carry = add ? carry_out(shifted, src) : borrow_out(shifted, src);
+            const bool overflow = add_overflows(shifted, b, r) || (left && ((shifted < 0) != (D < 0)));
+            D = sext56(r);
+            set_ccr_result(D, true, carry, overflow);
+            return;
+        }
         case Alu::Not: {
             const i64 a1 = (~D) & (i64{kWord} << 24);
             D = (D & ~(i64{kWord} << 24)) | a1;
@@ -633,8 +669,10 @@ void Core::alu(const Decoded& d, u32 /*ext*/, i64 pre_a, i64 pre_b) {
         case Alu::Adc: case Alu::Sbc: {
             const i64 cin = (r_.sr & C) ? 1 : 0;
             const i64 r = d.alu == Alu::Adc ? D + src + cin : D - src - cin;
+            const bool carry = d.alu == Alu::Adc ? carry_out(D, src, cin) : borrow_out(D, src, cin);
+            const bool overflow = add_overflows(D, d.alu == Alu::Adc ? src : -src, r);
             D = sext56(r);
-            set_ccr_result(D, false, false, false);
+            set_ccr_result(D, true, carry, overflow);
             return;
         }
     }
@@ -864,6 +902,8 @@ void Core::execute(const Decoded& d, u32 ext, u32 at) {
             if (set != want_set) return;
             const bool branch = info.op >= Op::BitBranchEa && info.op <= Op::BitBranchReg;
             jump_sub(branch ? relative(ext, 24) : (ext & kWord), sub);
+            if (!sub && !branch && !is_reg && address >= 0xFFFF80u && periph_ && periph_->static_until_next_frame(address, d.f('b') & 31u))
+                note_idle_wait(ext & kWord, at, next - at);
             return;
         }
         case Op::BitOpEa: case Op::BitOpAa: case Op::BitOpPp: case Op::BitOpQq: case Op::BitOpReg: {
@@ -1027,8 +1067,9 @@ void Core::execute(const Decoded& d, u32 ext, u32 at) {
                     const i64 b = info.variant == 0 ? src : -src;
                     const i64 r = D + b;
                     const bool overflow = ((D < 0) == (b < 0)) && ((sext56(r) < 0) != (D < 0));
+                    const bool carry = info.variant == 0 ? carry_out(D, src) : borrow_out(D, src);
                     if (info.variant != 2) D = sext56(r);
-                    set_ccr_result(sext56(r), false, false, overflow);
+                    set_ccr_result(sext56(r), true, carry, overflow);
                     return;
                 }
                 default: {
@@ -1054,9 +1095,9 @@ void Core::execute(const Decoded& d, u32 ext, u32 at) {
         case Op::AslImm: case Op::AsrImm: {
             const u32 count = d.f('i') & 63u;
             const i64 s = acc(d.f('S'));
-            i64 r = info.op == Op::AslImm ? sext56(s << count) : sext56(s >> count);
+            const i64 r = info.op == Op::AslImm ? sext56(s << count) : sext56(s >> count);
             acc(d.f('D')) = r;
-            set_ccr_result(r, false, false, false);
+            shift_flags(s, r, count, info.op == Op::AslImm);
             return;
         }
         case Op::AslReg: case Op::AsrReg: {
@@ -1065,17 +1106,21 @@ void Core::execute(const Decoded& d, u32 ext, u32 at) {
             const i64 s = acc(d.f('S'));
             const i64 r = info.op == Op::AslReg ? sext56(s << count) : sext56(s >> count);
             acc(d.f('D')) = r;
-            set_ccr_result(r, false, false, false);
+            shift_flags(s, r, count, info.op == Op::AslReg);
             return;
         }
         case Op::LslImm: case Op::LsrImm: case Op::LslReg: case Op::LsrReg: {
             static constexpr u8 kSss[8] = {0, 0, 12, 13, 4, 6, 5, 7};
             const u32 count = (info.op == Op::LslImm || info.op == Op::LsrImm) ? (d.f('i') & 31u) : (read_reg5(kSss[d.f('s') & 7u], false) & 31u);
             i64& D = acc(d.f('D'));
-            u32 a1 = static_cast<u32>(D >> 24) & kWord;
-            a1 = (info.op == Op::LslImm || info.op == Op::LslReg) ? ((a1 << count) & kWord) : (a1 >> count);
+            const u32 before = static_cast<u32>(D >> 24) & kWord;
+            const bool left = info.op == Op::LslImm || info.op == Op::LslReg;
+            const u32 a1 = left ? ((before << count) & kWord) : (before >> count);
             D = (D & ~(i64{kWord} << 24)) | (static_cast<i64>(a1) << 24);
             set_ccr_logical(D);
+            // C is the last bit shifted out of A1, cleared for a count of 0.
+            const bool c = count && (left ? ((before >> (24 - count)) & 1u) : ((before >> (count - 1)) & 1u));
+            r_.sr = (r_.sr & ~C) | (c ? C : 0u);
             return;
         }
         case Op::MulImm: {
@@ -1099,8 +1144,11 @@ void Core::execute(const Decoded& d, u32 ext, u32 at) {
         }
         case Op::Inc: case Op::Dec: {
             i64& D = acc(d.f('d'));
-            D = sext56(D + (info.op == Op::Inc ? 1 : -1));
-            set_ccr_result(D, false, false, false);
+            const i64 r = D + (info.op == Op::Inc ? 1 : -1);
+            const bool carry = info.op == Op::Inc ? carry_out(D, 1) : borrow_out(D, 1);
+            const bool overflow = add_overflows(D, info.op == Op::Inc ? 1 : -1, r);
+            D = sext56(r);
+            set_ccr_result(D, true, carry, overflow);
             return;
         }
         // ---- the non-parallel arithmetic (chapter 13; register tables 12-13 and 12-16) ----
@@ -1329,14 +1377,44 @@ u64 Core::run(u64 cycles) {
     u64 done = 0;
     while (done < cycles && error_.empty() && !halted_) {
         if (trace_)
-            std::fprintf(trace_, "%04x %-40s a=%014llx b=%014llx x=%06x:%06x y=%06x:%06x r=%x,%x,%x,%x,%x,%x,%x,%x\n", r_.pc, disassemble_at(r_.pc).c_str(),
+            std::fprintf(trace_, "%04x %-40s a=%014llx b=%014llx x=%06x:%06x y=%06x:%06x r=%x,%x,%x,%x,%x,%x,%x,%x sr=%06x sp=%x\n", r_.pc, disassemble_at(r_.pc).c_str(),
                          static_cast<unsigned long long>(r_.a) & 0xFFFFFFFFFFFFFFull, static_cast<unsigned long long>(r_.b) & 0xFFFFFFFFFFFFFFull, r_.x1, r_.x0, r_.y1, r_.y0,
-                         r_.r[0], r_.r[1], r_.r[2], r_.r[3], r_.r[4], r_.r[5], r_.r[6], r_.r[7]);
+                         r_.r[0], r_.r[1], r_.r[2], r_.r[3], r_.r[4], r_.r[5], r_.r[6], r_.r[7], r_.sr, r_.sp);
         const u32 c = step();
         if (c == 0) break;
         done += c;
+        if (idle_.pending) {
+            // Skip all but the last whole iteration of the wait; those run as usual and leave the flags as they were.
+            idle_.pending = false;
+            const u64 left = done < cycles ? cycles - done : 0, iterations = idle_.per_iteration ? left / idle_.per_iteration : 0;
+            if (iterations > 1) {
+                const u64 skip = iterations - 1;
+                if (idle_.delta) acc(idle_.dest) = sext56(acc(idle_.dest) + static_cast<i64>(skip) * idle_.delta);
+                cycles_ += skip * idle_.per_iteration;
+                instructions_ += skip * (idle_.delta ? 2 : 1);
+                done += skip * idle_.per_iteration;
+                if (trace_) std::fprintf(trace_, "idle wait at %04x: %llu iterations skipped\n", r_.pc, static_cast<unsigned long long>(skip));
+            }
+        }
     }
     return done;
+}
+
+}  // namespace mv::dsp
+
+namespace mv::dsp {
+
+void Core::note_idle_wait(u32 target, u32 at, u32 jump_words) {
+    if (target == at) {
+        idle_ = {true, 0, 0, jump_words};
+        return;
+    }
+    if (target + 1 != at) return;
+    const Decoded body = decode(read_p(target));
+    if (body.pattern < 0 || body.extension) return;
+    const OpInfo info = op_table()[static_cast<std::size_t>(body.pattern)];
+    if (info.op == Op::AluImmShort && info.variant == 0) idle_ = {true, body.f('d'), static_cast<i64>(body.f('i')) << 24, jump_words + 1};
+    else if (info.op == Op::Inc) idle_ = {true, body.f('d'), 1, jump_words + 1};
 }
 
 }  // namespace mv::dsp

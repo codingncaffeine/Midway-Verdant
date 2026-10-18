@@ -14,6 +14,8 @@ namespace {
 struct FakePeripherals : Peripherals {
     std::vector<std::pair<u32, u32>> writes;
     u32 read_value{0};
+    bool frame_static{false};
+    bool static_until_next_frame(u32, u32) const override { return frame_static; }
     u32 peripheral_read(u32) override { return read_value; }
     void peripheral_write(u32 address, u32 value) override { writes.emplace_back(address, value); }
 };
@@ -248,4 +250,95 @@ TEST(DspCore, MultiplyByPowerOfTwoAndUnsignedSquare) {
     m.emit(0x0127C0);  // MPY uu X0,X0,A: $FFFFFF unsigned squared (signed it would be -1 * -1)
     m.run(1);
     EXPECT_EQ(m.core.regs().a, (i64{0xFFFFFF} * 0xFFFFFF) << 1);
+}
+
+TEST(DspCore, TestWithLongImmediateMoveSetsZeroForTheBranch) {
+    // An audio program's state check: MOVEM P:$0001,A; TST A #$000BC0,R0; BNE +9. P:1 holds zero, so the branch
+    // falls through and R0 takes the immediate.
+    Machine m;
+    m.core.write_p(1, 0);
+    m.at = 0x10;
+    m.emit(0x07F08E, 0x000001);  // MOVEM P:$0001,A
+    m.emit(0x60F403, 0x000BC0);  // TST A #$000BC0,R0
+    m.emit(0x052409);            // BNE *+9
+    m.core.regs().pc = 0x10;
+    m.core.regs().a = 0x00000001000000;  // as the live program has it: A = 1, carry set
+    m.core.regs().sr = 0x311;
+    m.core.regs().b = 0x00000001000000;  // B non-zero, so testing the wrong accumulator shows
+    m.run(3);
+    EXPECT_EQ(m.core.regs().r[0], 0xBC0u);
+    EXPECT_EQ(m.core.regs().pc, 0x15u);
+}
+
+TEST(DspCore, CarryFollowsEachInstructionsRule) {
+    constexpr u32 kCarry = 1u << 0, kOverflow = 1u << 1, kZero = 1u << 2;
+    // CMP #xx computes the borrow: A = 1, CMP #2 borrows (C set); CMP #0 does not.
+    {
+        Machine m;
+        m.core.regs().a = 0x00000001000000;
+        m.emit(0x014285);  // CMP #2,A
+        m.run(1);
+        EXPECT_TRUE(m.core.regs().sr & kCarry);
+        m.emit(0x014085);  // CMP #0,A
+        m.run(1);
+        EXPECT_FALSE(m.core.regs().sr & kCarry);
+    }
+    // TFR changes no condition code; MPY and CLR keep C.
+    {
+        Machine m;
+        m.core.regs().sr = kCarry | kZero;
+        m.core.regs().b = 0x00000005000000;
+        m.emit(0x200001);  // TFR B,A
+        m.run(1);
+        EXPECT_EQ(m.core.regs().a, 0x00000005000000);
+        EXPECT_EQ(m.core.regs().sr & (kCarry | kZero), kCarry | kZero);
+        m.emit(0x2000D0);  // MPY X0,Y0,A
+        m.emit(0x200013);  // CLR A
+        m.run(2);
+        EXPECT_TRUE(m.core.regs().sr & kCarry);
+    }
+    // INC carries out of bit 55; ASL by 4 takes C from the last bit out and V from a sign change.
+    {
+        Machine m;
+        m.core.regs().a = -1;  // $FF FFFFFF FFFFFF
+        m.emit(0x000008);      // INC A
+        m.run(1);
+        EXPECT_EQ(m.core.regs().a, 0);
+        EXPECT_TRUE(m.core.regs().sr & kCarry);
+        m.core.regs().a = 0x08000000000000;  // bit 51 set: ASL #4 moves it to bit 55
+        m.emit(0x0C1D08);                    // ASL #4,A,A
+        m.run(1);
+        EXPECT_FALSE(m.core.regs().sr & kCarry);
+        EXPECT_TRUE(m.core.regs().sr & kOverflow);
+    }
+}
+
+TEST(DspCore, AWaitOnAFrameStaticBitSkipsToTheBudgetsEndWithTheSameResult) {
+    // An EP's idle loop: CLR A; ADD #1,A; JCLR #1,X:$FFFFC5,$0001 — counting while it waits for the frame flag.
+    // Run it with the skip and without; every register and both counters must match, for several budgets.
+    for (u64 budget : {7u, 8u, 100u, 101u, 106'666u, 853'333u}) {  // some end mid-instruction
+        Machine with, without;
+        for (Machine* m : {&with, &without}) {
+            m->emit(0x200013);            // CLR A
+            m->emit(0x014180);            // ADD #1,A
+            m->emit(0x0A8581, 0x000001);  // JCLR #1,X:$FFFFC5,$0001
+        }
+        with.periph.frame_static = true;
+        with.core.run(budget);
+        without.core.run(budget);
+        EXPECT_EQ(with.core.regs().a, without.core.regs().a) << budget;
+        EXPECT_EQ(with.core.regs().pc, without.core.regs().pc) << budget;
+        EXPECT_EQ(with.core.regs().sr, without.core.regs().sr) << budget;
+        EXPECT_EQ(with.core.cycles(), without.core.cycles()) << budget;
+        EXPECT_EQ(with.core.instructions(), without.core.instructions()) << budget;
+    }
+    // A jump that waits on itself skips the same way.
+    Machine self, plain;
+    for (Machine* m : {&self, &plain}) m->emit(0x0A8581, 0x000000);  // JCLR #1,X:$FFFFC5,$0000
+    self.periph.frame_static = true;
+    self.core.run(50'000);
+    plain.core.run(50'000);
+    EXPECT_EQ(self.core.cycles(), plain.core.cycles());
+    EXPECT_EQ(self.core.regs().pc, plain.core.regs().pc);
+    EXPECT_EQ(self.core.instructions(), plain.core.instructions());
 }

@@ -20,6 +20,14 @@ public:
     virtual ~Peripherals() = default;
     virtual u32 peripheral_read(u32 address) = 0;              // full 24-bit address, $FFFF80..$FFFFFF
     virtual void peripheral_write(u32 address, u32 value) = 0;
+    // True when `bit` of the peripheral register at `address` cannot change before the owner's next frame: a program
+    // polling it in a tight loop then only spins out its cycle budget, which Core::run skips (same registers, same
+    // cycle count).
+    virtual bool static_until_next_frame(u32 address, u32 bit) const {
+        (void)address;
+        (void)bit;
+        return false;
+    }
 };
 
 class Core {
@@ -104,6 +112,7 @@ private:
     void write_reg6(u32 code, u32 value);
     u32 limit24(i64 acc56);
     void set_ccr_result(i64 result, bool carry_in_known, bool carry, bool overflow);
+    void shift_flags(i64 before, i64 after, u32 count, bool left);
     void set_ccr_logical(i64 acc56);
     void alu(const Decoded& d, u32 ext, i64 pre_a, i64 pre_b);
     i64 multiply(u32 qqq, bool negate) const;
@@ -136,6 +145,15 @@ private:
     u32 rep_remaining_{0};
     u32 rep_saved_lc_{0};
     bool rep_active_{false};
+    // A tight wait on a frame-static peripheral bit, noted by the bit-jump that keeps looping: the loop is the jump
+    // alone, or the jump and one ADD #xx / INC on an accumulator before it (an idle counter).
+    struct IdleWait {
+        bool pending{false};
+        u32 dest{0};
+        i64 delta{0};
+        u32 per_iteration{0};
+    } idle_;
+    void note_idle_wait(u32 target, u32 at, u32 jump_words);
 };
 
 }  // namespace mv::dsp
