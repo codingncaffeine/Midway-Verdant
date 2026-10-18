@@ -434,10 +434,19 @@ void VulkanRenderer::write_back(Surface& s) {
     fn_->vkCmdCopyImageToBuffer(cb, s.color.image, VK_IMAGE_LAYOUT_GENERAL, staging_.buffer, 1, &region);
     dev_.finish_once(cb);
     const u8* pixels = static_cast<const u8*>(staging_.mapped);
-    for (u32 y = 0; y < s.height; ++y) {
-        for (u32 x = 0; x < s.width; ++x) {
-            const u32 off = s.swizzled ? swizzled_offset(x, y, 0, s.log_w, s.log_h, 0) * bpp : y * s.pitch + x * bpp;
-            if (static_cast<u64>(s.phys) + off + bpp <= ram_size_) std::memcpy(ram_ + s.phys + off, pixels + (static_cast<std::size_t>(y) * s.width + x) * bpp, bpp);
+    if (!s.swizzled) {
+        // Linear: a row at a time.
+        const u32 row_bytes = s.width * bpp;
+        for (u32 y = 0; y < s.height; ++y) {
+            const u64 off = static_cast<u64>(y) * s.pitch;
+            if (static_cast<u64>(s.phys) + off + row_bytes <= ram_size_) std::memcpy(ram_ + s.phys + off, pixels + static_cast<std::size_t>(y) * row_bytes, row_bytes);
+        }
+    } else {
+        for (u32 y = 0; y < s.height; ++y) {
+            for (u32 x = 0; x < s.width; ++x) {
+                const u32 off = swizzled_offset(x, y, 0, s.log_w, s.log_h, 0) * bpp;
+                if (static_cast<u64>(s.phys) + off + bpp <= ram_size_) std::memcpy(ram_ + s.phys + off, pixels + (static_cast<std::size_t>(y) * s.width + x) * bpp, bpp);
+            }
         }
     }
     s.dirty = false;
@@ -1038,6 +1047,21 @@ void VulkanRenderer::draw(const KelvinState& s, const DrawBatch& batch) {
     } else {
         fn_->vkCmdDraw(cb_, v.count, 1, 0, 0);
     }
+}
+
+void VulkanRenderer::flush_frame() {
+    flush();
+    vertex_cursor_ = index_cursor_ = uniform_cursor_ = 0;
+    fn_->vkResetDescriptorPool(dev_.device(), descriptor_pool_, 0);
+}
+
+bool VulkanRenderer::write_back_at(u32 phys) {
+    for (auto& [k, s] : surfaces_) {
+        if (s->phys != phys) continue;
+        if (s->dirty) write_back(*s);
+        return true;
+    }
+    return false;
 }
 
 void VulkanRenderer::end_frame() {

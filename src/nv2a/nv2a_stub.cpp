@@ -23,6 +23,8 @@ Nv2aStub::Nv2aStub(Bus& bus, Scheduler& sched, std::function<void(bool)> irq)
     vblank_.name = "nv2a.vblank";
     vblank_.fire = [this](Cycles) {
         ++vblanks_;
+        // The scanout reads the frame buffer now: a rendered one comes down from the device first.
+        if (renderer_) renderer_->write_back_at(reg(kPcrtcStart));
         regs_[kPcrtcIntr0] |= 1u;
         // The mode latch acknowledges software's toggle at the frame boundary: bit 4 takes bit 0.
         const u32 latch = reg(kPramdacModeLatch);
@@ -205,7 +207,7 @@ void Nv2aStub::on_method(const PushbufferMethod& m) {
     if (renderer_ && bound_[m.subchannel] == 0x97) {
         kelvin_.method(m.method, m.value);
         if (m.method == 0x1D70) {
-            renderer_->end_frame();
+            renderer_->flush_frame();
             ++rendered_frames_;
         }
     }

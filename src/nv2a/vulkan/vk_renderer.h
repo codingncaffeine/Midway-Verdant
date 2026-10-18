@@ -27,6 +27,10 @@ public:
     void draw(const KelvinState& state, const DrawBatch& batch) override;
     // Submits the frame's work, waits, writes every rendered surface back into guest RAM.
     void end_frame();
+    // The live machine's frame boundary: submit the work and recycle the rings, but leave the surfaces on the
+    // device — they reach RAM when a texture samples them, and the scanout one at vblank (write_back_at).
+    void flush_frame();
+    bool write_back_at(u32 phys);
     // Guest RAM in [phys, phys + len) was written: textures decoded from it are stale.
     void invalidate(u32 phys, u32 len);
 
