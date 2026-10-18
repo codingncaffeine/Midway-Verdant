@@ -10,6 +10,9 @@ namespace mv {
 namespace {
 constexpr u8 kRegSeconds = 0, kRegSecondsAlarm = 1, kRegMinutes = 2, kRegMinutesAlarm = 3, kRegHours = 4, kRegHoursAlarm = 5,
              kRegWeekday = 6, kRegDay = 7, kRegMonth = 8, kRegYear = 9, kRegA = 10, kRegB = 11, kRegC = 12, kRegD = 13;
+// The console keeps the century in the last CMOS byte, not where PC firmware does (0x32): the kernel reads the time
+// registers 0x00-0x09 and then 0x7F.
+constexpr u8 kRegCentury = 0x7F;
 constexpr u8 kAUip = 0x80;
 constexpr u8 kBSet = 0x80, kBPie = 0x40, kBAie = 0x20, kBUie = 0x10, kBBinary = 0x04, kB24h = 0x02;
 constexpr u8 kCIrqf = 0x80, kCPf = 0x40, kCAf = 0x20, kCUf = 0x10;
@@ -123,7 +126,7 @@ void Rtc::refresh_time_registers() {
     cmos_[kRegDay] = to_reg(c.day);
     cmos_[kRegMonth] = to_reg(c.month);
     cmos_[kRegYear] = to_reg(c.year % 100);
-    cmos_[0x32] = to_reg(c.year / 100);  // century byte, where PC firmware keeps it
+    cmos_[kRegCentury] = to_reg(c.year / 100);
 }
 
 void Rtc::apply_time_registers() {
@@ -133,7 +136,7 @@ void Rtc::apply_time_registers() {
     c.hour = from_reg(cmos_[kRegHours], true);
     c.day = from_reg(cmos_[kRegDay]);
     c.month = from_reg(cmos_[kRegMonth]);
-    const int century = from_reg(cmos_[0x32]);
+    const int century = from_reg(cmos_[kRegCentury]);
     c.year = (century ? century : 20) * 100 + from_reg(cmos_[kRegYear]);
     c.weekday = 1;
     const i64 wanted = unix_from_civil(c);

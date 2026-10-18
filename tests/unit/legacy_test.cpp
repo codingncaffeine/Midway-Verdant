@@ -141,7 +141,7 @@ TEST(Rtc, TimeRegistersFollowTheTimelineAndPeriodicInterruptsFire) {
     EXPECT_EQ(read(0x07), 9u);
     EXPECT_EQ(read(0x08), 9u);
     EXPECT_EQ(read(0x09), 1u);  // year 01
-    EXPECT_EQ(read(0x32), 20u);
+    EXPECT_EQ(read(0x7F), 20u) << "the century, where the console's kernel reads it";
     sched.advance_to(cycles_from_ns_ceil(25'000'000'000ull));  // 25 s
     EXPECT_EQ(read(0x00), 5u);
     EXPECT_EQ(read(0x02), 47u);
