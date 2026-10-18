@@ -196,6 +196,8 @@ void SetupEngine::link_on(u32 handle) {
 void SetupEngine::frame() {
     for (auto& bin : mix_) bin.fill(0.0f);
     for (u32 list = 0; list < kRegListTop.size(); ++list) walk(list);
+    for (u32 b = 0; b < kBins; ++b)
+        for (float s : mix_[b]) bin_energy_[b] += static_cast<double>(s) * static_cast<double>(s);
     // Twice a second, under the APU trace: every voice on a list with its position, envelope level and V0/V1 volumes.
     if (++frames_ % 750 == 0 && trace::on(trace::Cat::Apu)) {
         std::string line;
@@ -204,6 +206,14 @@ void SetupEngine::frame() {
                 line += std::format(" {:x}(cbo {} ea {} v0 {:x} v1 {:x}{})", h, field(h, kFieldOffset) & kOffsetMask, field(h, kFieldOffset) >> 24,
                                     (field(h, kFieldVolA) >> 4) & 0xFFFu, field(h, kFieldVolA) >> 20, (field(h, kFieldState) & kStatePaused) ? " paused" : "");
         trace::log(trace::Cat::Apu, "vp: frame {} voices:{}", frames_, line.empty() ? " none" : line);
+        // And the RMS level of each bin that carried sound over the half second, in dB of full scale.
+        std::string bins;
+        for (u32 b = 0; b < kBins; ++b) {
+            const double ms = bin_energy_[b] / (750.0 * kSamplesPerFrame);
+            if (ms > 1e-12) bins += std::format(" {}:{:.1f}", b, 10 * std::log10(ms));
+        }
+        bin_energy_.fill(0.0);
+        trace::log(trace::Cat::Apu, "vp: frame {} bin rms dB:{}", frames_, bins.empty() ? " silent" : bins);
     }
 }
 

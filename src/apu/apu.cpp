@@ -272,6 +272,17 @@ void Apu::on_frame(Cycles now) {
                 x[kMixBufWord + bin * apu::SetupEngine::kSamplesPerFrame + i] = static_cast<u32>(s) & 0xFFFFFFu;
             }
     }
+    // Instrument, twice a second under the APU trace: the RMS level each processor wrote to its output FIFO 0.
+    if (frames_ % 750 == 0 && trace::on(trace::Cat::Apu)) {
+        auto level = [](Memory& m) {
+            const double v = m.out0_samples_ ? 10 * std::log10(m.out0_energy_ / static_cast<double>(m.out0_samples_) / (32768.0 * 32768.0) + 1e-12) : -120.0;
+            m.out0_energy_ = 0;
+            m.out0_samples_ = 0;
+            return v;
+        };
+        const double gp_db = level(gp_memory_), ep_db = level(ep_memory_);
+        trace::log(trace::Cat::Apu, "fifo0 rms dB: gp {:.1f} ep {:.1f}", gp_db, ep_db);
+    }
     // Instrument: MV_DEBUG_GP_FRAME=N writes the GP's instructions during frame N to scratch/gp-frame-N.trace.
     static const long debug_frame = std::getenv("MV_DEBUG_GP_FRAME") ? std::atol(std::getenv("MV_DEBUG_GP_FRAME")) : -1;
     std::FILE* gp_trace = nullptr;
@@ -407,6 +418,13 @@ bool Apu::Memory::fifo_read(u32 fifo, u8* out, u32 len) {
 bool Apu::Memory::fifo_write(u32 fifo, const u8* in, u32 len) {
     if (fifo > 3) return false;
     out_bytes_[fifo] += len;
+    if (fifo == 0)  // instrument: the level of what goes out (16-bit samples, as the output rings carry)
+        for (u32 i = 0; i + 1 < len; i += 2) {
+            i16 s;
+            std::memcpy(&s, in + i, 2);
+            out0_energy_ += static_cast<double>(s) * s;
+            ++out0_samples_;
+        }
     trace::log(trace::Cat::Apu, "fifo write: regs +{:04x} out{} at {:x}, {} bytes", fifo_regs_, fifo, apu_.read_word(fifo_regs_ + fifo * kFifoStride + kFifoCurrent), len);
     return ring_transfer(fifo_regs_ + fifo * kFifoStride, nullptr, in, len);
 }

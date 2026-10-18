@@ -122,6 +122,10 @@ private:
         u32 scratch_table_, scratch_max_, fifo_table_, fifo_max_, fifo_regs_;
         std::string problem_;
         u64 out_bytes_[4]{}, in_bytes_[2]{};
+    public:
+        double out0_energy_{0};  // instrument: sum of squares of the 16-bit samples written to output FIFO 0
+        u64 out0_samples_{0};
+    private:
     };
 
     u32 read_word(u32 offset);
