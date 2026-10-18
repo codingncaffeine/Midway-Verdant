@@ -39,7 +39,6 @@ Apu::Apu(Bus& bus, Scheduler& sched, std::function<void(bool)> irq)
     set_cfg8(0x3D, 1);
     frame_.name = "apu.frame";
     frame_.fire = [this](Cycles now) { on_frame(now); };
-    sched_.schedule(frame_, cycles_from_ticks(1, clk::kApuFramesPerSecond));
 }
 
 void Apu::on_bar_changed(int index, u32 old_base, u32 new_base) {
@@ -57,6 +56,8 @@ void Apu::reset() {
     for (auto& r : regs_) r = 0;
     other_.clear();
     fe_trapped_ = false;
+    xgscnt_ = 0;
+    update_frame_clock();  // SECTL is clear: the frame clock stops
     update_irq();
 }
 
@@ -99,6 +100,7 @@ bool Apu::processor_write(apu::Processor& p, u32 offset, u32 value) {
 }
 
 u32 Apu::read_word(u32 offset) {
+    if (offset == kXgsCnt) return xgscnt_;
     if (offset < kVpBlock) return regs_[offset / 4];
     if (offset < kGpBlock) {
         if (offset - kVpBlock == kVpFree) return 0x80;  // the queue is always drained at this level of modelling
@@ -125,6 +127,8 @@ void Apu::write_word(u32 offset, u32 value) {
         }
         regs_[offset / 4] = value;
         if (offset == kIen) update_irq();
+        if (offset == kSectl) update_frame_clock();
+        if (offset == kXgsCnt) xgscnt_ = value;
         // The host resumes a trapped front end by writing any other method mode.
         if (offset == kFectl && (value & kFectlMethodMode) != kFectlTrapped && fe_trapped_) {
             fe_trapped_ = false;
@@ -207,6 +211,10 @@ void Apu::apply_reset(apu::Processor& p, u32& reset_word, u32 value, std::string
     const bool release = (value & (kResetBlock | kResetDsp)) == (kResetBlock | kResetDsp);
     if (release && !p.running()) {
         p.release_reset();
+        if (&p == &ep_) {
+            ++ep_releases_;
+            ep_runs_since_release_ = 0;
+        }
         if (p.running()) trace::log(trace::Cat::Apu, "{}: reset released, program loaded from scratch, P:0 = {:06x}", which, p.core().read_p(0));
         else trace::log(trace::Cat::Apu, "{}: reset released but the bootstrap failed: {}", which, p.last_problem());
     } else if (!release && p.running()) {
@@ -215,9 +223,24 @@ void Apu::apply_reset(apu::Processor& p, u32& reset_word, u32 value, std::string
     }
 }
 
-void Apu::run_frame(apu::Processor& p, FrameStats& stats, std::string_view which) {
+void Apu::update_frame_clock() {
+    const bool on = (regs_[kSectl / 4] & kSectlCountMode) != 0;
+    if (on == counting_) return;
+    counting_ = on;
+    if (on) {
+        // The first frame one period after the count starts [verify on hardware].
+        frame_epoch_ = sched_.now();
+        epoch_frames_ = 0;
+        sched_.schedule(frame_, frame_epoch_ + cycles_from_ticks(1, clk::kApuFramesPerSecond));
+    } else {
+        sched_.cancel(frame_);
+    }
+    trace::log(trace::Cat::Apu, "frame clock {} (sectl {:x}, xgscnt {:x})", on ? "on" : "off", regs_[kSectl / 4], xgscnt_);
+}
+
+void Apu::run_frame(apu::Processor& p, FrameStats& stats, std::string_view which, bool start_of_frame) {
     if (!p.running()) return;
-    const u64 used = p.run_frame(kDspHz / clk::kApuFramesPerSecond);
+    const u64 used = p.run_frame(kDspHz / clk::kApuFramesPerSecond, start_of_frame);
     stats.last_cycles = used;
     stats.max_cycles = std::max(stats.max_cycles, used);
     ++stats.frames_run;
@@ -262,14 +285,53 @@ void Apu::on_frame(Cycles now) {
                 std::fprintf(gp_trace, "X:%04x %06x %06x %06x %06x %06x %06x %06x %06x\n", a, xm[a], xm[a + 1], xm[a + 2], xm[a + 3], xm[a + 4], xm[a + 5], xm[a + 6], xm[a + 7]);
         }
     }
-    run_frame(gp_, gp_stats_, "gp");
+    run_frame(gp_, gp_stats_, "gp", true);
     if (gp_trace) {
         gp_.core().set_trace(nullptr);
         gp_.dma().set_trace(nullptr);
         std::fclose(gp_trace);
     }
-    run_frame(ep_, ep_stats_, "ep");
-    sched_.schedule(frame_, cycles_from_ticks(frames_ + 1, clk::kApuFramesPerSecond));
+    // Instrument: MV_DEBUG_EP_FRAME=N does the same for the EP during frame N (scratch/ep-frame-N.trace), and
+    // MV_DEBUG_EP_RUNS=K for its first K runs after each reset release (scratch/ep-run-R-K.trace: the fast mode's
+    // frame numbers move from run to run, the EP's own runs do not).
+    static const long debug_ep_frame = std::getenv("MV_DEBUG_EP_FRAME") ? std::atol(std::getenv("MV_DEBUG_EP_FRAME")) : -1;
+    static const long debug_ep_runs = std::getenv("MV_DEBUG_EP_RUNS") ? std::atol(std::getenv("MV_DEBUG_EP_RUNS")) : 0;
+    std::FILE* ep_trace = nullptr;
+    std::string trace_name;
+    if (debug_ep_frame >= 0 && frames_ == static_cast<u64>(debug_ep_frame)) trace_name = std::format("scratch/ep-frame-{}", debug_ep_frame);
+    if (ep_.running() && ep_runs_since_release_ < static_cast<u64>(debug_ep_runs))
+        trace_name = std::format("scratch/ep-run-{}-{}", ep_releases_, ep_runs_since_release_);
+    if (ep_.running()) ++ep_runs_since_release_;
+    if (!trace_name.empty()) {
+        ep_trace = std::fopen((trace_name + ".trace").c_str(), "w");
+        // With it, the program as it stands (P with raw words) and the X and Y memories, for reading the program offline.
+        if (std::FILE* lst = std::fopen((trace_name + ".lst").c_str(), "w")) {
+            auto& core = ep_.core();
+            for (u32 a = 0; a < core.p_memory().size(); ++a) std::fprintf(lst, "P:%04x %06x  %s\n", a, core.read_p(a), core.disassemble_at(a).c_str());
+            for (u32 a = 0; a < core.x_memory().size(); a += 8) {
+                std::fprintf(lst, "X:%04x", a);
+                for (u32 i = 0; i < 8 && a + i < core.x_memory().size(); ++i) std::fprintf(lst, " %06x", core.x_memory()[a + i]);
+                std::fprintf(lst, "\n");
+            }
+            for (u32 a = 0; a < core.y_memory().size(); a += 8) {
+                std::fprintf(lst, "Y:%04x", a);
+                for (u32 i = 0; i < 8 && a + i < core.y_memory().size(); ++i) std::fprintf(lst, " %06x", core.y_memory()[a + i]);
+                std::fprintf(lst, "\n");
+            }
+            std::fclose(lst);
+        }
+        ep_.core().set_trace(ep_trace);
+        ep_.dma().set_trace(ep_trace);
+    }
+    run_frame(ep_, ep_stats_, "ep", (xgscnt_ / apu::SetupEngine::kSamplesPerFrame) % kEpFrameDivider == 0);
+    if (ep_trace) {
+        ep_.core().set_trace(nullptr);
+        ep_.dma().set_trace(nullptr);
+        std::fclose(ep_trace);
+    }
+    xgscnt_ += apu::SetupEngine::kSamplesPerFrame;
+    ++epoch_frames_;
+    sched_.schedule(frame_, frame_epoch_ + cycles_from_ticks(epoch_frames_ + 1, clk::kApuFramesPerSecond));
 }
 
 // ── scratch and FIFO spaces ─────────────────────────────────────────────────────────────────────────────────────
@@ -338,11 +400,14 @@ bool Apu::Memory::ring_transfer(u32 regs, u8* out, const u8* in, u32 len) {
 
 bool Apu::Memory::fifo_read(u32 fifo, u8* out, u32 len) {
     if (fifo > 1) return false;
+    in_bytes_[fifo] += len;
     return ring_transfer(fifo_regs_ + kInputFifoRegs + fifo * kFifoStride, out, nullptr, len);
 }
 
 bool Apu::Memory::fifo_write(u32 fifo, const u8* in, u32 len) {
     if (fifo > 3) return false;
+    out_bytes_[fifo] += len;
+    trace::log(trace::Cat::Apu, "fifo write: regs +{:04x} out{} at {:x}, {} bytes", fifo_regs_, fifo, apu_.read_word(fifo_regs_ + fifo * kFifoStride + kFifoCurrent), len);
     return ring_transfer(fifo_regs_ + fifo * kFifoStride, nullptr, in, len);
 }
 

@@ -384,6 +384,36 @@ int main(int argc, char** argv) {
                     static_cast<unsigned long long>(gp.dma().transfers()), static_cast<unsigned long long>(gp.dma().bytes_moved()),
                     machine.apu().reg(mv::Apu::kGpFifoRegs + mv::Apu::kFifoCurrent), gp.last_problem().empty() ? "" : " PROBLEM: ",
                     gp.last_problem().c_str(), gp.dma().last_error().empty() ? "" : " DMA: ", gp.dma().last_error().c_str());
+        {
+            auto& ep = machine.apu().ep();
+            const auto& es = machine.apu().ep_stats();
+            std::printf("ep %s, %llu frames run, last %llu cycles, max %llu; dma %llu transfers (%llu bytes)%s%s%s%s\n", ep.running() ? "running" : "in reset",
+                        static_cast<unsigned long long>(es.frames_run), static_cast<unsigned long long>(es.last_cycles),
+                        static_cast<unsigned long long>(es.max_cycles), static_cast<unsigned long long>(ep.dma().transfers()),
+                        static_cast<unsigned long long>(ep.dma().bytes_moved()), ep.last_problem().empty() ? "" : " PROBLEM: ", ep.last_problem().c_str(),
+                        ep.dma().last_error().empty() ? "" : " DMA: ", ep.dma().last_error().c_str());
+            // Bytes each processor moved through its FIFOs, and where each output ring sits in the FIFO space.
+            for (const bool is_ep : {false, true}) {
+                const mv::u32 regs = is_ep ? mv::Apu::kEpFifoRegs : mv::Apu::kGpFifoRegs;
+                std::printf("%s fifos:", is_ep ? "ep" : "gp");
+                for (mv::u32 f = 0; f < 4; ++f)
+                    std::printf(" out%u %llu B [%x-%x cur %x]", f, static_cast<unsigned long long>(machine.apu().fifo_out_bytes(is_ep, f)),
+                                machine.apu().reg(regs + f * mv::Apu::kFifoStride + mv::Apu::kFifoBase), machine.apu().reg(regs + f * mv::Apu::kFifoStride + mv::Apu::kFifoEnd),
+                                machine.apu().reg(regs + f * mv::Apu::kFifoStride + mv::Apu::kFifoCurrent));
+                std::printf(" in0 %llu B in1 %llu B; table %08x max %u\n", static_cast<unsigned long long>(machine.apu().fifo_in_bytes(is_ep, 0)),
+                            static_cast<unsigned long long>(machine.apu().fifo_in_bytes(is_ep, 1)),
+                            machine.apu().reg(is_ep ? mv::Apu::kEpFifoTable : mv::Apu::kGpFifoTable), machine.apu().reg(is_ep ? mv::Apu::kEpFifoMaxSge : mv::Apu::kGpFifoMaxSge));
+                const mv::u32 table = machine.apu().reg(is_ep ? mv::Apu::kEpFifoTable : mv::Apu::kGpFifoTable);
+                const mv::u32 last = std::min<mv::u32>(machine.apu().reg(is_ep ? mv::Apu::kEpFifoMaxSge : mv::Apu::kGpFifoMaxSge), 15);
+                std::printf("  %s fifo pages:", is_ep ? "ep" : "gp");
+                for (mv::u32 i = 0; i <= last; ++i) {
+                    mv::u32 entry = 0;
+                    machine.bus().read_ram(table + i * 8, &entry, 4);
+                    std::printf(" %08x", entry);
+                }
+                std::printf("\n");
+            }
+        }
         std::printf("vp synthesis: %llu voice-frames mixed, peak %.4f of full scale\n", static_cast<unsigned long long>(machine.apu().setup_engine().frames_mixed()),
                     static_cast<double>(machine.apu().setup_engine().peak()));
         std::printf("vp: %llu voices on, %llu retired, %llu front-end traps%s, %llu stream notifications; fectl %08x ists %08x ien %08x\n",

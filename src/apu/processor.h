@@ -29,9 +29,9 @@ public:
     void release_reset();
     bool running() const { return running_; }
 
-    // A frame: raise the start-of-frame condition and run the core until it halts itself or the cycle budget
-    // is spent. Returns the cycles used.
-    u64 run_frame(u64 cycle_budget);
+    // A frame: resume the core, raise the start-of-frame condition when this frame starts one of the processor's
+    // own frames, and run until it halts itself or the cycle budget is spent. Returns the cycles used.
+    u64 run_frame(u64 cycle_budget, bool start_of_frame = true);
 
     u32 peripheral_read(u32 address) override;
     void peripheral_write(u32 address, u32 value) override;
@@ -39,6 +39,8 @@ public:
     u32 interrupts() const { return interrupts_; }
     // Instruments: how often the program touched each peripheral register (reads, writes), by address.
     const std::map<u32, std::pair<u64, u64>>& peripheral_traffic() const { return traffic_; }
+    // The start-of-frame flag rises only at a frame boundary.
+    bool static_until_next_frame(u32 address, u32 bit) const override { return address == 0xFFFFC5 && bit == 1; }
 
 private:
     dsp::Core core_;

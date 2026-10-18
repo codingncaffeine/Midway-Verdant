@@ -50,6 +50,16 @@ public:
     static constexpr u32 kResetBlock = 1u << 0, kResetDsp = 1u << 1;  // both set = the processor runs
     static constexpr u32 kMixBufWord = 0x1400, kMixBufWords = 0x400;
     static constexpr u64 kDspHz = 160'000'000;  // the processors' clock per the wiki [verify]
+    // The frame clock. Frames run only while the setup engine's count mode (SECTL bits 4:3) is on; the host stops
+    // it, zeroes the global sample count XGSCNT, releases the GP and EP, then turns it on, so both processors see
+    // the same first frame (the kernel and the titles do exactly this). XGSCNT counts 32 samples a frame.
+    static constexpr u32 kSectlCountMode = 0x18, kXgsCnt = 0x200C;
+    // The EP works in 256-sample frames: its start-of-frame flag rises when the count is a multiple of eight frames,
+    // and it then writes 256 stereo samples to FIFO 0 (the AC'97 rate); the GP's rings in scratch hold sixteen
+    // frames, two of the EP's (xboxdevwiki APU). Like the GP it is resumed from halt every frame: a title's EP halts
+    // inside its initialisation and finishes it on the next frame, then polls the flag; resumed only every eighth
+    // frame its first block would land after the AC'97, started with an 8 ms lead, had already passed it [inferred].
+    static constexpr u32 kEpFrameDivider = 8;
 
     Apu(Bus& bus, Scheduler& sched, std::function<void(bool)> irq);
     std::string_view name() const override { return PciDevice::name(); }
@@ -68,6 +78,8 @@ public:
     u64 frames() const { return frames_; }
     apu::Processor& gp() { return gp_; }
     apu::Processor& ep() { return ep_; }
+    u64 fifo_out_bytes(bool ep, u32 fifo) const { return (ep ? ep_memory_ : gp_memory_).fifo_out_bytes(fifo); }
+    u64 fifo_in_bytes(bool ep, u32 fifo) const { return (ep ? ep_memory_ : gp_memory_).fifo_in_bytes(fifo); }
     apu::SetupEngine& setup_engine() { return se_; }
     u64 traps() const { return traps_; }
     bool front_end_trapped() const { return fe_trapped_; }
@@ -81,6 +93,7 @@ public:
         u64 last_cycles{0}, max_cycles{0}, frames_run{0};
     };
     const FrameStats& gp_stats() const { return gp_stats_; }
+    const FrameStats& ep_stats() const { return ep_stats_; }
 
 protected:
     void on_bar_changed(int index, u32 old_base, u32 new_base) override;
@@ -97,6 +110,9 @@ private:
         bool fifo_read(u32 fifo, u8* out, u32 len) override;
         bool fifo_write(u32 fifo, const u8* in, u32 len) override;
         const std::string& last_problem() const { return problem_; }
+        // Instruments: bytes the program wrote to each output FIFO and read from each input FIFO.
+        u64 fifo_out_bytes(u32 fifo) const { return fifo < 4 ? out_bytes_[fifo] : 0; }
+        u64 fifo_in_bytes(u32 fifo) const { return fifo < 2 ? in_bytes_[fifo] : 0; }
 
     private:
         bool translate(u32 table_reg, u32 max_reg, u32 offset, PhysAddr& phys);
@@ -105,6 +121,7 @@ private:
         Apu& apu_;
         u32 scratch_table_, scratch_max_, fifo_table_, fifo_max_, fifo_regs_;
         std::string problem_;
+        u64 out_bytes_[4]{}, in_bytes_[2]{};
     };
 
     u32 read_word(u32 offset);
@@ -112,7 +129,8 @@ private:
     u32 processor_word(apu::Processor& p, u32 offset, u32 reset_word);
     bool processor_write(apu::Processor& p, u32 offset, u32 value);
     void apply_reset(apu::Processor& p, u32& reset_word, u32 value, std::string_view which);
-    void run_frame(apu::Processor& p, FrameStats& stats, std::string_view which);
+    void run_frame(apu::Processor& p, FrameStats& stats, std::string_view which, bool start_of_frame);
+    void update_frame_clock();
     void on_frame(Cycles now);
     void update_irq();
     void deliver_trap(u32 method, u32 parameter);
@@ -133,9 +151,14 @@ private:
     u64 traps_{0};
     TimerEvent frame_;
     u64 frames_{0};
+    bool counting_{false};     // the frame clock runs (SECTL count mode on)
+    Cycles frame_epoch_{0};    // when it was turned on
+    u64 epoch_frames_{0};      // frames since then
+    u32 xgscnt_{0};            // the global sample count
     bool irq_level_{false};
     u64 reads_{0}, writes_{0};
     bool gp_problem_logged_{false}, ep_problem_logged_{false};
+    u64 ep_releases_{0}, ep_runs_since_release_{0};  // instruments
 };
 
 }  // namespace mv

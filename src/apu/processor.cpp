@@ -31,9 +31,9 @@ void Processor::release_reset() {
     running_ = true;
 }
 
-u64 Processor::run_frame(u64 cycle_budget) {
+u64 Processor::run_frame(u64 cycle_budget, bool start_of_frame) {
     if (!running_) return 0;
-    interrupts_ |= kInterruptStartFrame;
+    if (start_of_frame) interrupts_ |= kInterruptStartFrame;
     core_.set_halted(false);
     const u64 used = core_.run(cycle_budget);
     if (core_.error() && problem_.empty()) problem_ = core_.error_text();

@@ -25,7 +25,11 @@ struct Rig {
                 irq = level;
                 ++irq_edges;
             }};
-    Rig() { apu.config_write(0x10, 4, kBar); }
+    // The frame clock starts as the kernel starts it: the setup engine's count mode on (SECTL = 0xF), at time 0.
+    Rig() {
+        apu.config_write(0x10, 4, kBar);
+        wr(Apu::kSectl, 0xF);
+    }
     u32 rd(u32 off) { return bus.read(kBar + off, 4); }
     void wr(u32 off, u32 v) { bus.write(kBar + off, 4, v); }
     void ram32(PhysAddr at, u32 v) { ASSERT_TRUE(bus.write_ram(at, &v, 4)); }
@@ -86,7 +90,7 @@ TEST(ApuRegisters, GlobalRegistersStoreAndTheVoiceProcessorWindowReportsFreeEntr
     r.wr(Apu::kVpBlock + 0x1000, 1);
     EXPECT_EQ(r.rd(Apu::kVpBlock + 0x1000), 1u) << "methods the engine does not model are kept";
     EXPECT_EQ(r.apu.reads(), 4u);
-    EXPECT_EQ(r.apu.writes(), 3u);
+    EXPECT_EQ(r.apu.writes(), 4u) << "three here and the rig's own SECTL write";
 }
 
 TEST(ApuGp, MemoriesAppearInTheWindowTwentyFourBitsWide) {
@@ -530,4 +534,37 @@ TEST(ApuGp, TheMixBufferAnswersAtXC00AsWellAsX1400ForInstructionsAndDma) {
     EXPECT_NE(x[Apu::kMixBufWord + 0x3FF], 0x111111u);
     r.apu.ep().core().x_memory()[0x400 - 1] = 0;
     EXPECT_EQ(r.apu.ep().core().read_x(0xC25), 0u) << "the EP has 3K words and nothing at X:0xC00";
+}
+
+TEST(ApuFrames, TheFrameClockRunsOnlyInCountModeAndTheEpFlagRisesEveryEighthFrameOfTheCount) {
+    // The host's start sequence: count mode off, XGSCNT zeroed, the processors released, count mode on.
+    Rig r;
+    r.wr(Apu::kSectl, 0x7);  // count mode (bits 4:3) off
+    const u64 before = r.apu.frames();
+    r.sched.advance_to(Rig::frame(20));
+    EXPECT_EQ(r.apu.frames(), before) << "no frames while the count mode is off";
+    r.wr(Apu::kXgsCnt, 0);
+    EXPECT_EQ(r.rd(Apu::kXgsCnt), 0u);
+    // An EP program that counts the start-of-frame flags it sees: JCLR #1,X:$FFFFC5,* (wait), MOVEP #2 to $FFFFC5
+    // (clear), ADD #1,A, halt, BRA back to the wait.
+    const u32 program[] = {0x0A8581, 0x000000,  // JCLR #1,X:$FFFFC5,$0 (wait for the flag)
+                           0x08F485, 0x000002,  // MOVEP #2,X:$FFFFC5 (clear it)
+                           0x014180,            // ADD #1,A
+                           0x08F484, 0x000001,  // MOVEP #1,X:$FFFFC4 (halt until the next frame)
+                           0x0C0000};           // JMP $0
+    r.table(0x1000, {0x6000, 0x7000});  // the boot ROM reads 8 KiB
+    for (u32 i = 0; i < 8; ++i) r.ram32(0x6000 + i * 4, program[i]);
+    r.wr(Apu::kEpScratchTable, 0x1000);
+    r.wr(Apu::kEpScratchMaxSge, 1);
+    r.wr(Apu::kEpBlock + Apu::kReset, Apu::kResetBlock | Apu::kResetDsp);
+    ASSERT_TRUE(r.apu.ep().running()) << r.apu.ep().last_problem();
+    const Cycles start = r.sched.now();
+    r.wr(Apu::kSectl, 0xF);  // count mode on: the first frame one period later
+    r.sched.advance_to(start + Rig::frame(1) - 1);
+    EXPECT_EQ(r.rd(Apu::kXgsCnt), 0u) << "no frame yet";
+    r.sched.advance_to(start + Rig::frame(1));
+    EXPECT_EQ(r.rd(Apu::kXgsCnt), 32u) << "32 samples a frame";
+    r.sched.advance_to(start + Rig::frame(24));
+    EXPECT_EQ(r.rd(Apu::kXgsCnt), 24u * 32);
+    EXPECT_EQ(r.apu.ep().core().regs().a >> 24, 3) << "flags at counts 0, 8 and 16: three EP frames in 24";
 }
