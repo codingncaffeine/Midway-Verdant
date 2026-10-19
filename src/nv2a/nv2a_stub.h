@@ -64,6 +64,9 @@ public:
                          kPgraphFifo = 0x400720;
     static constexpr u32 kPgraphIntrError = 1u << 20, kNsourceDataError = 1u << 1;
     static constexpr u32 kMethodNoOperation = 0x0100;
+    // The pattern class's SET_MONOCHROME_COLOR0 lands in PGRAPH PATT_COLOR0, which software reads back: Direct3D pushes
+    // a value through it and polls the register to know the engine has reached that point.
+    static constexpr u32 kClassPattern = 0x44, kMethodPatternColor0 = 0x0310, kPgraphPattColor0 = 0x400B10;
     // Two 3D-class methods whose values software reads back from the engine's register file: the kernel passes a
     // software method's arguments through them (a register offset or a flip address, and a value) [verify the
     // register names against the public listing].

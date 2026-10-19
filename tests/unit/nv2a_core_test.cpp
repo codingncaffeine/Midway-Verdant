@@ -206,3 +206,25 @@ TEST(Nv2aWrites, APusherRunStampsThePagesWrittenSinceTheLastOne) {
     EXPECT_LE(c.gpu.newest_write(0x20000, 0x1000), built) << "its first page was not";
     EXPECT_GT(c.gpu.newest_write(0x21000, 4), built) << "a second reader still sees it";
 }
+
+// The pattern class's SET_MONOCHROME_COLOR0 lands in PGRAPH PATT_COLOR0, where software reads it back: Direct3D pushes
+// a value through it and polls the register to know the engine has got that far (a title waited on it for ever).
+TEST(Nv2aFence, ThePatternColourMethodIsReadBackFromPgraph) {
+    Channel c;
+    constexpr u32 kPattern = 0x33, kPatternInstance = 0x102;
+    c.ramin(Channel::hash(kPattern) * 8, kPattern);
+    c.ramin(Channel::hash(kPattern) * 8 + 4, kPatternInstance);
+    c.ramin(kPatternInstance * 16, Nv2aStub::kClassPattern);
+    auto on_subchannel_1 = [&](u32 m, u32 v) {
+        c.words.push_back((1u << 18) | (1u << 13) | m);
+        c.words.push_back(v);
+    };
+    on_subchannel_1(0, kPattern);
+    on_subchannel_1(Nv2aStub::kMethodPatternColor0, 0x5EED0001);
+    c.kick();
+    EXPECT_EQ(c.gpu.mmio_read(Nv2aStub::kPgraphPattColor0, 4), 0x5EED0001u);
+    // The same method on the 3D class is not the pattern colour.
+    c.method(Nv2aStub::kMethodPatternColor0, 0x12345678);
+    c.kick();
+    EXPECT_EQ(c.gpu.mmio_read(Nv2aStub::kPgraphPattColor0, 4), 0x5EED0001u);
+}

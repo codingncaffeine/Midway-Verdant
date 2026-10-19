@@ -277,6 +277,7 @@ void Nv2aStub::on_method(const PushbufferMethod& m) {
         if (m.method == kMethodZStencilClearValue) regs_[kPgraphShadowZStencilClear] = m.value;
         else if (m.method == kMethodColorClearValue) regs_[kPgraphShadowColorClear] = m.value;
     }
+    if (bound_[m.subchannel] == kClassPattern && m.method == kMethodPatternColor0) regs_[kPgraphPattColor0] = m.value;
     if (m.method == kMethodNoOperation && m.value != 0) {
         regs_[kPgraphTrappedAddr] = (m.subchannel << 16) | m.method;  // method in bits 12:0, subchannel in 18:16
         regs_[kPgraphTrappedData] = m.value;
