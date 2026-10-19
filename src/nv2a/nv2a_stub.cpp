@@ -48,6 +48,15 @@ Nv2aStub::Nv2aStub(Bus& bus, Scheduler& sched, std::function<void(bool)> irq)
     vblank_.name = "nv2a.vblank";
     vblank_.fire = [this](Cycles) {
         auto gpu = lock_gpu();
+        // What was queued before the vblank is drawn by it, as when the pusher runs inline: the FIFO thread works on the
+        // host clock while the console runs on the CPU's, so a frame still in its hands at the vblank missed the flip and
+        // the title fell to half rate. The CPU waits here (a long exit, not guest time); within the frame the overlap stays.
+        if (fifo_threaded_ && fifo_busy_) {
+            const auto t0 = std::chrono::steady_clock::now();
+            wait_idle(gpu);
+            ++vblank_waits_;
+            vblank_wait_ns_ += static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
+        }
         guest_now_.store(sched_.now(), std::memory_order_relaxed);
         ++vblanks_;
         sync_point(kSyncVblank);
@@ -429,10 +438,14 @@ u32 Nv2aStub::newest_write(u32 phys, u32 len) const {
 
 void Nv2aStub::collect_writes() {
     if (!write_tracking_ && !capture_) return;
+    const auto harvest_t0 = std::chrono::steady_clock::now();
+    ++collect_calls_;
     // Everything written to RAM since the last run, by the guest (the backend's log) or by a device (the bus's).
     dirty_scratch_.clear();
     if (cpu_) cpu_->take_dirty_pages(dirty_scratch_);
     bus_.take_dirty_pages(dirty_scratch_);
+    collect_ns_ += static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - harvest_t0).count());
+    collect_pages_ += dirty_scratch_.size();
     if (dirty_scratch_.empty()) return;
     std::sort(dirty_scratch_.begin(), dirty_scratch_.end());
     dirty_scratch_.erase(std::unique(dirty_scratch_.begin(), dirty_scratch_.end()), dirty_scratch_.end());
@@ -566,7 +579,7 @@ u32 Nv2aStub::mmio_read(PhysAddr addr, unsigned size) {
     const unsigned shift = 8u * (off & 3u);
     const u32 v = size == 4 ? word : (size == 2 ? ((word >> shift) & 0xFFFFu) : ((word >> shift) & 0xFFu));
     {
-        auto& rc = read_counts_[key];
+        auto& rc = fifo_busy_ ? busy_read_counts_[key] : read_counts_[key];
         ++rc.first;
         rc.second = word;
     }
@@ -823,8 +836,9 @@ std::optional<std::array<u8, 768>> Nv2aStub::gamma_lut() const {
 }  // namespace mv
 
 namespace mv {
-std::string Nv2aStub::busiest_reads(std::size_t top) const {
-    std::vector<std::pair<u32, std::pair<u64, u32>>> v(read_counts_.begin(), read_counts_.end());
+std::string Nv2aStub::busiest_reads(std::size_t top, bool while_busy) const {
+    const auto& counts = while_busy ? busy_read_counts_ : read_counts_;
+    std::vector<std::pair<u32, std::pair<u64, u32>>> v(counts.begin(), counts.end());
     std::ranges::sort(v, std::greater{}, [](const auto& e) { return e.second.first; });
     std::string r;
     for (std::size_t i = 0; i < v.size() && i < top; ++i) r += std::format(" +{:06x} x{} (last {:08x})", v[i].first, v[i].second.first, v[i].second.second);

@@ -107,6 +107,7 @@ public:
     void start_fifo_thread(std::function<void()> request);
     void stop_fifo_thread();
     bool fifo_threaded() const { return fifo_threaded_; }
+    bool fifo_busy_now() const { return fifo_busy_.load(std::memory_order_relaxed); }  // instrument: the FIFO thread has work in hand
     void service();
     // Until the pusher has nothing left it can run (a halted CPU calls it before it skips guest time).
     void wait_fifo_idle();
@@ -244,6 +245,8 @@ private:
     u64 last_run_ns_{0}, overlap_ns_{0}, sync_points_{0};
     bool run_open_{false};
     std::unordered_map<u32, std::pair<u64, u32>> read_counts_;
+    std::unordered_map<u32, std::pair<u64, u32>> busy_read_counts_;  // reads answered while the FIFO thread had work
+    u64 collect_calls_{0}, collect_pages_{0}, collect_ns_{0};  // dirty-page harvests before pusher runs, their pages and host time
     // `why`: the register offset (bit 31 set for a write), or one of the codes below.
     static constexpr u32 kSyncVblank = 0xFFFFFFF0u, kSyncNextRun = 0xFFFFFFF1u;
     void sync_point(u32 why);
@@ -267,7 +270,8 @@ private:
     std::condition_variable fifo_cv_, idle_cv_;
     std::thread fifo_thread_;
     std::thread::id fifo_thread_id_{};
-    bool fifo_threaded_{false}, fifo_stop_{false}, fifo_busy_{false};
+    bool fifo_threaded_{false}, fifo_stop_{false};
+    std::atomic<bool> fifo_busy_{false};
     bool stuck_{false};  // the last walk made no progress: nothing to run until the next kick
     u32 chunk_methods_{0};
     static constexpr u32 kChunkMethods = 128;  // methods per walk between letting a waiting register access in
@@ -279,6 +283,7 @@ private:
     TimerEvent lead_;
     Cycles lead_cycles_{0};
     u64 lead_waits_{0}, lead_wait_ns_{0};
+    u64 vblank_waits_{0}, vblank_wait_ns_{0};  // vblanks that waited for the FIFO thread to finish what was queued
 public:
     u64 semaphore_releases() const { return semaphore_releases_; }
     u64 pusher_wall_ns() const { return pusher_wall_ns_; }  // instrument: host time the vCPU spent inside the pusher (methods + renderer)
@@ -287,7 +292,8 @@ public:
     u64 pusher_overlap_ns() const { return overlap_ns_; }
     u64 pusher_sync_points() const { return sync_points_; }
     // Instrument: register reads by offset, with the last value read, busiest first (a title spinning on a register).
-    std::string busiest_reads(std::size_t top) const;
+    std::string busiest_reads(std::size_t top, bool while_busy = false) const;
+    std::string harvest_report() const { return std::format("{} dirty-page harvests, {} pages, {:.3f} s", collect_calls_, collect_pages_, static_cast<double>(collect_ns_) / 1e9); }
     // Instrument: what ended the overlap windows, by the pusher time a FIFO thread could not have hidden, most first.
     std::string sync_reasons(std::size_t top) const;
     u64 notifies() const { return notifies_; }
@@ -298,6 +304,8 @@ public:
     u64 display_flips() const { return display_flips_; }
     u64 fifo_lead_waits() const { return lead_waits_; }
     u64 fifo_lead_wait_ns() const { return lead_wait_ns_; }
+    u64 fifo_vblank_waits() const { return vblank_waits_; }
+    u64 fifo_vblank_wait_ns() const { return vblank_wait_ns_; }
     u64 reports() const { return reports_; }
 };
 

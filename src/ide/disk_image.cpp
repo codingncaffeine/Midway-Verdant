@@ -1,5 +1,6 @@
 #include "ide/disk_image.h"
 
+#include <chrono>
 #include <format>
 
 namespace mv {
@@ -31,6 +32,11 @@ bool DiskImage::open(const std::filesystem::path& path, bool read_only, std::str
 
 bool DiskImage::read(u64 lba, u32 count, u8* out) const {
     if (!file_ || lba + count > sectors_) return false;
+    const auto t0 = std::chrono::steady_clock::now();
+    struct Timed {
+        std::chrono::steady_clock::time_point t0;
+        ~Timed() { host_read_ns_.fetch_add(static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count()), std::memory_order_relaxed); }
+    } timed{t0};
 #if defined(_WIN32)
     if (_fseeki64(file_, static_cast<long long>(lba * 512), SEEK_SET) != 0) return false;
 #else
@@ -40,6 +46,10 @@ bool DiskImage::read(u64 lba, u32 count, u8* out) const {
 }
 
 bool DiskImage::write(u64 lba, u32 count, const u8* in) {
+    struct Timed {
+        std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+        ~Timed() { host_read_ns_.fetch_add(static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count()), std::memory_order_relaxed); }
+    } timed;
     if (!file_ || read_only_ || lba + count > sectors_) return false;
 #if defined(_WIN32)
     if (_fseeki64(file_, static_cast<long long>(lba * 512), SEEK_SET) != 0) return false;
@@ -50,6 +60,10 @@ bool DiskImage::write(u64 lba, u32 count, const u8* in) {
 }
 
 void DiskImage::flush() {
+    struct Timed {
+        std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+        ~Timed() { host_read_ns_.fetch_add(static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count()), std::memory_order_relaxed); }
+    } timed;
     if (file_) std::fflush(file_);
 }
 

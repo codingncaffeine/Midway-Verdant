@@ -62,6 +62,12 @@ public:
     virtual std::string clock_name() const { return "the interpreter's cycle count"; }
     // A line for the end-of-run report beyond the counters (the oracle's findings), or empty.
     virtual std::string report() const { return {}; }
+    // Host time accounts in nanoseconds for a per-frame log (MV_FRAME_LOG): in the guest, exit handlers, device
+    // events fired on the CPU's thread, held by pacing. Read while the CPU holds at a vblank.
+    struct HostAccounts {
+        u64 in_guest_ns{0}, handler_ns{0}, event_ns{0}, pause_ns{0};
+    };
+    virtual HostAccounts host_accounts() const { return {}; }
 
     // Registers for the report and the debugger (fast mode reads them from the hypervisor).
     struct Regs {

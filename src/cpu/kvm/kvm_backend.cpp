@@ -464,6 +464,10 @@ void KvmBackend::join() {
         for (std::size_t i = 0; i < top.size() && i < 20; ++i)
             std::fprintf(stderr, "  %08x  %6llu  %5.1f%%\n", top[i].first, static_cast<unsigned long long>(top[i].second), 100.0 * static_cast<double>(top[i].second) / static_cast<double>(total));
         eip_samples_.clear();
+        std::vector<std::pair<u32, u64>> busy(eip_busy_samples_.begin(), eip_busy_samples_.end());
+        std::sort(busy.begin(), busy.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+        std::fprintf(stderr, "eip profile while the GPU thread had work (%.3f s of vCPU time in the guest):\n", static_cast<double>(busy_guest_ns_) / 1e9);
+        for (std::size_t i = 0; i < busy.size() && i < 20; ++i) std::fprintf(stderr, "  %08x  %6llu\n", busy[i].first, static_cast<unsigned long long>(busy[i].second));
     }
     running_ = false;
 }
@@ -652,18 +656,24 @@ void KvmBackend::thread_main() {
                 note_frame_tsc();
             }
         }
+        const bool gpu_busy = profile_eip_ && machine_->nv2a().fifo_busy_now();
+        const u64 guest_before = clock_.stats().in_guest_ns;
         const int rc = ioctl(vcpu_fd_, KVM_RUN, 0);
         if (guest_clock_on_) {
             const u64 wall = mono_ns();
             const u64 cpu = thread_cpu_ns();
             clock_.left(cpu, wall);
+            if (gpu_busy) busy_guest_ns_ += clock_.stats().in_guest_ns - guest_before;
         }
         ++stats_.exits;
         if (rc < 0 && errno == EINTR) {
             ++stats_.intr_exits;
             if (profile_eip_) {
                 kvm_regs r{};
-                if (ioctl(vcpu_fd_, KVM_GET_REGS, &r) == 0) ++eip_samples_[static_cast<u32>(r.rip)];
+                if (ioctl(vcpu_fd_, KVM_GET_REGS, &r) == 0) {
+                    ++eip_samples_[static_cast<u32>(r.rip)];
+                    if (gpu_busy) ++eip_busy_samples_[static_cast<u32>(r.rip)];
+                }
             }
             continue;  // kicked: loop to inject or stop
         }

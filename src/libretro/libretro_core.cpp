@@ -19,6 +19,8 @@
 
 #include "core/machine.h"
 #include "debug/trace.h"
+#include "ide/disk_image.h"
+#include "ide/dvd_image.h"
 #include "ide/hdd_format.h"
 #include "mv/version.h"
 #include "libretro/libretro.h"
@@ -64,6 +66,16 @@ double frame_ms_sum = 0, frame_ms_max = 0;
 // Each frame the CPU waits at its vblank until the picture is taken: how long the frontend's thread took to notice,
 // and the grab itself (with pipelining the CPU is released after it).
 double hold_wake_ms_sum = 0, hold_grab_ms_sum = 0, hold_wake_ms_max = 0;
+// MV_FRAME_LOG=FILE: a line per frame with where its host time went (deltas of the run's accounts, sampled while
+// the CPU holds at the vblank), so a slow frame can be traced to the part that made it slow.
+struct FrameSample {
+    std::chrono::steady_clock::time_point at{};
+    mv::u64 guest{0}, handlers{0}, events{0}, held{0}, pusher{0}, draw{0}, fetch{0}, texture{0}, upload{0}, flush{0}, write_back{0};
+    mv::u64 setup_engine{0}, dsp_wait{0}, draws{0}, decodes{0}, write_backs{0}, waits{0}, flips{0}, io{0};
+};
+std::FILE* frame_log = nullptr;
+FrameSample frame_last;
+unsigned long long frame_log_index = 0;
 
 void log(retro_log_level level, const char* fmt, ...) {
     char buf[1024];
@@ -252,6 +264,11 @@ RETRO_API bool retro_load_game(const retro_game_info* game) {
 
     // Instruments for a core run under a frontend: MV_TRACE=apu,boot,... (the shell's --trace list) into
     // MV_TRACE_FILE (default stderr).
+    if (const char* f = std::getenv("MV_FRAME_LOG"); f && *f && !frame_log) {
+        frame_log = std::fopen(f, "w");
+        frame_log_index = 0;
+        if (frame_log) std::fprintf(frame_log, "frame\tperiod\twait\tguest\thandlers\tevents\theld\tpusher\tdraw\tfetch\ttexture\tupload\tflush\twriteback\tsetup\tdspwait\tdraws\tdecodes\twritebacks\twaits\tflips\tio\n");
+    }
     if (const char* t = std::getenv("MV_TRACE"); t && *t) {
         mv::u32 mask = 0;
         if (mv::trace::parse_list(t, mask)) {
@@ -338,12 +355,15 @@ RETRO_API void retro_unload_game(void) {
         log(RETRO_LOG_INFO, "retro_run: the CPU held at each vblank for the picture: noticed after %.3f ms (max %.1f), grabbed in %.3f ms (means)",
             frames_run ? hold_wake_ms_sum / static_cast<double>(frames_run) : 0.0, hold_wake_ms_max, frames_run ? hold_grab_ms_sum / static_cast<double>(frames_run) : 0.0);
         log(RETRO_LOG_INFO, "gpu: busiest register reads:%s", machine->nv2a().busiest_reads(6).c_str());
+        log(RETRO_LOG_INFO, "gpu: %s", machine->nv2a().harvest_report().c_str());
+        if (machine->nv2a().fifo_threaded()) log(RETRO_LOG_INFO, "gpu: register reads while the FIFO thread had work:%s", machine->nv2a().busiest_reads(10, true).c_str());
         log(RETRO_LOG_INFO, "gpu: a FIFO thread could have run %.3f s of the pusher's %.3f s alongside the guest (%llu points where the guest needed its result)",
             static_cast<double>(machine->nv2a().pusher_overlap_ns()) / 1e9, static_cast<double>(machine->nv2a().pusher_wall_ns()) / 1e9,
             static_cast<unsigned long long>(machine->nv2a().pusher_sync_points()));
         if (machine->nv2a().fifo_threaded())
-            log(RETRO_LOG_INFO, "gpu: the FIFO thread ran the pusher; the CPU waited for it %llu times at the lead (%.3f s)",
-                static_cast<unsigned long long>(machine->nv2a().fifo_lead_waits()), static_cast<double>(machine->nv2a().fifo_lead_wait_ns()) / 1e9);
+            log(RETRO_LOG_INFO, "gpu: the FIFO thread ran the pusher; the CPU waited for it %llu times at the lead (%.3f s) and %llu times at a vblank (%.3f s)",
+                static_cast<unsigned long long>(machine->nv2a().fifo_lead_waits()), static_cast<double>(machine->nv2a().fifo_lead_wait_ns()) / 1e9,
+                static_cast<unsigned long long>(machine->nv2a().fifo_vblank_waits()), static_cast<double>(machine->nv2a().fifo_vblank_wait_ns()) / 1e9);
         log(RETRO_LOG_INFO, "gpu: what ended those runs' overlap (pusher time not hidden):%s", machine->nv2a().sync_reasons(8).c_str());
         log(RETRO_LOG_INFO, "apu: %llu front-end memory fences written, %llu front-end traps raised", static_cast<unsigned long long>(machine->apu().fence_writes()),
             static_cast<unsigned long long>(machine->apu().traps()));
@@ -358,6 +378,10 @@ RETRO_API void retro_unload_game(void) {
                 static_cast<unsigned long long>(st.textures_decoded), static_cast<unsigned long long>(st.textures_unchanged), static_cast<unsigned long long>(st.shaders_from_disk));
             // Draws the renderer could not draw, and why (the first of each distinct reason).
             if (st.skipped) log(RETRO_LOG_INFO, "gpu: %llu draws skipped", static_cast<unsigned long long>(st.skipped));
+            log(RETRO_LOG_INFO, "gpu: write-backs by cause: frame end %llu, texture %llu, scanout %llu, 2D/range %llu, relayout %llu, idle vblank %llu; %llu targets sampled in place, %llu snapshots for draws sampling their own target, %llu depth buffers converted to colour",
+                static_cast<unsigned long long>(st.writebacks_by[0]), static_cast<unsigned long long>(st.writebacks_by[1]), static_cast<unsigned long long>(st.writebacks_by[2]),
+                static_cast<unsigned long long>(st.writebacks_by[3]), static_cast<unsigned long long>(st.writebacks_by[4]), static_cast<unsigned long long>(st.writebacks_by[5]),
+                static_cast<unsigned long long>(st.surface_samples), static_cast<unsigned long long>(st.snapshots), static_cast<unsigned long long>(st.zeta_conversions));
             if (st.surface_reloads) log(RETRO_LOG_INFO, "gpu: %llu render targets reloaded from RAM after a 2D write", static_cast<unsigned long long>(st.surface_reloads));
             for (const auto& e : st.errors) log(RETRO_LOG_INFO, "gpu: renderer note: %s", e.c_str());
         }
@@ -381,6 +405,10 @@ RETRO_API void retro_unload_game(void) {
             }
         }
     }
+    if (frame_log) {
+        std::fclose(frame_log);
+        frame_log = nullptr;
+    }
     machine->finish();
     if (trace_file) {
         mv::trace::set_sink(nullptr);  // back to stderr, whose buffering a file sink's setvbuf must not touch
@@ -401,6 +429,40 @@ RETRO_API void retro_reset(void) {
         std::lock_guard g(machine->lock());
         machine->request_reset("frontend reset");
     }
+}
+
+// The run's accounts now (the machine lock held, the CPU at its vblank), and a frame-log line of the change since the last.
+static FrameSample frame_sample() {
+    FrameSample s;
+    s.at = std::chrono::steady_clock::now();
+    const auto h = machine->cpu()->host_accounts();
+    s.guest = h.in_guest_ns, s.handlers = h.handler_ns, s.events = h.event_ns, s.held = h.pause_ns;
+    s.pusher = machine->nv2a().pusher_wall_ns();
+    if (const auto* r = machine->nv2a().renderer()) {
+        const auto& st = r->stats();
+        s.draw = st.ns_draw, s.fetch = st.ns_fetch, s.texture = st.ns_texture, s.upload = st.ns_upload, s.flush = st.ns_flush;
+        s.write_back = st.ns_write_back, s.draws = st.draws, s.decodes = st.textures_decoded, s.write_backs = st.writebacks, s.waits = st.waits;
+    }
+    s.setup_engine = machine->apu().setup_engine_host_ns();
+    s.dsp_wait = machine->apu().dsp_wait_ns();
+    s.flips = machine->nv2a().display_flips();
+    s.io = mv::DvdImage::host_read_ns() + mv::DiskImage::host_read_ns();
+    return s;
+}
+
+static void frame_log_line(double wait_ms) {
+    const FrameSample s = frame_sample();
+    const auto ms = [](mv::u64 a, mv::u64 b) { return static_cast<double>(a - b) / 1e6; };
+    const double period = frame_log_index ? std::chrono::duration<double, std::milli>(s.at - frame_last.at).count() : 0.0;
+    const std::string line = std::format("{}\t{:.2f}\t{:.2f}\t{:.2f}\t{:.2f}\t{:.2f}\t{:.2f}\t{:.2f}\t{:.2f}\t{:.2f}\t{:.2f}\t{:.2f}\t{:.2f}\t{:.2f}\t{:.2f}\t{:.2f}\t{}\t{}\t{}\t{}\t{}\t{:.2f}\n",
+        frame_log_index, period, wait_ms, ms(s.guest, frame_last.guest), ms(s.handlers, frame_last.handlers), ms(s.events, frame_last.events),
+        ms(s.held, frame_last.held), ms(s.pusher, frame_last.pusher), ms(s.draw, frame_last.draw), ms(s.fetch, frame_last.fetch),
+        ms(s.texture, frame_last.texture), ms(s.upload, frame_last.upload), ms(s.flush, frame_last.flush), ms(s.write_back, frame_last.write_back),
+        ms(s.setup_engine, frame_last.setup_engine), ms(s.dsp_wait, frame_last.dsp_wait), s.draws - frame_last.draws, s.decodes - frame_last.decodes,
+        s.write_backs - frame_last.write_backs, s.waits - frame_last.waits, s.flips - frame_last.flips, ms(s.io, frame_last.io));
+    std::fputs(line.c_str(), frame_log);
+    frame_last = s;
+    ++frame_log_index;
 }
 
 RETRO_API void retro_run(void) {
@@ -434,6 +496,10 @@ RETRO_API void retro_run(void) {
             hold_wake_ms_sum += wake;
             hold_wake_ms_max = std::max(hold_wake_ms_max, wake);
         }
+    }
+    if (frame_log) {
+        std::lock_guard g(machine->lock());
+        frame_log_line(ms);
     }
     grab_frame();
     hold_grab_ms_sum += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t1).count();

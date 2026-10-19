@@ -49,6 +49,7 @@ public:
     bool hardware_assisted() const override { return true; }
     std::string clock_name() const override;
     std::string report() const override;
+    HostAccounts host_accounts() const override { return {clock_.stats().in_guest_ns, handler_ns_, event_ns_, pause_ns_}; }
 
     // Replace the top page's backing when the MCPX ROM is hidden, and again when a reset shows it.
     void on_rom_hidden();
@@ -89,6 +90,8 @@ private:
     // that make no exits), printed when the CPU thread ends.
     bool profile_eip_{false};
     std::unordered_map<u32, u64> eip_samples_;
+    std::unordered_map<u32, u64> eip_busy_samples_;  // MV_PROFILE_EIP: the samples taken while the GPU thread had work
+    u64 busy_guest_ns_{0};                          // and the vCPU time in the guest while it had
     bool tsc_scaled_{false};
     bool dirty_tracking_{false};
     std::vector<u64> dirty_bitmap_;
