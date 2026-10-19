@@ -63,7 +63,9 @@ bool Bus::write_ram(PhysAddr addr, const void* in, std::size_t len) {
 
 void Bus::set_dirty_tracking(bool on) {
     dirty_tracking_ = on;
-    dirty_.assign(on ? (ram_size_ / kPageSize + 63) / 64 : 0, 0);
+    dirty_words_ = on ? (ram_size_ / kPageSize + 63) / 64 : 0;
+    dirty_ = dirty_words_ ? std::make_unique<std::atomic<u64>[]>(dirty_words_) : nullptr;
+    for (std::size_t w = 0; w < dirty_words_; ++w) dirty_[w].store(0, std::memory_order_relaxed);
 }
 
 void Bus::mark_dirty(PhysAddr addr, std::size_t len) {
@@ -73,18 +75,18 @@ void Bus::mark_dirty(PhysAddr addr, std::size_t len) {
     const u64 start = static_cast<u64>(p - ram_.data());
     const u64 first = start / kPageSize;
     const u64 last = (start + static_cast<u64>(len) - 1) / kPageSize;
-    for (u64 page = first; page <= last; ++page) dirty_[page / 64] |= u64{1} << (page % 64);
+    for (u64 page = first; page <= last; ++page) dirty_[page / 64].fetch_or(u64{1} << (page % 64), std::memory_order_relaxed);
 }
 
 void Bus::take_dirty_pages(std::vector<u32>& pages) {
-    for (std::size_t w = 0; w < dirty_.size(); ++w) {
-        u64 bits = dirty_[w];
+    for (std::size_t w = 0; w < dirty_words_; ++w) {
+        if (dirty_[w].load(std::memory_order_relaxed) == 0) continue;
+        u64 bits = dirty_[w].exchange(0, std::memory_order_relaxed);
         while (bits) {
             const unsigned bit = static_cast<unsigned>(std::countr_zero(bits));
             pages.push_back(static_cast<u32>(w * 64 + bit));
             bits &= bits - 1;
         }
-        dirty_[w] = 0;
     }
 }
 

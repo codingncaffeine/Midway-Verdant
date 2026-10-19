@@ -1,4 +1,5 @@
 #pragma once
+#include <atomic>
 #include <cstddef>
 #include <map>
 #include <memory>
@@ -75,7 +76,8 @@ public:
 
     // Dirty-page tracking for the capture instruments: when on, every write that lands in RAM through the bus
     // (device DMA, semaphores, notifiers; the CPU backends keep their own record) marks its 4 KiB pages.
-    // `take_dirty_pages` appends the marked page indices and clears the record.
+    // `take_dirty_pages` appends the marked page indices and clears the record. Devices on other threads (the APU's
+    // processors) mark pages too, so the record is atomic words.
     void set_dirty_tracking(bool on);
     bool dirty_tracking() const { return dirty_tracking_; }
     void take_dirty_pages(std::vector<u32>& pages);
@@ -101,7 +103,8 @@ private:
     std::map<std::pair<PhysAddr, bool>, u64> unknown_mmio_;
     std::map<std::pair<u16, bool>, u64> unknown_pio_;
     bool dirty_tracking_{false};
-    std::vector<u64> dirty_;  // one bit per RAM page
+    std::unique_ptr<std::atomic<u64>[]> dirty_;  // one bit per RAM page
+    std::size_t dirty_words_{0};
 };
 
 }  // namespace mv
