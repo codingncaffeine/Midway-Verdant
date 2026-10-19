@@ -51,6 +51,8 @@ struct MachineConfig {
     // A raw hard-disk image (8 GiB for a retail layout); absent = no drive on the cable.
     std::optional<std::filesystem::path> hdd_image;
     bool hdd_locked{true};
+    // Compiled shaders and the driver's pipeline cache, kept between runs (absent = compiled afresh every run).
+    std::optional<std::filesystem::path> shader_cache_dir;
     // A game disc image (XISO or a full dump) in the DVD tray at power-on; absent = an empty, closed tray.
     std::optional<std::filesystem::path> dvd_image;
     // Pads plugged into the front ports at power-on, from port 1 (0-4).

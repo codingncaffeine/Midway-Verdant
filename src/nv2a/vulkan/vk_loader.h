@@ -81,6 +81,9 @@ namespace mv::vk {
     X(vkDestroyFramebuffer)         \
     X(vkCreateGraphicsPipelines)    \
     X(vkDestroyPipeline)            \
+    X(vkCreatePipelineCache)        \
+    X(vkGetPipelineCacheData)       \
+    X(vkDestroyPipelineCache)       \
     X(vkCmdBeginRenderPass)         \
     X(vkCmdEndRenderPass)           \
     X(vkCmdBindPipeline)            \

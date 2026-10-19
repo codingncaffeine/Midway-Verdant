@@ -1,5 +1,6 @@
 #pragma once
 #include <array>
+#include <filesystem>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -22,6 +23,10 @@ public:
     VulkanRenderer(vk::Device& device, const HandleResolver& handles, u8* ram, u32 ram_size);
     ~VulkanRenderer() override;
     bool init(std::string& error);
+    // Compiled shaders and the driver's pipeline cache kept between runs in `dir` (call after init): a shader seen in
+    // an earlier run loads instead of compiling, and its pipelines come from the driver's cache, so a scene seen before
+    // does not stall on first use. The pipeline cache is written back when the renderer closes.
+    void open_disk_cache(const std::filesystem::path& dir);
 
     void clear(const KelvinState& state, u32 clear_bits) override;
     void draw(const KelvinState& state, const DrawBatch& batch) override;
@@ -58,6 +63,7 @@ public:
         u64 uniform_reuses{0};  // uniform blocks equal to the frame's last upload, bound where that lies
         u64 descriptor_reuses{0};  // draws that kept the previous draw's descriptor set
         u64 surface_samples{0};  // textures bound straight to a render target's image
+        u64 shaders_from_disk{0};  // shader compiles the disk cache answered
         // Where the time goes, in nanoseconds: the whole draw and its parts (the texture part includes the
         // write-backs a sample forces; the shader parts are the compiles, a lookup costs nothing measurable); the
         // submits and the fence waits; the copies back to RAM, colour and depth (and the wait for the device copy
@@ -270,6 +276,12 @@ private:
     VkDescriptorSet last_set_{VK_NULL_HANDLE}, bound_set_{VK_NULL_HANDLE};
     vk::Image dummy2d_, dummycube_, dummy3d_;
     VkSampler dummy_sampler_{VK_NULL_HANDLE};
+    // The disk cache (open_disk_cache): where compiled shaders go, and the driver's pipeline cache.
+    std::filesystem::path cache_dir_;
+    VkPipelineCache pipeline_cache_{VK_NULL_HANDLE};
+    // SPIR-V for a translated shader: from the disk cache when it holds this exact source, else compiled (and stored).
+    std::vector<u32> spirv_for(bool vertex, const std::string& glsl, const char* name, std::string& log);
+    void save_pipeline_cache();
     VkFormat depth24_{VK_FORMAT_D24_UNORM_S8_UINT};
     Stats stats_;
     // Debug overrides from MV_RENDER_DEBUG (comma separated): flat (white fragments), nodepth, nocull, noblend.

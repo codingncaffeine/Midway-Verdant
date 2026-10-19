@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <bit>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <format>
@@ -171,6 +172,8 @@ VulkanRenderer::~VulkanRenderer() {
         recording_ = false;
     }
     f.vkDeviceWaitIdle(dev_.device());
+    save_pipeline_cache();
+    if (pipeline_cache_) f.vkDestroyPipelineCache(dev_.device(), pipeline_cache_, nullptr);
     for (Frame& fr : frames_) {
         for (vk::Image& i : fr.dead_images) dev_.destroy_image(i);
         for (VkImageView v : fr.dead_views) f.vkDestroyImageView(dev_.device(), v, nullptr);
@@ -896,12 +899,13 @@ VkShaderModule VulkanRenderer::vertex_shader(const KelvinState& s, std::string& 
         error = t.error;
         return VK_NULL_HANDLE;
     }
-    const CompiledShader c = compile_glsl(ShaderStage::Vertex, t.glsl, "kelvin-vp");
-    if (!c.ok()) {
-        error = "vertex program GLSL: " + c.log;
+    std::string log;
+    const std::vector<u32> spirv = spirv_for(true, t.glsl, "kelvin-vp", log);
+    if (spirv.empty()) {
+        error = "vertex program GLSL: " + log;
         return VK_NULL_HANDLE;
     }
-    VkShaderModule m = module(c.spirv);
+    VkShaderModule m = module(spirv);
     vs_cache_[key] = m;
     remember(m);
     return m;
@@ -937,12 +941,13 @@ VkShaderModule VulkanRenderer::fragment_shader(const psh::Key& key, std::array<p
         // The interpolated diffuse colour in place of the combiners' result (the last statement of main).
         if (const auto end = t.glsl.rfind('}'); end != std::string::npos) t.glsl.insert(end, "    frag_color = vec4(clamp(vtx_d0.rgb, 0.0, 1.0), 1.0);\n");
     }
-    const CompiledShader c = compile_glsl(ShaderStage::Fragment, t.glsl, "kelvin-combiners");
-    if (!c.ok()) {
-        error = "combiner GLSL: " + c.log;
+    std::string log;
+    const std::vector<u32> spirv = spirv_for(false, t.glsl, "kelvin-combiners", log);
+    if (spirv.empty()) {
+        error = "combiner GLSL: " + log;
         return VK_NULL_HANDLE;
     }
-    VkShaderModule m = module(c.spirv);
+    VkShaderModule m = module(spirv);
     fs_cache_[k] = m;
     fs_kinds_[k] = t.samplers;
     kinds = t.samplers;
@@ -1048,7 +1053,7 @@ VkPipeline VulkanRenderer::pipeline(const KelvinState& s, VkShaderModule vs, VkS
     gpi.layout = pipeline_layout_;
     gpi.renderPass = t.pass;
     VkPipeline p = VK_NULL_HANDLE;
-    if (VkResult r = fn_->vkCreateGraphicsPipelines(dev_.device(), VK_NULL_HANDLE, 1, &gpi, nullptr, &p); r != VK_SUCCESS) {
+    if (VkResult r = fn_->vkCreateGraphicsPipelines(dev_.device(), pipeline_cache_, 1, &gpi, nullptr, &p); r != VK_SUCCESS) {
         error = std::format("vkCreateGraphicsPipelines: {}", vk::result_name(r));
         return VK_NULL_HANDLE;
     }
@@ -1846,6 +1851,110 @@ bool VulkanRenderer::surface_rgba(const SurfaceInfo& s, std::vector<u8>& rgba) c
         }
     }
     return true;
+}
+
+}  // namespace mv::pgraph
+
+namespace mv::pgraph {
+
+// ── the disk cache ───────────────────────────────────────────────────────────────────────────────────────────────
+
+namespace {
+// FNV-1a over the bytes, from a seed: two seeds give the file name and an independent check stored inside it.
+u64 fnv1a(std::string_view bytes, u64 seed) {
+    u64 h = seed;
+    for (char c : bytes) {
+        h ^= static_cast<u8>(c);
+        h *= 0x100000001B3ull;
+    }
+    return h;
+}
+constexpr u32 kSpvFileMagic = 0x4353564Du;  // "MVSC"
+constexpr u32 kSpvFileVersion = 1;
+constexpr u64 kNameSeed = 0xCBF29CE484222325ull, kCheckSeed = 0x84222325CBF29CE4ull;
+
+bool read_file(const std::filesystem::path& p, std::vector<char>& out) {
+    std::FILE* f = std::fopen(p.string().c_str(), "rb");
+    if (!f) return false;
+    out.clear();
+    char buf[65536];
+    std::size_t n;
+    while ((n = std::fread(buf, 1, sizeof buf, f)) > 0) out.insert(out.end(), buf, buf + n);
+    std::fclose(f);
+    return true;
+}
+
+// Written to a temporary name and renamed over the old one, so a run that dies mid-write leaves no torn file.
+void write_file(const std::filesystem::path& p, const void* data, std::size_t len) {
+    const std::filesystem::path tmp = p.string() + ".tmp";
+    std::FILE* f = std::fopen(tmp.string().c_str(), "wb");
+    if (!f) return;
+    const bool ok = std::fwrite(data, 1, len, f) == len;
+    if (std::fclose(f) != 0 || !ok) {
+        std::error_code ec;
+        std::filesystem::remove(tmp, ec);
+        return;
+    }
+    std::error_code ec;
+    std::filesystem::rename(tmp, p, ec);
+}
+}  // namespace
+
+void VulkanRenderer::open_disk_cache(const std::filesystem::path& dir) {
+    std::error_code ec;
+    std::filesystem::create_directories(dir / "spirv", ec);
+    if (ec) return;
+    cache_dir_ = dir;
+    std::vector<char> data;
+    read_file(dir / "pipelines.bin", data);
+    VkPipelineCacheCreateInfo ci{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
+    // The driver checks the header (vendor, device, cache UUID) and starts empty on data from another driver.
+    ci.initialDataSize = data.size();
+    ci.pInitialData = data.empty() ? nullptr : data.data();
+    if (fn_->vkCreatePipelineCache(dev_.device(), &ci, nullptr, &pipeline_cache_) != VK_SUCCESS) {
+        ci.initialDataSize = 0;
+        ci.pInitialData = nullptr;
+        if (fn_->vkCreatePipelineCache(dev_.device(), &ci, nullptr, &pipeline_cache_) != VK_SUCCESS) pipeline_cache_ = VK_NULL_HANDLE;
+    }
+}
+
+void VulkanRenderer::save_pipeline_cache() {
+    if (!pipeline_cache_ || cache_dir_.empty()) return;
+    std::size_t size = 0;
+    if (fn_->vkGetPipelineCacheData(dev_.device(), pipeline_cache_, &size, nullptr) != VK_SUCCESS || size == 0) return;
+    std::vector<char> data(size);
+    if (fn_->vkGetPipelineCacheData(dev_.device(), pipeline_cache_, &size, data.data()) != VK_SUCCESS) return;
+    write_file(cache_dir_ / "pipelines.bin", data.data(), size);
+}
+
+std::vector<u32> VulkanRenderer::spirv_for(bool vertex, const std::string& glsl, const char* name, std::string& log) {
+    const std::string keyed = std::string(vertex ? "vs\n" : "fs\n") + glsl;
+    std::filesystem::path file;
+    const u64 check = fnv1a(keyed, kCheckSeed);
+    if (!cache_dir_.empty()) {
+        file = cache_dir_ / "spirv" / std::format("{:016x}.spv", fnv1a(keyed, kNameSeed));
+        std::vector<char> data;
+        if (read_file(file, data) && data.size() > 20 && data.size() % 4 == 0) {
+            u32 head[4];
+            std::memcpy(head, data.data(), sizeof head);
+            u32 first = 0;
+            std::memcpy(&first, data.data() + sizeof head, 4);
+            if (head[0] == kSpvFileMagic && head[1] == kSpvFileVersion && (static_cast<u64>(head[3]) << 32 | head[2]) == check && first == 0x07230203u) {
+                std::vector<u32> spirv((data.size() - sizeof head) / 4);
+                std::memcpy(spirv.data(), data.data() + sizeof head, spirv.size() * 4);
+                ++stats_.shaders_from_disk;
+                return spirv;
+            }
+        }
+    }
+    CompiledShader c = compile_glsl(vertex ? ShaderStage::Vertex : ShaderStage::Fragment, glsl, name);
+    log = c.log;
+    if (c.ok() && !file.empty()) {
+        std::vector<u32> out = {kSpvFileMagic, kSpvFileVersion, static_cast<u32>(check), static_cast<u32>(check >> 32)};
+        out.insert(out.end(), c.spirv.begin(), c.spirv.end());
+        write_file(file, out.data(), out.size() * 4);
+    }
+    return std::move(c.spirv);
 }
 
 }  // namespace mv::pgraph

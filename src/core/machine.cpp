@@ -232,6 +232,7 @@ bool Machine::init(std::string& error) {
         if (!gpu_device_->init(error)) return false;
         renderer_ = std::make_unique<pgraph::VulkanRenderer>(*gpu_device_, nv2a_, bus_.ram(), static_cast<u32>(bus_.ram_size()));
         if (!renderer_->init(error)) return false;
+        if (config_.shader_cache_dir) renderer_->open_disk_cache(*config_.shader_cache_dir);
         nv2a_.set_write_tracking(cpu_.get());
         nv2a_.set_renderer(renderer_.get());
         // The pusher on its own thread (PLAN D21), opt-in with MV_FIFO_THREAD=1, in fast mode without a capture (which
