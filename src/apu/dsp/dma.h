@@ -38,6 +38,8 @@ public:
     void write(Reg r, u32 value);
     bool eol();
     void clear_eol() { eol_ = false; }
+    // While a list is still moving: the core cycle at which it reports its end of list (and stops), else 0.
+    u64 eol_due() const { return pending_eol_ ? busy_until_ : 0; }
     const std::string& last_error() const { return error_; }
     u64 transfers() const { return transfers_; }
     u64 bytes_moved() const { return bytes_; }

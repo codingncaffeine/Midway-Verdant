@@ -22,6 +22,7 @@ public:
     Processor(const dsp::Core::Config& config, dsp::DmaMemory& memory);
 
     dsp::Core& core() { return core_; }
+    const dsp::Core& core() const { return core_; }
     dsp::Dma& dma() { return dma_; }
 
     // Reset (held) and release: the release bootstraps program memory from scratch and starts at P:0.
@@ -41,6 +42,12 @@ public:
     const std::map<u32, std::pair<u64, u64>>& peripheral_traffic() const { return traffic_; }
     // The start-of-frame flag rises only at a frame boundary.
     bool static_until_next_frame(u32 address, u32 bit) const override { return address == 0xFFFFC5 && bit == 1; }
+    // A running DMA list: the end-of-list flag ($FFFFC5 bit 7) and the control register's running and stopped bits
+    // ($FFFFD6 bits 4 and 5) hold until its transfer time has passed.
+    u64 static_until_cycle(u32 address, u32 bit) const override {
+        if ((address == 0xFFFFC5 && bit == 7) || (address == 0xFFFFD6 && (bit == 4 || bit == 5))) return dma_.eol_due();
+        return 0;
+    }
 
 private:
     dsp::Core core_;

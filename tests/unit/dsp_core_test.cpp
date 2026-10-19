@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <cstring>
+#include <format>
 #include <string>
 #include <vector>
 
@@ -15,8 +16,16 @@ struct FakePeripherals : Peripherals {
     std::vector<std::pair<u32, u32>> writes;
     u32 read_value{0};
     bool frame_static{false};
+    // A DMA stand-in: bit 7 reads set from core cycle `eol_at` on (when `core` is set); `until` is what the core is told.
+    const Core* core{nullptr};
+    u64 eol_at{0}, until{0};
+    u64 reads{0};
     bool static_until_next_frame(u32, u32) const override { return frame_static; }
-    u32 peripheral_read(u32) override { return read_value; }
+    u64 static_until_cycle(u32, u32 bit) const override { return bit == 7 ? until : 0; }
+    u32 peripheral_read(u32) override {
+        ++reads;
+        return read_value | (core && core->cycles() >= eol_at ? 0x80u : 0u);
+    }
     void peripheral_write(u32 address, u32 value) override { writes.emplace_back(address, value); }
 };
 
@@ -341,4 +350,39 @@ TEST(DspCore, AWaitOnAFrameStaticBitSkipsToTheBudgetsEndWithTheSameResult) {
     EXPECT_EQ(self.core.cycles(), plain.core.cycles());
     EXPECT_EQ(self.core.regs().pc, plain.core.regs().pc);
     EXPECT_EQ(self.core.instructions(), plain.core.instructions());
+}
+
+TEST(DspCore, APollOnARunningDmaSkipsToItsEndWithTheSameResult) {
+    // A processor waiting for its DMA list's end: BRCLR #7,X:$FFFFC5,* alone, and counting (CLR A; ADD #1,A; BRCLR
+    // back to the ADD). Told when the bit will rise, the core skips the polls before it; every register, both
+    // counters and the instruction the loop leaves from must match a run that polls every time.
+    for (u64 eol_at : {3u, 10u, 11u, 12u, 1001u, 50'000u}) {
+        for (bool counting : {false, true}) {
+            Machine with, without;
+            for (Machine* m : {&with, &without}) {
+                m->periph.core = &m->core;
+                m->periph.eol_at = eol_at;
+                if (counting) {
+                    m->emit(0x200013);            // CLR A
+                    m->emit(0x014180);            // ADD #1,A
+                    m->emit(0x0CC507, 0xFFFFFF);  // BRCLR #7,X:$FFFFC5,-1 (to the ADD)
+                } else {
+                    m->emit(0x0CC507, 0x000000);  // BRCLR #7,X:$FFFFC5,* (to itself)
+                }
+                m->emit(0x014180);  // ADD #1,A once the wait is over, then NOPs
+            }
+            with.periph.until = eol_at;
+            with.core.run(60'000);
+            without.core.run(60'000);
+            const std::string at = std::format("eol at {} counting {}", eol_at, counting);
+            EXPECT_EQ(with.core.regs().a, without.core.regs().a) << at;
+            EXPECT_EQ(with.core.regs().pc, without.core.regs().pc) << at;
+            EXPECT_EQ(with.core.regs().sr, without.core.regs().sr) << at;
+            EXPECT_EQ(with.core.cycles(), without.core.cycles()) << at;
+            EXPECT_EQ(with.core.instructions(), without.core.instructions()) << at;
+            if (eol_at >= 1001) {
+                EXPECT_LT(with.periph.reads * 10, without.periph.reads) << at << ": the polls were skipped";
+            }
+        }
+    }
 }

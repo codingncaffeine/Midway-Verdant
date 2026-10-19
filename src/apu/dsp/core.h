@@ -28,6 +28,13 @@ public:
         (void)bit;
         return false;
     }
+    // Otherwise the core cycle before which `bit` cannot change (a DMA transfer still running reports its end of
+    // list then), or 0 when it may change at any time. A poll loop on it is skipped up to that cycle the same way.
+    virtual u64 static_until_cycle(u32 address, u32 bit) const {
+        (void)address;
+        (void)bit;
+        return 0;
+    }
 };
 
 class Core {
@@ -52,6 +59,8 @@ public:
     void set_halted(bool h) { halted_ = h; }
     u64 cycles() const { return cycles_; }
     u64 instructions() const { return instructions_; }
+    // Instrument: cycles spent at each program address, counted while a histogram is attached (nullptr = off).
+    void set_pc_histogram(std::vector<u64>* h) { pc_hist_ = h; }
 
     // Memories (24-bit words in the low bits).
     u32 read_x(u32 address);
@@ -139,6 +148,7 @@ private:
     std::vector<Cached> cache_;
     Regs r_;
     u64 cycles_{0}, instructions_{0};
+    std::vector<u64>* pc_hist_{nullptr};
     std::string error_;
     bool halted_{false};
     // REP state: the next instruction repeats `rep_` times.
@@ -152,8 +162,9 @@ private:
         u32 dest{0};
         i64 delta{0};
         u32 per_iteration{0};
+        u64 until_cycle{0};  // the skip stays short of this cycle (0 = the budget's end)
     } idle_;
-    void note_idle_wait(u32 target, u32 at, u32 jump_words);
+    void note_idle_wait(u32 target, u32 at, u32 jump_words, u64 until_cycle);
 };
 
 }  // namespace mv::dsp

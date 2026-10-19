@@ -901,9 +901,14 @@ void Core::execute(const Decoded& d, u32 ext, u32 at) {
             const bool want_set = info.variant & 1u, sub = info.variant & 2u;
             if (set != want_set) return;
             const bool branch = info.op >= Op::BitBranchEa && info.op <= Op::BitBranchReg;
-            jump_sub(branch ? relative(ext, 24) : (ext & kWord), sub);
-            if (!sub && !branch && !is_reg && address >= 0xFFFF80u && periph_ && periph_->static_until_next_frame(address, d.f('b') & 31u))
-                note_idle_wait(ext & kWord, at, next - at);
+            const u32 target = branch ? relative(ext, 24) : (ext & kWord);
+            jump_sub(target, sub);
+            // A poll loop on a peripheral bit that cannot change yet (the frame flag, a DMA still running).
+            if (!sub && !is_reg && address >= 0xFFFF80u && periph_) {
+                const u32 bit = d.f('b') & 31u;
+                if (periph_->static_until_next_frame(address, bit)) note_idle_wait(target, at, next - at, 0);
+                else if (const u64 until = periph_->static_until_cycle(address, bit)) note_idle_wait(target, at, next - at, until);
+            }
             return;
         }
         case Op::BitOpEa: case Op::BitOpAa: case Op::BitOpPp: case Op::BitOpQq: case Op::BitOpReg: {
@@ -1348,7 +1353,8 @@ u32 Core::step() {
         fail(std::format("PC {:06x} outside program memory", at));
         return 0;
     }
-    const Decoded d = decoded(at);
+    const Decoded& d = decoded(at);  // by reference: the decoded form is ~280 bytes
+    if (pc_hist_) [[unlikely]] (*pc_hist_)[at] += d.extension ? 2 : 1;
     const u32 ext = d.extension ? read_p(at + 1) : 0;
     const u32 words = d.extension ? 2 : 1;
     if (rep_active_) {
@@ -1386,7 +1392,9 @@ u64 Core::run(u64 cycles) {
         if (idle_.pending) {
             // Skip all but the last whole iteration of the wait; those run as usual and leave the flags as they were.
             idle_.pending = false;
-            const u64 left = done < cycles ? cycles - done : 0, iterations = idle_.per_iteration ? left / idle_.per_iteration : 0;
+            const u64 left = done < cycles ? cycles - done : 0;
+            const u64 room = idle_.until_cycle ? std::min(left, idle_.until_cycle > cycles_ ? idle_.until_cycle - cycles_ : 0) : left;
+            const u64 iterations = idle_.per_iteration ? room / idle_.per_iteration : 0;
             if (iterations > 1) {
                 const u64 skip = iterations - 1;
                 if (idle_.delta) acc(idle_.dest) = sext56(acc(idle_.dest) + static_cast<i64>(skip) * idle_.delta);
@@ -1404,17 +1412,17 @@ u64 Core::run(u64 cycles) {
 
 namespace mv::dsp {
 
-void Core::note_idle_wait(u32 target, u32 at, u32 jump_words) {
+void Core::note_idle_wait(u32 target, u32 at, u32 jump_words, u64 until_cycle) {
     if (target == at) {
-        idle_ = {true, 0, 0, jump_words};
+        idle_ = {true, 0, 0, jump_words, until_cycle};
         return;
     }
     if (target + 1 != at) return;
     const Decoded body = decode(read_p(target));
     if (body.pattern < 0 || body.extension) return;
     const OpInfo info = op_table()[static_cast<std::size_t>(body.pattern)];
-    if (info.op == Op::AluImmShort && info.variant == 0) idle_ = {true, body.f('d'), static_cast<i64>(body.f('i')) << 24, jump_words + 1};
-    else if (info.op == Op::Inc) idle_ = {true, body.f('d'), 1, jump_words + 1};
+    if (info.op == Op::AluImmShort && info.variant == 0) idle_ = {true, body.f('d'), static_cast<i64>(body.f('i')) << 24, jump_words + 1, until_cycle};
+    else if (info.op == Op::Inc) idle_ = {true, body.f('d'), 1, jump_words + 1, until_cycle};
 }
 
 }  // namespace mv::dsp
