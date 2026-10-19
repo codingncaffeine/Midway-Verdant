@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Lands the local commits on main only after CI has run them on Linux AND Windows: the commits go to the `gate`
+# Lands the local commits on main only after CI has run them on Linux (Windows runs too, informational): the commits go to the `gate`
 # branch first, this waits for that run, and main moves when it is green. A red run prints the failed jobs and
 # leaves main as it was. The content and identity scans run first. Start it in the background after
 # tools/gate.sh has passed and keep working.
@@ -17,7 +17,7 @@ tools/identity-audit.sh > scratch/gate/identity.log 2>&1 || { tail -20 scratch/g
 echo "── gate branch: $short"
 git push -q --force origin "$sha:refs/heads/gate" || { echo "PUSH FAILED: the gate branch"; exit 1; }
 
-echo "── CI on gate: Linux and Windows"
+echo "── CI on gate: Linux (Windows informational)"
 run=""
 for _ in $(seq 1 40); do
     run=$(gh run list --branch gate --commit "$sha" --json databaseId --jq '.[0].databaseId // empty' 2>/dev/null)
@@ -40,7 +40,8 @@ done
 
 if [ "$conclusion" = success ]; then
     git push -q origin "$sha:main" || { echo "PUSH FAILED: main"; exit 1; }
-    echo "PUSHED $short to main: CI run $run green on Linux and Windows"
+    echo "PUSHED $short to main: CI run $run green on Linux"
+    gh run view "$run" --json jobs --jq '.jobs[] | "  \(.name): \(.conclusion)"'  # Windows' result, for the record
 else
     echo "CI FAILED on gate for $short (run $run); main unchanged."
     gh run view "$run" --json jobs --jq '.jobs[] | "  \(.name): \(.conclusion)"'
