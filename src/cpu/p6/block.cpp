@@ -409,6 +409,12 @@ unsigned BlockEngine::run_native(Run& r) {
         rsb_at_probe_ = rsb_;
         rsb_top_at_probe_ = rsb_top_;
     }
+    // A known spin loop: every transition through the engine, so the run ends when it is back where it began.
+    if (!c.logging && chain_budget_ >= 64 && known_spin(r.entry_eip)) {
+        c.chain_budget = 0;
+        c.chain_extra = 256;
+        ++stats_.spin_short_runs;
+    }
     // The state the run began from, for the spin skip (a copy of the registers; the run is long when it matters).
     const bool spin_watch = chain_budget_ >= 64;
     if (spin_watch) std::memcpy(&spin_start_, &cpu_.state(), sizeof spin_start_);  // bytes, padding too: compared as bytes
@@ -490,18 +496,18 @@ void* BlockEngine::chain(JitCtx& c, Block::Link* slot) {
     c.last_target = cpu_.state().eip;
     Block* b = slot->to;
     if (exit) ++c.mispredicts;
-    if (!b || slot->epoch != link_epoch_ || !b->native) return nullptr;
+    if (!b || slot->epoch != link_epoch_ || !b->native) return c.stop_why = 1, nullptr;
     // Past the budget a run goes on (a little) until it is back where it began: the spin skip compares the two.
     // (only while the run could still be a skippable pass, and not from where that already failed)
-    if (c.chain_budget == 0 && (back_at_start(c) || c.chain_extra == 0 || c.helpers || c.penalties || not_a_fixed_point(c.start_eip))) return nullptr;
+    if (c.chain_budget == 0 && (back_at_start(c) || c.chain_extra == 0 || c.helpers || c.penalties || not_a_fixed_point(c.start_eip))) return c.stop_why = 2, nullptr;
     const CpuState& s = cpu_.state();
-    if (b->jit_eip != s.eip || s.eip == idle_[0] || s.eip == idle_[1]) return nullptr;
+    if (b->jit_eip != s.eip || s.eip == idle_[0] || s.eip == idle_[1]) return c.stop_why = 3, nullptr;
     constexpr u64 kSlowestFetch = tp::kL2Latency + tp::kDramLatency;
-    if (end + b->cycles + kSlowestFetch >= c.limit) return nullptr;
-    if (bus_.code_writes_pending() || cpu_.memory().penalty_pending()) return nullptr;
+    if (end + b->cycles + kSlowestFetch >= c.limit) return c.stop_why = 4, nullptr;
+    if (bus_.code_writes_pending() || cpu_.memory().penalty_pending()) return c.stop_why = 5, nullptr;
     const u32 lin = s.seg[kCs].base + s.eip;
     const Memory::TlbEntry& e = cpu_.memory().tlb()[(lin >> 12) & (Memory::kTlbSize - 1)];
-    if (e.tag != (lin >> 12) || !e.host || bus_.ram_page(e.host) != b->ram_page || (lin & 0xFFFu) != b->page_off) return nullptr;
+    if (e.tag != (lin >> 12) || !e.host || bus_.ram_page(e.host) != b->ram_page || (lin & 0xFFFu) != b->page_off) return c.stop_why = 6, nullptr;
     if (c.chain_budget) --c.chain_budget;
     else --c.chain_extra;
     ++b->entry.runs;
@@ -559,6 +565,7 @@ void BlockEngine::spin_skip(const JitCtx& c, u64 start, u64 instructions) {
     const CpuState& s = cpu_.state();
     if (s.eip != c.start_eip) {
         ++stats_.spin_refused[3];
+        ++stats_.spin_elsewhere_why[c.stop_why & 15];
         return;
     }
     if (std::memcmp(&s, &spin_start_, sizeof s) != 0) {
@@ -584,6 +591,7 @@ void BlockEngine::spin_skip(const JitCtx& c, u64 start, u64 instructions) {
     const u64 k = passes - 1;
     cpu_.set_cycles_only(now + k * period);
     cpu_.add_instructions(k * instructions);
+    remember_spin(c.start_eip);
     ++stats_.spin_skips;
     stats_.spin_cycles += k * period;
 }

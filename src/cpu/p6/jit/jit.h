@@ -63,6 +63,7 @@ struct JitCtx {
         u64 where;  // the host address, the size in the top byte
         u64 old;
     } log[256];
+    u8 stop_why;  // instrument: which test in BlockEngine::chain ended the run (0: none)
 };
 
 // The native function's result: (instruction index << 2) | kind.

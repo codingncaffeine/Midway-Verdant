@@ -76,6 +76,8 @@ struct BlockStats {
     u64 mispredicts{0};
     u64 native_runs{0}, native_insns{0}, native_helpers{0}, native_ineligible{0}, native_handoffs{0}, chains{0}, links_refused{0};
     u64 spin_skips{0}, spin_cycles{0};  // loops whose passes were skipped, and the cycles they covered
+    u64 spin_short_runs{0};  // runs from a known spin loop, ended after one pass
+    std::array<u64, 16> spin_elsewhere_why{};  // runs ended away from their start: the chain test that stopped them     // of those, runs that measured their pass from their first return to the start
     // Why a long run was not a skippable pass: an interpreted instruction, a cache penalty, a mispredict, ended
     // elsewhere, the state changed, the probe's log overflowed, a store left memory changed.
     std::array<u64, 7> spin_refused{};
@@ -173,6 +175,11 @@ private:
     bool not_a_fixed_point(u32 eip) const { return not_fixed_[(eip ^ (eip >> 9)) & 255] == eip; }
     void remember_not_fixed(u32 eip) { not_fixed_[(eip ^ (eip >> 9)) & 255] = eip; }
     std::array<u32, 256> not_fixed_{};
+    // Loops the spin skip has skipped: a run starting at one stops after its first pass (back where it began) so the
+    // skip is tried at once, instead of after the chain budget — events end such runs thousands of times a second.
+    bool known_spin(u32 eip) const { return known_spin_[(eip ^ (eip >> 9)) & 255] == eip; }
+    void remember_spin(u32 eip) { known_spin_[(eip ^ (eip >> 9)) & 255] = eip; }
+    std::array<u32, 256> known_spin_{};
     static u64 key(u32 ram_page, unsigned off, u8 mode) { return (static_cast<u64>(ram_page) << 14) | (static_cast<u64>(off) << 2) | mode; }
     static unsigned fast_index(u32 lin, u8 mode) { return ((lin ^ (lin >> 16)) * 2 + mode) & (kFastSize - 1); }
 
