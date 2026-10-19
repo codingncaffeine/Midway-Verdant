@@ -188,6 +188,8 @@ VulkanRenderer::~VulkanRenderer() {
         if (s->framebuffer) f.vkDestroyFramebuffer(dev_.device(), s->framebuffer, nullptr);
         dev_.destroy_image(s->color);
         dev_.destroy_image(s->depth);
+        dev_.destroy_image(s->snap);
+        dev_.destroy_image(s->zcolor);
     }
     for (auto& [k, p] : passes_) f.vkDestroyRenderPass(dev_.device(), p, nullptr);
     for (auto& [k, m] : vs_cache_) f.vkDestroyShaderModule(dev_.device(), m, nullptr);
@@ -203,6 +205,13 @@ VulkanRenderer::~VulkanRenderer() {
     dev_.destroy_image(dummycube_);
     dev_.destroy_image(dummy3d_);
     if (pipeline_layout_) f.vkDestroyPipelineLayout(dev_.device(), pipeline_layout_, nullptr);
+    if (zc_pipeline_) f.vkDestroyPipeline(dev_.device(), zc_pipeline_, nullptr);
+    if (zc_layout_) f.vkDestroyPipelineLayout(dev_.device(), zc_layout_, nullptr);
+    if (zc_set_layout_) f.vkDestroyDescriptorSetLayout(dev_.device(), zc_set_layout_, nullptr);
+    if (zc_pool_) f.vkDestroyDescriptorPool(dev_.device(), zc_pool_, nullptr);
+    if (zc_module_) f.vkDestroyShaderModule(dev_.device(), zc_module_, nullptr);
+    dev_.destroy_buffer(zc_in_);
+    dev_.destroy_buffer(zc_out_);
     if (set_layout_) f.vkDestroyDescriptorSetLayout(dev_.device(), set_layout_, nullptr);
     dev_.destroy_buffer(vertex_ring_.buffer);
     dev_.destroy_buffer(index_ring_.buffer);
@@ -488,14 +497,20 @@ VulkanRenderer::Surface* VulkanRenderer::target_for(const KelvinState& s) {
         note(std::format("surface {:08x} relaid out: {}x{} {} format {:x} -> {}x{} {} format {:x}", phys, s0.width, s0.height, s0.swizzled ? "swizzled" : "pitch",
                          s0.color_format, width, height, d.swizzled() ? "swizzled" : "pitch", d.color_format()));
         if (pass_target_ == &s0) end_pass();
+        wb_why_ = Stats::kWbRelayout;
         if (s0.dirty) write_back(s0);
+        wb_why_ = Stats::kWbAll;
         // Draws already recorded or still on the GPU may use the old images: they go once those are done.
         retire(s0.x8_view);
         retire(s0.depth_view);
+        retire(s0.snap_x8_view);
+        retire(s0.zcolor_x8_view);
         destroy_surface_views(s0);
         retire(s0.framebuffer);
         retire(s0.color);
         retire(s0.depth);
+        retire(s0.snap);
+        retire(s0.zcolor);
         surfaces_.erase(it);
         stage_cache_.fill({});  // a stage may point at the erased target's entries
     }
@@ -534,6 +549,20 @@ VulkanRenderer::Surface* VulkanRenderer::target_for(const KelvinState& s) {
     end_pass();
     fresh_image(t.color);
     fresh_image(t.depth);
+    // A target that another target's dirty colour or depth covers starts from what that one rendered: written back first
+    // (the memory is the truth; a target over another's depth buffer loaded stale RAM once depth read as colour stayed
+    // on the GPU).
+    {
+        const u64 b0 = t.phys, b1 = static_cast<u64>(t.phys) + t.bytes();
+        wb_why_ = Stats::kWbRelayout;
+        for (auto& [k, o] : surfaces_) {
+            const u64 a0 = o->phys, a1 = a0 + o->bytes(), z0 = o->zeta_phys, z1 = z0 + o->zeta_bytes();
+            if (o->dirty && a0 < b1 && b0 < a1) queue_write_back(*o);
+            if (o->zeta_dirty && z0 < b1 && b0 < z1) queue_write_back_zeta(*o);
+        }
+        finish_write_backs();
+        wb_why_ = Stats::kWbAll;
+    }
     upload_color_from_ram(t);  // the guest may draw over an existing picture
     t.pass = render_pass(cf, df);
     VkImageView views[2] = {t.color.view, t.depth.view};
@@ -554,6 +583,7 @@ VulkanRenderer::Surface* VulkanRenderer::target_for(const KelvinState& s) {
 // engine has rewritten its memory (one title resets a glare buffer each frame with a 2D blit, then draws into it
 // additively; drawing on over the GPU's stale copy saturated it to white).
 void VulkanRenderer::upload_color_from_ram(Surface& t) {
+    ++t.draw_serial;
     const u32 bpp = t.color_bytes();
     std::vector<u8> pixels(static_cast<std::size_t>(t.width) * t.height * bpp, 0);
     for (u32 y = 0; y < t.height; ++y) {
@@ -667,6 +697,7 @@ void VulkanRenderer::queue_write_back(Surface& s) {
         return;
     }
     read_back(s.color, VK_IMAGE_ASPECT_COLOR_BIT, s.width, s.height, offset);
+    ++stats_.writebacks_by[wb_why_];
     write_backs_.push_back({&s, false, offset});
 }
 
@@ -686,6 +717,7 @@ void VulkanRenderer::queue_write_back_zeta(Surface& s) {
     VkDeviceSize offset = 0;
     readback_alloc(bytes, offset);  // fits: checked above
     read_back(s.depth, z16 ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT, s.width, s.height, offset);
+    ++stats_.writebacks_by[wb_why_];
     write_backs_.push_back({&s, true, offset});
 }
 
@@ -804,6 +836,7 @@ void VulkanRenderer::write_back_all() {
 }
 
 void VulkanRenderer::write_back_range(u32 phys, u32 len) {
+    wb_why_ = Stats::kWbRange;
     const u64 b0 = phys, b1 = static_cast<u64>(phys) + len;
     for (auto& [k, s] : surfaces_) {
         const u64 a0 = s->phys, a1 = static_cast<u64>(s->phys) + s->bytes();
@@ -812,6 +845,7 @@ void VulkanRenderer::write_back_range(u32 phys, u32 len) {
         if (s->zeta_dirty && z0 < b1 && b0 < z1) queue_write_back_zeta(*s);
     }
     finish_write_backs();
+    wb_why_ = Stats::kWbAll;
 }
 
 // A GPU-side write to guest memory (a blit): decoded textures over it are stale, and so is any target's image
@@ -1162,13 +1196,17 @@ const VulkanRenderer::TextureEntry* VulkanRenderer::texture(const KelvinState& s
     }
     // A render target the guest now samples: its pixels must be in RAM first — the colour image, or the depth
     // buffer when the texture is a shadow map.
+    wb_why_ = Stats::kWbTexture;
     for (auto& [k, surf] : surfaces_) {
         const u64 a0 = surf->phys, a1 = static_cast<u64>(surf->phys) + surf->bytes();
+        if (debug_tex_log_ && ((surf->dirty && a0 < static_cast<u64>(phys) + length && static_cast<u64>(phys) < a1) || (surf->zeta_dirty && surf->zeta_phys < static_cast<u64>(phys) + length && static_cast<u64>(phys) < static_cast<u64>(surf->zeta_phys) + surf->zeta_bytes())))
+            std::fprintf(stderr, "texlog: forced write-back %08x/%08x for a texture at %08x fmt %02x %ux%u: open %d ram_newer %d\n", surf->phys, surf->zeta_phys, phys, ts.color_format(), surf->width, surf->height, (pass_open_ && pass_target_ == surf.get()) ? 1 : 0, surf->ram_newer ? 1 : 0);
         if (surf->dirty && a0 < static_cast<u64>(phys) + length && static_cast<u64>(phys) < a1) queue_write_back(*surf);
         const u64 z0 = surf->zeta_phys, z1 = static_cast<u64>(surf->zeta_phys) + surf->zeta_bytes();
         if (surf->zeta_dirty && z0 < static_cast<u64>(phys) + length && static_cast<u64>(phys) < z1) queue_write_back_zeta(*surf);
     }
     finish_write_backs();
+    wb_why_ = Stats::kWbAll;
     if (same && sc.entry->valid && !sc.entry->surface && texture_current(*sc.entry)) return sc.entry;
     struct Ident {
         u32 phys, format, control1, rect, palette;
@@ -1309,6 +1347,10 @@ VulkanRenderer::TextureEntry* VulkanRenderer::surface_texture(const TextureStage
         // pitch layout (one colour, the same either way) and draws in the layout it samples.
         if (s.width != w || s.height != h) continue;
         const bool recent = !s.ram_newer && s.last_rendered_frame + 1 >= frame_index_;
+        // The depth buffer read as colour at its own address: converted on the GPU (Z24S8 on a device with D24S8).
+        if (color && s.zeta_phys == phys && s.phys != phys && s.zeta_format == 2 && depth24_ == VK_FORMAT_D24_UNORM_S8_UINT && s.aa_x == 1 && s.aa_y == 1 &&
+            (s.zeta_dirty || recent) && linear == !s.swizzled && (!linear || ts.pitch() == s.zeta_pitch))
+            return zeta_color_texture(s, ts, phys, w, h, linear, x8);
         if (color) {
             if (s.phys != phys || !(s.dirty || recent) || s.color_bytes() != 4 || color_vk_format(s.color_format) != VK_FORMAT_B8G8R8A8_UNORM) continue;
             if (linear && ts.pitch() != s.pitch) continue;
@@ -1316,7 +1358,10 @@ VulkanRenderer::TextureEntry* VulkanRenderer::surface_texture(const TextureStage
             if (s.zeta_phys != phys || !(s.zeta_dirty || recent) || (s.zeta_format == 1) != depth16) continue;
             if (!(depth16 ? depth16_sampled_ : depth24_sampled_) || (linear && ts.pitch() != s.zeta_pitch)) continue;
         }
-        if (pass_open_ && pass_target_ == &s) return nullptr;  // drawn into by the open pass: through RAM as before
+        if (&s == draw_target_) {
+            if (!color) return nullptr;  // a draw sampling its own depth buffer: through RAM
+            return snapshot_texture(s, ts, phys, w, h, linear, x8);
+        }
         TextureEntry& e = color ? (x8 ? s.color_x8_tex : s.color_tex) : s.depth_tex;
         if (!e.valid) {
             VkImageViewCreateInfo vci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
@@ -1349,6 +1394,244 @@ VulkanRenderer::TextureEntry* VulkanRenderer::surface_texture(const TextureStage
     return nullptr;
 }
 
+// A draw samples the target it draws into: on the console the texture unit reads RAM, which holds what the draws
+// before this one left. A copy of the image taken now (on the GPU, outside the pass) serves it, and is retaken only
+// after the target has been drawn into or cleared since; before, each such draw wrote the target back to RAM,
+// waited for the GPU and decoded the texture again (a glare buffer blurred in place did that many times a frame).
+VulkanRenderer::TextureEntry* VulkanRenderer::snapshot_texture(Surface& s, const TextureStage& ts, u32 phys, u32 w, u32 h, bool linear, bool x8) {
+    if (!s.snap.image) {
+        std::string error;
+        if (!dev_.create_image(s.color.format, s.color.width, s.color.height, 1, 1, 1, VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                               VK_IMAGE_ASPECT_COLOR_BIT, false, s.snap, error)) {
+            note("snapshot image: " + error);
+            return nullptr;
+        }
+        end_pass();
+        fresh_image(s.snap);
+        s.snap_serial = ~0ull;
+    }
+    if (s.snap_serial != s.draw_serial) {
+        end_pass();
+        // The target's attachment writes before the copy reads it; earlier draws' reads of the copy before it is
+        // overwritten.
+        VkMemoryBarrier before{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        before.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+        before.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+        fn_->vkCmdPipelineBarrier(cb_, VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &before, 0, nullptr, 0,
+                                  nullptr);
+        VkImageCopy region{};
+        region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        region.dstSubresource = region.srcSubresource;
+        region.extent = {s.color.width, s.color.height, 1};
+        fn_->vkCmdCopyImage(cb_, s.color.image, VK_IMAGE_LAYOUT_GENERAL, s.snap.image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+        // The copy before the draws that sample it, and before the target is drawn into again.
+        VkMemoryBarrier after{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        after.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT;
+        after.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        fn_->vkCmdPipelineBarrier(cb_, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT, 0, 1, &after, 0, nullptr, 0, nullptr);
+        s.snap_serial = s.draw_serial;
+        ++stats_.snapshots;
+    }
+    TextureEntry& e = x8 ? s.snap_x8_tex : s.snap_tex;
+    if (!e.valid) {
+        VkImageView view = s.snap.view;
+        if (x8) {
+            VkImageViewCreateInfo vci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+            vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+            vci.image = s.snap.image;
+            vci.format = s.snap.format;
+            vci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            vci.components.a = VK_COMPONENT_SWIZZLE_ONE;
+            if (fn_->vkCreateImageView(dev_.device(), &vci, nullptr, &view) != VK_SUCCESS) return nullptr;
+            s.snap_x8_view = view;
+        }
+        e.image = s.snap;
+        e.image.view = view;
+        e.image.levels = 1;
+        e.phys = phys;
+        e.width = w;
+        e.height = h;
+        e.linear = linear;
+        e.surface = true;
+        e.valid = true;
+    }
+    e.length = texture_size_in_memory(ts);
+    return &e;
+}
+
+// The conversion's pieces, made the first time a draw reads a depth buffer as colour.
+bool VulkanRenderer::init_zeta_convert() {
+    if (zc_pipeline_) return true;
+    if (zc_failed_) return false;
+    zc_failed_ = true;
+    const auto& f = *fn_;
+    std::string error;
+    const VkDeviceSize n = kZetaConvertMaxTexels;
+    if (!dev_.create_buffer(n * 5, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, vk::BufferMemory::Device, zc_in_, error) ||
+        !dev_.create_buffer(n * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, vk::BufferMemory::Device, zc_out_, error)) {
+        note("depth conversion buffers: " + error);
+        return false;
+    }
+    // Word i of the depth copy holds the depth in its low 24 bits; the stencil bytes follow the words, packed.
+    const CompiledShader cs = compile_glsl(ShaderStage::Compute,
+                                           "#version 450\n"
+                                           "layout(local_size_x = 64) in;\n"
+                                           "layout(std430, binding = 0) readonly buffer In { uint words[]; } src;\n"
+                                           "layout(std430, binding = 1) writeonly buffer Out { uint words[]; } dst;\n"
+                                           "layout(push_constant) uniform P { uint count; uint stencil_word; } pc;\n"
+                                           "void main() {\n"
+                                           "    uint i = gl_GlobalInvocationID.x;\n"
+                                           "    if (i >= pc.count) return;\n"
+                                           "    uint s = (src.words[pc.stencil_word + (i >> 2)] >> ((i & 3u) * 8u)) & 0xFFu;\n"
+                                           "    dst.words[i] = ((src.words[i] & 0xFFFFFFu) << 8) | s;\n"
+                                           "}\n",
+                                           "zeta-to-color");
+    if (!cs.ok()) {
+        note("depth conversion shader: " + cs.log);
+        return false;
+    }
+    zc_module_ = module(cs.spirv);
+    VkDescriptorSetLayoutBinding bindings[2]{};
+    for (u32 i = 0; i < 2; ++i) {
+        bindings[i].binding = i;
+        bindings[i].descriptorCount = 1;
+        bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        bindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    }
+    VkDescriptorSetLayoutCreateInfo dli{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    dli.bindingCount = 2;
+    dli.pBindings = bindings;
+    VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, 8};
+    VkPipelineLayoutCreateInfo pli{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    pli.setLayoutCount = 1;
+    pli.pSetLayouts = &zc_set_layout_;
+    pli.pushConstantRangeCount = 1;
+    pli.pPushConstantRanges = &push;
+    if (f.vkCreateDescriptorSetLayout(dev_.device(), &dli, nullptr, &zc_set_layout_) != VK_SUCCESS ||
+        f.vkCreatePipelineLayout(dev_.device(), &pli, nullptr, &zc_layout_) != VK_SUCCESS) {
+        note("depth conversion layouts failed");
+        return false;
+    }
+    VkComputePipelineCreateInfo cpi{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+    cpi.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    cpi.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    cpi.stage.module = zc_module_;
+    cpi.stage.pName = "main";
+    cpi.layout = zc_layout_;
+    VkDescriptorPoolSize size{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2};
+    VkDescriptorPoolCreateInfo dpi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    dpi.maxSets = 1;
+    dpi.poolSizeCount = 1;
+    dpi.pPoolSizes = &size;
+    if (f.vkCreateComputePipelines(dev_.device(), pipeline_cache_, 1, &cpi, nullptr, &zc_pipeline_) != VK_SUCCESS ||
+        f.vkCreateDescriptorPool(dev_.device(), &dpi, nullptr, &zc_pool_) != VK_SUCCESS) {
+        note("depth conversion pipeline failed");
+        return false;
+    }
+    VkDescriptorSetAllocateInfo dai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    dai.descriptorPool = zc_pool_;
+    dai.descriptorSetCount = 1;
+    dai.pSetLayouts = &zc_set_layout_;
+    if (f.vkAllocateDescriptorSets(dev_.device(), &dai, &zc_set_) != VK_SUCCESS) {
+        note("depth conversion descriptor set failed");
+        return false;
+    }
+    VkDescriptorBufferInfo infos[2] = {{zc_in_.buffer, 0, VK_WHOLE_SIZE}, {zc_out_.buffer, 0, VK_WHOLE_SIZE}};
+    VkWriteDescriptorSet writes[2]{};
+    for (u32 i = 0; i < 2; ++i) {
+        writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[i].dstSet = zc_set_;
+        writes[i].dstBinding = i;
+        writes[i].descriptorCount = 1;
+        writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[i].pBufferInfo = &infos[i];
+    }
+    f.vkUpdateDescriptorSets(dev_.device(), 2, writes, 0, nullptr);
+    zc_failed_ = false;
+    return true;
+}
+
+// A draw reads a Z24S8 depth buffer as an A8R8G8B8 texture at the same address (a title masking its glare by
+// depth): the texels are the words RAM would hold, the depth in bits 31-8 above the stencil byte. They are made on
+// the GPU — depth and stencil copied into a buffer, packed by a compute pass, copied into a colour image — where
+// before each read wrote the whole depth buffer back to RAM, waited for the GPU and decoded it again.
+VulkanRenderer::TextureEntry* VulkanRenderer::zeta_color_texture(Surface& s, const TextureStage& ts, u32 phys, u32 w, u32 h, bool linear, bool x8) {
+    const u32 n = s.width * s.height;
+    if (n > kZetaConvertMaxTexels || !init_zeta_convert()) return nullptr;
+    if (!s.zcolor.image) {
+        std::string error;
+        if (!dev_.create_image(VK_FORMAT_B8G8R8A8_UNORM, s.width, s.height, 1, 1, 1, VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                               VK_IMAGE_ASPECT_COLOR_BIT, false, s.zcolor, error)) {
+            note("depth-as-colour image: " + error);
+            return nullptr;
+        }
+        end_pass();
+        fresh_image(s.zcolor);
+        s.zcolor_serial = ~0ull;
+    }
+    if (s.zcolor_serial != s.draw_serial) {
+        end_pass();
+        const auto barrier = [this](VkPipelineStageFlags from, VkAccessFlags src, VkPipelineStageFlags to, VkAccessFlags dst) {
+            VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+            mb.srcAccessMask = src;
+            mb.dstAccessMask = dst;
+            fn_->vkCmdPipelineBarrier(cb_, from, to, 0, 1, &mb, 0, nullptr, 0, nullptr);
+        };
+        // The depth writes (and an earlier conversion's reads of the buffers) before the copies.
+        barrier(VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+        VkBufferImageCopy regions[2]{};
+        regions[0].imageSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1};
+        regions[0].imageExtent = {s.width, s.height, 1};
+        regions[1] = regions[0];
+        regions[1].imageSubresource.aspectMask = VK_IMAGE_ASPECT_STENCIL_BIT;
+        regions[1].bufferOffset = static_cast<VkDeviceSize>(n) * 4;
+        fn_->vkCmdCopyImageToBuffer(cb_, s.depth.image, VK_IMAGE_LAYOUT_GENERAL, zc_in_.buffer, 2, regions);
+        barrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+        fn_->vkCmdBindPipeline(cb_, VK_PIPELINE_BIND_POINT_COMPUTE, zc_pipeline_);
+        fn_->vkCmdBindDescriptorSets(cb_, VK_PIPELINE_BIND_POINT_COMPUTE, zc_layout_, 0, 1, &zc_set_, 0, nullptr);
+        const u32 push[2] = {n, n};
+        fn_->vkCmdPushConstants(cb_, zc_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof push, push);
+        fn_->vkCmdDispatch(cb_, (n + 63) / 64, 1, 1);
+        barrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        VkBufferImageCopy out{};
+        out.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        out.imageExtent = {s.width, s.height, 1};
+        fn_->vkCmdCopyBufferToImage(cb_, zc_out_.buffer, s.zcolor.image, VK_IMAGE_LAYOUT_GENERAL, 1, &out);
+        barrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+        s.zcolor_serial = s.draw_serial;
+        ++stats_.zeta_conversions;
+    }
+    TextureEntry& e = x8 ? s.zcolor_x8_tex : s.zcolor_tex;
+    if (!e.valid) {
+        VkImageView view = s.zcolor.view;
+        if (x8) {
+            VkImageViewCreateInfo vci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+            vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+            vci.image = s.zcolor.image;
+            vci.format = s.zcolor.format;
+            vci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            vci.components.a = VK_COMPONENT_SWIZZLE_ONE;
+            if (fn_->vkCreateImageView(dev_.device(), &vci, nullptr, &view) != VK_SUCCESS) return nullptr;
+            s.zcolor_x8_view = view;
+        }
+        e.image = s.zcolor;
+        e.image.view = view;
+        e.image.levels = 1;
+        e.phys = phys;
+        e.width = w;
+        e.height = h;
+        e.linear = linear;
+        e.surface = true;
+        e.valid = true;
+    }
+    e.length = texture_size_in_memory(ts);
+    return &e;
+}
+
 void VulkanRenderer::surface_barrier() {
     end_pass();
     VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
@@ -1363,8 +1646,10 @@ void VulkanRenderer::surface_barrier() {
 void VulkanRenderer::destroy_surface_views(Surface& s) {
     if (s.x8_view) fn_->vkDestroyImageView(dev_.device(), s.x8_view, nullptr);
     if (s.depth_view) fn_->vkDestroyImageView(dev_.device(), s.depth_view, nullptr);
-    s.x8_view = s.depth_view = VK_NULL_HANDLE;
-    s.color_tex = s.color_x8_tex = s.depth_tex = TextureEntry{};
+    if (s.snap_x8_view) fn_->vkDestroyImageView(dev_.device(), s.snap_x8_view, nullptr);
+    if (s.zcolor_x8_view) fn_->vkDestroyImageView(dev_.device(), s.zcolor_x8_view, nullptr);
+    s.x8_view = s.depth_view = s.snap_x8_view = s.zcolor_x8_view = VK_NULL_HANDLE;
+    s.color_tex = s.color_x8_tex = s.depth_tex = s.snap_tex = s.snap_x8_tex = s.zcolor_tex = s.zcolor_x8_tex = TextureEntry{};
 }
 
 VkSampler VulkanRenderer::sampler(const TextureStage& ts, u32 levels) {
@@ -1445,6 +1730,7 @@ void VulkanRenderer::clear(const KelvinState& s, u32 bits) {
     ensure_pass(*t);
     if (bits & 0xF0u) t->dirty = true;
     ++t->clears_this_frame;
+    ++t->draw_serial;
     VkClearAttachment att[2]{};
     u32 n = 0;
     const u32 rect_h = s.reg(mthd::kClearRectH), rect_v = s.reg(mthd::kClearRectV);
@@ -1666,6 +1952,7 @@ void VulkanRenderer::draw(const KelvinState& s, const DrawBatch& batch) {
     }
 
     // Textures (may write surfaces back and flush: before the pass for this draw begins).
+    draw_target_ = t;
     std::array<const TextureEntry*, 4> tex{};
     std::array<std::array<float, 2>, 4> scales{{{1.0f, 1.0f}, {1.0f, 1.0f}, {1.0f, 1.0f}, {1.0f, 1.0f}}};
     for (u32 i = 0; i < 4; ++i) {
@@ -1677,6 +1964,8 @@ void VulkanRenderer::draw(const KelvinState& s, const DrawBatch& batch) {
         }
         if (tex[i]->linear) scales[i] = {1.0f / static_cast<float>(tex[i]->width), 1.0f / static_cast<float>(tex[i]->height)};
     }
+
+    draw_target_ = nullptr;
 
     // Topology and the index list the host understands.
     auto t_part = std::chrono::steady_clock::now();
@@ -1839,6 +2128,7 @@ void VulkanRenderer::draw(const KelvinState& s, const DrawBatch& batch) {
     ensure_pass(*t);
     if (s.color_mask() != 0) t->dirty = true;
     ++t->draws_this_frame;
+    ++t->draw_serial;
     fn_->vkCmdBindPipeline(cb_, VK_PIPELINE_BIND_POINT_GRAPHICS, p);
     // A bound set stays bound across pipelines (they share one layout) and passes, for the whole command buffer.
     if (set != bound_set_) {
@@ -1909,11 +2199,14 @@ void VulkanRenderer::write_descriptors(VkDescriptorSet set, VkDeviceSize uoffset
 void VulkanRenderer::flush_frame() { submit(); }
 
 bool VulkanRenderer::write_back_at(u32 phys) {
+    wb_why_ = Stats::kWbScanout;
     for (auto& [k, s] : surfaces_) {
         if (s->phys != phys) continue;
         if (s->dirty) write_back(*s);
+        wb_why_ = Stats::kWbAll;
         return true;
     }
+    wb_why_ = Stats::kWbAll;
     return false;
 }
 
@@ -1921,9 +2214,11 @@ void VulkanRenderer::end_frame() {
     frame_draws_ = 0;
     ++frame_index_;
     // Colour reaches RAM every frame (the scanout and the CPU read it); depth only when a texture samples it.
+    wb_why_ = Stats::kWbFrameEnd;
     for (auto& [k, s] : surfaces_) queue_write_back(*s);
     if (write_backs_.empty()) submit();  // nothing to copy: the frame runs on without a wait
     else finish_write_backs();
+    wb_why_ = Stats::kWbAll;
 }
 
 std::vector<VulkanRenderer::SurfaceInfo> VulkanRenderer::surfaces() const {

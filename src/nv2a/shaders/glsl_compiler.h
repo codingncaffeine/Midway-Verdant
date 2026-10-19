@@ -7,7 +7,7 @@
 // GLSL to SPIR-V through glslang, for the shaders the translators emit. Thread-safe after the first call.
 namespace mv::pgraph {
 
-enum class ShaderStage { Vertex, Fragment };
+enum class ShaderStage { Vertex, Fragment, Compute };
 
 struct CompiledShader {
     std::vector<u32> spirv;

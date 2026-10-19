@@ -20,7 +20,7 @@ std::once_flag g_init;
 CompiledShader compile_glsl(ShaderStage stage, const std::string& source, const std::string& name) {
     std::call_once(g_init, [] { glslang::InitializeProcess(); });
     CompiledShader out;
-    const EShLanguage lang = stage == ShaderStage::Vertex ? EShLangVertex : EShLangFragment;
+    const EShLanguage lang = stage == ShaderStage::Vertex ? EShLangVertex : stage == ShaderStage::Fragment ? EShLangFragment : EShLangCompute;
     glslang::TShader shader(lang);
     const char* src = source.c_str();
     const char* names = name.c_str();

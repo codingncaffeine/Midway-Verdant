@@ -80,6 +80,9 @@ namespace mv::vk {
     X(vkCreateFramebuffer)          \
     X(vkDestroyFramebuffer)         \
     X(vkCreateGraphicsPipelines)    \
+    X(vkCreateComputePipelines)     \
+    X(vkCmdDispatch)                \
+    X(vkCmdPushConstants)           \
     X(vkDestroyPipeline)            \
     X(vkCreatePipelineCache)        \
     X(vkGetPipelineCacheData)       \
@@ -99,6 +102,7 @@ namespace mv::vk {
     X(vkCmdCopyBufferToImage)       \
     X(vkCmdCopyImageToBuffer)       \
     X(vkCmdCopyBuffer)              \
+    X(vkCmdCopyImage)               \
     X(vkCmdSetStencilReference)     \
     X(vkCmdSetBlendConstants)       \
     X(vkCmdSetDepthBias)

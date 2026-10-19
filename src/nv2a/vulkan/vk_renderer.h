@@ -63,9 +63,15 @@ public:
         u64 uniform_reuses{0};  // uniform blocks equal to the frame's last upload, bound where that lies
         u64 descriptor_reuses{0};  // draws that kept the previous draw's descriptor set
         u64 surface_samples{0};  // textures bound straight to a render target's image
+        u64 snapshots{0};  // copies of a target taken for draws that sample the target they draw into
+        u64 zeta_conversions{0};  // depth buffers converted on the GPU for a colour texture at their address
         u64 shaders_from_disk{0};  // shader compiles the disk cache answered
         u64 textures_unchanged{0};
         u64 surface_reloads{0};  // render targets reloaded from RAM after another engine wrote them  // textures whose pages were written but whose bytes hashed the same: kept
+        // Write-backs by cause: frame end, a texture sampling the target, the scanout at vblank, a 2D or CPU range,
+        // a target relaid out, the idle vblank (all).
+        enum WriteBackWhy : unsigned { kWbFrameEnd, kWbTexture, kWbScanout, kWbRange, kWbRelayout, kWbAll, kWbWhyCount };
+        u64 writebacks_by[kWbWhyCount]{};
         // Where the time goes, in nanoseconds: the whole draw and its parts (the texture part includes the
         // write-backs a sample forces; the shader parts are the compiles, a lookup costs nothing measurable); the
         // submits and the fence waits; the copies back to RAM, colour and depth (and the wait for the device copy
@@ -110,6 +116,18 @@ private:
         // entries a draw binds.
         VkImageView x8_view{VK_NULL_HANDLE}, depth_view{VK_NULL_HANDLE};
         TextureEntry color_tex, color_x8_tex, depth_tex;
+        // A copy of the colour image for draws that sample the target they draw into (a blur done in place): it holds
+        // what the draws before them left, as RAM would; retaken whenever the target was drawn into since.
+        vk::Image snap;
+        VkImageView snap_x8_view{VK_NULL_HANDLE};
+        TextureEntry snap_tex, snap_x8_tex;
+        u64 draw_serial{0}, snap_serial{~0ull};
+        // The depth buffer read as a colour texture at its address (the Z24S8 words as A8R8G8B8 texels), converted on
+        // the GPU; retaken whenever the target was drawn into or cleared since.
+        vk::Image zcolor;
+        VkImageView zcolor_x8_view{VK_NULL_HANDLE};
+        TextureEntry zcolor_tex, zcolor_x8_tex;
+        u64 zcolor_serial{~0ull};
         // The frame the target was last drawn in, and whether a GPU-side copy (a blit) wrote its memory since: a clean
         // target drawn this frame or the last, with nothing written over it, still holds what RAM holds.
         u64 last_rendered_frame{0};
@@ -163,6 +181,21 @@ private:
     const TextureEntry* texture(const KelvinState& s, u32 stage, std::string& error);
     // A render target the stage can sample in place (same address and size, a format of the same bytes), or null.
     TextureEntry* surface_texture(const TextureStage& ts, u32 phys);
+    TextureEntry* snapshot_texture(Surface& s, const TextureStage& ts, u32 phys, u32 w, u32 h, bool linear, bool x8);
+    Surface* draw_target_{nullptr};  // the target of the draw whose textures are being looked up
+    TextureEntry* zeta_color_texture(Surface& s, const TextureStage& ts, u32 phys, u32 w, u32 h, bool linear, bool x8);
+    bool init_zeta_convert();
+    // The depth-to-colour conversion: a compute pass over two device buffers (the copied depth words and stencil
+    // bytes in, the Z24S8 words out), made on first use.
+    static constexpr u32 kZetaConvertMaxTexels = 1024 * 1024;
+    VkDescriptorSetLayout zc_set_layout_{VK_NULL_HANDLE};
+    VkPipelineLayout zc_layout_{VK_NULL_HANDLE};
+    VkShaderModule zc_module_{VK_NULL_HANDLE};
+    VkPipeline zc_pipeline_{VK_NULL_HANDLE};
+    VkDescriptorPool zc_pool_{VK_NULL_HANDLE};
+    VkDescriptorSet zc_set_{VK_NULL_HANDLE};
+    vk::Buffer zc_in_, zc_out_;
+    bool zc_failed_{false};
     // Orders the attachment writes recorded so far before later sampling, and earlier sampling before later writes.
     void surface_barrier();
     void destroy_surface_views(Surface& s);
@@ -262,6 +295,7 @@ private:
         VkDeviceSize offset{0};  // where its copy lands in the read-back buffer
     };
     std::vector<PendingWriteBack> write_backs_;
+    unsigned wb_why_{Stats::kWbAll};  // the cause the write-backs being queued count under
     VkDeviceSize readback_cursor_{0};
     u32 descriptor_sets_used_{0};  // from the recording frame's pool
     // The vertex uniform block being built, and the last block of each kind uploaded in the recording frame.
