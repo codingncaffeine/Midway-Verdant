@@ -884,19 +884,6 @@ std::unique_ptr<CpuBackend> make_fast_backend(std::string& why_not) {
     return std::make_unique<KvmBackend>();
 }
 
-}  // namespace mv
-#else
-#include "cpu/backend.h"
-
-namespace mv {
-std::unique_ptr<CpuBackend> make_fast_backend(std::string& why_not) {
-    why_not = "no hardware virtualization backend on this platform yet (WHPX is planned)";
-    return nullptr;
-}
-}  // namespace mv
-#endif
-
-namespace mv {
 
 // The loops the kernel spins in when it has nothing to run: STI, two NOPs, CLI, then a compare of the DPC list head
 // with itself (the shape of the NT-family idle loop, found by profiling where an idle console spends its time). The
@@ -928,3 +915,13 @@ void KvmBackend::find_idle_loop() {
 }
 
 }  // namespace mv
+#else
+#include "cpu/backend.h"
+
+namespace mv {
+std::unique_ptr<CpuBackend> make_fast_backend(std::string& why_not) {
+    why_not = "no hardware virtualization backend on this platform yet (WHPX is planned)";
+    return nullptr;
+}
+}  // namespace mv
+#endif
