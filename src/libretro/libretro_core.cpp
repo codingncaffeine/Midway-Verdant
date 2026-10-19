@@ -49,6 +49,10 @@ std::mutex audio_lock;
 std::vector<mv::i16> audio;  // interleaved stereo at 48 kHz, filled on the machine's thread
 constexpr unsigned kPads = 4;
 unsigned pads_plugged = 1;
+// Frame pipelining: the CPU is let into the next frame before retro_run returns, up to the vblank it holds at.
+bool pipeline = true;
+bool cpu_released = false;
+mv::u64 released_to = 0;
 
 constexpr double kFps = 60000.0 / 1001.0;
 constexpr unsigned kSampleRate = 48000;
@@ -172,6 +176,7 @@ RETRO_API void retro_set_environment(retro_environment_t cb) {
     static const retro_variable vars[] = {
         {"midway_verdant_pads", "Controllers plugged in; 1|2|3|4"},
         {"midway_verdant_drive", "Hard drive; Drive 1|Drive 2|Drive 3"},
+        {"midway_verdant_pipeline", "Run the next frame while the frontend shows this one (faster, up to a frame more input lag); enabled|disabled"},
         {nullptr, nullptr},
     };
     cb(RETRO_ENVIRONMENT_SET_VARIABLES, const_cast<retro_variable*>(vars));
@@ -237,6 +242,8 @@ RETRO_API bool retro_load_game(const retro_game_info* game) {
         return false;
     }
     if (const char* p = option("midway_verdant_pads")) pads_plugged = std::clamp(static_cast<unsigned>(std::atoi(p)), 1u, kPads);
+    if (const char* p = option("midway_verdant_pipeline")) pipeline = std::strcmp(p, "disabled") != 0;
+    cpu_released = false;
     have_rumble = env_cb(RETRO_ENVIRONMENT_GET_RUMBLE_INTERFACE, &rumble) && rumble.set_rumble_state;
 
     // Instruments for a core run under a frontend: MV_TRACE=apu,boot,... (the shell's --trace list) into
@@ -369,15 +376,16 @@ RETRO_API void retro_run(void) {
     for (unsigned p = 0; p < pads_plugged; ++p)
         machine->pad(p).set_state(mv::libretro::map_retropad([p](unsigned device, unsigned index, unsigned id) { return input_state_cb(p, device, index, id); }));
     // One frame of the console's time: the CPU runs to the next vblank and holds there, however long the host takes
-    // (a hung guest or a stalled host returns after a second without the vblank, and the report counts it).
-    mv::u64 vblanks;
+    // (a hung guest or a stalled host returns after a second without the vblank, and the report counts it). With
+    // pipelining the CPU was let into this frame when the last call returned, so it may be done already.
+    mv::u64 target;
     {
         std::lock_guard g(machine->lock());
-        vblanks = machine->nv2a().vblanks();
-        machine->set_frame_limit(vblanks + 1);
+        target = cpu_released ? released_to : machine->nv2a().vblanks() + 1;
+        machine->set_frame_limit(target);
     }
     const auto t0 = std::chrono::steady_clock::now();
-    if (machine->pump(t0 + std::chrono::seconds(1), [vblanks](mv::Machine& m) { return m.nv2a().vblanks() != vblanks; }) ==
+    if (machine->pump(t0 + std::chrono::seconds(1), [target](mv::Machine& m) { return m.nv2a().vblanks() >= target; }) ==
         mv::Machine::StopReason::Duration) {
         if (frames_capped++ == 0) log(RETRO_LOG_WARN, "a frame took over a second of host time; returned without its vblank");
     }
@@ -386,6 +394,14 @@ RETRO_API void retro_run(void) {
     frame_ms_sum += ms;
     frame_ms_max = std::max(frame_ms_max, ms);
     grab_frame();
+    if (pipeline) {
+        // The picture is taken while the CPU holds at the vblank; now it runs the next frame while the frontend
+        // shows this one and the input for it arrives at the next call.
+        std::lock_guard g(machine->lock());
+        released_to = machine->nv2a().vblanks() + 1;
+        machine->set_frame_limit(released_to);
+        cpu_released = true;
+    }
     video_cb(frame.data(), frame_w, frame_h, frame_w * 4);
     // The audio the console played since the last frame, as it played it: the AC'97 output runs on the console's
     // own clock, so a frame carries about 800 stereo samples, a few more or fewer as the reads fall. Padding a short
