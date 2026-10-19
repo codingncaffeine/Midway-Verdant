@@ -255,6 +255,9 @@ bool Machine::init(std::string& error) {
         if (cpu_) cpu_->kick();
     });
     if (!cpu_->hardware_assisted()) {
+        // The accurate core's runs are deterministic (the oracle compares two of them): the audio processors, whose DMA
+        // reads and writes guest RAM, run on the CPU's thread at their frame.
+        apu_.run_processors_inline();
         // The interpreter: milestones on its own timeline, so their times are deterministic.
         milestone_poll_.name = "milestones";
         milestone_poll_.fire = [this](Cycles now) {

@@ -76,7 +76,9 @@ private:
     u64 stop_at_cycles_{~u64{0}};
     u64 delivery_hash_{0xcbf29ce484222325ull};
     u64 deliveries_{0};
-    std::FILE* delivery_log_{nullptr};  // MV_P6_DELIVERY_LOG=FILE: a line per delivery (cycle, instructions, EIP, hash)
+    // The rest of the architectural state at every delivery (x87, SSE, segments, control registers), and RAM at the end.
+    u64 state_hash_{0xcbf29ce484222325ull};
+    std::FILE* delivery_log_{nullptr};  // MV_P6_DELIVERY_LOG=FILE: a line per delivery (cycle, instructions, EIP, hash, state hash)
     void fold_delivery();
     // The kernel idle loop halts (D22, here by address): found in RAM by its shape, a pass through it with no
     // interrupt delivered since the last pass halts the core to the next event. MV_IDLE_SKIP=0: it spins.

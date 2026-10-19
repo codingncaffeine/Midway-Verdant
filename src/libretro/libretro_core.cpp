@@ -294,6 +294,8 @@ RETRO_API bool retro_load_game(const retro_game_info* game) {
     cfg.cpu = "kvm";
     if (const char* c = option("midway_verdant_cpu"); c && std::strncmp(c, "accurate", 8) == 0) cfg.cpu = "p6";
     cfg.frame_step = true;
+    // Instrument: MV_RTC_TIME=UNIX fixes the clock's start, so two accurate-core runs of a title can be compared.
+    if (const char* t = std::getenv("MV_RTC_TIME"); t && *t) cfg.rtc_base_time = std::strtoll(t, nullptr, 10);
     cfg.pads = pads_plugged;
     if (game && game->path && *game->path) cfg.dvd_image = game->path;
     machine = std::make_unique<mv::Machine>(cfg);

@@ -75,6 +75,9 @@ public:
     // The processors' frame runs on its own thread: wait until the one in flight (if any) has finished. Everything
     // that reads or writes their memories, their DMA or the FIFO registers from the machine's side calls it first.
     void dsp_sync() const;
+    // The processors inline, on the CPU's thread: the accurate core's runs must not depend on host timing (the
+    // processors read and write guest RAM by DMA while they run). Before the first frame only.
+    void run_processors_inline();
     std::string_view name() const override { return PciDevice::name(); }
     u32 mmio_read(PhysAddr addr, unsigned size) override;
     void mmio_write(PhysAddr addr, unsigned size, u32 value) override;

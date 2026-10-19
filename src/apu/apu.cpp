@@ -57,6 +57,20 @@ Apu::Apu(Bus& bus, Scheduler& sched, std::function<void(bool)> irq)
     }
 }
 
+void Apu::run_processors_inline() {
+    if (const char* t = std::getenv("MV_APU_THREAD"); t && *t == '1') return;  // the measurement control: threaded anyway
+    dsp_sync();
+    if (dsp_thread_.joinable()) {
+        {
+            std::lock_guard g(dsp_mutex_);
+            dsp_stop_ = true;
+        }
+        dsp_cv_.notify_all();
+        dsp_thread_.join();
+    }
+    dsp_threaded_ = false;
+}
+
 Apu::~Apu() {
     if (dsp_thread_.joinable()) {
         {

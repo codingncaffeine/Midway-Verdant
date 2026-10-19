@@ -278,10 +278,37 @@ void P6Backend::fold_delivery() {
     mix(s.eip);
     mix(s.eflags());
     for (u32 r : s.gpr) mix(r);
+    auto mix_state = [this](u64 v) {
+        state_hash_ ^= v;
+        state_hash_ *= 0x100000001b3ull;
+    };
+    for (const long double& st : s.fpu.st) {
+        u8 b[10];  // the 80-bit register, not the host type's padding
+        std::memcpy(b, &st, sizeof b);
+        u64 lo;
+        u16 hi;
+        std::memcpy(&lo, b, 8);
+        std::memcpy(&hi, b + 8, 2);
+        mix_state(lo);
+        mix_state(hi);
+    }
+    mix_state(s.fpu.fcw | (static_cast<u64>(s.fpu.fsw) << 16) | (static_cast<u64>(s.fpu.ftw) << 32) | (static_cast<u64>(s.fpu.mxcsr) << 48));
+    for (const auto& x : s.fpu.xmm) {
+        u64 q[2];
+        std::memcpy(q, x.data(), 16);
+        mix_state(q[0]);
+        mix_state(q[1]);
+    }
+    for (const p6::Segment& g : s.seg) {
+        mix_state(g.selector | (static_cast<u64>(g.base) << 16));
+        mix_state(g.limit | (static_cast<u64>(g.ar) << 32));
+    }
+    mix_state(s.cr0 | (static_cast<u64>(s.cr3) << 32));
+    mix_state(s.cr2 | (static_cast<u64>(s.cr4) << 32));
     ++deliveries_;
     if (delivery_log_)
-        std::fprintf(delivery_log_, "%llu %llu %08x %016llx\n", static_cast<unsigned long long>(cpu_->cycles()), static_cast<unsigned long long>(cpu_->instructions()), s.eip,
-                     static_cast<unsigned long long>(delivery_hash_));
+        std::fprintf(delivery_log_, "%llu %llu %08x %016llx %016llx\n", static_cast<unsigned long long>(cpu_->cycles()), static_cast<unsigned long long>(cpu_->instructions()), s.eip,
+                     static_cast<unsigned long long>(delivery_hash_), static_cast<unsigned long long>(state_hash_));
 }
 
 CpuBackend::Stats P6Backend::stats() const {
@@ -373,6 +400,16 @@ std::string P6Backend::report() const {
     else if (idle_skip_) r += std::format("\ncpu p6: the kernel idle loop was not found ({} scans): it spins", idle_scans_);
     r += std::format("\ncpu p6 delivery hash {:016x} over {} deliveries; stopped at cycle {}, {} instructions", delivery_hash_, deliveries_, cpu_ ? cpu_->cycles() : 0,
                      cpu_ ? cpu_->instructions() : 0);
+    if (machine_) {
+        u64 ram_hash = 0xcbf29ce484222325ull;
+        const u8* ram = machine_->bus().ram();
+        for (std::size_t i = 0; i + 8 <= machine_->bus().ram_size(); i += 8) {
+            u64 q;
+            std::memcpy(&q, ram + i, 8);
+            ram_hash = (ram_hash ^ q) * 0x100000001b3ull;
+        }
+        r += std::format("\ncpu p6 state hash {:016x}; RAM hash {:016x}", state_hash_, ram_hash);
+    }
     if (oracle_) r += "\n" + oracle_->summary();
     return r;
 }
