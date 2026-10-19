@@ -69,6 +69,13 @@ u64 thread_cpu_ns() { return clock_ns(CLOCK_THREAD_CPUTIME_ID); }
 KvmBackend::KvmBackend() {
     const char* p = std::getenv("MV_PROFILE_EIP");
     profile_eip_ = p && *p && *p != '0';
+    if (const char* w = std::getenv("MV_WATCH_AT_BREAK"); w && *w) {
+        const std::string s = w;
+        const auto plus = s.find('+'), star = s.find('*');
+        watch_reg_ = s.substr(0, plus);
+        if (plus != std::string::npos) watch_offset_ = static_cast<u32>(std::strtoul(s.c_str() + plus + 1, nullptr, 16));
+        if (star != std::string::npos) watch_max_ = static_cast<u32>(std::strtoul(s.c_str() + star + 1, nullptr, 10));
+    }
 }
 
 KvmBackend::~KvmBackend() {
@@ -687,7 +694,27 @@ void KvmBackend::thread_main() {
                 Regs r{};
                 lock.unlock();
                 read_regs(r);
+                if (watch_va_ && (run_->debug.arch.dr6 & (1u << 3))) {
+                    // The write watch: the instruction has written; log the writer and the word as it is now.
+                    u32 now_value = 0;
+                    if (const auto pa = debug::virt_to_phys(machine_->bus(), r, watch_va_)) machine_->bus().read_ram(*pa, &now_value, 4);
+                    trace::log(trace::Cat::Boot, "watch: write to {:08x} (now {:08x}), eip after it {:08x}\n{}", watch_va_, now_value, r.eip, debug::describe_stack(machine_->bus(), r, 32));
+                    if (++watch_hits_ >= watch_max_) {
+                        watch_va_ = 0;
+                        kvm_guest_debug off{};
+                        ioctl(vcpu_fd_, KVM_SET_GUEST_DEBUG, &off);
+                        breakpoints_armed_ = false;
+                        arm_breakpoints();
+                    }
+                    continue;
+                }
                 trace::log(trace::Cat::Boot, "break: eip {:08x} reached\n{}", r.eip, debug::describe_stack(machine_->bus(), r));
+                if (!watch_reg_.empty() && !watch_va_ && !watch_hits_) {
+                    const std::string& g = watch_reg_;
+                    const u32 base = g == "eax" ? r.eax : g == "ebx" ? r.ebx : g == "ecx" ? r.ecx : g == "edx" ? r.edx : g == "esi" ? r.esi : g == "edi" ? r.edi : g == "esp" ? r.esp : r.ebp;
+                    watch_va_ = base + watch_offset_;
+                    trace::log(trace::Cat::Boot, "watch: writes to {:08x} ({}+{:x}) from here on, up to {}", watch_va_, g, watch_offset_, watch_max_);
+                }
                 std::erase(break_eips_, r.eip);
                 kvm_guest_debug off{};
                 ioctl(vcpu_fd_, KVM_SET_GUEST_DEBUG, &off);
@@ -726,13 +753,17 @@ void KvmBackend::thread_main() {
 
 // Hardware execution breakpoints (DR0-DR3) on the --break-eip addresses; the debug exit logs and disarms them.
 void KvmBackend::arm_breakpoints() {
-    if (break_eips_.empty()) return;
+    if (break_eips_.empty() && !watch_va_) return;
     kvm_guest_debug dbg{};
     dbg.control = KVM_GUESTDBG_ENABLE | KVM_GUESTDBG_USE_HW_BP;
     dbg.arch.debugreg[7] = 1u << 10;  // the bit that is always set in DR7
     for (std::size_t i = 0; i < break_eips_.size() && i < 4; ++i) {
         dbg.arch.debugreg[i] = break_eips_[i];
         dbg.arch.debugreg[7] |= 1u << (i * 2);  // Li enabled; R/Wi 00 = execution, LENi 00 = one byte
+    }
+    if (watch_va_) {
+        dbg.arch.debugreg[3] = watch_va_;
+        dbg.arch.debugreg[7] |= (1u << 6) | (1u << 28) | (3u << 30);  // L3; R/W3 01 = data writes; LEN3 11 = 4 bytes
     }
     if (ioctl(vcpu_fd_, KVM_SET_GUEST_DEBUG, &dbg) < 0) {
         trace::log(trace::Cat::Boot, "break: KVM_SET_GUEST_DEBUG failed: {}", std::strerror(errno));

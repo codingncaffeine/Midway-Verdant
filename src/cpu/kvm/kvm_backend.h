@@ -95,6 +95,10 @@ private:
     // --break-eip: hardware execution breakpoints, armed at init and dropped after the first debug exit.
     std::vector<u32> break_eips_;
     bool breakpoints_armed_{false};
+    // MV_WATCH_AT_BREAK=REG+HEX[*N]: when a --break-eip address is reached, a hardware write watch (DR3, 4 bytes) on
+    // that register plus the offset, and every write to it logged with the writer's registers and stack, N times.
+    std::string watch_reg_;
+    u32 watch_offset_{0}, watch_va_{0}, watch_hits_{0}, watch_max_{20};
     u32 mmio_breaks_{0};
 
     // The guest clock (MV_GUEST_CLOCK=wall turns it off: the host clock drives the timeline, as before D16).
