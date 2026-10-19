@@ -249,6 +249,7 @@ private:
     // matched a host time; moved forward when the host falls behind, so the guest never races to catch up).
     u64 frame_limit_{0};
     bool cpu_paused_{false};
+    std::atomic<bool> nv2a_service_{false};  // the GPU's FIFO thread has an interrupt change for the machine
     std::chrono::steady_clock::time_point frame_hold_at_{};
     Cycles intr_rose_at_{0};
     u64 io_event_ns_{0};

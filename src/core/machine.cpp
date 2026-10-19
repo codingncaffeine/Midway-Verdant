@@ -5,6 +5,7 @@
 #endif
 
 #include <algorithm>
+#include <cstdlib>
 #include <chrono>
 #include <cstring>
 #include <format>
@@ -109,6 +110,7 @@ Machine::~Machine() {
         cpu_->stop();
         cpu_->join();
     }
+    nv2a_.stop_fifo_thread();
     nv2a_.set_capture(nullptr, nullptr);
     nv2a_.set_renderer(nullptr);
     renderer_.reset();
@@ -232,6 +234,16 @@ bool Machine::init(std::string& error) {
         if (!renderer_->init(error)) return false;
         nv2a_.set_write_tracking(cpu_.get());
         nv2a_.set_renderer(renderer_.get());
+        // The pusher on its own thread (PLAN D21), opt-in with MV_FIFO_THREAD=1, in fast mode without a capture (which
+        // records RAM before each run). Off by default: with the kernel's idle loop halting, the titles measured gain
+        // nothing from it, and the GPU taking guest time slows what is paced by the GPU (the boot animation: 2853
+        // frames of 2947 in its 12 s).
+        const char* ft = std::getenv("MV_FIFO_THREAD");
+        if (config_.cpu == "kvm" && !capture_ && ft && *ft == '1')
+            nv2a_.start_fifo_thread([this] {
+                nv2a_service_.store(true, std::memory_order_release);
+                if (cpu_) cpu_->kick();
+            });
         trace::log(trace::Cat::Boot, "live GPU on {}", gpu_device_->name());
     }
     pic_.set_on_intr([this](bool asserted) {
@@ -257,6 +269,8 @@ Cycles Machine::wall_cycles() const {
 }
 
 void Machine::advance_time() {
+    // An interrupt the GPU's FIFO thread raised, applied here under the machine lock.
+    if (nv2a_service_.load(std::memory_order_acquire) && nv2a_service_.exchange(false, std::memory_order_acq_rel)) nv2a_.service();
     if (cpu_ && cpu_->owns_timeline()) {
         // The CPU's clock is the timeline: the interpreter's cycles (it advances the scheduler at every deadline
         // itself, so here only what is already due fires), or the fast mode's guest clock, read live on the io

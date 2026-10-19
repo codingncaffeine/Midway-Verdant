@@ -327,8 +327,8 @@ RETRO_API void retro_unload_game(void) {
         std::string voices;
         for (const auto& s : machine->apu().setup_engine().handles_started())
             voices += std::format(" {:x}@{:.3f}", s.handle, static_cast<double>(s.at) / mv::clk::kCpuHz);
-        log(RETRO_LOG_INFO, "ran %.1f s of console time; %llu frames rendered; voices started:%s", static_cast<double>(machine->scheduler().now()) / mv::clk::kCpuHz,
-            static_cast<unsigned long long>(machine->nv2a().semaphore_releases()), voices.empty() ? " none" : voices.c_str());
+        log(RETRO_LOG_INFO, "ran %.1f s of console time; %llu frames rendered, %llu displayed; voices started:%s", static_cast<double>(machine->scheduler().now()) / mv::clk::kCpuHz,
+            static_cast<unsigned long long>(machine->nv2a().semaphore_releases()), static_cast<unsigned long long>(machine->nv2a().display_flips()), voices.empty() ? " none" : voices.c_str());
         log(RETRO_LOG_INFO, "retro_run: %llu frames, host time mean %.2f ms, max %.1f ms%s; pit late ticks delivered %llu, dropped %llu", frames_run,
             frames_run ? frame_ms_sum / static_cast<double>(frames_run) : 0.0, frame_ms_max,
             frames_capped ? std::format(", {} cut at 1 s without a vblank", frames_capped).c_str() : "",
@@ -339,6 +339,9 @@ RETRO_API void retro_unload_game(void) {
         log(RETRO_LOG_INFO, "gpu: a FIFO thread could have run %.3f s of the pusher's %.3f s alongside the guest (%llu points where the guest needed its result)",
             static_cast<double>(machine->nv2a().pusher_overlap_ns()) / 1e9, static_cast<double>(machine->nv2a().pusher_wall_ns()) / 1e9,
             static_cast<unsigned long long>(machine->nv2a().pusher_sync_points()));
+        if (machine->nv2a().fifo_threaded())
+            log(RETRO_LOG_INFO, "gpu: the FIFO thread ran the pusher; the CPU waited for it %llu times at the lead (%.3f s)",
+                static_cast<unsigned long long>(machine->nv2a().fifo_lead_waits()), static_cast<double>(machine->nv2a().fifo_lead_wait_ns()) / 1e9);
         log(RETRO_LOG_INFO, "gpu: what ended those runs' overlap (pusher time not hidden):%s", machine->nv2a().sync_reasons(8).c_str());
         log(RETRO_LOG_INFO, "apu: %llu front-end memory fences written, %llu front-end traps raised", static_cast<unsigned long long>(machine->apu().fence_writes()),
             static_cast<unsigned long long>(machine->apu().traps()));

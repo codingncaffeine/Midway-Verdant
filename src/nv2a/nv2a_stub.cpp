@@ -4,11 +4,35 @@
 
 #include <chrono>
 #include <algorithm>
+#include <cstdlib>
+#if defined(__linux__)
+#include <pthread.h>
+#endif
 
 #include "cpu/backend.h"
 #include "debug/trace.h"
 
 namespace mv {
+
+namespace {
+// The registers that report how far the pusher has come, or that it is idle: a read waits until the FIFO thread has
+// nothing left to run, so a guest polling them sees what it saw when the pusher ran inline. PATT_COLOR0 is a fence
+// Direct3D pushes a value through and polls.
+bool reports_progress(u32 key) {
+    switch (key) {
+        case Nv2aStub::kUser + 0x44:
+        case Nv2aStub::kUser + 0x48:
+        case Nv2aStub::kCache1DmaGet:
+        case Nv2aStub::kCache1Ref:
+        case Nv2aStub::kCache1Status:
+        case Nv2aStub::kCache1DmaPush:
+        case Nv2aStub::kPfifoRunoutStatus:
+        case Nv2aStub::kPgraphStatus:
+        case Nv2aStub::kPgraphPattColor0: return true;
+        default: return false;
+    }
+}
+}  // namespace
 
 Nv2aStub::Nv2aStub(Bus& bus, Scheduler& sched, std::function<void(bool)> irq)
     : PciDevice("nv2a", 0x10DE, 0x02A0, 0x030000, 0xA1), bus_(bus), sched_(sched), irq_(std::move(irq)), walker_(bus) {
@@ -23,6 +47,8 @@ Nv2aStub::Nv2aStub(Bus& bus, Scheduler& sched, std::function<void(bool)> irq)
     regs_[kPtimerDenominator] = 1;
     vblank_.name = "nv2a.vblank";
     vblank_.fire = [this](Cycles) {
+        auto gpu = lock_gpu();
+        guest_now_.store(sched_.now(), std::memory_order_relaxed);
         ++vblanks_;
         sync_point(kSyncVblank);
         // The scanout reads the frame buffer now: a rendered one comes down from the device first.
@@ -40,6 +66,7 @@ Nv2aStub::Nv2aStub(Bus& bus, Scheduler& sched, std::function<void(bool)> irq)
     };
     alarm_.name = "nv2a.ptimer-alarm";
     alarm_.fire = [this](Cycles) {
+        auto gpu = lock_gpu();
         regs_[kPtimerIntr0] |= 1u;
         update_irq();
         schedule_alarm();
@@ -53,6 +80,8 @@ Nv2aStub::Nv2aStub(Bus& bus, Scheduler& sched, std::function<void(bool)> irq)
 }
 
 void Nv2aStub::reset() {
+    auto gpu = lock_gpu();
+    wait_idle(gpu);
     regs_.clear();
     regs_[0x000000] = kPmcBoot0;
     regs_[kPtimerNumerator] = 1;
@@ -133,6 +162,12 @@ void Nv2aStub::schedule_vblank() {
 }
 
 void Nv2aStub::update_irq() {
+    if (fifo_threaded_ && std::this_thread::get_id() == fifo_thread_id_) {
+        // The FIFO thread holds only the GPU lock: the machine applies the change at its next exit (service).
+        irq_deferred_.store(true, std::memory_order_release);
+        if (service_request_) service_request_();
+        return;
+    }
     u32 intr = 0;
     if (regs_[kPcrtcIntr0] & regs_[kPcrtcIntrEn0] & 1u) intr |= kPmcIntrPcrtc;
     if (regs_[kPtimerIntr0] & regs_[kPtimerIntrEn0] & 1u) intr |= kPmcIntrPtimer;
@@ -149,7 +184,7 @@ void Nv2aStub::update_irq() {
 
 u64 Nv2aStub::ptimer_ticks() const {
     // GPU cycles scaled by denominator / numerator, as the kernel programs them [verify against hardware].
-    const u64 gpu_cycles = muldiv64(sched_.now(), clk::kGpuHzNum * clk::kCpuHzDen, clk::kCpuHzNum * clk::kGpuHzDen);
+    const u64 gpu_cycles = muldiv64(gpu_now(), clk::kGpuHzNum * clk::kCpuHzDen, clk::kCpuHzNum * clk::kGpuHzDen);
     const u32 num = reg(kPtimerNumerator) ? reg(kPtimerNumerator) : 1;
     const u32 den = reg(kPtimerDenominator) ? reg(kPtimerDenominator) : 1;
     return muldiv64(gpu_cycles, den, num) + ptimer_offset_;
@@ -238,6 +273,9 @@ void Nv2aStub::set_renderer(pgraph::VulkanRenderer* renderer) {
 }
 
 void Nv2aStub::on_method(const PushbufferMethod& m) {
+    // On the FIFO thread the walk stops every few methods to let a waiting register access in (the rest of the header
+    // follows on the next chunk).
+    if (fifo_threaded_ && ++chunk_methods_ >= kChunkMethods) walker_.request_stop();
     if (capture_) {
         capture_->method(m.subchannel, m.method == 0 ? 0 : bound_[m.subchannel], m.method, m.value);
         // The objects a handle names are recorded when the stream binds them: SET_OBJECT, and the context DMA
@@ -429,6 +467,23 @@ void Nv2aStub::sync_point(u32 why) {
 }
 
 void Nv2aStub::run_pusher() {
+    if (fifo_threaded_) {
+        // A kick: the FIFO thread walks it; until it has, the registers that report progress wait when read.
+        stuck_ = false;
+        if (pusher_runnable()) {
+            fifo_busy_ = true;
+            fifo_cv_.notify_one();
+            if (lead_cycles_ && !lead_.scheduled()) sched_.schedule(lead_, sched_.now() + lead_cycles_);
+        }
+        return;
+    }
+    run_pusher_inline();
+}
+
+void Nv2aStub::run_pusher_inline() {
+    chunk_methods_ = 0;
+    const u32 get_before = reg(kCache1DmaGet);
+    const u64 methods_before = walker_.methods_seen();
     if (!(reg(kCache1DmaPush) & 1u)) return;
     if (pgraph_stalled_) return;  // held on a trapped method until software sets the FIFO access bit
     if (flip_stalled_) {
@@ -454,11 +509,17 @@ void Nv2aStub::run_pusher() {
     last_run_end_ = t1;
     run_open_ = true;
     regs_[kCache1DmaGet] = get;
+    // A walk that moved nothing (a fetch outside its object, an unknown header) would be retried for ever by the FIFO
+    // thread; it waits for the next kick instead, as the inline pusher does.
+    if (get == get_before && walker_.methods_seen() == methods_before) stuck_ = true;
 }
 
 u32 Nv2aStub::mmio_read(PhysAddr addr, unsigned size) {
     const u32 off = addr - mapped_at_;
     const u32 key = off & ~3u;
+    auto gpu = lock_gpu();
+    guest_now_.store(sched_.now(), std::memory_order_relaxed);
+    if (fifo_busy_ && reports_progress(key)) wait_idle(gpu);
     if (off == kPrmcioInputStatus1 && size == 1) {
         // Bit 3: vertical retrace in progress; bit 0: display inactive (blanking).
         const bool vr = in_vertical_retrace();
@@ -517,6 +578,11 @@ u32 Nv2aStub::mmio_read(PhysAddr addr, unsigned size) {
 void Nv2aStub::mmio_write(PhysAddr addr, unsigned size, u32 value) {
     const u32 off = addr - mapped_at_;
     const u32 key = off & ~3u;
+    auto gpu = lock_gpu();
+    guest_now_.store(sched_.now(), std::memory_order_relaxed);
+    // The FIFO's own registers change under a walk in progress only by a kick (PUT, the push enable); any other write
+    // there (a rewound GET, a new DMA object) waits for it to finish.
+    if (fifo_busy_ && ((key >= 0x002000 && key < 0x004000 && key != kCache1DmaPut && key != kCache1DmaPush) || key == kUser + 0x44)) wait_idle(gpu);
     u32 word;
     if (size == 4) {
         word = value;
@@ -582,6 +648,7 @@ void Nv2aStub::mmio_write(PhysAddr addr, unsigned size, u32 value) {
             return;
         case kPgraphIncrement:
             if (word & 2u) {
+                ++display_flips_;
                 advance_flip_field(24);
                 if (flip_stalled_ && flip_released()) run_pusher();
             }
@@ -777,4 +844,113 @@ std::string Nv2aStub::sync_reasons(std::size_t top) const {
     }
     return r;
 }
+}  // namespace mv
+
+namespace mv {
+
+// ── the FIFO thread (PLAN D21) ──────────────────────────────────────────────────────────────────────────────────
+
+Nv2aStub::~Nv2aStub() { stop_fifo_thread(); }
+
+std::unique_lock<std::mutex> Nv2aStub::lock_gpu() const {
+    if (!fifo_threaded_) return {};
+    gpu_waiters_.fetch_add(1, std::memory_order_acq_rel);
+    std::unique_lock l(gpu_mutex_);
+    gpu_waiters_.fetch_sub(1, std::memory_order_acq_rel);
+    return l;
+}
+
+void Nv2aStub::wait_idle(std::unique_lock<std::mutex>& lock) {
+    if (!fifo_threaded_ || !lock.owns_lock()) return;
+    idle_cv_.wait(lock, [this] { return !fifo_busy_; });
+}
+
+void Nv2aStub::wait_fifo_idle() {
+    auto gpu = lock_gpu();
+    wait_idle(gpu);
+}
+
+Cycles Nv2aStub::gpu_now() const {
+    if (fifo_threaded_ && std::this_thread::get_id() == fifo_thread_id_) return guest_now_.load(std::memory_order_relaxed);
+    return sched_.now();
+}
+
+bool Nv2aStub::pusher_runnable() const {
+    if (stuck_ || !(reg(kCache1DmaPush) & 1u) || pgraph_stalled_) return false;
+    if (flip_stalled_ && !flip_released()) return false;
+    if (reg(kCache1DmaPut) == reg(kCache1DmaGet)) return false;
+    return dma_object(reg(kCache1DmaInstance) & 0xFFFFu).valid;
+}
+
+void Nv2aStub::start_fifo_thread(std::function<void()> request) {
+    if (fifo_threaded_) return;
+    {
+        const char* l = std::getenv("MV_FIFO_LEAD_US");
+        const u64 us = l && *l ? std::strtoull(l, nullptr, 10) : 2000;
+        lead_cycles_ = cycles_from_ns(us * 1000);
+    }
+    lead_.name = "nv2a.fifo-lead";
+    lead_.fire = [this](Cycles) {
+        // Under the machine lock: the CPU stops at its next exit until the GPU has caught up (a long exit, not guest time).
+        auto gpu = lock_gpu();
+        if (!fifo_busy_) return;
+        const auto t0 = std::chrono::steady_clock::now();
+        wait_idle(gpu);
+        ++lead_waits_;
+        lead_wait_ns_ += static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
+    };
+    service_request_ = std::move(request);
+    guest_now_.store(sched_.now(), std::memory_order_relaxed);
+    fifo_stop_ = false;
+    fifo_threaded_ = true;
+    fifo_thread_ = std::thread([this] { fifo_main(); });
+}
+
+void Nv2aStub::stop_fifo_thread() {
+    if (!fifo_threaded_) return;
+    {
+        std::lock_guard g(gpu_mutex_);
+        fifo_stop_ = true;
+    }
+    fifo_cv_.notify_all();
+    if (fifo_thread_.joinable()) fifo_thread_.join();
+    fifo_threaded_ = false;
+    fifo_busy_ = false;
+    sched_.cancel(lead_);
+    // An interrupt the thread left for the machine is applied here, on the machine's side.
+    if (irq_deferred_.exchange(false)) update_irq();
+}
+
+void Nv2aStub::service() {
+    auto gpu = lock_gpu();
+    if (irq_deferred_.exchange(false, std::memory_order_acq_rel)) update_irq();
+}
+
+void Nv2aStub::fifo_main() {
+#if defined(__linux__)
+    pthread_setname_np(pthread_self(), "mv-nv2a-fifo");
+#endif
+    std::unique_lock g(gpu_mutex_);
+    fifo_thread_id_ = std::this_thread::get_id();
+    for (;;) {
+        fifo_cv_.wait(g, [this] { return fifo_stop_ || pusher_runnable(); });
+        if (fifo_stop_) break;
+        fifo_busy_ = true;
+        run_pusher_inline();
+        if (!pusher_runnable()) {
+            fifo_busy_ = false;
+            idle_cv_.notify_all();
+            continue;
+        }
+        // Between chunks, a register access waiting for the lock goes first.
+        if (gpu_waiters_.load(std::memory_order_acquire)) {
+            g.unlock();
+            while (gpu_waiters_.load(std::memory_order_acquire)) std::this_thread::yield();
+            g.lock();
+        }
+    }
+    fifo_busy_ = false;
+    idle_cv_.notify_all();
+}
+
 }  // namespace mv

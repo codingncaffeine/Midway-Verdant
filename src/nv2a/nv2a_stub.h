@@ -1,7 +1,11 @@
 #pragma once
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
 #include <memory>
 #include <optional>
 #include <functional>
@@ -90,6 +94,22 @@ public:
     static constexpr u32 kPmcIntrPfifo = 1u << 8, kPmcIntrPgraph = 1u << 12, kPmcIntrPtimer = 1u << 20, kPmcIntrPcrtc = 1u << 24;
 
     Nv2aStub(Bus& bus, Scheduler& sched, std::function<void(bool)> irq);
+    ~Nv2aStub() override;
+    Nv2aStub(const Nv2aStub&) = delete;
+    Nv2aStub& operator=(const Nv2aStub&) = delete;
+
+    // The FIFO thread (PLAN D21): the pusher walks on a thread of its own, under the GPU's own lock, which is always
+    // taken after the machine lock. A kick wakes it; it publishes GET as it goes; the registers that report its
+    // progress or idleness wait until it is idle when read, every other register reads the live state. An interrupt
+    // it raises is handed over through `request` (called on the FIFO thread with no lock held: set a flag, kick the
+    // CPU), and the machine applies it with service() under its lock. Not started: the pusher runs inline on the
+    // thread that kicked it, as before.
+    void start_fifo_thread(std::function<void()> request);
+    void stop_fifo_thread();
+    bool fifo_threaded() const { return fifo_threaded_; }
+    void service();
+    // Until the pusher has nothing left it can run (a halted CPU calls it before it skips guest time).
+    void wait_fifo_idle();
     std::string_view name() const override { return "nv2a"; }
 
     u32 mmio_read(PhysAddr addr, unsigned size) override;
@@ -166,6 +186,14 @@ private:
     void schedule_vblank();
     void schedule_alarm();
     void run_pusher();
+    void run_pusher_inline();
+    bool pusher_runnable() const;
+    void fifo_main();
+    // The GPU lock for an entry point (an empty lock without the FIFO thread).
+    std::unique_lock<std::mutex> lock_gpu() const;
+    void wait_idle(std::unique_lock<std::mutex>& lock);
+    // Guest time as the GPU sees it: the scheduler's on the machine's threads, the last register access's on the FIFO thread.
+    Cycles gpu_now() const;
     void on_method(const PushbufferMethod& m);
 
     void capture_object(u32 handle);
@@ -226,12 +254,31 @@ private:
     bool flip_stalled_{false};
     u32 report_handle_{0};
     u64 flip_stalls_{0}, reports_{0};
+    u64 display_flips_{0};  // INCREMENT writes that moved the display on to the next buffer
     capture::Writer* capture_{nullptr};
     CpuBackend* cpu_{nullptr};
     std::vector<u32> dirty_scratch_;
     bool write_tracking_{false};
     u32 write_generation_{1};
     std::vector<u32> page_generation_;  // per 4 KiB RAM page: the generation of the last write seen
+    // The FIFO thread's state, all under gpu_mutex_ but the atomics.
+    mutable std::mutex gpu_mutex_;
+    mutable std::atomic<u32> gpu_waiters_{0};  // entry points waiting for the lock: the FIFO thread lets them in between chunks
+    std::condition_variable fifo_cv_, idle_cv_;
+    std::thread fifo_thread_;
+    std::thread::id fifo_thread_id_{};
+    bool fifo_threaded_{false}, fifo_stop_{false}, fifo_busy_{false};
+    bool stuck_{false};  // the last walk made no progress: nothing to run until the next kick
+    u32 chunk_methods_{0};
+    static constexpr u32 kChunkMethods = 128;  // methods per walk between letting a waiting register access in
+    std::atomic<bool> irq_deferred_{false};
+    std::atomic<Cycles> guest_now_{0};
+    std::function<void()> service_request_;
+    // The lead (PLAN D21): the CPU may run this far past a kick the FIFO thread has not finished, then waits for it,
+    // so in guest time the GPU never takes longer than this over a kick (MV_FIFO_LEAD_US, microseconds of guest time).
+    TimerEvent lead_;
+    Cycles lead_cycles_{0};
+    u64 lead_waits_{0}, lead_wait_ns_{0};
 public:
     u64 semaphore_releases() const { return semaphore_releases_; }
     u64 pusher_wall_ns() const { return pusher_wall_ns_; }  // instrument: host time the vCPU spent inside the pusher (methods + renderer)
@@ -248,6 +295,9 @@ public:
     bool pgraph_stalled() const { return pgraph_stalled_; }
     bool flip_stalled() const { return flip_stalled_; }
     u64 flip_stalls() const { return flip_stalls_; }
+    u64 display_flips() const { return display_flips_; }
+    u64 fifo_lead_waits() const { return lead_waits_; }
+    u64 fifo_lead_wait_ns() const { return lead_wait_ns_; }
     u64 reports() const { return reports_; }
 };
 
