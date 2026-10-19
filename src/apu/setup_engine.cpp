@@ -171,8 +171,16 @@ bool SetupEngine::method(u32 offset, u32 value) {
             const u32 handle = value & kHandleMask;
             if (handle >= kMaxVoices) return true;
             const u32 ea = (field(handle, kFieldLfoEnv) & 0xFFFu) * 16, ef = (field(handle, kFieldMisc) & 0xFFFu) * 16;
+            trace::log(trace::Cat::Apu, "vp: voice {:x} release: amplitude rate {:x}, filter rate {:x}, envelope phases {:08x}, level {}", handle, ea / 16, ef / 16,
+                       field(handle, kFieldState), field(handle, kFieldOffset) >> 24);
             set_field(handle, kFieldEcnt, (ef << 16) | (ea & 0xFFFFu));
-            set_field(handle, kFieldState, (field(handle, kFieldState) & 0x00FFFFFFu) | (kRelease << kStateEaShift) | (kRelease << kStateEfShift));
+            // A zero-rate release of a voice whose amplitude envelope never ran (phase off: a buffer without an
+            // envelope) ends it at once, as both reference emulators do and as one title's recording shows (its
+            // looping ambience stops dead at the release); a running envelope's zero-rate release holds (below).
+            // [INFERRED from the two recordings; hw/apu.md]
+            const u32 state = field(handle, kFieldState);
+            const u32 ea_phase = ((state >> kStateEaShift) & 0xFu) == kOff && ea == 0 ? kForceRelease : kRelease;
+            set_field(handle, kFieldState, (state & 0x00FFFFFFu) | (ea_phase << kStateEaShift) | (kRelease << kStateEfShift));
             return true;
         }
         case kMethodVoicePause: {
@@ -428,7 +436,8 @@ float SetupEngine::step_envelope(u32 handle, bool amplitude, bool& ended) {
             break;
         case kRelease:
             if (release == 0) {
-                // A release rate of zero holds the level the release began at: the voice sounds on until VOICE_OFF.
+                // A release rate of zero holds the level the release began at: the voice sounds on until VOICE_OFF
+                // (a voice released from the off phase went straight to the forced release instead, above).
                 // The boot sound releases its two bass drones this way and keeps re-pitching one of them for five
                 // seconds; the recording of a real console still carries both fundamentals after the releases.
                 value = level;

@@ -617,6 +617,27 @@ TEST(ApuSynthesis, AReleaseRateOfZeroHoldsTheVoiceUntilVoiceOff) {
     EXPECT_EQ(r.apu.setup_engine().voices_retired(), 1u) << "VOICE_OFF ends it";
 }
 
+TEST(ApuSynthesis, AZeroRateReleaseOfAVoiceWhoseEnvelopeNeverRanEndsItAtOnce) {
+    // A buffer without an envelope starts in the off phase; one title stops its looping ambience this way and the
+    // recording goes silent at the release. (The test above, a sustaining envelope, is the control: it holds.)
+    using SE = apu::SetupEngine;
+    SynthRig r;
+    for (u32 i = 0; i < 64; ++i) {
+        const u16 v = 16384;
+        ASSERT_TRUE(r.bus.write_ram(SynthRig::kPage + i * 2, &v, 2));
+    }
+    r.vp(SE::kMethodSetCurrentVoice, SynthRig::kVoice);
+    r.vp(0x36C, 0);  // TAR_LFO_ENV: release rate 0
+    r.start(kPcm16Mono | SE::kFmtLoop, 63, 0, 0, 0, SE::kOff << SE::kStateEaShift);
+    r.sched.advance_to(Rig::frame(4));
+    EXPECT_NEAR(r.bin(0, 0), 0.5f, 1e-6f) << "no envelope: full level";
+    r.vp(SE::kMethodVoiceRelease, SynthRig::kVoice);
+    r.sched.advance_to(Rig::frame(7));
+    EXPECT_EQ(r.apu.setup_engine().voices_retired(), 1u) << "the release ends it without a VOICE_OFF";
+    EXPECT_FALSE(r.field(SynthRig::kVoice, SE::kFieldState) & SE::kStateActive);
+    EXPECT_FLOAT_EQ(r.bin(0, 0), 0.0f);
+}
+
 TEST(ApuSynthesis, TheVoiceBufferTableIsWrittenThroughItsMethods) {
     using SE = apu::SetupEngine;
     SynthRig r;
