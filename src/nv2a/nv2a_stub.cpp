@@ -24,6 +24,7 @@ Nv2aStub::Nv2aStub(Bus& bus, Scheduler& sched, std::function<void(bool)> irq)
     vblank_.name = "nv2a.vblank";
     vblank_.fire = [this](Cycles) {
         ++vblanks_;
+        sync_point();
         // The scanout reads the frame buffer now: a rendered one comes down from the device first.
         if (renderer_) renderer_->write_back_at(reg(kPcrtcStart));
         // A whole frame without a method: the GPU is idle, so what it drew is in RAM on the hardware; put it there.
@@ -416,6 +417,14 @@ void Nv2aStub::collect_writes() {
     }
 }
 
+void Nv2aStub::sync_point() {
+    if (!run_open_) return;
+    run_open_ = false;
+    ++sync_points_;
+    const u64 gap = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - last_run_end_).count());
+    overlap_ns_ += std::min(gap, last_run_ns_);
+}
+
 void Nv2aStub::run_pusher() {
     if (!(reg(kCache1DmaPush) & 1u)) return;
     if (pgraph_stalled_) return;  // held on a trapped method until software sets the FIFO access bit
@@ -433,9 +442,14 @@ void Nv2aStub::run_pusher() {
     }
     collect_writes();
     if (capture_) capture_->run(sched_.now(), get, put);
+    sync_point();  // a run still open: the next one would queue behind it
     const auto t0 = std::chrono::steady_clock::now();
     get = walker_.run(dma, get, put);
-    pusher_wall_ns_ += static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
+    const auto t1 = std::chrono::steady_clock::now();
+    last_run_ns_ = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
+    pusher_wall_ns_ += last_run_ns_;
+    last_run_end_ = t1;
+    run_open_ = true;
     regs_[kCache1DmaGet] = get;
 }
 
@@ -465,6 +479,7 @@ u32 Nv2aStub::mmio_read(PhysAddr addr, unsigned size) {
         }
         return v;
     }
+    if (key != kPtimerTime0 && key != kPtimerTime1 && key != kPcrtcRaster) sync_point();
     u32 word;
     switch (key) {
         case kPtimerTime0: word = static_cast<u32>((ptimer_ticks() & 0x7FFFFFFu) << 5); break;
@@ -485,6 +500,11 @@ u32 Nv2aStub::mmio_read(PhysAddr addr, unsigned size) {
     }
     const unsigned shift = 8u * (off & 3u);
     const u32 v = size == 4 ? word : (size == 2 ? ((word >> shift) & 0xFFFFu) : ((word >> shift) & 0xFFu));
+    {
+        auto& rc = read_counts_[key];
+        ++rc.first;
+        rc.second = word;
+    }
     ++reads_;
     if (key != kPtimerTime0 && key != kPtimerTime1) trace::log(trace::Cat::Gpu, "read  +{:06x} size {} -> {:08x}", off, size, v);
     return v;
@@ -503,6 +523,7 @@ void Nv2aStub::mmio_write(PhysAddr addr, unsigned size, u32 value) {
     }
     ++writes_;
     trace::log(trace::Cat::Gpu, "write +{:06x} size {} <- {:08x}", off, size, value);
+    if (size != 1 && key != kCache1DmaPut && key != kUser + 0x40 && key != kCache1DmaPush) sync_point();
     if (size == 1 && off == kPrmcioCrtcIndex) {
         crtc_index_ = static_cast<u8>(value);
         return;
@@ -727,5 +748,15 @@ namespace mv {
 std::optional<std::array<u8, 768>> Nv2aStub::gamma_lut() const {
     if (dac_identity_) return std::nullopt;
     return dac_;
+}
+}  // namespace mv
+
+namespace mv {
+std::string Nv2aStub::busiest_reads(std::size_t top) const {
+    std::vector<std::pair<u32, std::pair<u64, u32>>> v(read_counts_.begin(), read_counts_.end());
+    std::ranges::sort(v, std::greater{}, [](const auto& e) { return e.second.first; });
+    std::string r;
+    for (std::size_t i = 0; i < v.size() && i < top; ++i) r += std::format(" +{:06x} x{} (last {:08x})", v[i].first, v[i].second.first, v[i].second.second);
+    return r;
 }
 }  // namespace mv

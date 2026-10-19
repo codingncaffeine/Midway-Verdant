@@ -1,6 +1,7 @@
 #pragma once
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <memory>
 #include <optional>
 #include <functional>
@@ -211,6 +212,11 @@ private:
     std::array<SyncState, 8> sync_{};
     u64 semaphore_releases_{0}, notifies_{0}, software_methods_{0};
     u64 pusher_wall_ns_{0};
+    std::chrono::steady_clock::time_point last_run_end_{};
+    u64 last_run_ns_{0}, overlap_ns_{0}, sync_points_{0};
+    bool run_open_{false};
+    std::unordered_map<u32, std::pair<u64, u32>> read_counts_;
+    void sync_point();
     bool pgraph_stalled_{false};
     // FLIP_STALL: the puller waits until the display has taken the buffer just finished (the read index moves off
     // the write index).
@@ -226,6 +232,12 @@ private:
 public:
     u64 semaphore_releases() const { return semaphore_releases_; }
     u64 pusher_wall_ns() const { return pusher_wall_ns_; }  // instrument: host time the vCPU spent inside the pusher (methods + renderer)
+    // Instrument for a FIFO thread: of the pusher's time, how much the guest could have run alongside it — the host
+    // time from the end of each run to the guest's next access that would need the GPU's result, capped at the run.
+    u64 pusher_overlap_ns() const { return overlap_ns_; }
+    u64 pusher_sync_points() const { return sync_points_; }
+    // Instrument: register reads by offset, with the last value read, busiest first (a title spinning on a register).
+    std::string busiest_reads(std::size_t top) const;
     u64 notifies() const { return notifies_; }
     u64 software_methods() const { return software_methods_; }
     bool pgraph_stalled() const { return pgraph_stalled_; }
