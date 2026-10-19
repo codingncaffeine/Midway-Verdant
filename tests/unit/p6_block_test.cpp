@@ -204,12 +204,12 @@ struct Gen {
         switch (next() % 14) {
             case 0: case 1:
                 if (depth >= 8 && !reckless) return;
-                c.insert(c.end(), {0xD9, 0x43, d8});  // fld dword [ebx+d8]
+                c.insert(c.end(), {static_cast<u8>(next() & 1 ? 0xDD : 0xD9), 0x43, d8});  // fld qword / dword [ebx+d8]
                 ++depth;
                 return;
             case 2:
                 if (depth <= 0 && !reckless) return;
-                c.insert(c.end(), {0xD9, static_cast<u8>(next() & 1 ? 0x5B : 0x53), d8});  // fstp / fst dword [ebx+d8]
+                c.insert(c.end(), {static_cast<u8>(next() & 2 ? 0xDD : 0xD9), static_cast<u8>(next() & 1 ? 0x5B : 0x53), d8});  // fstp / fst qword or dword
                 if (c[c.size() - 2] == 0x5B) --depth;
                 return;
             case 3: case 4: {

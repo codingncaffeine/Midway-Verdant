@@ -788,6 +788,23 @@ private:
         a.jcc(NE, fail);
         a.bind(ok);
     }
+    // Jump to `fail` unless the double at [RSI] is a normal number or a zero.
+    void x87_m64_ok(Label fail) {
+        Label zero = a.label(), ok = a.label();
+        a.mov(8, rax, mem(rsi));
+        a.mov(8, rdx, rax);
+        a.shift_imm(8, 5, rdx, 52);
+        a.alu_imm(4, 4, rdx, 0x7FF);
+        a.jcc(E, zero);
+        a.alu_imm(4, 7, rdx, 0x7FF);
+        a.jcc(E, fail);
+        a.jmp(ok);
+        a.bind(zero);
+        a.shift_imm(8, 4, rax, 1);  // the sign out: zero only if every other bit is
+        a.test(8, rax, rax);
+        a.jcc(NE, fail);
+        a.bind(ok);
+    }
     // Jump to `fail` unless the single at [RSI] is a normal number or a zero.
     void x87_m32_ok(Label fail) {
         Label zero = a.label(), ok = a.label();
@@ -896,7 +913,7 @@ private:
         a.mov(2, mem(to, 8), rax);
     }
 
-    enum class X87Form { None, LoadM32, StoreM32, ArithM32, CompareM32, ArithD8, ArithDcDe, LoadReg, StoreReg, Exchange, Sign, LoadConst, StoreSw };
+    enum class X87Form { None, LoadM32, StoreM32, LoadM64, StoreM64, ArithM32, CompareM32, ArithD8, ArithDcDe, LoadReg, StoreReg, Exchange, Sign, LoadConst, StoreSw };
 
     bool x87(unsigned i, const Insn& in, Label after) {
         if (!kNativeX87) return false;
@@ -904,6 +921,8 @@ private:
         X87Form k = X87Form::None;
         if (in.mem) {
             if (esc == 0xD9 && in.reg == 0) k = X87Form::LoadM32;
+            else if (esc == 0xDD && in.reg == 0) k = X87Form::LoadM64;
+            else if (esc == 0xDD && (in.reg == 2 || in.reg == 3)) k = X87Form::StoreM64;
             else if (esc == 0xD9 && (in.reg == 2 || in.reg == 3)) k = X87Form::StoreM32;
             else if (esc == 0xD8 && (in.reg == 2 || in.reg == 3)) k = X87Form::CompareM32;
             else if (esc == 0xD8) k = X87Form::ArithM32;
@@ -918,9 +937,11 @@ private:
             else if (esc == 0xDF && in.modrm == 0xE0) k = X87Form::StoreSw;
         }
         if (k == X87Form::None) return false;
-        const bool write = k == X87Form::StoreM32;
-        if (in.mem && !segment_ok(in.mem_seg, 4, write)) return false;
-        const bool host = k == X87Form::StoreM32 || k == X87Form::ArithM32 || k == X87Form::CompareM32 || k == X87Form::ArithD8 || k == X87Form::ArithDcDe ||
+        const bool write = k == X87Form::StoreM32 || k == X87Form::StoreM64;
+        const bool m64 = k == X87Form::LoadM64 || k == X87Form::StoreM64;
+        const unsigned msize = m64 ? 8 : 4;
+        if (in.mem && !segment_ok(in.mem_seg, msize, write)) return false;
+        const bool host = k == X87Form::StoreM32 || k == X87Form::LoadM64 || k == X87Form::StoreM64 || k == X87Form::ArithM32 || k == X87Form::CompareM32 || k == X87Form::ArithD8 || k == X87Form::ArithDcDe ||
                           k == X87Form::LoadM32;
         const bool cw_before = cw_active_;
         const Label f = fallback(i, after, cw_before, host || cw_before);
@@ -935,18 +956,26 @@ private:
         if (in.mem) {
             effective_address(in);
             a.mov(4, ctx_at(kCtxEa), rax);
-            access_checks(in.mem_seg, 4, write, f);
-            if (k != X87Form::StoreM32) x87_m32_ok(f);
+            access_checks(in.mem_seg, msize, write, f);
+            if (m64) {
+                // The interpreter reads or writes the two halves: native when they share a cache line.
+                a.mov(4, rax, rsi);
+                a.alu_imm(4, 4, rax, 31);
+                a.alu_imm(4, 7, rax, 24);
+                a.jcc(A, f);
+            }
+            if (k == X87Form::LoadM64) x87_m64_ok(f);
+            else if (!write) x87_m32_ok(f);
         }
         // Every check before any effect: the stack, the operands' classes.
         x87_top();
         const unsigned ri = in.rm;
         switch (k) {
-            case X87Form::LoadM32: case X87Form::LoadConst:
+            case X87Form::LoadM32: case X87Form::LoadM64: case X87Form::LoadConst:
                 x87_phys(r9, 7);
                 x87_tag_test(r9, true, f);
                 break;
-            case X87Form::StoreM32:
+            case X87Form::StoreM32: case X87Form::StoreM64:
                 x87_tag_test(r8, false, f);
                 break;
             case X87Form::ArithM32: case X87Form::CompareM32: case X87Form::Sign: case X87Form::StoreReg:
@@ -980,10 +1009,10 @@ private:
         x87_pointers(i, in);
         if (host) x87_enter();
         switch (k) {
-            case X87Form::LoadM32: {
+            case X87Form::LoadM32: case X87Form::LoadM64: {
                 x87_phys(r9, 7);
                 x87_addr(r10, r9);
-                a.x87_mem(0xD9, 0, mem(rsi));   // fld dword
+                a.x87_mem(m64 ? 0xDD : 0xD9, 0, mem(rsi));   // fld qword / dword
                 a.x87_mem(0xDB, 7, mem(r10));   // fstp tbyte
                 x87_clear_c1();
                 x87_set_top(r9);
@@ -1004,10 +1033,10 @@ private:
                 x87_set_tag(r9);
                 break;
             }
-            case X87Form::StoreM32: {
+            case X87Form::StoreM32: case X87Form::StoreM64: {
                 x87_addr(r10, r8);
                 a.x87_mem(0xDB, 5, mem(r10));   // fld tbyte
-                a.x87_mem(0xD9, 3, mem(rsi));   // fstp dword
+                a.x87_mem(m64 ? 0xDD : 0xD9, 3, mem(rsi));   // fstp qword / dword
                 x87_status(true);
                 if (in.reg == 3) x87_pop();
                 break;
@@ -1773,6 +1802,157 @@ private:
         return true;
     }
 
+    // IMUL r, r/m and IMUL r, r/m, imm (16/32-bit): the product's low part, CF = OF = it overflowed the size; the
+    // interpreter's record is a result kind (SF/ZF/PF from the low part, AF clear).
+    bool imul(unsigned i, const Insn& in, Label after) {
+        const unsigned size = in.size;
+        if ((size != 2 && size != 4) || in.dst.kind != OpndKind::Reg) return false;
+        const bool m = in.src.kind == OpndKind::Mem;
+        if (!m && in.src.kind != OpndKind::Reg) return false;
+        if (m && !segment_ok(in.mem_seg, size, false)) return false;
+        if (m) {
+            const Label f = fallback(i, after);
+            effective_address(in);
+            access_checks(in.mem_seg, size, false, f);
+            cache(i, false);
+            if (size == 4) a.mov(4, rcx, mem(rsi));
+            else a.movsx(rcx, 2, mem(rsi));
+        } else if (size == 4) {
+            a.mov(4, rcx, greg(in.src.reg, 4));
+        } else {
+            a.movsx(rcx, 2, greg(in.src.reg, 2));
+        }
+        if (in.op == Op::Imul3) a.mov32(rax, size == 4 ? in.imm : static_cast<u32>(static_cast<i32>(static_cast<i16>(in.imm & 0xFFFF))));
+        else if (size == 4) a.mov(4, rax, greg(in.dst.reg, 4));
+        else a.movsx(rax, 2, greg(in.dst.reg, 2));
+        a.imul(4, rax, rcx);
+        if (size == 4) {
+            a.setcc(O, rdx);
+        } else {
+            a.movsx(rcx, 2, rax);  // the low part sign-extended differs from the product: it overflowed
+            a.alu(4, 7, rcx, rax);
+            a.setcc(NE, rdx);
+            a.alu_imm(4, 4, rax, 0xFFFF);
+        }
+        a.mov(size, greg(in.dst.reg, size), rax);
+        a.mov(4, st_at(kLazyR), rax);
+        a.mov(1, st_at(kLazyC), rdx);
+        a.mov(1, st_at(kLazyOf), rdx);
+        a.mov_imm(1, st_at(kLazyAf), 0);
+        a.mov_imm(2, st_at(kLazyOp), static_cast<u32>(LazyOp::Result) | (size << 8));
+        known_ = Known::Result;
+        known_size_ = size;
+        host_flags_ = host_cf_ = false;
+        finish(i, m);
+        return true;
+    }
+
+    // MUL r/m32: EDX:EAX = EAX * src; CF = OF = the high half is not zero.
+    bool mul(unsigned i, const Insn& in, Label after) {
+        if (in.size != 4) return false;
+        const bool m = in.dst.kind == OpndKind::Mem;
+        if (!m && in.dst.kind != OpndKind::Reg) return false;
+        if (m && !segment_ok(in.mem_seg, 4, false)) return false;
+        if (m) {
+            const Label f = fallback(i, after);
+            effective_address(in);
+            access_checks(in.mem_seg, 4, false, f);
+            cache(i, false);
+            a.mov(4, rcx, mem(rsi));
+        } else {
+            a.mov(4, rcx, greg(in.dst.reg, 4));
+        }
+        a.mov(4, rax, greg(kEax, 4));
+        a.unary(4, 4, rcx);  // mul ecx
+        a.mov(4, greg(kEax, 4), rax);
+        a.mov(4, greg(kEdx, 4), rdx);
+        a.mov(4, st_at(kLazyR), rax);
+        a.test(4, rdx, rdx);
+        a.setcc(NE, rdx);
+        a.mov(1, st_at(kLazyC), rdx);
+        a.mov(1, st_at(kLazyOf), rdx);
+        a.mov_imm(1, st_at(kLazyAf), 0);
+        a.mov_imm(2, st_at(kLazyOp), static_cast<u32>(LazyOp::Result) | (4u << 8));
+        known_ = Known::Result;
+        known_size_ = 4;
+        host_flags_ = host_cf_ = false;
+        finish(i, m);
+        return true;
+    }
+
+    // ADC/SBB: the carry in from the flags before; the record keeps it (a = destination, b = source).
+    bool adc_sbb(unsigned i, const Insn& in, Label after) {
+        const unsigned size = in.size;
+        const bool dst_mem = in.dst.kind == OpndKind::Mem, src_mem = in.src.kind == OpndKind::Mem;
+        if (!dst_mem && in.dst.kind != OpndKind::Reg) return false;
+        if (!src_mem && in.src.kind != OpndKind::Reg && in.src.kind != OpndKind::Imm) return false;
+        if (dst_mem && src_mem) return false;
+        const bool touched = dst_mem || src_mem;
+        if (touched && !segment_ok(in.mem_seg, size, dst_mem)) return false;
+        cf_to_edx();
+        a.mov(1, ctx_at(kIncCf), rdx);
+        if (touched) {
+            const Label f = fallback(i, after);
+            effective_address(in);
+            access_checks(in.mem_seg, size, dst_mem, f);
+            cache(i, false);
+            if (dst_mem) cache(i, true);
+        }
+        if (dst_mem) load_host(rax, size);
+        else load_greg(rax, in.dst.reg, size);
+        if (src_mem) load_host(rcx, size);
+        else if (in.src.kind == OpndKind::Imm) a.mov32(rcx, in.imm & mask_of(size));
+        else load_greg(rcx, in.src.reg, size);
+        a.mov(4, st_at(kLazyA), rax);
+        a.mov(4, st_at(kLazyB), rcx);
+        a.movzx(rdx, 1, ctx_at(kIncCf));
+        a.mov(1, st_at(kLazyC), rdx);
+        a.op_rr(4, {0x0F, 0xBA}, 4, rdx);  // bt edx, 0: the carry into the host CF
+        a.byte(0);
+        a.alu(size, in.op == Op::Adc ? 2 : 3, rax, rcx);
+        a.mov(4, st_at(kLazyR), rax);
+        if (dst_mem) a.mov(size, mem(rsi), rax);
+        else a.mov(size, greg(in.dst.reg, size), rax);
+        a.mov_imm(2, st_at(kLazyOp), static_cast<u32>(in.op == Op::Adc ? LazyOp::Adc : LazyOp::Sbb) | (size << 8));
+        known_ = Known::Unknown;
+        host_flags_ = host_cf_ = !touched;
+        finish(i, touched);
+        return true;
+    }
+
+    // XADD r/m, r: the sum into the destination first, then the old destination into the source register.
+    bool xadd(unsigned i, const Insn& in, Label after) {
+        const unsigned size = in.size;
+        const bool m = in.dst.kind == OpndKind::Mem;
+        if ((!m && in.dst.kind != OpndKind::Reg) || in.src.kind != OpndKind::Reg || in.lock) return false;
+        if (m && !segment_ok(in.mem_seg, size, true)) return false;
+        if (m) {
+            const Label f = fallback(i, after);
+            effective_address(in);
+            access_checks(in.mem_seg, size, true, f);
+            cache(i, false);
+            cache(i, true);
+            load_host(rax, size);
+        } else {
+            load_greg(rax, in.dst.reg, size);
+        }
+        load_greg(rcx, in.src.reg, size);
+        a.mov(4, st_at(kLazyA), rax);
+        a.mov(4, st_at(kLazyB), rcx);
+        a.mov(4, rdx, rax);
+        a.alu(size, 0, rdx, rcx);
+        a.mov(4, st_at(kLazyR), rdx);
+        if (m) a.mov(size, mem(rsi), rdx);
+        else a.mov(size, greg(in.dst.reg, size), rdx);
+        a.mov(size, greg(in.src.reg, size), rax);
+        set_lazy(LazyOp::Add, size);
+        known_ = Known::Add;
+        known_size_ = size;
+        host_flags_ = host_cf_ = false;
+        finish(i, m);
+        return true;
+    }
+
     // ---- instructions ----
     bool native(unsigned i, Label after) {
         const Insn& in = b_.insns[i];
@@ -1801,6 +1981,10 @@ private:
             case Op::Simd: return mmx(i, in, after) || sse(i, in, after);
             case Op::Shl: case Op::Shr: case Op::Sar: return shift(i, in, after);
             case Op::Rol: case Op::Ror: return rotate(i, in);
+            case Op::Imul2: case Op::Imul3: return imul(i, in, after);
+            case Op::Mul: return mul(i, in, after);
+            case Op::Adc: case Op::Sbb: return adc_sbb(i, in, after);
+            case Op::Xadd: return xadd(i, in, after);
             case Op::Cwd: case Op::Cbw: return convert(i, in);
             case Op::Div: case Op::Idiv: return divide(i, in, after);
             case Op::CallRm: case Op::JmpRm: return indirect(i, in, after);
