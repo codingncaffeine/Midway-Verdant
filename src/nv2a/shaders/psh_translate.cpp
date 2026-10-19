@@ -1,5 +1,7 @@
 #include "nv2a/shaders/psh_translate.h"
 
+#include <cstdlib>
+#include <string_view>
 #include <format>
 
 #include "nv2a/shaders/fsh_interface.h"
@@ -269,6 +271,12 @@ Key key_from_state(const KelvinState& s) {
     k.clip_plane_mode = s.reg(mthd::kShaderClipPlaneMode) & 0xFFFFu;
     k.dot_mapping = s.reg(mthd::kDotRgbMapping) & 0x777u;
     k.shadow_compare_func = s.reg(kShadowCompareFunc) & 7u;
+    // MV_RENDER_DEBUG=noshadow: every shadow-map comparison passes (the control for a shadow-map artefact).
+    static const bool no_shadow = [] {
+        const char* d = std::getenv("MV_RENDER_DEBUG");
+        return d && std::string_view(d).find("noshadow") != std::string_view::npos;
+    }();
+    if (no_shadow) k.shadow_compare_func = 7;
     for (u32 t = 0; t < 4; ++t) {
         const TextureStage ts = s.texture(t);
         k.texture_format[t] = ts.format & 0xFFFFu;
@@ -521,6 +529,18 @@ Translation translate(const Key& key) {
                 if (t.error.empty()) t.error = std::format("texture stage {} mode {} is reserved", i, mode);
                 break;
         }
+    }
+    // MV_RENDER_DEBUG=white:N (a bit per stage, 1-15): those stages' results replaced by white, to find which stage
+    // carries an artefact.
+    {
+        static const u32 white = [] {
+            const char* d = std::getenv("MV_RENDER_DEBUG");
+            const std::string_view v = d ? d : "";
+            const auto at = v.find("white:");
+            return at == std::string_view::npos ? 0u : static_cast<u32>(std::strtoul(v.data() + at + 6, nullptr, 10));
+        }();
+        for (u32 i = 0; i < 4; ++i)
+            if (white & (1u << i)) g += std::format("    t{} = vec4(1.0);\n", i);
     }
     // The combiners' r0 starts with t0's alpha (NV_register_combiners: spare0 alpha = texture 0 alpha). With stage 0
     // set to none that is 0 here; the reference emulator uses 1 there, which no public source settles [verify].

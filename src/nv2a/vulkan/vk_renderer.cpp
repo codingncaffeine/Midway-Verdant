@@ -9,6 +9,7 @@
 #include <format>
 #include <type_traits>
 
+#include "debug/png.h"
 #include "nv2a/shaders/glsl_compiler.h"
 
 namespace mv::pgraph {
@@ -495,6 +496,8 @@ VulkanRenderer::Surface* VulkanRenderer::target_for(const KelvinState& s) {
         surfaces_.erase(it);
         stage_cache_.fill({});  // a stage may point at the erased target's entries
     }
+    if (debug_tex_log_)
+        std::fprintf(stderr, "texlog: target %08x %ux%u %s colour %u zeta %u pitch %u\n", phys, width, height, d.swizzled() ? "swizzled" : "linear", d.color_format(), d.zeta_format(), d.color_pitch());
     auto surf = std::make_unique<Surface>();
     Surface& t = *surf;
     t.phys = phys;
@@ -702,6 +705,7 @@ void VulkanRenderer::write_back(Surface& s) {
 }
 
 void VulkanRenderer::store_color(Surface& s, const u8* pixels) {
+    if (debug_tex_log_) std::fprintf(stderr, "texlog: store %08x %ux%u %s\n", s.phys, s.width, s.height, s.swizzled ? "swizzled" : "linear");
     const u32 bpp = s.color_bytes();
     const std::size_t bytes = static_cast<std::size_t>(s.width) * s.height * bpp;
     if (!s.swizzled) {
@@ -1135,7 +1139,31 @@ const VulkanRenderer::TextureEntry* VulkanRenderer::texture(const KelvinState& s
         bool target = false;
         for (auto& [k2, surf] : surfaces_)
             target = target || (surf->phys < phys + length && phys < surf->phys + surf->bytes()) || (surf->zeta_phys < phys + length && phys < surf->zeta_phys + surf->zeta_bytes());
-        std::fprintf(stderr, "texlog: decode %08x format %02x %ux%u levels %u faces %u%s\n", phys, ts.color_format(), d.width, d.height, d.levels, d.faces, target ? " (a render target)" : "");
+        std::fprintf(stderr, "texlog: decode %08x format %02x %ux%u levels %u faces %u filter %08x%s\n", phys, ts.color_format(), d.width, d.height, d.levels, d.faces, ts.filter, target ? " (a render target)" : "");
+        // MV_RENDER_DEBUG=texlog,texdump: the first decode of each address, format and size as scratch/texdump/*.png.
+        static const bool dump_all = std::getenv("MV_RENDER_DEBUG") && std::string_view(std::getenv("MV_RENDER_DEBUG")).find("texdump") != std::string_view::npos;
+        static std::unordered_map<u64, bool> dumped;
+        const u64 dump_key = (static_cast<u64>(phys) << 32) ^ (static_cast<u64>(ts.color_format()) << 24) ^ (static_cast<u64>(d.width) << 12) ^ d.height;
+        if (dump_all && d.pixel == HostPixel::Rgba8 && d.depth == 1 && !dumped[dump_key]) {
+            dumped[dump_key] = true;
+            std::error_code ec;
+            std::filesystem::create_directories("scratch/texdump", ec);
+            std::vector<u8> img(d.image(0, 0));
+            for (std::size_t i = 3; i < img.size(); i += 4) img[i] = 255;
+            std::string e;
+            png::write(std::format("scratch/texdump/{:08x}-{:02x}-{}x{}.png", phys, ts.color_format(), d.width, d.height), d.width, d.height, img.data(), d.width * 4, e);
+        }
+        // And every 50th cube map decoded, its six faces side by side, to scratch/texlog-cube-PHYS-N.png.
+        static u32 cubes = 0;
+        if (d.faces == 6 && d.pixel == HostPixel::Rgba8 && cubes++ % 50 == 0) {
+            std::vector<u8> strip(static_cast<std::size_t>(d.width) * 6 * d.height * 4);
+            for (u32 face = 0; face < 6; ++face)
+                for (u32 y = 0; y < d.height; ++y)
+                    std::memcpy(&strip[(static_cast<std::size_t>(y) * d.width * 6 + face * d.width) * 4], &d.image(face, 0)[static_cast<std::size_t>(y) * d.width * 4], d.width * 4);
+            for (std::size_t i = 3; i < strip.size(); i += 4) strip[i] = 255;
+            std::string e;
+            png::write(std::format("scratch/texlog-cube-{:08x}-{}.png", phys, cubes), d.width * 6, d.height, strip.data(), d.width * 6 * 4, e);
+        }
     }
     const VkFormat format = d.pixel == HostPixel::Rgba8 ? VK_FORMAT_R8G8B8A8_UNORM : (d.pixel == HostPixel::R16 ? VK_FORMAT_R16_UNORM : VK_FORMAT_R32_SFLOAT);
     auto entry = std::make_unique<TextureEntry>();
@@ -1510,6 +1538,7 @@ void VulkanRenderer::draw(const KelvinState& s, const DrawBatch& batch) {
         ++stats_.skipped;
         return;
     }
+    if (debug_tex_log_) std::fprintf(stderr, "texlog: draw into %08x %s\n", t->phys, s.surface().swizzled() ? "swizzled" : "linear");
     FetchedVertices v;
     bool fetched;
     {
