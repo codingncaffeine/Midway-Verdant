@@ -132,6 +132,9 @@ public:
         return ep_stats_;
     }
     u64 setup_engine_host_ns() const { return se_host_ns_; }  // host time inside the setup engine's frames
+    // Host time the machine side spent waiting for the processors' thread to finish a frame, and how often.
+    u64 dsp_wait_ns() const { return dsp_wait_ns_.load(std::memory_order_relaxed); }
+    u64 dsp_waits() const { return dsp_waits_.load(std::memory_order_relaxed); }
     // MV_DEBUG_DSP_PCHIST=gp,ep: the program addresses each processor spent its executed cycles at, busiest first.
     std::string pc_histogram_report(std::size_t top) const;
 
@@ -195,6 +198,7 @@ private:
     apu::SetupEngine se_;
     FrameStats gp_stats_, ep_stats_;
     u64 se_host_ns_{0};
+    mutable std::atomic<u64> dsp_wait_ns_{0}, dsp_waits_{0};
     // The processors' thread: a frame posted by on_frame (dsp_busy_ while it runs), its number and EP start flag.
     bool dsp_threaded_{true};
     mutable std::mutex dsp_mutex_;

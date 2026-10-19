@@ -371,8 +371,9 @@ RETRO_API void retro_unload_game(void) {
             for (const auto& c : costs)
                 by_event += std::format(" {} {:.3f} s/{}", c.name, static_cast<double>(c.host_ns) / 1e9, c.fired);
             const auto& apu = machine->apu();
-            log(RETRO_LOG_INFO, "event host time (s/fired):%s; apu frame = setup engine %.3f s + gp %.3f s + ep %.3f s", by_event.c_str(),
-                static_cast<double>(apu.setup_engine_host_ns()) / 1e9, static_cast<double>(apu.gp_stats().host_ns) / 1e9, static_cast<double>(apu.ep_stats().host_ns) / 1e9);
+            log(RETRO_LOG_INFO, "event host time (s/fired):%s; apu frame = setup engine %.3f s + gp %.3f s + ep %.3f s; the machine waited %.3f s at %llu points for the processors' thread",
+                by_event.c_str(), static_cast<double>(apu.setup_engine_host_ns()) / 1e9, static_cast<double>(apu.gp_stats().host_ns) / 1e9,
+                static_cast<double>(apu.ep_stats().host_ns) / 1e9, static_cast<double>(apu.dsp_wait_ns()) / 1e9, static_cast<unsigned long long>(apu.dsp_waits()));
             for (std::string r = apu.pc_histogram_report(24); !r.empty();) {
                 const auto nl = r.find('\n');
                 log(RETRO_LOG_INFO, "%s", r.substr(0, nl).c_str());

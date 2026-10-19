@@ -7,6 +7,13 @@
 #include "apu/dsp/decode.h"
 #include "core/types.h"
 
+// Forced inlining on the hot paths (the compilers spell it differently).
+#if defined(_MSC_VER)
+#define MV_DSP_INLINE __forceinline
+#else
+#define MV_DSP_INLINE [[gnu::always_inline]] inline
+#endif
+
 // A DSP56300-family core as the APU's global and encode processors use it: 24-bit words, two 56-bit accumulators,
 // four 24-bit input registers, eight address/offset/modifier register triples, a 16-deep system stack, hardware
 // DO loops and REP, fractional arithmetic with convergent rounding and transfer limiting. Written from the public
@@ -102,13 +109,38 @@ public:
     // A listing line for the instruction at `address` (debugging).
     std::string disassemble_at(u32 address) const;
 
-private:
-    struct Cached {
-        Decoded d;
-        bool valid{false};
+    // The whole state as words (memories, registers, the REP state, the counters) and back: snapshots for the
+    // benchmark and for comparing the two execution paths. `restore` refuses another configuration's snapshot.
+    std::vector<u32> snapshot() const;
+    bool restore(const std::vector<u32>& words);
+
+    // The reference path: every instruction decoded afresh and executed from its full decoded form, instead of
+    // the compiled form cached per program word. The two run the same semantic code; tests compare them.
+    void set_reference(bool on) { reference_ = on; }
+
+    // A program word compiled for execution: its fields packed into 16 slots (no pattern uses more than nine
+    // letters), the extension word and the operation's class fetched once; one cache line.
+    struct alignas(64) Compiled {
+        u32 word{0}, ext{0};
+        i16 pattern{-1};
+        Move move{Move::NotParallel};
+        Alu alu{Alu::None};
+        u8 alu_dest{0}, alu_src{0};
+        bool alu_negate{false}, extension{false};
+        u8 op{0}, variant{0};
+        bool valid{false}, packed{false};
+        std::array<u16, 16> slot{};
+        u8 words{1};
+        // The handler (the parallel ones per move kind, the others per operation class); it returns the words. An
+        // entry not compiled yet runs the compiler first.
+        u32 (*run)(Core& core, const Compiled& insn, u32 at){nullptr};
+        u32 f(char c) const;
     };
-    const Decoded& decoded(u32 address);
-    void execute(const Decoded& d, u32 ext, u32 at);
+
+private:
+    MV_DSP_INLINE const Compiled& compiled(u32 address);
+    template <class Insn> u32 step_with(const Insn& d, u32 ext, u32 at);
+    template <class Insn> void execute(const Insn& d, u32 ext, u32 at);
     void fail(const std::string& why);
 
     // Data ALU.
@@ -116,6 +148,7 @@ private:
     static i64 sext56(i64 v) { return (v << 8) >> 8; }
     i64 source56(u32 jjj, u32 dest) const;  // Table 12-20 source operands as 56-bit values
     u32 read_reg5(u32 code, bool limit);     // 5-bit register codes (Table 12-16), with the limiter on A/B
+    u32 read_reg5_with(u32 code, i64 a, i64 b);  // the same with the limiter, A and B given (a parallel move's pre-ALU values)
     void write_reg5(u32 code, u32 value);
     u32 read_reg6(u32 code);                 // 6-bit codes (Table 12-13): all on-chip registers
     void write_reg6(u32 code, u32 value);
@@ -123,15 +156,24 @@ private:
     void set_ccr_result(i64 result, bool carry_in_known, bool carry, bool overflow);
     void shift_flags(i64 before, i64 after, u32 count, bool left);
     void set_ccr_logical(i64 acc56);
-    void alu(const Decoded& d, u32 ext, i64 pre_a, i64 pre_b);
+    template <class Insn> void alu(const Insn& d);
     i64 multiply(u32 qqq, bool negate) const;
     i64 round56(i64 v) const;
     bool condition(u32 cccc) const;
 
     // AGU.
-    u32 ea_address(u32 mmmrrr, u32 ext, bool& used_ext, bool update);  // resolves and (optionally) updates Rn
-    u32 agu_update(u32 r, u32 m, i32 delta) const;
-    void parallel_move(const Decoded& d, u32 ext, i64 pre_a, i64 pre_b);
+    MV_DSP_INLINE u32 ea_address(u32 mmmrrr, u32 ext, bool& used_ext, bool update);  // resolves and (optionally) updates Rn
+    MV_DSP_INLINE u32 agu_update(u32 r, u32 m, i32 delta) const;
+    template <class Insn> void parallel_move(const Insn& d, u32 ext, i64 pre_a, i64 pre_b);
+    template <Move M, class Insn> void parallel_move_kind(const Insn& d, u32 ext, i64 pre_a, i64 pre_b);
+    template <Move M> static u32 run_parallel(Core& core, const Compiled& d, u32 at);
+    static u32 run_general(Core& core, const Compiled& d, u32 at);
+    template <u8 O> static u32 run_op(Core& core, const Compiled& d, u32 at);
+    static u32 run_compile(Core& core, const Compiled& d, u32 at);   // compiles the entry, then runs it
+    static u32 run_unpacked(Core& core, const Compiled& d, u32 at);  // a word the compiled form cannot hold
+    void invalidate(u32 address);
+    template <u8 O, class Insn> void execute_op(const Insn& d, u32 ext, u32 at);
+    u64 run_fast(u64 cycles);
 
     // Program control.
     void push(u32 pc_value, u32 sr_value);
@@ -145,7 +187,8 @@ private:
     Peripherals* periph_;
     std::vector<u32> x_, y_, p_;
     std::FILE* trace_{nullptr};
-    std::vector<Cached> cache_;
+    std::vector<Compiled> code_;
+    bool reference_{false};
     Regs r_;
     u64 cycles_{0}, instructions_{0};
     std::vector<u64>* pc_hist_{nullptr};

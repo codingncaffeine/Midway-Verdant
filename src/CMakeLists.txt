@@ -96,6 +96,10 @@ target_link_libraries(midway-verdant PRIVATE mvcore SDL3::SDL3)
 # mv-pbcap: the pushbuffer capture reader (summaries and dumps of what --capture wrote).
 add_executable(mv-pbcap tools/mv-pbcap.cpp)
 target_link_libraries(mv-pbcap PRIVATE mvcore)
+# mv-dsp-bench: times (and cross-checks) the DSP core's two execution paths on a snapshot of a game's GP.
+add_executable(mv-dsp-bench tools/mv-dsp-bench.cpp)
+target_link_libraries(mv-dsp-bench PRIVATE mvcore)
+
 # mv-fatx: reads files from a hard-disk image's FATX partitions (test results, saves).
 add_executable(mv-fatx tools/mv-fatx.cpp)
 target_link_libraries(mv-fatx PRIVATE mvcore)

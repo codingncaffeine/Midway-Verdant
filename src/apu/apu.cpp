@@ -70,8 +70,11 @@ Apu::~Apu() {
 
 void Apu::dsp_sync() const {
     if (!dsp_busy_.load(std::memory_order_acquire)) return;
+    const auto t0 = std::chrono::steady_clock::now();
     std::unique_lock l(dsp_mutex_);
     dsp_cv_.wait(l, [this] { return !dsp_busy_.load(std::memory_order_relaxed); });
+    dsp_wait_ns_.fetch_add(static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count()), std::memory_order_relaxed);
+    dsp_waits_.fetch_add(1, std::memory_order_relaxed);
 }
 
 void Apu::dsp_worker() {
@@ -401,6 +404,15 @@ void Apu::run_processors(u64 frame, bool ep_start) {
                 std::fprintf(gp_trace, "X:%04x %06x %06x %06x %06x %06x %06x %06x %06x\n", a, xm[a], xm[a + 1], xm[a + 2], xm[a + 3], xm[a + 4], xm[a + 5], xm[a + 6], xm[a + 7]);
         }
     }
+    // Instrument: MV_DEBUG_GP_SNAPSHOT=N writes the GP's whole state before frame N to scratch/gp-snap-N.bin (for
+    // mv-dsp-bench).
+    static const long snapshot_frame = std::getenv("MV_DEBUG_GP_SNAPSHOT") ? std::atol(std::getenv("MV_DEBUG_GP_SNAPSHOT")) : -1;
+    if (snapshot_frame >= 0 && frame == static_cast<u64>(snapshot_frame))
+        if (std::FILE* f = std::fopen(std::format("scratch/gp-snap-{}.bin", frame).c_str(), "wb")) {
+            const std::vector<u32> words = gp_.core().snapshot();
+            std::fwrite(words.data(), 4, words.size(), f);
+            std::fclose(f);
+        }
     run_frame(gp_, gp_stats_, "gp", true);
     if (gp_trace) {
         gp_.core().set_trace(nullptr);

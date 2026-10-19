@@ -1,7 +1,9 @@
 #include "apu/dsp/core.h"
 
+#include <cstdlib>
 #include <cstring>
 #include <format>
+#include <utility>
 
 #include "apu/dsp/opcode_table.h"
 
@@ -175,13 +177,69 @@ const std::vector<OpInfo>& op_table() {
     return t;
 }
 
+// The compiled form's field slots: letters that share a pattern get different slots (a greedy colouring over the
+// opcode table and the parallel move formats), so a pattern's fields never collide; compile() checks it anyway.
+constexpr const char* kMoveFormats[] = {"1wmmeeffWrrMMRRRoooooooo", "0100L0LLW1MMMRRRoooooooo", "0100L0LLW0aaaaaaoooooooo", "01ddsdddW1MMMRRRoooooooo",
+                                        "01ddsdddW0aaaaaaoooooooo", "001dddddiiiiiiiioooooooo", "00100000010MMRRRoooooooo", "001000eeeeedddddoooooooo",
+                                        "0001deffW1MMMRRRoooooooo", "0001ffdFW0MMMRRRoooooooo", "0000100d10MMMRRRoooooooo", "0000100d00MMMRRRoooooooo"};
+
+constexpr std::size_t letter_index(char c) { return static_cast<std::size_t>((c >= 'a' && c <= 'z') ? c - 'a' : 26 + (c - 'A')); }
+
+constexpr std::array<u8, 52> slot_colouring() {
+    std::array<std::array<bool, 52>, 52> together{};
+    // Cheap enough for every compiler's constant-evaluation budget: a pattern's few letters, then their pairs.
+    auto note = [&](const char* pattern) {
+        std::array<std::size_t, 24> letters{};
+        std::size_t n = 0;
+        for (std::size_t i = 0; i < 24; ++i) {
+            const char c = pattern[i];
+            if (c == '0' || c == '1') continue;
+            const std::size_t l = letter_index(c);
+            bool seen = false;
+            for (std::size_t k = 0; k < n; ++k) seen = seen || letters[k] == l;
+            if (!seen) letters[n++] = l;
+        }
+        for (std::size_t x = 0; x < n; ++x)
+            for (std::size_t y = 0; y < n; ++y)
+                if (x != y) together[letters[x]][letters[y]] = true;
+    };
+    for (const OpcodePattern& p : kOpcodePatterns) note(p.pattern);
+    for (const char* m : kMoveFormats) note(m);
+    std::array<u8, 52> slot{};
+    for (std::size_t x = 0; x < 52; ++x) {
+        std::array<bool, 52> taken{};
+        for (std::size_t y = 0; y < x; ++y)
+            if (together[x][y]) taken[slot[y]] = true;
+        u8 c = 0;
+        while (taken[c]) ++c;
+        slot[x] = c;
+    }
+    return slot;
+}
+constexpr std::array<u8, 52> kSlot = slot_colouring();
+constexpr u8 max_slot() {
+    u8 m = 0;
+    for (u8 v : kSlot) m = v > m ? v : m;
+    return m;
+}
+static_assert(max_slot() < 16, "the compiled form has 16 field slots");
+
+using Handler = u32 (*)(Core&, const Core::Compiled&, u32);
+constexpr std::size_t kOps = static_cast<std::size_t>(Op::Nop2) + 1;
+
+OpInfo info_of(const Decoded& d) { return op_table()[static_cast<std::size_t>(d.pattern)]; }
+OpInfo info_of(const Core::Compiled& d) { return {static_cast<Op>(d.op), d.variant}; }
+
 }  // namespace
+
+MV_DSP_INLINE u32 Core::Compiled::f(char c) const { return slot[kSlot[letter_index(c)]]; }
 
 Core::Core(const Config& config, Peripherals* peripherals) : cfg_(config), periph_(peripherals) {
     x_.assign(cfg_.x_words, 0);
     y_.assign(cfg_.y_words, 0);
     p_.assign(cfg_.p_words, 0);
-    cache_.assign(cfg_.p_words, Cached{});
+    code_.assign(cfg_.p_words, Compiled{});
+    for (u32 a = 0; a < code_.size(); ++a) invalidate(a);
     reset();
 }
 
@@ -193,6 +251,55 @@ void Core::reset() {
     halted_ = false;
     rep_active_ = false;
     rep_remaining_ = 0;
+}
+
+namespace {
+constexpr u32 kSnapshotMagic = 0x44535031u;  // "DSP1"
+}  // namespace
+
+std::vector<u32> Core::snapshot() const {
+    std::vector<u32> w{kSnapshotMagic, cfg_.x_words, cfg_.y_words, cfg_.p_words, cfg_.mix_alias, cfg_.mix_target};
+    w.insert(w.end(), x_.begin(), x_.end());
+    w.insert(w.end(), y_.begin(), y_.end());
+    w.insert(w.end(), p_.begin(), p_.end());
+    auto u64s = [&](u64 v) { w.push_back(static_cast<u32>(v)); w.push_back(static_cast<u32>(v >> 32)); };
+    u64s(static_cast<u64>(r_.a));
+    u64s(static_cast<u64>(r_.b));
+    for (u32 v : {r_.x0, r_.x1, r_.y0, r_.y1}) w.push_back(v);
+    for (const auto* arr : {&r_.r, &r_.n, &r_.m}) w.insert(w.end(), arr->begin(), arr->end());
+    for (u32 v : {r_.pc, r_.sr, r_.omr, r_.la, r_.lc, r_.sp, r_.sz, r_.vba, r_.sc, r_.ep}) w.push_back(v);
+    w.insert(w.end(), r_.ssh.begin(), r_.ssh.end());
+    w.insert(w.end(), r_.ssl.begin(), r_.ssl.end());
+    for (u32 v : {rep_remaining_, rep_saved_lc_, rep_active_ ? 1u : 0u, halted_ ? 1u : 0u}) w.push_back(v);
+    u64s(cycles_);
+    u64s(instructions_);
+    return w;
+}
+
+bool Core::restore(const std::vector<u32>& w) {
+    std::size_t i = 0;
+    auto take = [&]() { return i < w.size() ? w[i++] : 0u; };
+    if (take() != kSnapshotMagic || take() != cfg_.x_words || take() != cfg_.y_words || take() != cfg_.p_words || take() != cfg_.mix_alias || take() != cfg_.mix_target) return false;
+    for (auto* mem : {&x_, &y_, &p_})
+        for (u32& v : *mem) v = take();
+    auto u64t = [&]() { const u64 lo = take(); return lo | (static_cast<u64>(take()) << 32); };
+    r_.a = static_cast<i64>(u64t());
+    r_.b = static_cast<i64>(u64t());
+    for (u32* v : {&r_.x0, &r_.x1, &r_.y0, &r_.y1}) *v = take();
+    for (auto* arr : {&r_.r, &r_.n, &r_.m})
+        for (u32& v : *arr) v = take();
+    for (u32* v : {&r_.pc, &r_.sr, &r_.omr, &r_.la, &r_.lc, &r_.sp, &r_.sz, &r_.vba, &r_.sc, &r_.ep}) *v = take();
+    for (u32& v : r_.ssh) v = take();
+    for (u32& v : r_.ssl) v = take();
+    rep_remaining_ = take();
+    rep_saved_lc_ = take();
+    rep_active_ = take() != 0;
+    halted_ = take() != 0;
+    cycles_ = u64t();
+    instructions_ = u64t();
+    for (u32 a = 0; a < code_.size(); ++a) invalidate(a);
+    error_.clear();
+    return i == w.size();
 }
 
 void Core::fail(const std::string& why) {
@@ -241,8 +348,8 @@ void Core::write_p(u32 address, u32 value) {
     address &= kWord;
     if (address < p_.size()) {
         p_[address] = value & kWord;
-        cache_[address].valid = false;
-        if (address > 0) cache_[address - 1].valid = false;  // an extension word changed
+        invalidate(address);
+        if (address > 0) invalidate(address - 1);  // an extension word changed
     }
 }
 
@@ -252,13 +359,60 @@ void Core::write_space(bool y, u32 address, u32 value) {
     else write_x(address, value);
 }
 
-const Decoded& Core::decoded(u32 address) {
-    Cached& c = cache_[address % cfg_.p_words];
-    if (!c.valid) {
-        c.d = decode(p_[address % cfg_.p_words]);
+const Core::Compiled& Core::compiled(u32 address) {
+    Compiled& c = code_[address];  // the caller checked the address
+    if (!c.valid) [[unlikely]] {
+        const Decoded d = decode(p_[address]);
+        c = Compiled{};
+        c.word = d.word;
+        c.ext = d.extension ? read_p(address + 1) : 0;
+        c.pattern = static_cast<i16>(d.pattern);
+        c.move = d.move;
+        c.alu = d.alu;
+        c.alu_dest = d.alu_dest;
+        c.alu_src = d.alu_src;
+        c.alu_negate = d.alu_negate;
+        c.extension = d.extension;
+        c.words = d.extension ? 2 : 1;
+        if (d.pattern >= 0) {
+            const OpInfo info = op_table()[static_cast<std::size_t>(d.pattern)];
+            c.op = static_cast<u8>(info.op);
+            c.variant = info.variant;
+        }
+        c.packed = true;
+        std::array<bool, 16> used{};
+        for (std::size_t i = 0; i < 52; ++i) {
+            if (!d.width[i]) continue;
+            if (used[kSlot[i]] || d.field[i] > 0xFFFFu) {
+                c.packed = false;  // the reference path takes such a word
+                if (std::getenv("MV_DEBUG_DSP_UNPACKED"))
+                    std::fprintf(stderr, "dsp: P:%04x %06x unpacked (letter %c, slot %u, value %x, slot taken %d)\n", address, d.word,
+                                 static_cast<char>(i < 26 ? 'a' + i : 'A' + i - 26), kSlot[i], d.field[i], used[kSlot[i]] ? 1 : 0);
+            }
+            used[kSlot[i]] = true;
+            c.slot[kSlot[i]] = static_cast<u16>(d.field[i]);
+        }
+        if (d.pattern == -2) {
+            c.run = run_general;
+        } else if (d.pattern >= 0) {
+            static constexpr auto kOpHandlers = []<std::size_t... I>(std::index_sequence<I...>) {
+                return std::array<Handler, kOps>{&Core::run_op<static_cast<u8>(I)>...};
+            }(std::make_index_sequence<kOps>{});
+            c.run = kOpHandlers[c.op];
+        } else {
+            static constexpr Handler kParallel[] = {run_parallel<Move::NotParallel>, run_parallel<Move::None>, run_parallel<Move::Immediate>, run_parallel<Move::Register>,
+                                                    run_parallel<Move::Update>, run_parallel<Move::X>, run_parallel<Move::Y>, run_parallel<Move::XR1>,
+                                                    run_parallel<Move::XR2>, run_parallel<Move::RY1>, run_parallel<Move::RY2>, run_parallel<Move::L>,
+                                                    run_parallel<Move::XY>};
+            c.run = kParallel[static_cast<std::size_t>(d.move)];
+        }
+        if (!c.packed) {
+            c.run = run_unpacked;
+            c.ext = d.extension ? read_p(address + 1) : 0;
+        }
         c.valid = true;
     }
-    return c.d;
+    return c;
 }
 
 std::string Core::disassemble_at(u32 address) const {
@@ -399,6 +553,20 @@ u32 Core::read_reg5(u32 code, bool limit) {
     }
 }
 
+u32 Core::read_reg5_with(u32 code, i64 a, i64 b) {
+    switch (code & 31u) {
+        case 8: return static_cast<u32>(a) & kWord;
+        case 9: return static_cast<u32>(b) & kWord;
+        case 10: return static_cast<u32>(a >> 48) & 0xFFu;
+        case 11: return static_cast<u32>(b >> 48) & 0xFFu;
+        case 12: return static_cast<u32>(a >> 24) & kWord;
+        case 13: return static_cast<u32>(b >> 24) & kWord;
+        case 14: return limit24(a);
+        case 15: return limit24(b);
+        default: return read_reg5(code, true);
+    }
+}
+
 void Core::write_reg5(u32 code, u32 value) {
     value &= kWord;
     switch (code & 31u) {
@@ -474,7 +642,7 @@ void Core::write_reg6(u32 code, u32 value) {
 
 u32 Core::agu_update(u32 r, u32 m, i32 delta) const {
     const u32 mod = m & 0xFFFFu;
-    if (mod == 0xFFFFu) return static_cast<u32>(static_cast<i32>(r) + delta) & kWord;  // linear
+    if (mod == 0xFFFFu) [[likely]] return static_cast<u32>(static_cast<i32>(r) + delta) & kWord;  // linear
     if (mod == 0) {
         // Reverse carry: propagate the carry from the MSB toward the LSB.
         u32 rev_r = 0, rev_d = 0;
@@ -564,9 +732,8 @@ void Core::end_of_loop_check(u32 executed_at) {
 
 // ---- the parallel family ----
 
-void Core::alu(const Decoded& d, u32 /*ext*/, i64 pre_a, i64 pre_b) {
-    (void)pre_a;
-    (void)pre_b;
+template <class Insn>
+void Core::alu(const Insn& d) {
     const u32 dst = d.alu_dest;
     i64& D = acc(dst);
     const i64 src = source56(d.alu_src, dst);
@@ -678,19 +845,31 @@ void Core::alu(const Decoded& d, u32 /*ext*/, i64 pre_a, i64 pre_b) {
     }
 }
 
-void Core::parallel_move(const Decoded& d, u32 ext, i64 pre_a, i64 pre_b) {
-    // Reads of the accumulators use their values before the ALU operation of the same instruction.
-    const i64 cur_a = r_.a, cur_b = r_.b;
-    auto read_pre5 = [&](u32 code) {
-        r_.a = pre_a;
-        r_.b = pre_b;
-        const u32 v = read_reg5(code, true);
-        r_.a = cur_a;
-        r_.b = cur_b;
-        return v;
-    };
-    bool used_ext = false;
+template <class Insn>
+void Core::parallel_move(const Insn& d, u32 ext, i64 pre_a, i64 pre_b) {
     switch (d.move) {
+        case Move::NotParallel: case Move::None: return;
+        case Move::Immediate: parallel_move_kind<Move::Immediate>(d, ext, pre_a, pre_b); return;
+        case Move::Register: parallel_move_kind<Move::Register>(d, ext, pre_a, pre_b); return;
+        case Move::Update: parallel_move_kind<Move::Update>(d, ext, pre_a, pre_b); return;
+        case Move::X: parallel_move_kind<Move::X>(d, ext, pre_a, pre_b); return;
+        case Move::Y: parallel_move_kind<Move::Y>(d, ext, pre_a, pre_b); return;
+        case Move::XR1: parallel_move_kind<Move::XR1>(d, ext, pre_a, pre_b); return;
+        case Move::XR2: parallel_move_kind<Move::XR2>(d, ext, pre_a, pre_b); return;
+        case Move::RY1: parallel_move_kind<Move::RY1>(d, ext, pre_a, pre_b); return;
+        case Move::RY2: parallel_move_kind<Move::RY2>(d, ext, pre_a, pre_b); return;
+        case Move::L: parallel_move_kind<Move::L>(d, ext, pre_a, pre_b); return;
+        case Move::XY: parallel_move_kind<Move::XY>(d, ext, pre_a, pre_b); return;
+    }
+}
+
+// One kind of parallel move, the kind fixed at compile time (the compiled path's handlers call it directly).
+template <Move M, class Insn>
+void Core::parallel_move_kind(const Insn& d, u32 ext, i64 pre_a, i64 pre_b) {
+    // Reads of the accumulators use their values before the ALU operation of the same instruction.
+    auto read_pre5 = [&](u32 code) { return read_reg5_with(code, pre_a, pre_b); };
+    bool used_ext = false;
+    switch (M) {
         case Move::NotParallel: case Move::None: return;
         case Move::Immediate: {
             const u32 code = d.f('d'), imm = d.f('i');
@@ -811,18 +990,28 @@ void Core::parallel_move(const Decoded& d, u32 ext, i64 pre_a, i64 pre_b) {
 
 // ---- the non-parallel instructions ----
 
-void Core::execute(const Decoded& d, u32 ext, u32 at) {
+template <class Insn>
+void Core::execute(const Insn& d, u32 ext, u32 at) {
     if (d.pattern == -2) {
         fail(std::format("unknown instruction word {:06x} at P:{:04x}", d.word, at));
         return;
     }
     if (d.pattern < 0) {
         const i64 pre_a = r_.a, pre_b = r_.b;
-        alu(d, ext, pre_a, pre_b);
+        alu(d);
         parallel_move(d, ext, pre_a, pre_b);
         return;
     }
-    const OpInfo info = op_table()[static_cast<std::size_t>(d.pattern)];
+    // One operation class at a time: each class's code is its own function (the compiled path calls it directly).
+    static constexpr auto kTable = []<std::size_t... I>(std::index_sequence<I...>) {
+        return std::array<void (Core::*)(const Insn&, u32, u32), kOps>{&Core::execute_op<static_cast<u8>(I), Insn>...};
+    }(std::make_index_sequence<kOps>{});
+    (this->*kTable[static_cast<std::size_t>(info_of(d).op)])(d, ext, at);
+}
+
+template <u8 O, class Insn>
+void Core::execute_op(const Insn& d, u32 ext, u32 at) {
+    const OpInfo info{static_cast<Op>(O), info_of(d).variant};
     const u32 next = r_.pc;  // already past this instruction
     bool used_ext = false;
     auto mmmrrr = [&]() { return (d.f('M') << 3) | d.f('R'); };
@@ -842,7 +1031,7 @@ void Core::execute(const Decoded& d, u32 ext, u32 at) {
         if (sub) push(next, r_.sr);
         r_.pc = target & kWord;
     };
-    switch (info.op) {
+    switch (static_cast<Op>(O)) {
         case Op::Nop: case Op::Debug: case Op::Reset: return;
         case Op::Rts: {
             u32 pc_value, sr_value;
@@ -1346,6 +1535,44 @@ void Core::execute(const Decoded& d, u32 ext, u32 at) {
     }
 }
 
+// ---- the compiled path's handlers ----
+
+template <Move M>
+u32 Core::run_parallel(Core& core, const Compiled& d, u32 /*at*/) {
+    const i64 pre_a = core.r_.a, pre_b = core.r_.b;
+    if (d.alu != Alu::None) core.alu(d);
+    if constexpr (M != Move::None && M != Move::NotParallel) core.parallel_move_kind<M>(d, d.ext, pre_a, pre_b);
+    return d.words;
+}
+
+u32 Core::run_general(Core& core, const Compiled& d, u32 at) {
+    core.execute(d, d.ext, at);
+    return d.words;
+}
+
+template <u8 O>
+u32 Core::run_op(Core& core, const Compiled& d, u32 at) {
+    core.execute_op<O>(d, d.ext, at);
+    return d.words;
+}
+
+u32 Core::run_compile(Core& core, const Compiled& /*stale*/, u32 at) {
+    const Compiled& c = core.compiled(at);
+    core.r_.pc = (at + c.words) & kWord;  // the loop set it from the stale entry
+    return c.run(core, c, at);
+}
+
+u32 Core::run_unpacked(Core& core, const Compiled& d, u32 at) {
+    const Decoded full = decode(d.word);
+    core.execute(full, full.extension ? d.ext : 0, at);
+    return d.words;
+}
+
+void Core::invalidate(u32 address) {
+    code_[address].valid = false;
+    code_[address].run = run_compile;
+}
+
 u32 Core::step() {
     if (!error_.empty() || halted_) return 0;
     const u32 at = r_.pc & kWord;
@@ -1353,9 +1580,17 @@ u32 Core::step() {
         fail(std::format("PC {:06x} outside program memory", at));
         return 0;
     }
-    const Decoded& d = decoded(at);  // by reference: the decoded form is ~280 bytes
+    if (!reference_) [[likely]] {
+        const Compiled& c = compiled(at);
+        if (c.packed) [[likely]] return step_with(c, c.extension ? c.ext : 0, at);
+    }
+    const Decoded d = decode(p_[at]);
+    return step_with(d, d.extension ? read_p(at + 1) : 0, at);
+}
+
+template <class Insn>
+u32 Core::step_with(const Insn& d, u32 ext, u32 at) {
     if (pc_hist_) [[unlikely]] (*pc_hist_)[at] += d.extension ? 2 : 1;
-    const u32 ext = d.extension ? read_p(at + 1) : 0;
     const u32 words = d.extension ? 2 : 1;
     if (rep_active_) {
         // The repeated instruction runs LC times from one fetch, then LC is restored.
@@ -1375,11 +1610,48 @@ u32 Core::step() {
     cycles_ += words;
     // The loop address names the LAST word of the loop's final instruction (the kernel's DOR at P:03CA ends on
     // the extension word of a two-word ADD).
-    if (!rep_active_) end_of_loop_check(at + words - 1);
+    if ((r_.sr & LF) && !rep_active_ && at + words - 1 == r_.la) [[unlikely]] end_of_loop_check(at + words - 1);
     return words;
 }
 
+// The compiled path's loop: an instruction's handler and the bookkeeping step() does, minus what only tracing, the
+// histogram and REP need (an instruction under REP, an unpacked word or a PC outside memory goes through step()).
+u64 Core::run_fast(u64 cycles) {
+    u64 done = 0;
+    while (done < cycles && error_.empty() && !halted_) {
+        const u32 at = r_.pc & kWord;
+        u32 words;
+        if (rep_active_ || at >= cfg_.p_words) [[unlikely]] {
+            words = step();
+            if (words == 0) break;
+        } else {
+            const Compiled& c = code_[at];
+            r_.pc = (at + c.words) & kWord;
+            words = c.run(*this, c, at);
+            ++instructions_;
+            cycles_ += words;
+            if ((r_.sr & LF) && !rep_active_ && at + words - 1 == r_.la) [[unlikely]] end_of_loop_check(at + words - 1);
+        }
+        done += words;
+        if (idle_.pending) [[unlikely]] {
+            idle_.pending = false;
+            const u64 left = done < cycles ? cycles - done : 0;
+            const u64 room = idle_.until_cycle ? std::min(left, idle_.until_cycle > cycles_ ? idle_.until_cycle - cycles_ : 0) : left;
+            const u64 iterations = idle_.per_iteration ? room / idle_.per_iteration : 0;
+            if (iterations > 1) {
+                const u64 skip = iterations - 1;
+                if (idle_.delta) acc(idle_.dest) = sext56(acc(idle_.dest) + static_cast<i64>(skip) * idle_.delta);
+                cycles_ += skip * idle_.per_iteration;
+                instructions_ += skip * (idle_.delta ? 2 : 1);
+                done += skip * idle_.per_iteration;
+            }
+        }
+    }
+    return done;
+}
+
 u64 Core::run(u64 cycles) {
+    if (!trace_ && !pc_hist_ && !reference_) [[likely]] return run_fast(cycles);
     u64 done = 0;
     while (done < cycles && error_.empty() && !halted_) {
         if (trace_)

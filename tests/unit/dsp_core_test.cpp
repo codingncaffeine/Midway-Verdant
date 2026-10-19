@@ -386,3 +386,55 @@ TEST(DspCore, APollOnARunningDmaSkipsToItsEndWithTheSameResult) {
         }
     }
 }
+
+TEST(DspCore, TheCompiledPathMatchesTheReferencePathOnRandomInstructionsAndStates) {
+    // Every instruction word the decoder knows, on random register and memory states: one step through the compiled
+    // form (fields packed into slots, a handler per move kind or operation class) and one through the full decoded
+    // form must leave the whole state identical. Small memories keep the snapshots cheap; addresses past them read 0.
+    const dsp::Core::Config cfg{256, 256, 64};
+    dsp::Core fast(cfg, nullptr), ref(cfg, nullptr);
+    ref.set_reference(true);
+    u64 seed = 0x9E3779B97F4A7C15ull;
+    auto next = [&] {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        return seed;
+    };
+    u32 compared = 0;
+    for (int i = 0; i < 200000; ++i) {
+        dsp::Core& base = fast;
+        base.reset();
+        for (u32& w : base.x_memory()) w = static_cast<u32>(next()) & 0xFFFFFFu;
+        for (u32& w : base.y_memory()) w = static_cast<u32>(next()) & 0xFFFFFFu;
+        auto& r = base.regs();
+        r.a = static_cast<i64>(next() << 8) >> 8;
+        r.b = static_cast<i64>(next() << 8) >> 8;
+        r.x0 = static_cast<u32>(next()) & 0xFFFFFFu;
+        r.x1 = static_cast<u32>(next()) & 0xFFFFFFu;
+        r.y0 = static_cast<u32>(next()) & 0xFFFFFFu;
+        r.y1 = static_cast<u32>(next()) & 0xFFFFFFu;
+        for (u32 k = 0; k < 8; ++k) {
+            r.r[k] = static_cast<u32>(next()) & 0x1FFu;  // mostly inside the memories
+            r.n[k] = static_cast<u32>(next()) & 0x1Fu;
+            r.m[k] = (next() & 3u) ? 0xFFFFFFu : static_cast<u32>(next()) & 0xFFFFu;  // linear, modulo, reverse carry
+        }
+        r.sr = static_cast<u32>(next()) & 0xFFu;  // the condition codes
+        r.pc = 8;
+        base.write_p(8, static_cast<u32>(next()) & 0xFFFFFFu);
+        base.write_p(9, static_cast<u32>(next()) & 0xFFFFFFu);
+        const std::vector<u32> start = base.snapshot();
+        ASSERT_TRUE(ref.restore(start));
+        fast.run(1);
+        ref.run(1);
+        const auto a = fast.snapshot(), b = ref.snapshot();
+        if (a != b || fast.error_text() != ref.error_text()) {
+            std::size_t w = 0;
+            while (w < a.size() && a[w] == b[w]) ++w;
+            FAIL() << "word " << std::hex << start[6 + 256 + 256 + 8] << " ext " << start[6 + 256 + 256 + 9] << ": state word " << std::dec << w
+                   << " differs (compiled " << std::hex << a[w] << ", reference " << b[w] << "); errors '" << fast.error_text() << "' / '" << ref.error_text() << "'";
+        }
+        ++compared;
+    }
+    EXPECT_EQ(compared, 200000u);
+}
