@@ -251,6 +251,7 @@ bool Timing::Cache::access(PhysAddr phys, u64 now) {
     const u32 line = phys >> 5;
     const unsigned set = line & (sets_ - 1);
     const unsigned base = set * ways_;
+    mru_[set] = line + 1;
     unsigned victim = base;
     u64 oldest = ~u64{0};
     for (unsigned w = 0; w < ways_; ++w) {
@@ -599,6 +600,57 @@ u32 schedule_block(Timing& ideal, const Insn* const* insns, unsigned n, u16* aft
     const u32 total = std::max<u32>(1, n ? after[n - 1] : 0);
     if (n) after[n - 1] = static_cast<u16>(total);
     return total;
+}
+
+}  // namespace mv::p6
+
+namespace mv::p6 {
+
+u64 Timing::cache_hash() const {
+    u64 h = 0xcbf29ce484222325ull;
+    auto mix = [&h](u64 v) { h = (h ^ v) * 0x100000001b3ull; };
+    for (const Cache* c : {&l1i_, &l1d_, &l2_}) {
+        for (unsigned set = 0; set < c->sets_; ++set) {
+            const unsigned base = set * c->ways_;
+            for (unsigned w = 0; w < c->ways_; ++w) {
+                const unsigned i = base + w;
+                if (!c->valid_[i]) continue;
+                // The way's rank by age in its set: the order, not the clock values, decides the victims.
+                unsigned rank = 0;
+                for (unsigned o = 0; o < c->ways_; ++o)
+                    if (c->valid_[base + o] && c->last_use_[base + o] < c->last_use_[i]) ++rank;
+                mix((static_cast<u64>(c->tags_[i]) << 8) | rank);
+            }
+        }
+    }
+    return h;
+}
+
+}  // namespace mv::p6
+
+namespace mv::p6 {
+
+// A block's code fetch on the block timing's clock: each line looked up in L1I (and L2 on a miss) as fetch_ready
+// does; a line that is its set's most recent is a hit with no order to change. The penalty is the slowest line's.
+unsigned Timing::code_fetch(PhysAddr phys, unsigned len) {
+    unsigned penalty = 0;
+    for (PhysAddr at = phys & ~31u; at <= ((phys + len - 1) & ~31u); at += 32) {
+        const u32 line = at >> 5;
+        if (l1i_.mru_[line & (l1i_.sets_ - 1)] != line + 1) {
+            const u64 now = ++lru_clock_;
+            if (!l1i_.access(at, now)) {
+                ++stats_.l1i_misses;
+                unsigned p = tp::kL2Latency;
+                if (!l2_.access(at, now)) {
+                    ++stats_.l2_misses;
+                    p += tp::kDramLatency;
+                }
+                penalty = std::max(penalty, p);
+            }
+        }
+        if (at == 0xFFFFFFE0u) break;
+    }
+    return penalty;
 }
 
 }  // namespace mv::p6

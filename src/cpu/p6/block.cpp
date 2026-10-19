@@ -1,9 +1,12 @@
 #include "cpu/p6/block.h"
 
+#include "cpu/p6/jit/jit.h"
 #include "cpu/p6/timing.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <format>
+#include <string_view>
 
 namespace mv::p6 {
 
@@ -61,6 +64,20 @@ BranchKind branch_kind(Op op) {
 BlockEngine::BlockEngine(Cpu& cpu, Bus& bus) : cpu_(cpu), bus_(bus), fast_(kFastSize), page_blocks_(bus.ram_size() / 4096) {
     bus_.set_code_tracking(true);
     cpu_.memory().set_code_watcher(this);
+    if (const char* l = std::getenv("MV_P6_BLOCK_LOG"); l && *l) {
+        std::string spec(l);
+        const auto c2 = spec.rfind(':'), c1 = spec.rfind(':', c2 - 1);
+        if (c1 != std::string::npos && c2 != std::string::npos && c1 < c2) {
+            log_from_ = std::strtoull(spec.c_str() + c1 + 1, nullptr, 0);
+            log_to_ = std::strtoull(spec.c_str() + c2 + 1, nullptr, 0);
+            block_log_ = std::fopen(spec.substr(0, c1).c_str(), "w");
+        }
+    }
+    const char* j = std::getenv("MV_P6_JIT");
+    if (!(j && std::string_view(j) == "0")) {
+        jit_ = std::make_unique<Jit>();
+        if (!jit_->available()) jit_.reset();
+    }
 }
 
 BlockEngine::~BlockEngine() {
@@ -124,12 +141,14 @@ Block* BlockEngine::build(const u8* page, unsigned off, u32 ram_page, u8 mode) {
         }
         if (in.rep && is_string(in.op)) {
             if (b->insns.empty()) {
+                b->off[0] = static_cast<u16>(at - off);
                 b->insns.push_back(in);
                 b->rep = true;
                 at += in.len;
             }
             break;
         }
+        b->off[b->insns.size()] = static_cast<u16>(at - off);
         b->insns.push_back(in);
         at += in.len;
         if (ends_block(in)) break;
@@ -229,7 +248,9 @@ u32 BlockEngine::exit_cost(Block& b, u32 entry_eip) {
 BlockEngine::Run BlockEngine::begin(Block& b, u64 limit) {
     ++b.runs;
     const PhysAddr code = static_cast<PhysAddr>(b.ram_page) * 4096u + b.page_off;
-    const Run r{&b, cpu_.cycles(), cpu_.state().eip, cpu_.cache_timing().code_fetch(code, b.bytes), limit};
+    // Penalties still pending (a page walk for the fetch, a delivery's stack) belong to the run from its start.
+    const u64 pending = cpu_.memory().take_penalty();
+    const Run r{&b, cpu_.cycles(), cpu_.state().eip, pending + cpu_.cache_timing().code_fetch(code, b.bytes), limit};
     cpu_.set_cycles_only(r.start + r.extra);
     return r;
 }
@@ -276,10 +297,106 @@ BlockEngine::Next BlockEngine::exec(Run& r, unsigned i) {
 
 unsigned BlockEngine::run(Block& b, u64 limit) {
     Run r = begin(b, limit);
+    cpu_.cache_timing().trace_ = nullptr;
+    if (block_log_ && r.start >= log_from_ && r.start <= log_to_) {
+        const CpuState& s = cpu_.state();
+        u64 h = 0xcbf29ce484222325ull;
+        for (u32 g : s.gpr) h = (h ^ g) * 0x100000001b3ull;
+        h = (h ^ s.eflags()) * 0x100000001b3ull;
+        const TimingStats& t = cpu_.cache_timing().stats();
+        cpu_.cache_timing().trace_ = block_log_;
+        std::fprintf(block_log_, "  schedule %u:", b.cycles);
+        for (unsigned k = 0; k < b.n; ++k) std::fprintf(block_log_, " %u", b.after[k]);
+        std::fprintf(block_log_, " extra %llu\n", static_cast<unsigned long long>(r.extra));
+        std::fprintf(block_log_, "%llu %08x %u %016llx l1d %llu l2 %llu l1i %llu caches %016llx limit %llu inhibit %d\n", static_cast<unsigned long long>(r.start), s.eip, b.n, static_cast<unsigned long long>(h),
+                     static_cast<unsigned long long>(t.l1d_misses), static_cast<unsigned long long>(t.l2_misses), static_cast<unsigned long long>(t.l1i_misses),
+                     static_cast<unsigned long long>(cpu_.cache_timing().cache_hash()), static_cast<unsigned long long>(r.limit), s.inhibit_interrupts ? 1 : 0);
+    }
     ++stats_.whole_runs;
+    if (jit_ && !b.rep) {
+        // Hot blocks are translated; a block whose assumptions no longer hold is translated again, a few times.
+        if (!b.native && !b.jit_failed && b.runs >= hot_) {
+            if (!jit_->compile(b, cpu_)) {
+                jit_->flush(*this);
+                if (!jit_->compile(b, cpu_)) b.jit_failed = true;
+            }
+            ++b.jit_compiles;
+        }
+        if (b.native && r.start + r.extra + b.cycles < r.limit) {
+            if (Jit::eligible(b, cpu_)) return run_native(r);
+            ++stats_.native_ineligible;
+            if (b.jit_compiles < 4) b.native = nullptr;
+            else b.jit_failed = true;
+        }
+    }
     unsigned i = 0;
     while (exec(r, i) == Next::Continue) ++i;
     return i + 1;
+}
+
+}  // namespace mv::p6
+
+namespace mv::p6 {
+
+// A native run: the generated code executes the block (with the interpreter for what it does not cover) and returns
+// the instruction it ended at; the clock is then set exactly as `exec` would have set it.
+unsigned BlockEngine::run_native(Run& r) {
+    Block& b = *r.b;
+    Memory& mem = cpu_.memory();
+    JitCtx c{};
+    c.st = &cpu_.state();
+    c.cpu = &cpu_;
+    c.engine = this;
+    c.block = &b;
+    c.base = r.start + r.extra;
+    c.limit = r.limit;
+    c.devices = mem.device_events();
+    c.error = &jit_error_;
+    cpu_.clear_faulted();
+    running_ = &b;
+    running_dead_ = false;
+    const u32 result = Jit::entry(b)(&c);
+    running_ = nullptr;
+    if (jit_error_) {
+        const std::exception_ptr e = jit_error_;
+        jit_error_ = nullptr;
+        std::rethrow_exception(e);
+    }
+    const unsigned i = result >> 2;
+    const unsigned kind = result & 3;
+    cpu_.add_instructions(i + 1 - c.helpers);
+    stats_.block_insns += i + 1;
+    ++stats_.native_runs;
+    stats_.native_insns += i + 1 - c.helpers;
+    stats_.native_helpers += c.helpers;
+    c.base += mem.take_penalty();
+    stats_.penalty_cycles += c.base - (r.start + r.extra);
+    if (kind == kJitEnd) {
+        const u32 exit = exit_cost(b, r.entry_eip);
+        stats_.schedule_cycles += b.cycles;
+        stats_.exit_cycles += exit;
+        cpu_.set_cycles_only(c.base + b.cycles + exit);
+    } else if (kind == kJitExit && c.exit == 2) {
+        // The interpreter finishes the block from the next instruction, with the penalties so far.
+        cpu_.set_cycles_only(c.base + b.after[i]);
+        Run rest = r;
+        rest.extra = c.base - r.start;
+        ++stats_.native_handoffs;
+        unsigned j = i + 1;
+        while (exec(rest, j) == Next::Continue) ++j;
+        return j + 1;
+    } else {
+        stats_.schedule_cycles += b.after[i];
+        cpu_.set_cycles_only(c.base + b.after[i] + (kind == kJitFault ? tp::kInterruptDelivery : 0));
+    }
+    return i + 1;
+}
+
+void BlockEngine::disable_jit() { jit_.reset(); }
+
+void BlockEngine::drop_native() {
+    for (auto& [k, b] : blocks_) b->native = nullptr;
+    for (auto& b : graveyard_) b->native = nullptr;
 }
 
 }  // namespace mv::p6

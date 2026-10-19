@@ -6,6 +6,7 @@
 
 #include "core/machine.h"
 #include "cpu/p6/block.h"
+#include "cpu/p6/jit/jit.h"
 #include "cpu/p6/oracle.h"
 #include "debug/trace.h"
 
@@ -41,6 +42,7 @@ bool P6Backend::init(Machine& machine, std::string& error) {
     // Trace lines carry the interpreter's own clock, exact to the instruction.
     trace::set_clock_source(cpu_->cycles_pointer());
     if (const char* s = std::getenv("MV_P6_STOP_CYCLES"); s && *s) stop_at_cycles_ = std::strtoull(s, nullptr, 0);
+    if (const char* s = std::getenv("MV_P6_DELIVERY_LOG"); s && *s) delivery_log_ = std::fopen(s, "w");
     if (const char* s = std::getenv("MV_IDLE_SKIP"); s && *s == '0') idle_skip_ = false;
     if (with_oracle_) {
         oracle_ = std::make_unique<p6::Oracle>();
@@ -197,7 +199,8 @@ void P6Backend::run_batch_blocks() {
 bool P6Backend::between_instructions() {
     p6::Cpu& cpu = *cpu_;
     if (cpu.cycles() >= machine_->scheduler().next_deadline()) sync_time();
-    if (!cpu.take_interrupt()) return false;
+    // The PIC's INTR line follows its every change (pending_vector() >= 0): without it there is nothing to take.
+    if (!machine_->pic().intr_asserted() || !cpu.take_interrupt()) return false;
     ++stats_.irq_injections;
     ++stats_.by_vector[cpu.last_vector()];
     fold_delivery();
@@ -271,6 +274,9 @@ void P6Backend::fold_delivery() {
     mix(s.eflags());
     for (u32 r : s.gpr) mix(r);
     ++deliveries_;
+    if (delivery_log_)
+        std::fprintf(delivery_log_, "%llu %llu %08x %016llx\n", static_cast<unsigned long long>(cpu_->cycles()), static_cast<unsigned long long>(cpu_->instructions()), s.eip,
+                     static_cast<unsigned long long>(delivery_hash_));
 }
 
 CpuBackend::Stats P6Backend::stats() const {
@@ -324,6 +330,9 @@ std::string P6Backend::report() const {
         r += std::format("\ncpu p6 blocks: {} built, {} live, {} killed ({} page writes, {} by devices); runs {} whole; {} fallback steps; {} instructions in blocks; {} exit mispredicts; cycles: schedules {}, penalties {}, exits {}, REP {}",
                          b.built, blocks_->live_blocks(), b.killed, b.pages_written, b.device_page_writes, b.whole_runs, b.fallback_steps,
                          b.block_insns, b.mispredicts, b.schedule_cycles, b.penalty_cycles, b.exit_cycles, b.rep_cycles);
+        if (p6::Jit* j = blocks_->jit())
+            r += std::format("\ncpu p6 recompiler: {} blocks translated ({} KiB, {} flushes); {} native runs, {} native instructions, {} by the interpreter inside them; {} hand-offs, {} runs refused (assumptions changed)",
+                             j->compiled(), j->code_bytes() / 1024, j->flushes(), b.native_runs, b.native_insns, b.native_helpers, b.native_handoffs, b.native_ineligible);
         r += "\ncpu p6 hottest blocks (address x instructions: cycles * runs):" + blocks_->hottest(12);
     }
     if (idle_eips_[0]) r += std::format("\ncpu p6: the kernel idle loops at {:08x} {:08x}: {} passes, {} turned into halts", idle_eips_[0], idle_eips_[1], idle_hits_, idle_halts_);

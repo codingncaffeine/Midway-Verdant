@@ -22,7 +22,7 @@ constexpr u32 kCode = 0x1000, kData = 0x20000, kStack = 0x8000;
 struct Rig {
     Bus bus{4u << 20};
     Cpu cpu{bus};
-    Rig() {
+    explicit Rig(bool paged = false) {
         cpu.reset(0x68A);
         // Big real mode with flat 32-bit code, stack and data (as the P6 unit tests), code at 0x1000.
         cpu.state().seg[kCs] = Segment{0, 0, 0xFFFFFFFFu, 0xC09B};
@@ -30,6 +30,19 @@ struct Rig {
         cpu.state().seg[kDs] = cpu.state().seg[kEs] = Segment{0, 0, 0xFFFFFFFFu, 0xC093};
         cpu.state().eip = kCode;
         cpu.state().gpr[kEsp] = kStack;
+        if (paged) {
+            // Protected mode with paging: one 4 MiB page maps the RAM 1:1 (PSE), flat ring-0 segments as the
+            // kernel runs (the recompiler runs only here).
+            constexpr u32 kPageDir = 0x100000;
+            const u32 pde = 0x83;  // present, writable, 4 MiB
+            std::memcpy(bus.ram() + kPageDir, &pde, 4);
+            cpu.state().cr3 = kPageDir;
+            cpu.state().cr4 |= cr4::PSE;
+            cpu.state().cr0 |= cr0::PE | cr0::PG;
+            cpu.state().seg[kCs].selector = 0x08;
+            cpu.state().seg[kSs].selector = cpu.state().seg[kDs].selector = cpu.state().seg[kEs].selector = 0x10;
+            cpu.memory().flush_tlb(false);
+        }
     }
     void load(const std::vector<u8>& code, u32 at = kCode) { std::memcpy(bus.ram() + at, code.data(), code.size()); }
 };
@@ -48,11 +61,21 @@ void run_blocks(Rig& r, BlockEngine& e) {
     }
 }
 
-void expect_same(Rig& a, Rig& b, const char* what) {
+void expect_same(Rig& a, Rig& b, const char* what, bool cycles = false) {
+    if (cycles) {
+        EXPECT_EQ(a.cpu.cycles(), b.cpu.cycles()) << what << " cycles";
+    }
     for (unsigned g = 0; g < 8; ++g) EXPECT_EQ(a.cpu.state().gpr[g], b.cpu.state().gpr[g]) << what << " gpr " << g;
     EXPECT_EQ(a.cpu.state().eip, b.cpu.state().eip) << what;
     EXPECT_EQ(a.cpu.state().eflags(), b.cpu.state().eflags()) << what;
     EXPECT_EQ(a.cpu.instructions(), b.cpu.instructions()) << what;
+    if (cycles) {
+        const TimingStats& ta = a.cpu.cache_timing().stats();
+        const TimingStats& tb = b.cpu.cache_timing().stats();
+        EXPECT_EQ(ta.l1d_misses, tb.l1d_misses) << what << " L1D misses";
+        EXPECT_EQ(ta.l2_misses, tb.l2_misses) << what << " L2 misses";
+        EXPECT_EQ(ta.l1i_misses, tb.l1i_misses) << what << " L1I misses";
+    }
     EXPECT_EQ(0, std::memcmp(a.bus.ram() + kData, b.bus.ram() + kData, 0x200)) << what << " data";
     EXPECT_EQ(0, std::memcmp(a.bus.ram() + kStack - 0x100, b.bus.ram() + kStack - 0x100, 0x100)) << what << " stack";
 }
@@ -81,7 +104,7 @@ struct Gen {
     void one(std::vector<u8>& c) {
         static constexpr u8 alu[] = {0x01, 0x09, 0x11, 0x19, 0x21, 0x29, 0x31, 0x39, 0x85};
         const u8 d = reg(), s = src();
-        switch (next() % 24) {
+        switch (next() % 30) {
             case 0: case 1: case 2: c.insert(c.end(), {alu[next() % 9], static_cast<u8>(0xC0 | s << 3 | d)}); break;
             case 3: c.insert(c.end(), {static_cast<u8>(alu[next() % 8] - 1), static_cast<u8>(0xC0 | reg8() << 3 | reg8())}); break;
             case 4: c.insert(c.end(), {0x66, alu[next() % 9], static_cast<u8>(0xC0 | s << 3 | d)}); break;
@@ -117,20 +140,30 @@ struct Gen {
             case 21: c.insert(c.end(), {static_cast<u8>(0x50 + s), static_cast<u8>(0x58 + d)}); break;
             case 22: c.insert(c.end(), {static_cast<u8>(0x70 + (next() & 15)), 0x02, static_cast<u8>(0x40 + d), static_cast<u8>(0x48 + reg())}); break;
             case 23: c.insert(c.end(), {0x0F, static_cast<u8>(next() & 1 ? 0xC1 : 0xA3), static_cast<u8>(0xC0 | reg() << 3 | d)}); break;
+            case 24: c.insert(c.end(), {0x8A, static_cast<u8>(0x43 | reg8() << 3), static_cast<u8>(next())}); break;  // mov r8, [ebx+d8]
+            case 25: c.insert(c.end(), {0x88, static_cast<u8>(0x43 | reg8() << 3), static_cast<u8>(next())}); break;  // mov [ebx+d8], r8
+            case 26: c.insert(c.end(), {0xFF, static_cast<u8>(0x43 | (next() & 1) << 3), static_cast<u8>(next())}); break;  // inc/dec [ebx+d8]
+            case 27: c.insert(c.end(), {0x83, static_cast<u8>(0x43 | (next() % 8) << 3), static_cast<u8>(next()), static_cast<u8>(next())}); break;  // alu [ebx+d8], imm8
+            case 28: c.insert(c.end(), {0x66, 0x89, static_cast<u8>(0x43 | s << 3), static_cast<u8>(next())}); break;  // mov [ebx+d8], r16
+            case 29: c.insert(c.end(), {0x66, 0x8B, static_cast<u8>(0x43 | d << 3), static_cast<u8>(next() & 0xFE)}); break;  // mov r16, [ebx+d8]
         }
     }
 };
 
 }  // namespace
 
+// The three executors on the same programs: the step (architecture), the block interpreter, the recompiled blocks
+// (architecture, and the clock and instruction count exactly: both run block timing).
 TEST(P6Block, GeneratedProgramsMatchTheStep) {
+    u64 native = 0, paged_insns = 0;
     for (u32 program = 0; program < 300; ++program) {
         Gen g{program * 7919u + 1};
         std::vector<u8> code;
         while (code.size() < 900) g.one(code);
         code.push_back(0xF4);  // hlt
-        Rig a, b;
-        for (Rig* r : {&a, &b}) {
+        const bool paged = (program & 1) != 0;
+        Rig a(paged), b(paged), c(paged);
+        for (Rig* r : {&a, &b, &c}) {
             r->load(code);
             r->cpu.state().gpr[kEbx] = kData;
             for (unsigned i = 0; i < 0x200; ++i) r->bus.ram()[kData + i] = static_cast<u8>(i * 37 + program);
@@ -141,11 +174,21 @@ TEST(P6Block, GeneratedProgramsMatchTheStep) {
         run_steps(a);
         b.cpu.set_block_timing(true);
         BlockEngine e(b.cpu, b.bus);
+        e.disable_jit();
         run_blocks(b, e);
-        expect_same(a, b, "generated");
+        expect_same(a, b, "block interpreter against the step");
         ASSERT_FALSE(::testing::Test::HasFailure()) << "program " << program;
         EXPECT_GT(e.stats().block_insns, a.cpu.instructions() / 2);  // blocks ran it, not the fallback
+        c.cpu.set_block_timing(true);
+        BlockEngine ej(c.cpu, c.bus);
+        ej.set_jit_threshold(0);
+        run_blocks(c, ej);
+        expect_same(b, c, "recompiled against the block interpreter", true);
+        ASSERT_FALSE(::testing::Test::HasFailure()) << "program " << program << (paged ? " (paged)" : "");
+        native += ej.stats().native_insns;
+        if (paged) paged_insns += c.cpu.instructions();
     }
+    EXPECT_GT(native * 2, paged_insns);  // the recompiler ran most of the paged programs natively
 }
 
 // A block writes the instruction after the next one inside its own page: the new bytes must run (the step sees them).

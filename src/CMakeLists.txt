@@ -18,6 +18,7 @@ add_library(mvcore STATIC
   cpu/p6/simd.cpp
   cpu/p6/timing.cpp
   cpu/p6/block.cpp
+  cpu/p6/jit/jit_x64.cpp
   cpu/p6/p6_backend.cpp
   cpu/p6/oracle.cpp
   debug/trace.cpp

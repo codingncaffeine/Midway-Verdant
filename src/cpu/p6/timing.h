@@ -6,6 +6,7 @@
 // stack, and the uncached latencies of device and port accesses. A cycle COUNT whose observable orderings are
 // checked against hardware where ground truth exists; it does not claim exactness.
 #include <array>
+#include <cstdio>
 
 #include "core/types.h"
 #include "cpu/p6/decode.h"
@@ -67,6 +68,11 @@ public:
     // The core slept to `cycle` (HLT): every pipeline clock moves there.
     void skip_to(u64 cycle);
     u64 now() const { return retire_cycle_; }
+    // A hash of the caches' contents and LRU order (instruments: where two runs' caches part).
+    u64 cache_hash() const;
+    // The data cache's most-recently-used lines (see Cache::mru_) for the recompiler.
+    const u32* l1d_mru() const { return l1d_.mru_.data(); }
+    unsigned l1d_sets() const { return l1d_.sets_; }
     const TimingStats& stats() const { return stats_; }
     // Block timing (D26): an ideal pipeline (code and data hit L1, branches are predicted) that schedules a translated
     // block once; its caches and predictor are never touched.
@@ -75,11 +81,15 @@ public:
     void reset_pipeline();
     // Block timing's cache terms (D26), on the same L1/L2 tag arrays: a load's penalty over an L1 hit (a store's is
     // posted: 0), and a block's code fetch. LRU ages from an access count (deterministic).
-    unsigned data_access(PhysAddr phys, bool store) { return memory_penalty(phys, ++lru_clock_, store); }
-    unsigned code_fetch(PhysAddr phys, unsigned len) {
-        const u64 now = ++lru_clock_;
-        return static_cast<unsigned>(fetch_ready(phys, len, now) - now);
+    // A hit on a set's most recent line changes no LRU order (the clock only grows here), so it skips the model.
+    unsigned data_access(PhysAddr phys, bool store) {
+        if (trace_) std::fprintf(trace_, "  %c %08x\n", store ? 'w' : 'r', phys);
+        const u32 line = phys >> 5;
+        if (l1d_.mru_[line & (l1d_.sets_ - 1)] == line + 1) return 0;
+        return memory_penalty(phys, ++lru_clock_, store);
     }
+    std::FILE* trace_{nullptr};  // instruments: every block-timing data access, when set
+    unsigned code_fetch(PhysAddr phys, unsigned len);
     // Every register ready (the next instructions do not depend on the earlier ones).
     void clear_dependencies() { reg_ready_.fill(0); }
 
@@ -87,6 +97,9 @@ private:
     struct Cache {
         Cache(unsigned sets, unsigned ways);
         bool access(PhysAddr phys, u64 now);  // true on a hit; allocates on a miss
+        // The most recently used line of each set, plus one (0: none): a hit on it changes no LRU order, so the
+        // recompiler's generated code checks it inline and skips the model.
+        std::array<u32, 512> mru_{};
         unsigned sets_, ways_;
         std::array<u32, 4096> tags_{};
         std::array<u64, 4096> last_use_{};

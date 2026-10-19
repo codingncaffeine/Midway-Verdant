@@ -2,6 +2,7 @@
 // The accurate mode: the interpreted Pentium III as a CpuBackend. Its instruction stream is the master clock.
 #include <array>
 #include <atomic>
+#include <cstdio>
 #include <memory>
 #include <string>
 #include <thread>
@@ -69,6 +70,7 @@ private:
     u64 stop_at_cycles_{~u64{0}};
     u64 delivery_hash_{0xcbf29ce484222325ull};
     u64 deliveries_{0};
+    std::FILE* delivery_log_{nullptr};  // MV_P6_DELIVERY_LOG=FILE: a line per delivery (cycle, instructions, EIP, hash)
     void fold_delivery();
     // The kernel idle loop halts (D22, here by address): found in RAM by its shape, a pass through it with no
     // interrupt delivered since the last pass halts the core to the next event. MV_IDLE_SKIP=0: it spins.

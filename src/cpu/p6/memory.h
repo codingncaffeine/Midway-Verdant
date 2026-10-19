@@ -123,7 +123,7 @@ public:
     u64 tlb_misses() const { return tlb_misses_; }
     u64 page_walks() const { return page_walks_; }
 
-private:
+    // The TLB, as the recompiler's generated code reads it too (32 bytes an entry, offsets fixed).
     struct TlbEntry {
         u32 tag{0xFFFFFFFFu};  // linear page number, or ~0 when empty
         PhysAddr phys_page{0};
@@ -131,9 +131,17 @@ private:
         bool writable{false};  // a write walk succeeded (the dirty bit is set)
         bool user{false};
         bool global{false};
+        u8 pad_[13]{};
     };
     static constexpr unsigned kTlbBits = 10;
     static constexpr unsigned kTlbSize = 1u << kTlbBits;
+    const TlbEntry* tlb() const { return tlb_.data(); }
+    bool dirty_tracking() const { return dirty_tracking_; }
+    Timing* cache_model() const { return cache_model_; }
+    // The recompiler's slow paths hand their cache and device penalties to the run directly.
+    void add_penalty(u64 c) { penalty_ += c; }
+
+private:
 
     TlbEntry& lookup(u32 lin, Access access);
     TlbEntry& walk(u32 lin, Access access);

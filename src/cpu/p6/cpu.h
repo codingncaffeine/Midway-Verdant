@@ -54,6 +54,9 @@ public:
     // engine sets the clock). Returns false when it faulted; the fault was delivered (and cost its latency).
     bool exec_decoded(const Insn& in);
     void set_cycles_only(u64 c) { cycles_ = c; }
+    // The recompiler's bookkeeping: instructions it ran natively, and a native run that did not fault.
+    void add_instructions(u64 n) { instructions_ += n; }
+    void clear_faulted() { last_faulted_ = false; }
     unsigned rep_iterations() const { return rep_iterations_; }
     Timing& scheduler() { return sched_; }
     // Take a pending external interrupt if the core accepts one now (IF set, no inhibit): delivers it and

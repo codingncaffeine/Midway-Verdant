@@ -7,6 +7,8 @@
 // drops a page's blocks when the CPU or a device writes into it, and runs a block's instructions through the
 // interpreter's own `execute` — the reference the native recompiler is checked against.
 #include <array>
+#include <cstdio>
+#include <exception>
 #include <string>
 #include <memory>
 #include <unordered_map>
@@ -38,7 +40,16 @@ struct Block {
     u32 cycles{0};       // the schedule's total
     std::array<u16, kMaxBlockInsns> after{};  // cycles from the start to each instruction's retirement
     std::vector<Insn> insns;
+    std::array<u16, kMaxBlockInsns> off{};  // each instruction's offset from the first byte
     void* native{nullptr};  // the recompiled form, when there is one
+    // The recompiled form's assumptions, checked before it runs: the entry EIP, the segments its memory accesses
+    // used (by base, limit and rights), whether write tracking was on.
+    u32 jit_eip{0};
+    u8 jit_segs{0};
+    bool jit_dirty{false};
+    bool jit_failed{false};
+    u8 jit_compiles{0};
+    std::array<Segment, kSegCount> jit_seg{};
     u64 runs{0};
     u32 lin{0};  // the linear address it was first built at (reports)
 };
@@ -47,9 +58,12 @@ struct BlockStats {
     u64 built{0}, killed{0}, pages_written{0}, device_page_writes{0};
     u64 whole_runs{0}, fallback_steps{0}, block_insns{0};
     u64 mispredicts{0};
+    u64 native_runs{0}, native_insns{0}, native_helpers{0}, native_ineligible{0}, native_handoffs{0};
     // Where the cycles went: the schedules, the penalties (caches, devices), the exits' mispredicts, REP elements.
     u64 schedule_cycles{0}, penalty_cycles{0}, exit_cycles{0}, rep_cycles{0};
 };
+
+class Jit;
 
 class BlockEngine : public CodeWatcher {
 public:
@@ -90,6 +104,15 @@ public:
     // Drop every block (a reset).
     void clear();
 
+    // The recompiler (D26): on unless MV_P6_JIT=0 or the host cannot run generated code.
+    Jit* jit() { return jit_.get(); }
+    void disable_jit();
+    // Runs before a block is translated (tests use 0: translate at once).
+    void set_jit_threshold(u64 runs) { hot_ = runs; }
+    bool running_dead() const { return running_dead_; }
+    // Forget every block's native code (the code buffer was flushed).
+    void drop_native();
+
     void code_written(u32 ram_page) override;
     const BlockStats& stats() const { return stats_; }
     std::size_t live_blocks() const { return blocks_.size(); }
@@ -101,6 +124,7 @@ private:
     void kill_page(u32 ram_page);
     void take_device_writes();
     u32 exit_cost(Block& b, u32 entry_eip);
+    unsigned run_native(Run& r);
     static u64 key(u32 ram_page, unsigned off, u8 mode) { return (static_cast<u64>(ram_page) << 14) | (static_cast<u64>(off) << 2) | mode; }
     static unsigned fast_index(u32 lin, u8 mode) { return ((lin ^ (lin >> 16)) * 2 + mode) & (kFastSize - 1); }
 
@@ -125,6 +149,14 @@ private:
     unsigned rsb_top_{0};
     std::vector<u32> written_;
     BlockStats stats_;
+    std::unique_ptr<Jit> jit_;
+    std::exception_ptr jit_error_;
+    u64 hot_{8};
+    // MV_P6_BLOCK_LOG=FILE:FROM:TO: a line per block run whose start lies in the cycle window (its schedule; start,
+    // EIP, a hash of the registers and flags, the cache counters, a hash of the caches' contents and order, the limit),
+    // then every cache-model access it makes: to find where two executors part.
+    std::FILE* block_log_{nullptr};
+    u64 log_from_{0}, log_to_{0};
 };
 
 }  // namespace mv::p6

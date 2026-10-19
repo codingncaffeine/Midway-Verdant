@@ -96,6 +96,8 @@ public:
     bool code_page(u32 page) const { return code_tracking_ && (code_[page / 64].load(std::memory_order_relaxed) & (u64{1} << (page % 64))) != 0; }
     // The RAM page index of a host pointer into RAM.
     u32 ram_page(const u8* p) const { return static_cast<u32>(static_cast<u64>(p - ram_.data()) / kPageSize); }
+    // The code-page bitmap as plain words (the recompiler's generated code tests it).
+    const u64* code_map() const { return reinterpret_cast<const u64*>(code_.get()); }
     bool code_writes_pending() const { return code_pending_.load(std::memory_order_acquire); }
     void take_code_writes(std::vector<u32>& pages);
 
