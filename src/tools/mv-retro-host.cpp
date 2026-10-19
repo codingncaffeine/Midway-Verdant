@@ -1,7 +1,7 @@
 // mv-retro-host: a headless libretro frontend for testing the core the way Emutastic drives it. It loads the core
 // library, answers the environment calls (system directory, pixel format, options, log), runs N frames, saves
 // pictures of chosen frames and holds RetroPad buttons over chosen frame ranges.
-//   mv-retro-host CORE.so SYSTEM_DIR [GAME] --frames N [--png-every K DIR] [--press BUTTON@FROM-TO ...]
+//   mv-retro-host CORE.so SYSTEM_DIR [GAME] --frames N [--png-every K DIR [--png-from N --png-to M]] [--press BUTTON@FROM-TO ...]
 // Buttons: a b x y l r l2 r2 start select up down left right.
 #include <dlfcn.h>
 #if defined(__linux__)
@@ -160,19 +160,21 @@ int main(int argc, char** argv) {
     if (const char* p = std::getenv("MV_ALLOW_PROFILER"); p && *p == '1') prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY, 0, 0, 0);
 #endif
     if (argc < 3) {
-        std::fprintf(stderr, "usage: mv-retro-host CORE.so SYSTEM_DIR [GAME] --frames N [--png-every K DIR] [--press BUTTON@FROM-TO ...] [--option KEY=VALUE ...] [--wav FILE] [--frontend-ms N] [--realtime]\n");
+        std::fprintf(stderr, "usage: mv-retro-host CORE.so SYSTEM_DIR [GAME] --frames N [--png-every K DIR [--png-from N --png-to M]] [--press BUTTON@FROM-TO ...] [--option KEY=VALUE ...] [--wav FILE] [--frontend-ms N] [--realtime]\n");
         return 2;
     }
     const char* core_path = argv[1];
     system_dir = argv[2];
     std::string game;
-    unsigned frames = 600, png_every = 0;
+    unsigned frames = 600, png_every = 0, png_from = 0, png_to = ~0u;  // --png-from/--png-to: every frame in [from, to] too
     double frontend_ms = 0;  // --frontend-ms N: time a frontend spends presenting each frame, spent here as a sleep
     bool realtime = false;  // --realtime: call retro_run no faster than the core's frame rate, as a frontend synced to the display does
     std::filesystem::path png_dir;
     for (int i = 3; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--frames" && i + 1 < argc) frames = static_cast<unsigned>(std::atoi(argv[++i]));
+        else if (a == "--png-from" && i + 1 < argc) png_from = static_cast<unsigned>(std::atoi(argv[++i]));
+        else if (a == "--png-to" && i + 1 < argc) png_to = static_cast<unsigned>(std::atoi(argv[++i]));
         else if (a == "--png-every" && i + 2 < argc) {
             png_every = static_cast<unsigned>(std::atoi(argv[++i]));
             png_dir = argv[++i];
@@ -243,7 +245,7 @@ int main(int argc, char** argv) {
         over17 += call_ms > 1000.0 / 60.0;
         over33 += call_ms > 2000.0 / 60.0;
         ++audio_per_call[audio_this_call];
-        if (png_every && (current_frame + 1) % png_every == 0) save_png(png_dir / std::format("frame-{:06}.png", current_frame + 1));
+        if (png_every && ((current_frame + 1) % png_every == 0 || (png_from && current_frame + 1 >= png_from && current_frame + 1 <= png_to))) save_png(png_dir / std::format("frame-{:06}.png", current_frame + 1));
         if (frontend_ms > 0) std::this_thread::sleep_for(std::chrono::duration<double, std::milli>(frontend_ms));
         if (realtime) std::this_thread::sleep_until(t0 + std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>((current_frame + 1) / av.timing.fps)));
     }
