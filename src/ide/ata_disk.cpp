@@ -517,6 +517,7 @@ void AtapiCdrom::hardware_reset() {
 bool AtapiCdrom::spinning_up() const { return channel_ && channel_->scheduler().now() < ready_at_; }
 
 void AtapiCdrom::reset() {
+    drop_read();
     tf_.error = 0x01;
     tf_.sector_count = 1;
     tf_.lba_low = 1;
@@ -598,6 +599,14 @@ Cycles AtapiCdrom::start_command(u8 command) {
     }
 }
 
+// A read begun on the image's thread whose data phase never came (a reset, another command): collected and dropped.
+void AtapiCdrom::drop_read() {
+    if (!read_in_flight_) return;
+    read_in_flight_ = false;
+    std::vector<u8> unused;
+    disc_->end_read(unused);
+}
+
 void AtapiCdrom::finish_ok() {
     tf_.status = ata::kStatusDrdy;
     tf_.error = 0;
@@ -618,6 +627,7 @@ void AtapiCdrom::check_condition(u8 sense_key, u8 asc, u8 ascq) {
 }
 
 void AtapiCdrom::data_in(const u8* data, u32 len, Cycles latency) {
+    drop_read();
     if (latency == 0) latency = kCommandLatency;
     if (dma_) {
         // A DMA data phase: the bytes move through the bus master once the host starts its engine. No byte count,
@@ -809,13 +819,28 @@ void AtapiCdrom::read_sectors(u64 lba, u32 count) {
         check_condition(0x05, 0x21, 0x00);  // illegal request: logical block address out of range
         return;
     }
-    std::vector<u8> data(static_cast<std::size_t>(count) * DvdImage::kSectorSize);
+    sectors_read_ += count;
+    const u32 bytes = count * DvdImage::kSectorSize;
+    const Cycles latency = kCommandLatency + cycles_from_ns(static_cast<u64>(bytes) * kDvdNsPerByte);
+    if (dma_) {
+        // The sectors are read on the image's thread while the drive's time runs, and collected when the bus master
+        // starts the data phase.
+        drop_read();
+        disc_->begin_read(lba, count);
+        read_in_flight_ = true;
+        buffer_.clear();
+        buffer_pos_ = 0;
+        tf_.status = ata::kStatusBsy;
+        pending_ = Pending::DmaData;
+        channel_->schedule(*this, latency);
+        return;
+    }
+    std::vector<u8> data(bytes);
     if (!disc_->read(lba, count, data.data())) {
         check_condition(0x03, 0x11, 0x00);  // medium error: unrecovered read error
         return;
     }
-    sectors_read_ += count;
-    data_in(data.data(), static_cast<u32>(data.size()), kCommandLatency + cycles_from_ns(static_cast<u64>(data.size()) * kDvdNsPerByte));
+    data_in(data.data(), bytes, latency);
 }
 
 // READ DVD STRUCTURE: a 4-byte header (the data length that follows, plus 2) and the structure. Format 0x00 is the
@@ -929,6 +954,15 @@ void AtapiCdrom::continue_command() {
             break;
         case Pending::DmaData: {
             if (!channel_->dma_active()) return;  // the engine starts us again
+            if (read_in_flight_) {
+                read_in_flight_ = false;
+                if (!disc_->end_read(buffer_)) {
+                    buffer_.clear();
+                    channel_->dma_complete(false);
+                    check_condition(0x03, 0x11, 0x00);  // medium error: unrecovered read error
+                    break;
+                }
+            }
             const bool ok = channel_->dma_transfer(buffer_.data(), nullptr, static_cast<u32>(buffer_.size()));
             buffer_.clear();
             channel_->dma_complete(ok);

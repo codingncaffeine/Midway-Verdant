@@ -135,6 +135,8 @@ private:
     u64 sectors_read_{0};
     u8 sense_key_{0}, asc_{0}, ascq_{0};
     bool dma_{false};  // the current PACKET command's data phase goes through the bus master (features bit 0)
+    bool read_in_flight_{false};  // a READ's sectors are on the image's thread until its DMA data phase begins
+    void drop_read();
     u64 packets_{0};
     Cycles ready_at_{cycles_from_ns(kSpinUpNs)};  // power-on is time 0
 };
