@@ -160,7 +160,7 @@ int main(int argc, char** argv) {
     if (const char* p = std::getenv("MV_ALLOW_PROFILER"); p && *p == '1') prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY, 0, 0, 0);
 #endif
     if (argc < 3) {
-        std::fprintf(stderr, "usage: mv-retro-host CORE.so SYSTEM_DIR [GAME] --frames N [--png-every K DIR] [--press BUTTON@FROM-TO ...] [--option KEY=VALUE ...] [--wav FILE] [--frontend-ms N]\n");
+        std::fprintf(stderr, "usage: mv-retro-host CORE.so SYSTEM_DIR [GAME] --frames N [--png-every K DIR] [--press BUTTON@FROM-TO ...] [--option KEY=VALUE ...] [--wav FILE] [--frontend-ms N] [--realtime]\n");
         return 2;
     }
     const char* core_path = argv[1];
@@ -168,6 +168,7 @@ int main(int argc, char** argv) {
     std::string game;
     unsigned frames = 600, png_every = 0;
     double frontend_ms = 0;  // --frontend-ms N: time a frontend spends presenting each frame, spent here as a sleep
+    bool realtime = false;  // --realtime: call retro_run no faster than the core's frame rate, as a frontend synced to the display does
     std::filesystem::path png_dir;
     for (int i = 3; i < argc; ++i) {
         const std::string a = argv[i];
@@ -186,6 +187,8 @@ int main(int argc, char** argv) {
                                static_cast<unsigned>(std::atoi(spec.c_str() + dash + 1))});
         } else if (a == "--frontend-ms" && i + 1 < argc) {
             frontend_ms = std::atof(argv[++i]);
+        } else if (a == "--realtime") {
+            realtime = true;
         } else if (a == "--wav" && i + 1 < argc) {
             wav_out = std::fopen(argv[++i], "wb");
             if (!wav_out) {
@@ -238,6 +241,7 @@ int main(int argc, char** argv) {
         ++audio_per_call[audio_this_call];
         if (png_every && (current_frame + 1) % png_every == 0) save_png(png_dir / std::format("frame-{:06}.png", current_frame + 1));
         if (frontend_ms > 0) std::this_thread::sleep_for(std::chrono::duration<double, std::milli>(frontend_ms));
+        if (realtime) std::this_thread::sleep_until(t0 + std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>((current_frame + 1) / av.timing.fps)));
     }
     const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     std::printf("ran %u frames in %.2f s (%.1f fps, slowest call %.1f ms); %llu video callbacks, last %ux%u; %llu audio frames, %llu non-zero samples\n", frames,
