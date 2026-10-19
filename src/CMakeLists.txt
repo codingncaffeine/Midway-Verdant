@@ -85,6 +85,11 @@ if(NOT WIN32)
   # Vulkan structures are filled sType-first with the rest zeroed: the idiom the API documents.
   set_source_files_properties(nv2a/vulkan/vk_device.cpp nv2a/vulkan/vk_renderer.cpp PROPERTIES COMPILE_OPTIONS "-Wno-missing-field-initializers;-Wno-old-style-cast")
 endif()
+# The x87 and SSE units run host floating point under the guest's rounding mode and read the exception flags back:
+# MSVC may move or fold float operations across those control-word changes unless the environment is honoured.
+if(MSVC)
+  set_source_files_properties(cpu/p6/fpu.cpp cpu/p6/simd.cpp PROPERTIES COMPILE_OPTIONS "/fp:strict")
+endif()
 # glslang's headers are not warning-clean under our flags; that one file is built with them as system headers.
 if(NOT MSVC)
   set_source_files_properties(nv2a/shaders/glsl_compiler.cpp PROPERTIES COMPILE_OPTIONS "-Wno-shadow;-Wno-conversion")
