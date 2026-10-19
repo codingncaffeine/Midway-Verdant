@@ -250,7 +250,18 @@ struct ShaderDumpSink : mv::pgraph::RenderSink {
             std::printf("texture %u: mode %u enabled %d format %08x (colour %02x dim %u cube %d levels %u %ux%u rect %ux%u pitch %u) at %08x filter %08x address %08x\n", t,
                         s.shader_stage_program(t), ts.enabled(), ts.format, ts.color_format(), ts.dimensionality(), ts.cubemap(), ts.mip_levels(), 1u << ts.log_width(),
                         1u << ts.log_height(), ts.rect_width(), ts.rect_height(), ts.pitch(), dma.base + ts.offset, ts.filter, ts.address);
+            // Its first 48 bytes as the replay's RAM holds them (a small texture's whole mip chain).
+            if (const mv::u8* bytes = replay->memory().at(dma.base + ts.offset, 48)) {
+                std::printf("   bytes:");
+                for (mv::u32 b = 0; b < 48; ++b) std::printf("%s%02x", b % 16 == 0 ? "  " : " ", bytes[b]);
+                std::printf("\n");
+            }
         }
+        std::printf("vertex arrays (format, offset):");
+        for (mv::u32 i = 0; i < 16; ++i)
+            if ((s.reg(mthd::kVertexDataArrayFormat + 4 * i) >> 4) & 0xFu)
+                std::printf(" v%u %08x@%08x", i, s.reg(mthd::kVertexDataArrayFormat + 4 * i), s.reg(mthd::kVertexDataArrayOffset + 4 * i));
+        std::printf("\n");
         std::printf("combiner control %08x; stage programs %08x; other stage input %08x\n", s.reg(mthd::kCombinerControl), s.reg(mthd::kShaderStageProgram), s.reg(mthd::kShaderOtherStageInput));
         for (mv::u32 i = 0; i < 8; ++i)
             std::printf("stage %u: colour icw %08x ocw %08x alpha icw %08x ocw %08x factor0 %08x factor1 %08x\n", i, s.reg(mthd::kCombinerColorIcw + 4 * i),

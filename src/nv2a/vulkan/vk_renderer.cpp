@@ -148,8 +148,8 @@ VulkanRenderer::VulkanRenderer(vk::Device& device, const HandleResolver& handles
         debug_shadow_pass_ = s.find("shadow1") != std::string::npos;
         debug_show_v0_ = s.find("showv0") != std::string::npos;
         debug_skip_blend_ = s.find("skipblend") != std::string::npos;
-        // drawid: every draw paints its index in the frame (red = low byte, green = high byte, blue = 1) wherever it
-        // writes colour: a flat white shader blended by the constant colour.
+        // drawid: every draw paints its number (the renderer's draw count, logged with the draw: red = bits 0-7,
+        // green = 8-15, blue = 16-23) wherever it writes colour: a flat white shader blended by the constant colour.
         debug_draw_id_ = s.find("drawid") != std::string::npos;
         debug_flip_front_ = s.find("flipfront") != std::string::npos;
         // ffdump: each new fixed-function shader's state words and lighting values, to stderr (the first 400).
@@ -1474,7 +1474,11 @@ const VulkanRenderer::TextureEntry* VulkanRenderer::texture(const KelvinState& s
         bool target = false;
         for (auto& [k2, surf] : surfaces_)
             target = target || (surf->phys < phys + length && phys < surf->phys + surf->bytes()) || (surf->zeta_phys < phys + length && phys < surf->zeta_phys + surf->zeta_bytes());
-        std::fprintf(stderr, "texlog: decode %08x format %02x %ux%u levels %u faces %u filter %08x%s\n", phys, ts.color_format(), d.width, d.height, d.levels, d.faces, ts.filter, target ? " (a render target)" : "");
+        std::string head;
+        if (const u8* src = MemoryView{ram_, ram_size_}.at(phys, 16))
+            for (u32 i = 0; i < 16; ++i) head += std::format(" {:02x}", src[i]);
+        std::fprintf(stderr, "texlog: decode %08x format %02x %ux%u levels %u faces %u filter %08x%s; bytes%s\n", phys, ts.color_format(), d.width, d.height, d.levels, d.faces, ts.filter,
+                     target ? " (a render target)" : "", head.c_str());
         // MV_RENDER_DEBUG=texlog,texdump: the first decode of each address, format and size as scratch/texdump/*.png.
         static const bool dump_all = std::getenv("MV_RENDER_DEBUG") && std::string_view(std::getenv("MV_RENDER_DEBUG")).find("texdump") != std::string_view::npos;
         // MV_TEXDUMP_EVERY=N: every Nth decode of each texture instead of only the first (named -N in decodes).
@@ -2206,7 +2210,9 @@ VkPipeline VulkanRenderer::clear_pipeline(VkRenderPass pass, VkColorComponentFla
 void VulkanRenderer::draw(const KelvinState& s, const DrawBatch& batch) {
     Timed timed(stats_.ns_draw);
     ++stats_.draws;
-    const u32 draw_id = frame_draws_++;
+    ++frame_draws_;
+    // The renderer's draw number since it started (unique across frames: the replay's frames and the flips differ).
+    const u32 draw_id = static_cast<u32>(stats_.draws);
     if (debug_draw_id_)
         std::fprintf(stderr,
                      "drawid %u: surface %08x, stages %05x, blend %u, %zu indices, %zu ranges, %zu inline words, %u immediate; program %u, depth test %u func %x write %u, "
@@ -2488,7 +2494,8 @@ void VulkanRenderer::draw(const KelvinState& s, const DrawBatch& batch) {
     if (debug_draw_id_) {
         constants[0] = static_cast<float>(draw_id & 0xFFu) / 255.0f;
         constants[1] = static_cast<float>((draw_id >> 8) & 0xFFu) / 255.0f;
-        constants[2] = constants[3] = 1.0f;
+        constants[2] = static_cast<float>((draw_id >> 16) & 0xFFu) / 255.0f;
+        constants[3] = 1.0f;
     }
     fn_->vkCmdSetBlendConstants(cb_, constants);
     fn_->vkCmdSetStencilReference(cb_, VK_STENCIL_FACE_FRONT_AND_BACK, s.reg(mthd::kStencilRef) & 0xFFu);

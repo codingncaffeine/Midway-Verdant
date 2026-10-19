@@ -532,17 +532,30 @@ Translation translate(const Key& key) {
                 break;
         }
     }
-    // MV_RENDER_DEBUG=white:N (a bit per stage, 1-15): those stages' results replaced by white, to find which stage
-    // carries an artefact.
+    // MV_RENDER_DEBUG=white:N / grey:N (a bit per stage, 1-15): those stages' results replaced by white (mid grey),
+    // to find which stage carries an artefact.
     {
-        static const u32 white = [] {
+        const auto mask = [](std::string_view name) {
             const char* d = std::getenv("MV_RENDER_DEBUG");
             const std::string_view v = d ? d : "";
-            const auto at = v.find("white:");
-            return at == std::string_view::npos ? 0u : static_cast<u32>(std::strtoul(v.data() + at + 6, nullptr, 10));
-        }();
-        for (u32 i = 0; i < 4; ++i)
+            const auto at = v.find(name);
+            return at == std::string_view::npos ? 0u : static_cast<u32>(std::strtoul(v.data() + at + name.size(), nullptr, 10));
+        };
+        static const u32 white = mask("white:"), grey = mask("grey:");
+        for (u32 i = 0; i < 4; ++i) {
             if (white & (1u << i)) g += std::format("    t{} = vec4(1.0);\n", i);
+            else if (grey & (1u << i)) g += std::format("    t{} = vec4(0.5);\n", i);
+        }
+        // showa:N / showc:N (a stage 0-3): the output is that stage's sampled alpha (colour), opaque.
+        const auto stage = [](std::string_view name) {
+            const char* d = std::getenv("MV_RENDER_DEBUG");
+            const std::string_view v = d ? d : "";
+            const auto at = v.find(name);
+            return at == std::string_view::npos ? -1 : static_cast<int>(std::strtoul(v.data() + at + name.size(), nullptr, 10) & 3u);
+        };
+        static const int show_a = stage("showa:"), show_c = stage("showc:");
+        if (show_a >= 0) g += std::format("    vec4 debug_show = vec4(t{}.aaa, 1.0);\n", show_a);
+        else if (show_c >= 0) g += std::format("    vec4 debug_show = vec4(t{}.rgb, 1.0);\n", show_c);
     }
     // The combiners' r0 starts with t0's alpha (NV_register_combiners: spare0 alpha = texture 0 alpha). With stage 0
     // set to none that is 0 here; the reference emulator uses 1 there, which no public source settles [verify].
@@ -617,6 +630,7 @@ Translation translate(const Key& key) {
             g += std::format("    if (!(round(clamp(final_color.a, 0.0, 1.0) * 255.0) {} round(alpha_ref.x * 255.0))) discard;\n", compare_op(func));
     }
     g += "    frag_color = clamp(final_color, 0.0, 1.0);\n";
+    if (g.find("vec4 debug_show") != std::string::npos) g += "    frag_color = debug_show;\n";
     g += "}\n";
     t.glsl = std::move(g);
     return t;
