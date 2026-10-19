@@ -56,6 +56,7 @@ public:
         u64 batch_flushes{0};  // batches submitted mid-frame because the rings or the descriptor pool were full
         u64 waits{0};          // times the CPU stopped for the GPU (a fence wait)
         u64 uniform_reuses{0};  // uniform blocks equal to the frame's last upload, bound where that lies
+        u64 descriptor_reuses{0};  // draws that kept the previous draw's descriptor set
         u64 surface_samples{0};  // textures bound straight to a render target's image
         // Where the time goes, in nanoseconds: the whole draw and its parts (the texture part includes the
         // write-backs a sample forces; the shader parts are the compiles, a lookup costs nothing measurable); the
@@ -173,6 +174,8 @@ private:
     // Whether a draw with these vertex and index sizes still fits the rings and the descriptor pool of the batch.
     bool fits_in_batch(VkDeviceSize vertex_bytes, VkDeviceSize index_bytes) const;
     u32 texture_phys(const KelvinState& s, const TextureStage& ts) const;
+    // Fills a new descriptor set: the two uniform blocks at their ring offsets and the four texture stages.
+    void write_descriptors(VkDescriptorSet set, VkDeviceSize uoffset_vs, VkDeviceSize uoffset_ps, const VkDescriptorImageInfo* imgs);
 
     vk::Device& dev_;
     const HandleResolver& handles_;
@@ -256,6 +259,15 @@ private:
         bool valid{false};
     };
     UniformUpload last_vs_upload_, last_ps_upload_;
+    // What the frame's last descriptor set binds, the set itself, and the set bound in the command buffer.
+    struct DescriptorKey {
+        VkDeviceSize vs_offset{0}, ps_offset{0};
+        std::array<VkImageView, 4> views{};
+        std::array<VkSampler, 4> samplers{};
+        bool operator==(const DescriptorKey&) const = default;
+    };
+    DescriptorKey last_set_key_;
+    VkDescriptorSet last_set_{VK_NULL_HANDLE}, bound_set_{VK_NULL_HANDLE};
     vk::Image dummy2d_, dummycube_, dummy3d_;
     VkSampler dummy_sampler_{VK_NULL_HANDLE};
     VkFormat depth24_{VK_FORMAT_D24_UNORM_S8_UINT};

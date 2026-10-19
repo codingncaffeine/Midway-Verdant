@@ -322,6 +322,7 @@ void VulkanRenderer::begin_frame(u32 slot) {
     descriptor_sets_used_ = 0;
     for (Ring* r : {&vertex_ring_, &index_ring_, &uniform_ring_, &staging_}) r->begin = r->cursor = r->region * slot;
     last_vs_upload_.valid = last_ps_upload_.valid = false;  // they lie in another frame's region
+    last_set_ = bound_set_ = VK_NULL_HANDLE;                // the pool was reset, and binding is per command buffer
     slot_ = slot;
     cb_ = fr.cb;
     f.vkResetCommandBuffer(cb_, 0);
@@ -1665,19 +1666,7 @@ void VulkanRenderer::draw(const KelvinState& s, const DrawBatch& batch) {
 
     stats_.ns_upload += ns_since(t_part);
     t_part = std::chrono::steady_clock::now();
-    // Descriptors.
-    VkDescriptorSetAllocateInfo dai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
-    dai.descriptorPool = frames_[slot_].pool;
-    dai.descriptorSetCount = 1;
-    dai.pSetLayouts = &set_layout_;
-    VkDescriptorSet set = VK_NULL_HANDLE;
-    if (fn_->vkAllocateDescriptorSets(dev_.device(), &dai, &set) != VK_SUCCESS) {
-        note("descriptor pool exhausted for this frame");
-        ++stats_.skipped;
-        return;
-    }
-    ++descriptor_sets_used_;
-    VkDescriptorBufferInfo bufs[2] = {{uniform_ring_.buffer.buffer, uoffset_vs, vsh::kUniformBytes}, {uniform_ring_.buffer.buffer, uoffset_ps, sizeof(psh::Uniforms)}};
+    // Descriptors: the frame's last set serves again when it binds the same uniform offsets, views and samplers.
     VkDescriptorImageInfo imgs[4]{};
     for (u32 i = 0; i < 4; ++i) {
         const TextureStage ts = s.texture(i);
@@ -1690,21 +1679,29 @@ void VulkanRenderer::draw(const KelvinState& s, const DrawBatch& batch) {
             imgs[i].sampler = dummy_sampler_;
         }
     }
-    VkWriteDescriptorSet writes[6]{};
-    for (u32 i = 0; i < 6; ++i) {
-        writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        writes[i].dstSet = set;
-        writes[i].dstBinding = i;
-        writes[i].descriptorCount = 1;
-        if (i < 2) {
-            writes[i].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-            writes[i].pBufferInfo = &bufs[i];
-        } else {
-            writes[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-            writes[i].pImageInfo = &imgs[i - 2];
-        }
+    DescriptorKey dkey{uoffset_vs, uoffset_ps, {}, {}};
+    for (u32 i = 0; i < 4; ++i) {
+        dkey.views[i] = imgs[i].imageView;
+        dkey.samplers[i] = imgs[i].sampler;
     }
-    fn_->vkUpdateDescriptorSets(dev_.device(), 6, writes, 0, nullptr);
+    VkDescriptorSet set = last_set_;
+    if (set != VK_NULL_HANDLE && dkey == last_set_key_) {
+        ++stats_.descriptor_reuses;
+    } else {
+        VkDescriptorSetAllocateInfo dai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        dai.descriptorPool = frames_[slot_].pool;
+        dai.descriptorSetCount = 1;
+        dai.pSetLayouts = &set_layout_;
+        if (fn_->vkAllocateDescriptorSets(dev_.device(), &dai, &set) != VK_SUCCESS) {
+            note("descriptor pool exhausted for this frame");
+            ++stats_.skipped;
+            return;
+        }
+        ++descriptor_sets_used_;
+        write_descriptors(set, uoffset_vs, uoffset_ps, imgs);
+        last_set_ = set;
+        last_set_key_ = dkey;
+    }
 
     stats_.ns_descriptors += ns_since(t_part);
     t_part = std::chrono::steady_clock::now();
@@ -1713,7 +1710,11 @@ void VulkanRenderer::draw(const KelvinState& s, const DrawBatch& batch) {
     if (s.color_mask() != 0) t->dirty = true;
     ++t->draws_this_frame;
     fn_->vkCmdBindPipeline(cb_, VK_PIPELINE_BIND_POINT_GRAPHICS, p);
-    fn_->vkCmdBindDescriptorSets(cb_, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout_, 0, 1, &set, 0, nullptr);
+    // A bound set stays bound across pipelines (they share one layout) and passes, for the whole command buffer.
+    if (set != bound_set_) {
+        fn_->vkCmdBindDescriptorSets(cb_, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout_, 0, 1, &set, 0, nullptr);
+        bound_set_ = set;
+    }
     VkViewport viewport{0.0f, 0.0f, static_cast<float>(t->width), static_cast<float>(t->height), 0.0f, 1.0f};
     fn_->vkCmdSetViewport(cb_, 0, 1, &viewport);
     const SurfaceState sd = s.surface();
@@ -1741,6 +1742,25 @@ void VulkanRenderer::draw(const KelvinState& s, const DrawBatch& batch) {
         fn_->vkCmdDraw(cb_, v.count, 1, 0, 0);
     }
     stats_.ns_record += ns_since(t_part);
+}
+
+void VulkanRenderer::write_descriptors(VkDescriptorSet set, VkDeviceSize uoffset_vs, VkDeviceSize uoffset_ps, const VkDescriptorImageInfo* imgs) {
+    VkDescriptorBufferInfo bufs[2] = {{uniform_ring_.buffer.buffer, uoffset_vs, vsh::kUniformBytes}, {uniform_ring_.buffer.buffer, uoffset_ps, sizeof(psh::Uniforms)}};
+    VkWriteDescriptorSet writes[6]{};
+    for (u32 i = 0; i < 6; ++i) {
+        writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[i].dstSet = set;
+        writes[i].dstBinding = i;
+        writes[i].descriptorCount = 1;
+        if (i < 2) {
+            writes[i].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+            writes[i].pBufferInfo = &bufs[i];
+        } else {
+            writes[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            writes[i].pImageInfo = &imgs[i - 2];
+        }
+    }
+    fn_->vkUpdateDescriptorSets(dev_.device(), 6, writes, 0, nullptr);
 }
 
 // Nothing on the CPU reads the frame's results here: the semaphore's value is the guest's, and the pixels reach RAM
