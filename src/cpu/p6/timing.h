@@ -72,6 +72,8 @@ public:
     u64 cache_hash() const;
     // The data cache's most-recently-used lines (see Cache::mru_) for the recompiler.
     const u32* l1d_mru() const { return l1d_.mru_.data(); }
+    const u32* l1i_mru() const { return l1i_.mru_.data(); }
+    unsigned l1i_sets() const { return l1i_.sets_; }
     unsigned l1d_sets() const { return l1d_.sets_; }
     const TimingStats& stats() const { return stats_; }
     // Block timing (D26): an ideal pipeline (code and data hit L1, branches are predicted) that schedules a translated

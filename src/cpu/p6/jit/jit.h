@@ -30,7 +30,7 @@ struct JitCtx {
     u8 exit;               // 60: leave after the current instruction (1), or hand the rest of the block to the
                            //     interpreter after it (2: a penalty may make a later boundary reach the limit)
     u8 pad[3];             // 61
-    u64 scratch[6];        // 64
+    u64 scratch[12];       // 64: slots for the generated code (see jit_x64.cpp)
     std::exception_ptr* error;  // where a helper leaves what the interpreter threw (an unimplemented form)
     u64* helper_ops;  // statistics: the interpreter's instructions by operation
     // Chains (used by C++ only): the current block's entry EIP; whether its exit was already costed and the cycle it
@@ -42,6 +42,7 @@ struct JitCtx {
     u64 insns_done;
     u32 chain_budget;
     Block::Link* last_slot;
+    u32 last_target;
     u64 penalties;
 };
 
@@ -59,7 +60,7 @@ public:
     bool available() const { return buffer_ != nullptr; }
     // Translate `b` for the machine as it is now (its entry EIP, segments, write tracking). False if it cannot
     // be (the block stays interpreted).
-    bool compile(Block& b, Cpu& cpu);
+    bool compile(Block& b, Cpu& cpu, BlockEngine& engine);
     // Whether `b`'s native code may run from the current state.
     static bool eligible(const Block& b, Cpu& cpu);
     using Fn = u32 (*)(JitCtx*);

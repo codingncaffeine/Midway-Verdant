@@ -147,6 +147,8 @@ public:
     // The recompiler's slow paths hand their cache and device penalties to the run directly.
     void add_penalty(u64 c) { penalty_ += c; }
     bool penalty_pending() const { return penalty_ != 0 || device_cycles_ != 0; }
+    const u64* penalty_word() const { return &penalty_; }
+    const u64* device_cycles_word() const { return &device_cycles_; }
 
 private:
 

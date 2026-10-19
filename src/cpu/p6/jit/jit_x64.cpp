@@ -89,7 +89,17 @@ static_assert(offsetof(CpuState, lazy_size) == offsetof(CpuState, lazy_op) + 1 &
 constexpr i32 kCtxSt = static_cast<i32>(offsetof(JitCtx, st));
 constexpr i32 kCtxExit = static_cast<i32>(offsetof(JitCtx, exit));
 constexpr i32 kCtxScratch = static_cast<i32>(offsetof(JitCtx, scratch));
-constexpr i32 kCtxHostCw = kCtxScratch + 40, kCtxDefCw = kCtxScratch + 42, kCtxEa = kCtxScratch + 44;  // u16, u16, u32
+constexpr i32 kCtxBase = static_cast<i32>(offsetof(JitCtx, base)), kCtxLimit = static_cast<i32>(offsetof(JitCtx, limit));
+constexpr i32 kCtxBlock = static_cast<i32>(offsetof(JitCtx, block)), kCtxBudget = static_cast<i32>(offsetof(JitCtx, chain_budget));
+constexpr i32 kCtxInsnsDone = static_cast<i32>(offsetof(JitCtx, insns_done)), kCtxEntryEip = static_cast<i32>(offsetof(JitCtx, entry_eip));
+constexpr i32 kCtxEnded = static_cast<i32>(offsetof(JitCtx, ended));
+// The scratch slots, one owner each: the cache call's saved RSI RAX RDI; INC/DEC's CF; a new ESP; a computed
+// address or target; the x87 control words (the guest's for the host, C++'s); two pairs of saved RSI/RDI (an
+// instruction with two accesses) or DIV's operands.
+constexpr i32 slot(unsigned n) { return kCtxScratch + static_cast<i32>(8 * n); }
+constexpr i32 kSaveRsi = slot(0), kSaveRax = slot(1), kSaveRdi = slot(2), kIncCf = slot(3), kNewEsp = slot(4), kCtxEa = slot(5);
+constexpr i32 kCtxHostCw = slot(6), kCtxDefCw = slot(6) + 2;
+constexpr i32 kTmp0 = slot(7), kTmp1 = slot(8), kTmp2 = slot(9), kTmp3 = slot(10);
 constexpr i32 kCr0Off = static_cast<i32>(offsetof(CpuState, cr0));
 constexpr i32 kFpuOff = static_cast<i32>(offsetof(CpuState, fpu));
 constexpr i32 kSt0 = kFpuOff + static_cast<i32>(offsetof(FpuState, st));
@@ -177,6 +187,7 @@ void h_cache(JitCtx* c, u32 phys, u32 arg) {
 // on (the next block's native code, or null: back to the dispatcher).
 void* h_chain(JitCtx* c, Block::Link* slot) { return c->engine->chain(*c, slot); }
 
+void h_materialise(CpuState* s) { s->materialise(); }
 u32 h_cf(const CpuState* s) { return s->cf() ? 1u : 0u; }
 u32 h_cond(const Cpu* cpu, u32 cc) { return cpu->condition(static_cast<u8>(cc)) ? 1u : 0u; }
 
@@ -190,7 +201,7 @@ bool uses_cf(u8 cc) { return (cc >> 1) == 1 || (cc >> 1) == 3; }  // B/AE, BE/A
 
 class Translator {
 public:
-    Translator(Block& b, Cpu& cpu) : b_(b), cpu_(cpu), st_(cpu.state()) {}
+    Translator(Block& b, Cpu& cpu, BlockEngine::NativeView ev) : b_(b), cpu_(cpu), st_(cpu.state()), ev_(ev) {}
     Asm a;
     std::size_t body{0};  // where the block's own code starts, past the prologue (chains enter there)
 
@@ -230,6 +241,7 @@ private:
     Block& b_;
     Cpu& cpu_;
     const CpuState& st_;
+    BlockEngine::NativeView ev_;
     Label epilogue_;
     std::vector<Stub> stubs_;
     Known known_{Known::Unknown};
@@ -312,6 +324,13 @@ private:
     void end(unsigned i, u64 eip, unsigned slot) {
         x87_leave();
         if (eip != kNoEip) a.mov_imm(4, st_at(kEipOff), static_cast<u32>(eip));
+        Label slow = a.label();
+        const BranchKind kind = b_.branch;
+        const bool inline_chain = eip != kNoEip && (kind == BranchKind::None || kind == BranchKind::Conditional || kind == BranchKind::Direct ||
+                                                     kind == BranchKind::Call);
+        // Taken as the engine counts it: a jump to the next instruction is not taken.
+        if (inline_chain) chain_inline(static_cast<u32>(eip), slot, static_cast<u32>(eip) != next_eip(b_.n - 1u), slow);
+        a.bind(slow);
         a.mov(8, kArg0, kCtx);
         a.mov64(kArg1, reinterpret_cast<u64>(&b_.links[slot]));
         a.call_abs(reinterpret_cast<const void*>(&h_chain));
@@ -322,6 +341,152 @@ private:
         a.bind(back);
         a.mov32(rax, (i << 2) | kJitEnd);
         a.jmp(epilogue_);
+    }
+    // BlockEngine::chain's common case in the block's own code: the exit's prediction worked out without committing,
+    // every condition of a chain checked (the link, the next block's translation, the budget, the limit with the
+    // slowest fetch, no device write into code, no penalty pending, the fetch translation, the fetch's lines being
+    // the most recent of their sets: no cache state to change); then the predictor, the statistics and the run
+    // move on and the next block's code is entered. Anything else goes to `slow`, where the engine does it all.
+    void chain_inline(u32 target, unsigned slot, bool taken, Label slow) {
+        static const i32 kEntry = [] {
+            static const Block probe;
+            return static_cast<i32>(reinterpret_cast<const u8*>(&probe.entry) - reinterpret_cast<const u8*>(&probe));
+        }();
+        const i32 eBody = kEntry + static_cast<i32>(offsetof(Block::Entry, body));
+        const i32 eHost = kEntry + static_cast<i32>(offsetof(Block::Entry, host_page));
+        const i32 eRuns = kEntry + static_cast<i32>(offsetof(Block::Entry, runs));
+        const i32 eCycles = kEntry + static_cast<i32>(offsetof(Block::Entry, cycles));
+        const i32 eLine = kEntry + static_cast<i32>(offsetof(Block::Entry, fetch_line));
+        const i32 eLines = kEntry + static_cast<i32>(offsetof(Block::Entry, fetch_lines));
+        const i32 eEip = kEntry + static_cast<i32>(offsetof(Block::Entry, jit_eip));
+        const BranchKind kind = b_.branch;
+        // R11 = the link, RCX = the next block, RDX = its entry.
+        a.mov64(r11, reinterpret_cast<u64>(&b_.links[slot]));
+        a.mov(8, rcx, mem(r11, static_cast<i32>(offsetof(Block::Link, to))));
+        a.test(8, rcx, rcx);
+        a.jcc(E, slow);
+        a.mov64(rax, reinterpret_cast<u64>(ev_.link_epoch));
+        a.mov(4, rax, mem(rax));
+        a.alu(4, 7, rax, mem(r11, static_cast<i32>(offsetof(Block::Link, epoch))));
+        a.jcc(NE, slow);
+        a.mov(8, rdx, mem(rcx, eBody));
+        a.test(8, rdx, rdx);
+        a.jcc(E, slow);
+        a.alu_imm(4, 7, mem(rcx, eEip), target);  // the next block is the target's (a link is only a hint)
+        a.jcc(NE, slow);
+        a.alu_imm(4, 7, ctx_at(kCtxBudget), 0);
+        a.jcc(E, slow);
+        // R8D = 1 on a mispredict; R9D = the conditional predictor's new state.
+        if (kind == BranchKind::Conditional) {
+            a.movzx(r9, 1, mem_abs(r10, &b_.exit_counter));
+            a.mov32(r8, 0);
+            a.alu_imm(4, 7, r9, 2);
+            a.setcc(taken ? B : AE, r8);  // taken: predicted not taken below 2; not taken: predicted taken from 2
+            if (taken) {
+                a.lea(4, rax, mem(r9, 1));
+                a.mov32(rsi, 3);
+                a.alu(4, 7, rax, rsi);
+                a.cmov(4, A, rax, rsi);
+                a.mov(4, r9, rax);
+            } else {
+                a.lea(4, rax, mem(r9, -1));
+                a.test(4, r9, r9);
+                a.cmov(4, NE, r9, rax);
+            }
+        } else if (kind == BranchKind::Direct || kind == BranchKind::Call) {
+            a.movzx(r8, 1, mem_abs(r10, &b_.exit_seen));
+            a.alu_imm(4, 6, r8, 1);
+        } else {
+            a.mov32(r8, 0);
+        }
+        // R10 = the cycle the block ends at.
+        a.lea(4, rax, mem(r8, r8, 1, 0));
+        a.shift_imm(4, 4, rax, 2);  // x12
+        static_assert(tp::kBlockMispredict == 12);
+        a.mov(8, r10, ctx_at(kCtxBase));
+        a.alu(8, 0, r10, rax);
+        a.alu_imm(8, 0, r10, b_.cycles);
+        // The limit with the slowest fetch.
+        a.mov(4, rax, mem(rcx, eCycles));
+        a.alu(8, 0, rax, r10);
+        a.alu_imm(8, 0, rax, tp::kL2Latency + tp::kDramLatency);
+        a.alu(8, 7, rax, ctx_at(kCtxLimit));
+        a.jcc(AE, slow);
+        // Nothing pending: a device\x27s write into code, a penalty not yet charged.
+        a.mov64(rax, reinterpret_cast<u64>(cpu_.memory().bus().code_pending_byte()));
+        a.alu_imm(1, 7, mem(rax), 0);
+        a.jcc(NE, slow);
+        a.mov64(rax, reinterpret_cast<u64>(cpu_.memory().penalty_word()));
+        a.alu_imm(8, 7, mem(rax), 0);
+        a.jcc(NE, slow);
+        a.mov64(rax, reinterpret_cast<u64>(cpu_.memory().device_cycles_word()));
+        a.alu_imm(8, 7, mem(rax), 0);
+        a.jcc(NE, slow);
+        // The fetch translation: a TLB hit on the next block\x27s page (the linear address is the target: flat CS).
+        const u32 lin = st_.seg[kCs].base + target;
+        const i32 tlb = static_cast<i32>(((lin >> 12) & (Memory::kTlbSize - 1)) * 32);
+        a.alu_imm(4, 7, mem(kTlb, tlb), lin >> 12);
+        a.jcc(NE, slow);
+        a.mov(8, rax, mem(kTlb, tlb + 8));
+        a.alu(8, 7, rax, mem(rcx, eHost));
+        a.jcc(NE, slow);
+        // The fetch: one or two lines, each its set\x27s most recent in L1I (else the model has work: the engine\x27s).
+        const unsigned isets = cpu_.cache_timing().l1i_sets();
+        a.mov64(rax, reinterpret_cast<u64>(cpu_.cache_timing().l1i_mru()));
+        a.movzx(rdi, 1, mem(rcx, eLines));
+        a.alu_imm(4, 7, rdi, 2);
+        a.jcc(A, slow);
+        a.mov(4, rsi, mem(rcx, eLine));
+        a.lea(4, rdi, mem(rsi, -1));
+        a.alu_imm(4, 4, rdi, isets - 1);
+        a.alu(4, 7, rsi, mem(rax, rdi, 2, 0));
+        a.jcc(NE, slow);
+        Label one = a.label();
+        a.alu_imm(1, 7, mem(rcx, eLines), 1);
+        a.jcc(E, one);
+        a.lea(4, rdi, mem(rsi, 0));
+        a.alu_imm(4, 4, rdi, isets - 1);
+        a.lea(4, rsi, mem(rsi, 1));
+        a.alu(4, 7, rsi, mem(rax, rdi, 2, 0));
+        a.jcc(NE, slow);
+        a.bind(one);
+        // ---- committed from here ----
+        if (kind == BranchKind::Conditional) a.mov(1, mem_abs(rax, &b_.exit_counter), r9);
+        if (kind != BranchKind::None) {
+            a.mov_imm(1, mem_abs(rax, &b_.exit_seen), 1);
+            a.mov_imm(4, mem_abs(rax, &b_.exit_target), target);
+        }
+        if (kind == BranchKind::Call) {
+            a.mov64(rax, reinterpret_cast<u64>(ev_.rsb_top));
+            a.mov(4, rsi, mem(rax));
+            a.mov64(rdi, reinterpret_cast<u64>(ev_.rsb));
+            a.mov_imm(4, mem(rdi, rsi, 2, 0), next_eip(b_.n - 1u));
+            a.lea(4, rsi, mem(rsi, 1));
+            a.alu_imm(4, 4, rsi, 15);
+            a.mov(4, mem(rax), rsi);
+        }
+        a.mov64(rax, reinterpret_cast<u64>(ev_.stats));
+        a.alu(8, 0, mem(rax, static_cast<i32>(offsetof(BlockStats, mispredicts))), r8);
+        a.lea(4, rsi, mem(r8, r8, 1, 0));
+        a.shift_imm(4, 4, rsi, 2);
+        a.alu(8, 0, mem(rax, static_cast<i32>(offsetof(BlockStats, exit_cycles))), rsi);
+        a.alu_imm(8, 0, mem(rax, static_cast<i32>(offsetof(BlockStats, schedule_cycles))), b_.cycles);
+        a.alu_imm(8, 0, mem(rax, static_cast<i32>(offsetof(BlockStats, whole_runs))), 1);
+        a.alu_imm(8, 0, mem(rax, static_cast<i32>(offsetof(BlockStats, chains))), 1);
+        a.alu_imm(8, 0, mem(rax, static_cast<i32>(offsetof(BlockStats, block_insns))), b_.n);
+        a.alu_imm(4, 5, ctx_at(kCtxBudget), 1);
+        a.alu_imm(8, 0, ctx_at(kCtxInsnsDone), b_.n);
+        a.mov(8, ctx_at(kCtxBase), r10);
+        a.mov(8, ctx_at(kCtxBlock), rcx);
+        a.mov_imm(4, ctx_at(kCtxEntryEip), target);
+        a.mov_imm(1, ctx_at(kCtxEnded), 0);
+        a.alu_imm(8, 0, mem(rcx, eRuns), 1);
+        a.jmp(rdx);
+    }
+    // A memory operand at an absolute host address (through `scratch`, loaded first).
+    Mem mem_abs(Reg scratch, const void* p) {
+        a.mov64(scratch, reinterpret_cast<u64>(p));
+        return mem(scratch);
     }
     void leave(unsigned i, u32 eip, u32 kind) {
         a.mov_imm(4, st_at(kEipOff), eip);
@@ -428,16 +593,16 @@ private:
         // MV_JIT_NO_MRU=1 sends every access through the full model (a control for the inline check).
         static const bool every_access = std::getenv("MV_JIT_NO_MRU") != nullptr;
         if (!every_access) a.jcc(E, hit);
-        a.mov(8, ctx_at(kCtxScratch), rsi);
-        a.mov(8, ctx_at(kCtxScratch + 8), rax);
-        a.mov(8, ctx_at(kCtxScratch + 32), rdi);
+        a.mov(8, ctx_at(kSaveRsi), rsi);
+        a.mov(8, ctx_at(kSaveRax), rax);
+        a.mov(8, ctx_at(kSaveRdi), rdi);
         a.mov(4, kArg1, rdi);
         a.mov(8, kArg0, kCtx);
         a.mov32(kArg2, (i << 8) | (store ? 1u : 0u));
         a.call_abs(reinterpret_cast<const void*>(&h_cache));
-        a.mov(8, rsi, ctx_at(kCtxScratch));
-        a.mov(8, rax, ctx_at(kCtxScratch + 8));
-        a.mov(8, rdi, ctx_at(kCtxScratch + 32));
+        a.mov(8, rsi, ctx_at(kSaveRsi));
+        a.mov(8, rax, ctx_at(kSaveRax));
+        a.mov(8, rdi, ctx_at(kSaveRdi));
         a.bind(hit);
     }
     void load_host(Reg dst, unsigned size) {
@@ -982,14 +1147,247 @@ private:
         return true;
     }
 
+    // CDQ/CWD and CWDE/CBW: no flags.
+    bool convert(unsigned i, const Insn& in) {
+        if (in.op == Op::Cwd) {
+            if (in.size == 4) {
+                a.mov(4, rax, greg(kEax, 4));
+                a.shift_imm(4, 7, rax, 31);
+                a.mov(4, greg(kEdx, 4), rax);
+            } else {
+                a.movsx(rax, 2, greg(kEax, 2));
+                a.shift_imm(4, 7, rax, 15);
+                a.mov(2, greg(kEdx, 2), rax);
+            }
+        } else {
+            if (in.size == 4) {
+                a.movsx(rax, 2, greg(kEax, 2));
+                a.mov(4, greg(kEax, 4), rax);
+            } else {
+                a.movsx(rax, 1, greg(kEax, 1));
+                a.mov(2, greg(kEax, 2), rax);
+            }
+        }
+        host_flags_ = host_cf_ = false;
+        finish(i, false);
+        return true;
+    }
+
+    // DIV/IDIV r/m32: a zero divisor or a quotient out of range is the interpreter's (#DE), found before any effect;
+    // the flags are left as they were (the interpreter only marks them undefined).
+    bool divide(unsigned i, const Insn& in, Label after) {
+        if (in.size != 4) return false;
+        const bool m = in.dst.kind == OpndKind::Mem;
+        if (!m && in.dst.kind != OpndKind::Reg) return false;
+        if (m && !segment_ok(in.mem_seg, 4, false)) return false;
+        const Label f = fallback(i, after);
+        if (m) {
+            effective_address(in);
+            access_checks(in.mem_seg, 4, false, f);
+            a.mov(4, rcx, mem(rsi));
+        } else {
+            a.mov(4, rcx, greg(in.dst.reg, 4));
+        }
+        a.test(4, rcx, rcx);
+        a.jcc(E, f);
+        a.mov(4, rax, greg(kEax, 4));
+        a.mov(4, rdx, greg(kEdx, 4));
+        if (in.op == Op::Div) {
+            a.alu(4, 7, rdx, rcx);  // EDX >= divisor: the quotient does not fit
+            a.jcc(AE, f);
+            if (m) {
+                a.mov(8, ctx_at(kTmp0), rcx);
+                cache(i, false);
+                a.mov(8, rcx, ctx_at(kTmp0));
+                a.mov(4, rax, greg(kEax, 4));
+                a.mov(4, rdx, greg(kEdx, 4));
+            }
+            a.op_rr(4, {0xF7}, 6, rcx);  // div ecx
+        } else {
+            // In 64 bits: EDX:EAX / sign-extended divisor; the quotient must fit 32 bits signed.
+            a.shift_imm(8, 4, rdx, 32);
+            a.alu(8, 1, rax, rdx);       // or rax, rdx: the 64-bit dividend
+            a.op_rr(8, {0x63}, rcx, rcx);  // movsxd rcx, ecx
+            a.mov64(rdx, 0x8000000000000000ull);
+            a.alu(8, 7, rax, rdx);
+            Label fine = a.label();
+            a.jcc(NE, fine);
+            a.alu_imm(8, 7, rcx, 0xFFFFFFFFu);  // INT64_MIN / -1
+            a.jcc(E, f);
+            a.bind(fine);
+            a.mov(8, ctx_at(kTmp0), rcx);
+            a.mov(8, ctx_at(kTmp1), rax);
+            a.byte(0x48);
+            a.byte(0x99);                  // cqo
+            a.op_rr(8, {0xF7}, 7, rcx);    // idiv rcx
+            a.op_rr(8, {0x63}, r9, rax);   // movsxd r9, eax
+            a.alu(8, 7, r9, rax);
+            a.jcc(NE, f);
+            if (m) {
+                cache(i, false);
+                a.mov(8, rcx, ctx_at(kTmp0));
+                a.mov(8, rax, ctx_at(kTmp1));
+                a.byte(0x48);
+                a.byte(0x99);
+                a.op_rr(8, {0xF7}, 7, rcx);
+            }
+        }
+        a.mov(4, greg(kEax, 4), rax);
+        a.mov(4, greg(kEdx, 4), rdx);
+        host_flags_ = host_cf_ = false;
+        finish(i, m);
+        return true;
+    }
+
+    // An indirect CALL or JMP through a register or memory (32-bit); CALL pushes the next EIP. The accesses in the
+    // interpreter's order: the target's read, then the push.
+    bool indirect(unsigned i, const Insn& in, Label after) {
+        if (!last(i) || in.size != 4) return false;
+        const bool m = in.dst.kind == OpndKind::Mem;
+        if (!m && in.dst.kind != OpndKind::Reg) return false;
+        const bool call = in.op == Op::CallRm;
+        if (m && !segment_ok(in.mem_seg, 4, false)) return false;
+        if (call && !segment_ok(kSs, 4, true)) return false;
+        const Label f = fallback(i, after);
+        if (m) {
+            effective_address(in);
+            access_checks(in.mem_seg, 4, false, f);
+            a.mov(8, ctx_at(kTmp0), rsi);
+            a.mov(8, ctx_at(kTmp1), rdi);
+        }
+        if (call) {
+            a.mov(4, rax, greg(kEsp, 4));
+            a.lea(4, rax, mem(rax, -4));
+            a.mov(4, ctx_at(kNewEsp), rax);
+            access_checks(kSs, 4, true, f);
+        }
+        if (m) {
+            a.mov(8, ctx_at(kTmp2), rsi);  // the stack slot (if any)
+            a.mov(8, ctx_at(kTmp3), rdi);
+            a.mov(8, rsi, ctx_at(kTmp0));
+            a.mov(8, rdi, ctx_at(kTmp1));
+            cache(i, false);
+            a.mov(4, rax, mem(rsi));
+            a.mov(4, ctx_at(kCtxEa), rax);  // the target
+            a.mov(8, rsi, ctx_at(kTmp2));
+            a.mov(8, rdi, ctx_at(kTmp3));
+        } else {
+            a.mov(4, rax, greg(in.dst.reg, 4));
+            a.mov(4, ctx_at(kCtxEa), rax);
+        }
+        if (call) {
+            cache(i, true);
+            a.mov_imm(4, mem(rsi), next_eip(i));
+            a.mov(4, rcx, ctx_at(kNewEsp));
+            a.mov(4, greg(kEsp, 4), rcx);
+        }
+        a.mov(4, rax, ctx_at(kCtxEa));
+        a.mov(4, st_at(kEipOff), rax);
+        end(i, kNoEip, 0);
+        return true;
+    }
+
+    // PUSH r/m32 from memory: the read, then the push.
+    bool push_mem(unsigned i, const Insn& in, Label after) {
+        const Opnd o = in.src.kind != OpndKind::None ? in.src : in.dst;
+        if (in.size != 4 || o.kind != OpndKind::Mem) return false;
+        if (!segment_ok(in.mem_seg, 4, false) || !segment_ok(kSs, 4, true)) return false;
+        const Label f = fallback(i, after);
+        effective_address(in);
+        access_checks(in.mem_seg, 4, false, f);
+        a.mov(8, ctx_at(kTmp0), rsi);
+        a.mov(8, ctx_at(kTmp1), rdi);
+        a.mov(4, rax, greg(kEsp, 4));
+        a.lea(4, rax, mem(rax, -4));
+        a.mov(4, ctx_at(kNewEsp), rax);
+        access_checks(kSs, 4, true, f);
+        a.mov(8, ctx_at(kTmp2), rsi);
+        a.mov(8, ctx_at(kTmp3), rdi);
+        a.mov(8, rsi, ctx_at(kTmp0));
+        a.mov(8, rdi, ctx_at(kTmp1));
+        cache(i, false);
+        a.mov(4, rax, mem(rsi));
+        a.mov(4, ctx_at(kCtxEa), rax);
+        a.mov(8, rsi, ctx_at(kTmp2));
+        a.mov(8, rdi, ctx_at(kTmp3));
+        cache(i, true);
+        a.mov(4, rax, ctx_at(kCtxEa));
+        a.mov(4, mem(rsi), rax);
+        a.mov(4, rcx, ctx_at(kNewEsp));
+        a.mov(4, greg(kEsp, 4), rcx);
+        host_flags_ = host_cf_ = false;
+        finish(i, true);
+        return true;
+    }
+
+    // LEAVE (32-bit): ESP = EBP + 4 after the read at SS:EBP; EBP = the value read.
+    bool leave_frame(unsigned i, const Insn& in, Label after) {
+        if (in.size != 4 || !segment_ok(kSs, 4, false)) return false;
+        const Label f = fallback(i, after);
+        a.mov(4, rax, greg(kEbp, 4));
+        a.mov(4, ctx_at(kNewEsp), rax);
+        access_checks(kSs, 4, false, f);
+        cache(i, false);
+        a.mov(4, rax, mem(rsi));
+        a.mov(4, rcx, ctx_at(kNewEsp));
+        a.lea(4, rcx, mem(rcx, 4));
+        a.mov(4, greg(kEsp, 4), rcx);
+        a.mov(4, greg(kEbp, 4), rax);
+        host_flags_ = host_cf_ = false;
+        finish(i, true);
+        return true;
+    }
+
+    // ROL/ROR by an immediate (register destination): the interpreter materialises the flags and sets CF and OF in
+    // them; a count of zero changes nothing.
+    bool rotate(unsigned i, const Insn& in) {
+        if (in.dst.kind != OpndKind::Reg || in.src.kind != OpndKind::Imm) return false;
+        const unsigned size = in.size, bits = size * 8;
+        const unsigned n = in.imm & 0x1F;
+        if (n == 0) {
+            finish(i, false);
+            return true;
+        }
+        a.mov(8, kArg0, kSt);
+        a.call_abs(reinterpret_cast<const void*>(&h_materialise));
+        load_greg(rax, in.dst.reg, size);
+        a.shift_imm(size, in.op == Op::Rol ? 0 : 1, rax, static_cast<u8>(n));  // the host rotates modulo the size
+        a.mov(size, greg(in.dst.reg, size), rax);
+        // CF and OF from the result: ROL: CF = bit 0, OF = msb ^ CF; ROR: CF = msb, OF = msb ^ the bit below it.
+        a.movzx(rcx, size == 4 ? 2 : size, rax);  // (only the low bits matter below)
+        if (size == 4) a.mov(4, rcx, rax);
+        a.mov(4, rdx, rcx);
+        if (in.op == Op::Rol) {
+            a.alu_imm(4, 4, rdx, 1);                                   // CF
+            a.shift_imm(4, 5, rcx, static_cast<u8>(bits - 1));
+            a.alu_imm(4, 4, rcx, 1);
+            a.alu(4, 6, rcx, rdx);                                     // OF = msb ^ CF
+        } else {
+            a.shift_imm(4, 5, rdx, static_cast<u8>(bits - 1));
+            a.alu_imm(4, 4, rdx, 1);                                   // CF = msb
+            a.shift_imm(4, 5, rcx, static_cast<u8>(bits - 2));
+            a.alu_imm(4, 4, rcx, 1);
+            a.alu(4, 6, rcx, rdx);                                     // OF = msb ^ next
+        }
+        a.shift_imm(4, 4, rcx, 11);
+        a.alu(4, 1, rcx, rdx);                                         // CF | OF << 11
+        a.mov(4, rax, st_at(kFlagsOff));
+        a.alu_imm(4, 4, rax, ~(fl::CF | fl::OF));
+        a.alu(4, 1, rax, rcx);
+        a.mov(4, st_at(kFlagsOff), rax);
+        known_ = Known::Unknown;
+        host_flags_ = host_cf_ = false;
+        finish(i, false);
+        return true;
+    }
+
     // ---- instructions ----
     bool native(unsigned i, Label after) {
         const Insn& in = b_.insns[i];
         if (in.lock && in.op != Op::Nop) return false;
         if (in.mem && in.adsize != 4) return false;
         switch (in.op) {
-            case Op::Nop: case Op::NopEv: case Op::Prefetch:
-                if (in.mem) return false;
+            case Op::Nop: case Op::NopEv: case Op::Prefetch:  // nothing at all, a memory operand included
                 if (last(i)) end(i, next_eip(i), 0);
                 return true;
             case Op::Mov: return mov(i, in, after);
@@ -998,7 +1396,7 @@ private:
             case Op::Add: case Op::Or: case Op::And: case Op::Sub: case Op::Xor: case Op::Cmp: case Op::Test: return alu(i, in, after);
             case Op::Inc: case Op::Dec: return incdec(i, in, after);
             case Op::Neg: case Op::Not: return negnot(i, in, after);
-            case Op::Push: return push(i, in, after);
+            case Op::Push: return push(i, in, after) || push_mem(i, in, after);
             case Op::Pop: return pop(i, in, after);
             case Op::Jcc: return jcc(i, in);
             case Op::Jmp: return jmp(i, in);
@@ -1009,6 +1407,11 @@ private:
             case Op::Xchg: return xchg(i, in);
             case Op::X87: return x87(i, in, after);
             case Op::Shl: case Op::Shr: case Op::Sar: return shift(i, in, after);
+            case Op::Rol: case Op::Ror: return rotate(i, in);
+            case Op::Cwd: case Op::Cbw: return convert(i, in);
+            case Op::Div: case Op::Idiv: return divide(i, in, after);
+            case Op::CallRm: case Op::JmpRm: return indirect(i, in, after);
+            case Op::Leave: return leave_frame(i, in, after);
             default: return false;
         }
     }
@@ -1158,7 +1561,7 @@ private:
         if (m && !segment_ok(in.mem_seg, size, true)) return false;
         // The CF the record keeps, from the flags before the instruction.
         cf_to_edx();
-        a.mov(1, ctx_at(kCtxScratch + 16), rdx);
+        a.mov(1, ctx_at(kIncCf), rdx);
         if (m) {
             const Label f = fallback(i, after);
             effective_address(in);
@@ -1182,7 +1585,7 @@ private:
         a.mov(4, st_at(kLazyR), rax);
         if (m) a.mov(size, mem(rsi), rax);
         else a.mov(size, greg(in.dst.reg, size), rax);
-        a.movzx(rcx, 1, ctx_at(kCtxScratch + 16));
+        a.movzx(rcx, 1, ctx_at(kIncCf));
         a.mov(1, st_at(kLazyC), rcx);
         a.mov_imm(2, st_at(kLazyOp), static_cast<u32>(LazyOp::Result) | (size << 8));
         known_ = Known::Result;
@@ -1238,13 +1641,13 @@ private:
         const Label f = fallback(i, after);
         a.mov(4, rax, greg(kEsp, 4));
         a.lea(4, rax, mem(rax, -4));
-        a.mov(4, ctx_at(kCtxScratch + 24), rax);  // the new ESP
+        a.mov(4, ctx_at(kNewEsp), rax);  // the new ESP
         access_checks(kSs, 4, true, f);
         if (o.kind == OpndKind::Reg) load_greg(rax, o.reg, 4);
         else a.mov32(rax, in.imm);
         cache(i, true);
         a.mov(4, mem(rsi), rax);
-        a.mov(4, rcx, ctx_at(kCtxScratch + 24));
+        a.mov(4, rcx, ctx_at(kNewEsp));
         a.mov(4, greg(kEsp, 4), rcx);
         host_flags_ = host_cf_ = false;
         finish(i, true);
@@ -1256,11 +1659,11 @@ private:
         if (!segment_ok(kSs, 4, false)) return false;
         const Label f = fallback(i, after);
         a.mov(4, rax, greg(kEsp, 4));
-        a.mov(4, ctx_at(kCtxScratch + 24), rax);
+        a.mov(4, ctx_at(kNewEsp), rax);
         access_checks(kSs, 4, false, f);
         cache(i, false);
         a.mov(4, rax, mem(rsi));
-        a.mov(4, rcx, ctx_at(kCtxScratch + 24));
+        a.mov(4, rcx, ctx_at(kNewEsp));
         a.lea(4, rcx, mem(rcx, 4));
         a.mov(4, greg(kEsp, 4), rcx);
         a.mov(4, greg(in.dst.reg, 4), rax);  // POP ESP: the popped value wins
@@ -1292,11 +1695,11 @@ private:
         const Label f = fallback(i, after);
         a.mov(4, rax, greg(kEsp, 4));
         a.lea(4, rax, mem(rax, -4));
-        a.mov(4, ctx_at(kCtxScratch + 24), rax);
+        a.mov(4, ctx_at(kNewEsp), rax);
         access_checks(kSs, 4, true, f);
         cache(i, true);
         a.mov_imm(4, mem(rsi), next_eip(i));
-        a.mov(4, rcx, ctx_at(kCtxScratch + 24));
+        a.mov(4, rcx, ctx_at(kNewEsp));
         a.mov(4, greg(kEsp, 4), rcx);
         end(i, static_cast<u32>(next_eip(i) + in.imm), 0);
         return true;
@@ -1305,12 +1708,12 @@ private:
         if (!last(i) || in.size != 4 || !segment_ok(kSs, 4, false)) return false;
         const Label f = fallback(i, after);
         a.mov(4, rax, greg(kEsp, 4));
-        a.mov(4, ctx_at(kCtxScratch + 24), rax);
+        a.mov(4, ctx_at(kNewEsp), rax);
         access_checks(kSs, 4, false, f);
         cache(i, false);
         a.mov(4, rax, mem(rsi));
         a.mov(4, st_at(kEipOff), rax);
-        a.mov(4, rcx, ctx_at(kCtxScratch + 24));
+        a.mov(4, rcx, ctx_at(kNewEsp));
         a.lea(4, rcx, mem(rcx, static_cast<i32>(4 + in.imm)));
         a.mov(4, greg(kEsp, 4), rcx);
         end(i, kNoEip, 0);
@@ -1352,19 +1755,20 @@ private:
 
 }  // namespace
 
-bool Jit::compile(Block& b, Cpu& cpu) {
+bool Jit::compile(Block& b, Cpu& cpu, BlockEngine& engine) {
     if (!buffer_ || b.rep || b.mode != 3) return false;
     b.jit_eip = cpu.state().eip;
     for (unsigned g = 0; g < kSegCount; ++g) b.jit_seg[g] = cpu.state().seg[g];
     b.jit_dirty = cpu.memory().dirty_tracking();
-    Translator t(b, cpu);
+    Translator t(b, cpu, engine.native_view());
     t.run();
     if (!t.a.finish()) return false;
     const std::size_t n = t.a.code.size();
     if (used_ + n > capacity_) return false;
     std::memcpy(buffer_ + used_, t.a.code.data(), n);
     b.native = buffer_ + used_;
-    b.native_body = buffer_ + used_ + t.body;
+    b.entry.body = buffer_ + used_ + t.body;
+    b.entry.jit_eip = b.jit_eip;
     used_ += (n + 15) & ~std::size_t{15};
     ++compiled_;
     return true;
@@ -1372,7 +1776,7 @@ bool Jit::compile(Block& b, Cpu& cpu) {
 
 #else  // no x86-64 host: blocks stay interpreted
 
-bool Jit::compile(Block&, Cpu&) { return false; }
+bool Jit::compile(Block&, Cpu&, BlockEngine&) { return false; }
 
 #endif
 

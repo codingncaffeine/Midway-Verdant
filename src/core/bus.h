@@ -99,6 +99,8 @@ public:
     // The code-page bitmap as plain words (the recompiler's generated code tests it).
     const u64* code_map() const { return reinterpret_cast<const u64*>(code_.get()); }
     bool code_writes_pending() const { return code_pending_.load(std::memory_order_acquire); }
+    // The pending flag's byte, for generated code (read with a plain load: x86 orders it as acquire).
+    const void* code_pending_byte() const { return &code_pending_; }
     void take_code_writes(std::vector<u32>& pages);
 
     // Unknown-access bookkeeping: (page, is_write) -> count; printed by the runner at the end.

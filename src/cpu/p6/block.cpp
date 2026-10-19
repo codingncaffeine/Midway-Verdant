@@ -1,6 +1,7 @@
 #include "cpu/p6/block.h"
 
 #include "cpu/p6/jit/jit.h"
+#include "debug/trace.h"
 #include "cpu/p6/timing.h"
 
 #include <algorithm>
@@ -166,6 +167,14 @@ Block* BlockEngine::build(const u8* page, unsigned off, u32 ram_page, u8 mode) {
     std::array<const Insn*, kMaxBlockInsns> list{};
     for (unsigned i = 0; i < b->n; ++i) list[i] = &b->insns[i];
     b->cycles = schedule_block(cpu_.scheduler(), list.data(), b->n, b->after.data());
+    b->entry.cycles = b->cycles;
+    b->entry.n = b->n;
+    b->entry.host_page = bus_.ram() + static_cast<std::size_t>(ram_page) * 4096u;
+    {
+        const PhysAddr code = static_cast<PhysAddr>(ram_page) * 4096u + static_cast<PhysAddr>(off);
+        b->entry.fetch_line = (code >> 5) + 1;
+        b->entry.fetch_lines = static_cast<u8>(((code + b->bytes - 1) >> 5) - (code >> 5) + 1);
+    }
     Block* raw = b.get();
     page_blocks_[ram_page].push_back(raw);
     bus_.set_code_page(ram_page, true);
@@ -177,10 +186,10 @@ Block* BlockEngine::build(const u8* page, unsigned off, u32 ram_page, u8 mode) {
 std::string BlockEngine::hottest(unsigned count) const {
     std::vector<const Block*> all;
     for (const auto& [k, b] : blocks_) all.push_back(b.get());
-    std::sort(all.begin(), all.end(), [](const Block* a, const Block* b) { return a->runs * a->cycles > b->runs * b->cycles; });
+    std::sort(all.begin(), all.end(), [](const Block* a, const Block* b) { return a->entry.runs * a->cycles > b->entry.runs * b->cycles; });
     std::string s;
     for (unsigned i = 0; i < count && i < all.size(); ++i)
-        s += std::format(" {:08x}x{}:{}c*{}", all[i]->lin, all[i]->n, all[i]->cycles, all[i]->runs);
+        s += std::format(" {:08x}x{}:{}c*{}", all[i]->lin, all[i]->n, all[i]->cycles, all[i]->entry.runs);
     return s;
 }
 
@@ -254,7 +263,7 @@ u32 BlockEngine::exit_cost(Block& b, u32 entry_eip) {
 }
 
 BlockEngine::Run BlockEngine::begin(Block& b, u64 limit) {
-    ++b.runs;
+    ++b.entry.runs;
     const PhysAddr code = static_cast<PhysAddr>(b.ram_page) * 4096u + b.page_off;
     // Penalties still pending (a page walk for the fetch, a delivery's stack) belong to the run from its start.
     const u64 pending = cpu_.memory().take_penalty();
@@ -323,26 +332,33 @@ unsigned BlockEngine::run(Block& b, u64 limit) {
     ++stats_.whole_runs;
     if (jit_ && !b.rep) {
         // Hot blocks are translated; a block whose assumptions no longer hold is translated again, a few times.
-        if (!b.native && !b.jit_failed && b.runs >= hot_) {
-            if (!jit_->compile(b, cpu_)) {
+        if (!b.native && !b.jit_failed && b.entry.runs >= hot_) {
+            if (!jit_->compile(b, cpu_, *this)) {
                 jit_->flush(*this);
-                if (!jit_->compile(b, cpu_)) b.jit_failed = true;
+                if (!jit_->compile(b, cpu_, *this)) b.jit_failed = true;
             }
             ++b.jit_compiles;
             ++link_epoch_;
         }
         // The last native exit's slot learns where it led, when a chain there could be valid (same snapshot).
         if (pending_slot_) {
-            if (b.native && b.jit_eip == r.entry_eip && b.jit_dirty == pending_from_->jit_dirty && same_segments(b, *pending_from_)) {
+            // Only the block the exit itself led to: an interrupt, a fault or a fallback step in between runs another.
+            if (b.native && b.jit_eip == r.entry_eip && r.entry_eip == pending_target_ && b.jit_dirty == pending_from_->jit_dirty &&
+                same_segments(b, *pending_from_) && b.jit_eip != idle_[0] && b.jit_eip != idle_[1]) {
                 pending_slot_->to = &b;
                 pending_slot_->epoch = link_epoch_;
+            }
+            else if (b.native && r.entry_eip != pending_target_) {
+                if (++stats_.links_refused <= 8)
+                    trace::log(trace::Cat::Cpu, "link refused: an exit of the block at {:08x} went to {:08x}, the next block run starts at {:08x}", pending_from_->lin,
+                               pending_target_, r.entry_eip);
             }
             pending_slot_ = nullptr;
         }
         if (b.native && r.start + r.extra + b.cycles < r.limit) {
             if (Jit::eligible(b, cpu_)) return run_native(r);
             ++stats_.native_ineligible;
-            if (b.jit_compiles < 4) b.native = nullptr;
+            if (b.jit_compiles < 4) b.native = b.entry.body = nullptr;
             else b.jit_failed = true;
             ++link_epoch_;
         }
@@ -401,6 +417,7 @@ unsigned BlockEngine::run_native(Run& r) {
         if (c.ended) {
             cpu_.set_cycles_only(c.end_cycles);  // the exit was costed where the chain stopped
             pending_slot_ = c.last_slot;
+            pending_target_ = c.last_target;
             pending_from_ = &b;
         } else {
             const u32 exit = exit_cost(b, c.entry_eip);
@@ -438,6 +455,7 @@ void* BlockEngine::chain(JitCtx& c, Block::Link* slot) {
     c.end_cycles = end;
     c.ended = 1;
     c.last_slot = slot;
+    c.last_target = cpu_.state().eip;
     Block* b = slot->to;
     if (!b || slot->epoch != link_epoch_ || !b->native || c.chain_budget == 0) return nullptr;
     const CpuState& s = cpu_.state();
@@ -449,7 +467,7 @@ void* BlockEngine::chain(JitCtx& c, Block::Link* slot) {
     const Memory::TlbEntry& e = cpu_.memory().tlb()[(lin >> 12) & (Memory::kTlbSize - 1)];
     if (e.tag != (lin >> 12) || !e.host || bus_.ram_page(e.host) != b->ram_page || (lin & 0xFFFu) != b->page_off) return nullptr;
     --c.chain_budget;
-    ++b->runs;
+    ++b->entry.runs;
     ++stats_.whole_runs;
     ++stats_.chains;
     stats_.block_insns += a.n;
@@ -461,7 +479,7 @@ void* BlockEngine::chain(JitCtx& c, Block::Link* slot) {
     c.ended = 0;
     running_ = b;
     cpu_.set_cycles_only(c.base);
-    return b->native_body;
+    return b->entry.body;
 }
 
 void BlockEngine::disable_jit() { jit_.reset(); }
@@ -469,8 +487,8 @@ void BlockEngine::disable_jit() { jit_.reset(); }
 void BlockEngine::drop_native() {
     ++link_epoch_;
     pending_slot_ = nullptr;
-    for (auto& [k, b] : blocks_) b->native = nullptr;
-    for (auto& b : graveyard_) b->native = nullptr;
+    for (auto& [k, b] : blocks_) b->native = b->entry.body = nullptr;
+    for (auto& b : graveyard_) b->native = b->entry.body = nullptr;
 }
 
 }  // namespace mv::p6

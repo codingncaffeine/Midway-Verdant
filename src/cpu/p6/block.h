@@ -46,7 +46,17 @@ struct Block {
     // limit and rights; native code never changes one, so a chain between blocks with equal snapshots needs no
     // check), whether write tracking was on.
     u32 jit_eip{0};
-    void* native_body{nullptr};  // past the prologue: where a chain from another block enters
+    // What a chain into this block reads (the generated code addresses it through a link: plain data, fixed layout).
+    struct Entry {
+        void* body{nullptr};          // past the prologue of the native code: where a chain enters (null: none)
+        const u8* host_page{nullptr};  // the code's RAM page on the host (the fetch translation must still give it)
+        u64 runs{0};
+        u32 cycles{0};                 // the schedule's total (a copy)
+        u32 fetch_line{0};             // the first code line (physical address / 32) plus one, as the L1I MRU keeps it
+        u8 fetch_lines{0};             // lines the code spans
+        u8 n{0};
+        u32 jit_eip{0};                // the EIP the native code was made for (a copy)
+    } entry;
     // Where each exit of the final instruction went last (a hint: every condition is checked when a chain is taken).
     struct Link {
         Block* to{nullptr};
@@ -57,7 +67,6 @@ struct Block {
     bool jit_failed{false};
     u8 jit_compiles{0};
     std::array<Segment, kSegCount> jit_seg{};
-    u64 runs{0};
     u32 lin{0};  // the linear address it was first built at (reports)
 };
 
@@ -65,7 +74,7 @@ struct BlockStats {
     u64 built{0}, killed{0}, pages_written{0}, device_page_writes{0};
     u64 whole_runs{0}, fallback_steps{0}, block_insns{0};
     u64 mispredicts{0};
-    u64 native_runs{0}, native_insns{0}, native_helpers{0}, native_ineligible{0}, native_handoffs{0}, chains{0};
+    u64 native_runs{0}, native_insns{0}, native_helpers{0}, native_ineligible{0}, native_handoffs{0}, chains{0}, links_refused{0};
     // Where the cycles went: the schedules, the penalties (caches, devices), the exits' mispredicts, REP elements.
     u64 schedule_cycles{0}, penalty_cycles{0}, exit_cycles{0}, rep_cycles{0};
     std::array<u64, 256 + 256> helper_ops{};  // instructions the interpreter ran inside native code, by operation; x87 by form
@@ -127,7 +136,18 @@ public:
     // the run may go on there without the dispatcher, else null. See block.cpp.
     void* chain(JitCtx& c, Block::Link* slot);
     // The kernel idle loop's check addresses: never chained into (the dispatcher halts there).
-    void set_idle_eips(u32 a, u32 b) { idle_ = {a, b}; }
+    void set_idle_eips(u32 a, u32 b) {
+        idle_ = {a, b};
+        ++link_epoch_;  // links made before are not checked against them inline
+    }
+    // What the generated code reads and updates in the engine (stable addresses for the engine's life).
+    struct NativeView {
+        u32* link_epoch;
+        BlockStats* stats;
+        u32* rsb;
+        unsigned* rsb_top;
+    };
+    NativeView native_view() { return {&link_epoch_, &stats_, rsb_.data(), &rsb_top_}; }
 
     void code_written(u32 ram_page) override;
     const BlockStats& stats() const { return stats_; }
@@ -173,6 +193,7 @@ private:
     std::array<u32, 2> idle_{};
     JitCtx* current_{nullptr};  // the native run in progress
     Block::Link* pending_slot_{nullptr};  // the last native exit's link slot, filled by the next block run
+    u32 pending_target_{0};  // where that exit went (the next block run must start there to be linked)
     Block* pending_from_{nullptr};
     // MV_P6_BLOCK_LOG=FILE:FROM:TO: a line per block run whose start lies in the cycle window (its schedule; start,
     // EIP, a hash of the registers and flags, the cache counters, a hash of the caches' contents and order, the limit),

@@ -216,7 +216,7 @@ struct Gen {
             fpu(c);
             return;
         }
-        switch (next() % 32) {
+        switch (next() % 40) {
             case 0: case 1: case 2: c.insert(c.end(), {alu[next() % 9], static_cast<u8>(0xC0 | s << 3 | d)}); break;
             case 3: c.insert(c.end(), {static_cast<u8>(alu[next() % 8] - 1), static_cast<u8>(0xC0 | reg8() << 3 | reg8())}); break;
             case 4: c.insert(c.end(), {0x66, alu[next() % 9], static_cast<u8>(0xC0 | s << 3 | d)}); break;
@@ -263,6 +263,40 @@ struct Gen {
                 c.insert(c.end(), {0xC1, static_cast<u8>(0x43 | sh[next() % 3] << 3), static_cast<u8>(next()), static_cast<u8>(next() & 31)});  // shift [ebx+d8], imm
                 break;
             }
+            case 32: {  // cdq or cwde, then a safe division by a register or a memory operand
+                const u8 r = reg();
+                const u32 v = (next() % 0x7FFFFFF0u) + 2;
+                c.insert(c.end(), {static_cast<u8>(next() & 1 ? 0x99 : 0x98)});
+                if (r == 2) break;  // the divisor must not be EDX
+                c.insert(c.end(), {static_cast<u8>(0xB8 + r), static_cast<u8>(v), static_cast<u8>(v >> 8), static_cast<u8>(v >> 16), static_cast<u8>(v >> 24)});
+                if (next() & 1) c.insert(c.end(), {0x99, 0xF7, static_cast<u8>(0xF8 | r)});           // cdq; idiv r
+                else c.insert(c.end(), {0x31, 0xD2, 0xF7, static_cast<u8>(0xF0 | r)});               // xor edx, edx; div r
+                break;
+            }
+            case 33: {  // a division by memory
+                const u32 v = (next() % 0x7FFFFFF0u) + 2;
+                const u8 dd = static_cast<u8>(next() & 0xFC);
+                c.insert(c.end(), {0xC7, 0x43, dd, static_cast<u8>(v), static_cast<u8>(v >> 8), static_cast<u8>(v >> 16), static_cast<u8>(v >> 24)});
+                if (next() & 1) c.insert(c.end(), {0x99, 0xF7, 0x7B, dd});
+                else c.insert(c.end(), {0x31, 0xD2, 0xF7, 0x73, dd});
+                break;
+            }
+            case 34: case 35: {  // an indirect CALL or JMP to the next instruction, through a register or memory
+                const u8 r = reg();
+                const bool call = next() & 1, viamem = next() & 1;
+                const u8 dd = static_cast<u8>(next() & 0xFC);
+                const u32 at = kCode + static_cast<u32>(c.size());
+                const u32 len = viamem ? 7u + 3u : 5u + 2u;  // the store/load of the target, then the branch
+                const u32 target = at + len;
+                if (viamem) c.insert(c.end(), {0xC7, 0x43, dd, static_cast<u8>(target), static_cast<u8>(target >> 8), static_cast<u8>(target >> 16), static_cast<u8>(target >> 24), 0xFF, static_cast<u8>(call ? 0x53 : 0x63), dd});
+                else c.insert(c.end(), {static_cast<u8>(0xB8 + r), static_cast<u8>(target), static_cast<u8>(target >> 8), static_cast<u8>(target >> 16), static_cast<u8>(target >> 24), 0xFF, static_cast<u8>((call ? 0xD0 : 0xE0) | r)});
+                if (call) c.push_back(static_cast<u8>(0x58 + reg()));  // pop the return address
+                break;
+            }
+            case 36: c.insert(c.end(), {0xFF, 0x73, static_cast<u8>(next()), static_cast<u8>(0x58 + reg())}); break;  // push [ebx+d8]; pop r
+            case 37: c.insert(c.end(), {0x55, 0x89, 0xE5, 0xC9}); break;  // push ebp; mov ebp, esp; leave
+            case 38: c.insert(c.end(), {0xC1, static_cast<u8>(0xC0 | (next() & 1) << 3 | d), static_cast<u8>(next() & 31)}); break;  // rol/ror r, imm
+            case 39: c.insert(c.end(), {0x0F, 0x18, static_cast<u8>(0x43 | (next() % 4) << 3), static_cast<u8>(next())}); break;  // prefetch
             case 31: {
                 static constexpr u8 sh[] = {4, 5, 7};
                 const u8 op = static_cast<u8>(next() % 3 == 0 ? 0xD2 : 0xD3);  // byte or dword
@@ -280,13 +314,17 @@ struct Gen {
 // The three executors on the same programs: the step (architecture), the block interpreter, the recompiled blocks
 // (architecture, and the clock and instruction count exactly: both run block timing).
 TEST(P6Block, GeneratedProgramsMatchTheStep) {
-    u64 native = 0, paged_insns = 0;
+    u64 native = 0, paged_insns = 0, chains = 0;
     for (u32 program = 0; program < 300; ++program) {
         Gen g{program * 7919u + 1};
         g.x87 = program % 3 == 0;
         static constexpr u16 kCw[] = {0x37F, 0x27F, 0x07F, 0xF7F, 0x77F};  // precisions and roundings, all masked
-        std::vector<u8> code;
+        // Five passes over the body (a counter on the stack the forms leave alone): blocks run again and chain.
+        std::vector<u8> code = {0x6A, 0x05};  // push 5
         while (code.size() < 900) g.one(code);
+        const i32 back = 2 - static_cast<i32>(code.size() + 3 + 6);
+        code.insert(code.end(), {0xFF, 0x0C, 0x24, 0x0F, 0x85, static_cast<u8>(back), static_cast<u8>(back >> 8), static_cast<u8>(back >> 16),
+                                 static_cast<u8>(back >> 24), 0x58});  // dec dword [esp]; jnz body; pop eax
         code.push_back(0xF4);  // hlt
         const bool paged = (program & 1) != 0;
         Rig a(paged), b(paged), c(paged);
@@ -322,14 +360,17 @@ TEST(P6Block, GeneratedProgramsMatchTheStep) {
         c.cpu.set_block_timing(true);
         BlockEngine ej(c.cpu, c.bus);
         ej.set_jit_threshold(0);
-        ej.set_chain_budget(program % 2 ? 0 : 1024);  // one block a dispatch (compared after each) or chained
+        ej.set_chain_budget((program / 2) % 2 ? 0 : 1024);  // one block a dispatch (compared after each) or chained
         run_lockstep(b2, e2, c, ej, "recompiled against the block interpreter, in lock step");
         expect_same(b, c, "recompiled against the block interpreter", true);
         ASSERT_FALSE(::testing::Test::HasFailure()) << "program " << program << (paged ? " (paged)" : "");
         native += ej.stats().native_insns;
+        chains += ej.stats().chains;
         if (paged) paged_insns += c.cpu.instructions();
     }
     EXPECT_GT(native * 2, paged_insns);  // the recompiler ran most of the paged programs natively
+    EXPECT_GT(chains, 1000u);            // the passes chained
+    std::printf("generated programs: %llu native instructions of %llu, %llu chains\n", static_cast<unsigned long long>(native), static_cast<unsigned long long>(paged_insns), static_cast<unsigned long long>(chains));
 }
 
 // A block writes the instruction after the next one inside its own page: the new bytes must run (the step sees them).
@@ -487,4 +528,93 @@ TEST(P6Block, WriteTrackingMatchesTheInterpreter) {
             EXPECT_EQ(pages[1], (std::vector<u32>{kData / 4096, kData / 4096 + 1, 0x100000 / 4096}));  // + the walk's A/D bits
         }
     }
+}
+
+// A native exit whose target no block holds (an instruction crossing a page runs as a fallback step) and the block
+// after it: the exit must not be linked to that next block, or chaining would skip the step.
+TEST(P6Block, ChainsOnlyToTheExitTarget) {
+    Rig a(true), c(true);
+    for (Rig* r : {&a, &c}) {
+        r->load({0xE9, 0xF9, 0x0F, 0x00, 0x00});            // 0x1000: jmp 0x1ffe
+        r->load({0x05, 0x01, 0x00, 0x00, 0x00}, 0x1FFE);    // 0x1ffe: add eax, 1 (crosses into 0x2000)
+        r->load({0x49, 0x0F, 0x85, 0xF6, 0xEF, 0xFF, 0xFF, 0xF4}, 0x2003);  // dec ecx; jnz 0x1000; hlt
+        r->cpu.state().gpr[kEcx] = 20;
+    }
+    run_steps(a);
+    c.cpu.set_block_timing(true);
+    BlockEngine e(c.cpu, c.bus);
+    e.set_jit_threshold(0);
+    run_blocks(c, e);
+    EXPECT_EQ(a.cpu.state().gpr[kEax], 20u);
+    expect_same(a, c, "a jump to a fallback step");
+    EXPECT_GT(e.stats().native_insns, 20u);
+}
+
+// Interrupts between blocks, as the backend delivers them: an event every 997 cycles is a run's limit; at it the
+// dispatcher delivers vector 0x20 (a handler that counts and returns). A native exit followed by a delivery must not
+// be linked to the handler's block (a chain would skip the delivery's effects). The recompiler against the block
+// interpreter: the same deliveries at the same instruction boundaries, the same state and clock.
+TEST(P6Block, ChainsAcrossInterruptsMatchTheInterpreter) {
+    auto setup = [](Rig& r) {
+        const u64 gdt[3] = {0, 0x00CF9B000000FFFFull, 0x00CF93000000FFFFull};
+        std::memcpy(r.bus.ram() + 0x5000, gdt, sizeof gdt);
+        r.cpu.state().gdtr = DescTable{0x5000, 0x17};
+        const u32 gate[2] = {(0x08u << 16) | 0x1800u, 0x00008E00u};  // vector 0x20: interrupt gate to 0x1800 (the loop's page)
+        std::memcpy(r.bus.ram() + 0x3000 + 0x20 * 8, gate, sizeof gate);
+        r.cpu.state().idtr = DescTable{0x3000, 0x7FF};
+        r.load({0x83, 0xC6, 0x01, 0xCF}, 0x1800);  // handler: add esi, 1; iret
+        // 0x1000: jmp 0x1010 | 0x1010: add eax, 1 | 0x1013: dec ecx; jnz 0x1000 | hlt
+        r.load({0xEB, 0x0E});
+        r.load({0x83, 0xC0, 0x01, 0x49, 0x0F, 0x85, 0xE7, 0xFF, 0xFF, 0xFF, 0xF4}, 0x1010);
+        r.cpu.state().gpr[kEcx] = 3000;
+        r.cpu.state().set_eflags(fl::IF);
+    };
+    auto run = [](Rig& r, BlockEngine& e) {
+        u64 next_event = 997;
+        for (unsigned n = 0; n < 200000 && !r.cpu.state().halted; ++n) {
+            e.apply_device_writes();
+            if (r.cpu.cycles() >= next_event) {
+                next_event += 997;
+                if (r.cpu.state().flags & fl::IF) r.cpu.deliver_external(0x20);
+            }
+            if (Block* b = e.find()) e.run(*b, next_event);
+            else r.cpu.step();
+        }
+    };
+    Rig b(true), c(true);
+    setup(b);
+    setup(c);
+    b.cpu.set_block_timing(true);
+    BlockEngine eb(b.cpu, b.bus);
+    eb.disable_jit();
+    run(b, eb);
+    c.cpu.set_block_timing(true);
+    BlockEngine ec(c.cpu, c.bus);
+    ec.set_jit_threshold(0);
+    run(c, ec);
+    EXPECT_EQ(b.cpu.state().gpr[kEax], 3000u);
+    EXPECT_GT(b.cpu.state().gpr[kEsi], 10u);  // interrupts were taken
+    expect_same(b, c, "deliveries between native blocks", true);
+    EXPECT_GT(ec.stats().chains, 100u);
+}
+
+// The boot's case: an exit to a REP string block (never translated) and then the next block on the same page. The
+// exit must not be linked past the REP block (a chain would skip the copy).
+TEST(P6Block, ChainsDoNotSkipAStringBlock) {
+    Rig a(true), c(true);
+    for (Rig* r : {&a, &c}) {
+        r->load({0xB9, 0x01, 0x00, 0x00, 0x00, 0xEB, 0x09});                   // 0x1000: mov ecx, 1; jmp 0x1010
+        r->load({0xF3, 0xA5, 0x4D, 0x0F, 0x85, 0xE7, 0xFF, 0xFF, 0xFF, 0xF4}, 0x1010);  // rep movsd; dec ebp; jnz 0x1000; hlt
+        r->cpu.state().gpr[kEbp] = 3000;
+        r->cpu.state().gpr[kEcx] = 0;
+        r->cpu.state().gpr[kEsi] = 0x20000;
+        r->cpu.state().gpr[kEdi] = 0x30000;
+    }
+    run_steps(a);
+    c.cpu.set_block_timing(true);
+    BlockEngine e(c.cpu, c.bus);
+    e.set_jit_threshold(0);
+    run_blocks(c, e);
+    expect_same(a, c, "a REP block between an exit and the next block");
+    EXPECT_GT(e.stats().chains, 100u);
 }
