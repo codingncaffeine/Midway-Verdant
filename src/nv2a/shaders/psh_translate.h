@@ -1,6 +1,7 @@
 #pragma once
 #include <array>
 #include <string>
+#include <type_traits>
 
 #include "core/types.h"
 #include "nv2a/pgraph/kelvin_state.h"
@@ -21,13 +22,15 @@ struct Key {
     u32 dot_mapping{0};      // SET_DOT_RGBMAPPING: how stages 1-3 read their source's colour for a dot product
     u32 shadow_compare_func{0};
     std::array<u32, 4> texture_format{};  // only the fields that shape the shader (dimensionality, cube, colour)
+    u32 alpha_func{0x207};
     std::array<bool, 4> texture_enabled{};
     bool alpha_test{false};
-    u32 alpha_func{0x207};
     bool smooth_shading{true};
     bool fog_enable{false};
+    bool unused{false};  // fills the last word: the renderer keys its shader cache by the key's bytes
     bool operator==(const Key&) const = default;
 };
+static_assert(std::has_unique_object_representations_v<Key>, "a padding byte would make equal keys differ as bytes");
 Key key_from_state(const KelvinState& state);
 
 // Uniform block (std140, set 0, binding 1), see the layout in the generated shader.

@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <format>
+#include <type_traits>
 
 #include "nv2a/shaders/glsl_compiler.h"
 
@@ -954,10 +955,12 @@ VkPipeline VulkanRenderer::pipeline(const KelvinState& s, VkShaderModule vs, VkS
         VkRenderPass pass;
         u32 topology, blend_enable, sfactor, dfactor, equation, depth_test, depth_func, depth_write, cull_enable, cull_face, front_face,
             color_mask, stencil_enable, stencil_func, stencil_mask, stencil_write_mask, op_fail, op_zfail, op_zpass;
+        u32 unused;  // fills the last eight bytes: the key is its bytes, and a padding word held whatever the stack did
     } k{vs, fs, t.pass, static_cast<u32>(topology) | (debug_nocull_ ? 0x100u : 0u) | (debug_nodepth_ ? 0x200u : 0u) | (debug_noblend_ ? 0x400u : 0u), s.blend(), s.reg(mthd::kBlendSfactor), s.reg(mthd::kBlendDfactor), s.reg(mthd::kBlendEquation),
         s.depth_test(), s.reg(mthd::kDepthFunc), s.depth_write(), s.cull_face(), s.reg(mthd::kCullFace), s.reg(mthd::kFrontFace), s.color_mask(),
         s.stencil_test(), s.reg(mthd::kStencilFunc), s.reg(mthd::kStencilFuncMask), s.reg(mthd::kStencilMask), s.reg(mthd::kStencilOpFail),
-        s.reg(mthd::kStencilOpZfail), s.reg(mthd::kStencilOpZpass)};
+        s.reg(mthd::kStencilOpZfail), s.reg(mthd::kStencilOpZpass), 0u};
+    static_assert(std::has_unique_object_representations_v<RasterKey>);
     std::string key(reinterpret_cast<const char*>(&k), sizeof k);
     if (auto it = pipelines_.find(key); it != pipelines_.end()) return it->second;
 
