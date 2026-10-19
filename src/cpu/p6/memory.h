@@ -140,6 +140,7 @@ public:
     Timing* cache_model() const { return cache_model_; }
     // The recompiler's slow paths hand their cache and device penalties to the run directly.
     void add_penalty(u64 c) { penalty_ += c; }
+    bool penalty_pending() const { return penalty_ != 0 || device_cycles_ != 0; }
 
 private:
 

@@ -32,6 +32,17 @@ struct JitCtx {
     u8 pad[3];             // 61
     u64 scratch[6];        // 64
     std::exception_ptr* error;  // where a helper leaves what the interpreter threw (an unimplemented form)
+    u64* helper_ops;  // statistics: the interpreter's instructions by operation
+    // Chains (used by C++ only): the current block's entry EIP; whether its exit was already costed and the cycle it
+    // ended at; the instructions of the blocks before it in this run; how many more blocks may chain; the link slot
+    // the last exit tried; the penalties added (statistics).
+    u32 entry_eip;
+    u8 ended;
+    u64 end_cycles;
+    u64 insns_done;
+    u32 chain_budget;
+    Block::Link* last_slot;
+    u64 penalties;
 };
 
 // The native function's result: (instruction index << 2) | kind.

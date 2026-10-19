@@ -185,6 +185,16 @@ public:
     void cmov(unsigned size, Cond c, Reg dst, Reg src) { op_rr(size, {0x0F, static_cast<u8>(0x40 + c)}, dst, src); }
     void bt(unsigned size, const Mem& m, Reg bit) { op_rm(size, {0x0F, 0xA3}, bit, m); }
     void xchg(unsigned size, Reg a, Reg b) { op_rr(size, {static_cast<u8>(size == 1 ? 0x86 : 0x87)}, a, b); }
+    // ---- x87 ----
+    // An x87 instruction with a memory operand: escape byte and ModRM reg digit.
+    void x87_mem(u8 escape, unsigned digit, const Mem& m) { op_rm(4, {escape}, digit, m); }
+    void x87_raw(u8 escape, u8 modrm) {
+        byte(escape);
+        byte(modrm);
+    }
+    void fnstsw_ax() { x87_raw(0xDF, 0xE0); }
+    void fnclex() { x87_raw(0xDB, 0xE2); }
+
     void bswap(Reg r) {
         rex(false, 0, 0, r);
         byte(0x0F);
@@ -210,6 +220,11 @@ public:
     void call_abs(const void* fn) {
         mov64(rax, reinterpret_cast<u64>(fn));
         call(rax);
+    }
+    void jmp(Reg r) {
+        rex(false, 0, 0, r);
+        byte(0xFF);
+        modrm_reg(4, r);
     }
     void jmp(Label l) {
         byte(0xE9);

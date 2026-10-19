@@ -1,5 +1,6 @@
 #include "cpu/p6/p6_backend.h"
 
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <format>
@@ -226,6 +227,7 @@ void P6Backend::find_idle_loop() {
     }
     if (matches == 0 || matches > found.size()) return;
     idle_eips_ = found;
+    if (blocks_) blocks_->set_idle_eips(found[0], found[1]);
     trace::log(trace::Cat::Cpu, "the kernel idle loops are at {:08x} {:08x}: their idle turns halt", found[0], found[1]);
 }
 
@@ -331,8 +333,23 @@ std::string P6Backend::report() const {
                          b.built, blocks_->live_blocks(), b.killed, b.pages_written, b.device_page_writes, b.whole_runs, b.fallback_steps,
                          b.block_insns, b.mispredicts, b.schedule_cycles, b.penalty_cycles, b.exit_cycles, b.rep_cycles);
         if (p6::Jit* j = blocks_->jit())
-            r += std::format("\ncpu p6 recompiler: {} blocks translated ({} KiB, {} flushes); {} native runs, {} native instructions, {} by the interpreter inside them; {} hand-offs, {} runs refused (assumptions changed)",
-                             j->compiled(), j->code_bytes() / 1024, j->flushes(), b.native_runs, b.native_insns, b.native_helpers, b.native_handoffs, b.native_ineligible);
+            r += std::format("\ncpu p6 recompiler: {} blocks translated ({} KiB, {} flushes); {} native runs, {} native instructions, {} by the interpreter inside them; {} hand-offs, {} runs refused (assumptions changed); {} blocks entered by a chain",
+                             j->compiled(), j->code_bytes() / 1024, j->flushes(), b.native_runs, b.native_insns, b.native_helpers, b.native_handoffs, b.native_ineligible, b.chains);
+        {
+            std::vector<std::pair<u64, unsigned>> ops;
+            for (unsigned k = 0; k < 256; ++k)
+                if (k < 256 && b.helper_ops[k]) ops.emplace_back(b.helper_ops[k], k);
+            std::sort(ops.rbegin(), ops.rend());
+            r += "\ncpu p6 interpreted inside native code:";
+            for (std::size_t k = 0; k < ops.size() && k < 16; ++k) r += std::format(" {} {}", p6::op_name(static_cast<p6::Op>(ops[k].second)), ops[k].first);
+            std::vector<std::pair<u64, unsigned>> x87;
+            for (unsigned k = 0; k < 256; ++k)
+                if (b.helper_ops[256 + k]) x87.emplace_back(b.helper_ops[256 + k], k);
+            std::sort(x87.rbegin(), x87.rend());
+            r += "\ncpu p6 x87 forms inside native code (escape/mem/reg):";
+            for (std::size_t k = 0; k < x87.size() && k < 24; ++k)
+                r += std::format(" {:02x}{}{:x} {}", 0xD8 + x87[k].second / 32, (x87[k].second & 16) ? "m" : "r", x87[k].second & 15, x87[k].first);
+        }
         r += "\ncpu p6 hottest blocks (address x instructions: cycles * runs):" + blocks_->hottest(12);
     }
     if (idle_eips_[0]) r += std::format("\ncpu p6: the kernel idle loops at {:08x} {:08x}: {} passes, {} turned into halts", idle_eips_[0], idle_eips_[1], idle_hits_, idle_halts_);

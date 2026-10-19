@@ -61,7 +61,6 @@ bool Jit::eligible(const Block& b, Cpu& cpu) {
     if ((s.cr0 & (cr0::PE | cr0::PG)) != (cr0::PE | cr0::PG) || (s.flags & fl::VM)) return false;
     if (cpu.memory().dirty_tracking() != b.jit_dirty) return false;
     for (unsigned g = 0; g < kSegCount; ++g) {
-        if (!(b.jit_segs & (1u << g))) continue;
         const Segment& now = s.seg[g];
         const Segment& then = b.jit_seg[g];
         if (now.base != then.base || now.limit != then.limit || now.ar != then.ar) return false;
@@ -90,6 +89,21 @@ static_assert(offsetof(CpuState, lazy_size) == offsetof(CpuState, lazy_op) + 1 &
 constexpr i32 kCtxSt = static_cast<i32>(offsetof(JitCtx, st));
 constexpr i32 kCtxExit = static_cast<i32>(offsetof(JitCtx, exit));
 constexpr i32 kCtxScratch = static_cast<i32>(offsetof(JitCtx, scratch));
+constexpr i32 kCtxHostCw = kCtxScratch + 40, kCtxDefCw = kCtxScratch + 42, kCtxEa = kCtxScratch + 44;  // u16, u16, u32
+constexpr i32 kCr0Off = static_cast<i32>(offsetof(CpuState, cr0));
+constexpr i32 kFpuOff = static_cast<i32>(offsetof(CpuState, fpu));
+constexpr i32 kSt0 = kFpuOff + static_cast<i32>(offsetof(FpuState, st));
+constexpr i32 kFcw = kFpuOff + static_cast<i32>(offsetof(FpuState, fcw));
+constexpr i32 kFsw = kFpuOff + static_cast<i32>(offsetof(FpuState, fsw));
+constexpr i32 kFtw = kFpuOff + static_cast<i32>(offsetof(FpuState, ftw));
+constexpr i32 kFop = kFpuOff + static_cast<i32>(offsetof(FpuState, fop));
+constexpr i32 kFip = kFpuOff + static_cast<i32>(offsetof(FpuState, fip));
+constexpr i32 kFdp = kFpuOff + static_cast<i32>(offsetof(FpuState, fdp));
+constexpr i32 kFcs = kFpuOff + static_cast<i32>(offsetof(FpuState, fcs));
+constexpr i32 kFds = kFpuOff + static_cast<i32>(offsetof(FpuState, fds));
+constexpr i32 seg_selector(unsigned s) { return static_cast<i32>(offsetof(CpuState, seg) + s * sizeof(Segment) + offsetof(Segment, selector)); }
+// Native x87 needs the interpreter's 80-bit registers in 16-byte slots (GCC/Clang on x86-64).
+constexpr bool kNativeX87 = kHostX87 && sizeof(long double) == 16;
 static_assert(offsetof(Memory::TlbEntry, tag) == 0 && offsetof(Memory::TlbEntry, phys_page) == 4 && offsetof(Memory::TlbEntry, host) == 8 &&
               offsetof(Memory::TlbEntry, writable) == 16 && sizeof(Memory::TlbEntry) == 32);
 
@@ -120,6 +134,13 @@ u32 h_exec(JitCtx* c, u32 i) {
     cpu.state().eip = b.jit_eip + b.off[i];
     cpu.set_cycles_only(c->base + (i ? b.after[i - 1] : 0));
     ++c->helpers;
+    ++c->helper_ops[static_cast<unsigned>(b.insns[i].op) & 255];
+    if (b.insns[i].op == Op::X87) {
+        const Insn& x = b.insns[i];
+        // Form: escape (0-7), then the ModRM reg field, memory or register; register forms of D9/DB keep the low bits.
+        const unsigned form = (x.opcode - 0xD8u) * 32u + (x.mem ? 16u : 0u) + (x.mem ? x.reg : ((x.opcode == 0xD9 || x.opcode == 0xDB) ? (x.modrm & 0x3F) >> 2 : x.reg)) ;
+        ++c->helper_ops[256 + (form & 255)];
+    }
     bool ok;
     try {
         ok = cpu.exec_decoded(b.insns[i]);
@@ -127,7 +148,9 @@ u32 h_exec(JitCtx* c, u32 i) {
         *c->error = std::current_exception();
         return (i << 2) | kJitFault;
     }
-    c->base += mem.take_penalty();
+    const u64 penalty = mem.take_penalty();
+    c->base += penalty;
+    c->penalties += penalty;
     if (!ok) return (i << 2) | kJitFault;
     if (i + 1 == b.n) return (i << 2) | kJitEnd;
     if (mem.device_events() != c->devices || c->engine->running_dead() || c->base + b.after[i] >= c->limit) return (i << 2) | kJitExit;
@@ -143,11 +166,16 @@ void h_cache(JitCtx* c, u32 phys, u32 arg) {
     const unsigned i = arg >> 8;
     const u64 p = c->cpu->cache_timing().data_access(phys, (arg & 1) != 0);
     c->base += p;
+    c->penalties += p;
     // The limit at the next boundary: leave there. Past the block's end only: a later boundary may reach it, which
     // the interpreter finds instruction by instruction — hand the rest of the block over to it.
     if (c->base + c->block->after[i] >= c->limit) c->exit = 1;
     else if (c->base + c->block->cycles >= c->limit) c->exit = 2;
 }
+
+// The end of a block whose last instruction left normally: the engine costs the exit and returns where the run goes
+// on (the next block's native code, or null: back to the dispatcher).
+void* h_chain(JitCtx* c, Block::Link* slot) { return c->engine->chain(*c, slot); }
 
 u32 h_cf(const CpuState* s) { return s->cf() ? 1u : 0u; }
 u32 h_cond(const Cpu* cpu, u32 cc) { return cpu->condition(static_cast<u8>(cc)) ? 1u : 0u; }
@@ -164,10 +192,12 @@ class Translator {
 public:
     Translator(Block& b, Cpu& cpu) : b_(b), cpu_(cpu), st_(cpu.state()) {}
     Asm a;
+    std::size_t body{0};  // where the block's own code starts, past the prologue (chains enter there)
 
     void run() {
         epilogue_ = a.label();
         prologue();
+        body = a.size();
         for (unsigned i = 0; i < b_.n; ++i) {
             Label after = a.label();
             if (!native(i, after)) inline_helper(i);
@@ -178,11 +208,13 @@ public:
         epilogue();
         for (const Stub& s : stubs_) {
             a.bind(s.entry);
+            if (s.cw_before) default_cw();
             call_helper(s.index);
             if (s.index + 1 == b_.n) a.jmp(epilogue_);
             else {
                 a.test(4, rax, rax);
                 a.jcc(NE, epilogue_);
+                if (s.cw_after) guest_cw();
                 a.jmp(s.resume);
             }
         }
@@ -192,6 +224,7 @@ private:
     struct Stub {
         Label entry, resume;
         unsigned index;
+        bool cw_before, cw_after;  // the host x87 control word was the guest's at the jump / must be at the resume
     };
 
     Block& b_;
@@ -203,6 +236,7 @@ private:
     unsigned known_size_{4};
     bool host_flags_{false};   // the host flags hold the last flag writer's result
     bool host_cf_{false};      // ... including CF (not after INC/DEC)
+    bool cw_active_{false};    // the host x87 runs under the guest's control word (see x87_enter)
 
     u32 eip_of(unsigned i) const { return b_.jit_eip + b_.off[i]; }
     u32 next_eip(unsigned i) const { return eip_of(i) + b_.insns[i].len; }
@@ -224,6 +258,7 @@ private:
 #endif
         a.mov(8, kCtx, kArg0);
         a.mov(8, kSt, ctx_at(kCtxSt));
+        a.x87_mem(0xD9, 7, ctx_at(kCtxDefCw));  // fnstcw: the control word C++ code runs under
         Memory& m = cpu_.memory();
         a.mov64(kTlb, reinterpret_cast<u64>(m.tlb()));
         a.mov64(kRam, reinterpret_cast<u64>(m.bus().ram()));
@@ -231,6 +266,7 @@ private:
         a.mov64(kCodeMap, reinterpret_cast<u64>(m.bus().code_map()));
     }
     void epilogue() {
+        a.x87_mem(0xD9, 5, ctx_at(kCtxDefCw));  // fldcw: back to it
 #if defined(_WIN32)
         a.alu_imm(8, 0, rsp, 40);
         a.pop(rdi);
@@ -253,6 +289,7 @@ private:
         a.call_abs(reinterpret_cast<const void*>(&h_exec));
     }
     void inline_helper(unsigned i) {
+        x87_leave();
         call_helper(i);
         if (last(i)) a.jmp(epilogue_);
         else {
@@ -263,10 +300,28 @@ private:
         host_flags_ = host_cf_ = false;
     }
     // A fallback for instruction i: its native checks jump here; the interpreter executes it from the start.
-    Label fallback(unsigned i, Label resume) {
-        Stub s{a.label(), resume, i};
+    Label fallback(unsigned i, Label resume) { return fallback(i, resume, cw_active_, cw_active_); }
+    Label fallback(unsigned i, Label resume, bool cw_before, bool cw_after) {
+        Stub s{a.label(), resume, i, cw_before, cw_after};
         stubs_.push_back(s);
         return s.entry;
+    }
+    // The block's normal end at EIP `eip` (kNoEip: already stored): the engine costs the exit through link slot `slot`
+    // and may chain into the next block's native code.
+    static constexpr u64 kNoEip = ~u64{0};
+    void end(unsigned i, u64 eip, unsigned slot) {
+        x87_leave();
+        if (eip != kNoEip) a.mov_imm(4, st_at(kEipOff), static_cast<u32>(eip));
+        a.mov(8, kArg0, kCtx);
+        a.mov64(kArg1, reinterpret_cast<u64>(&b_.links[slot]));
+        a.call_abs(reinterpret_cast<const void*>(&h_chain));
+        Label back = a.label();
+        a.test(8, rax, rax);
+        a.jcc(E, back);
+        a.jmp(rax);
+        a.bind(back);
+        a.mov32(rax, (i << 2) | kJitEnd);
+        a.jmp(epilogue_);
     }
     void leave(unsigned i, u32 eip, u32 kind) {
         a.mov_imm(4, st_at(kEipOff), eip);
@@ -303,8 +358,6 @@ private:
         if (s.unusable() || !s.data() || s.expand_down()) return false;
         if (write && !s.writable()) return false;
         if (s.limit != 0xFFFFFFFFu && s.limit < size - 1) return false;
-        b_.jit_segs |= static_cast<u8>(1u << seg);
-        b_.jit_seg[seg] = s;
         return true;
     }
     // EAX holds the offset in `seg`: limit check, linear address, page and TLB checks. Leaves RSI = the host byte,
@@ -441,6 +494,385 @@ private:
         }
     }
 
+    // ---- x87 (the forms a profile of the boot found hot; the rest stay with the interpreter) ----
+    // The host runs the guest's arithmetic under the control word the interpreter's HostFpu uses (every exception
+    // masked, the guest's precision and rounding), set once and kept until C++ code runs; FNCLEX with it, so the
+    // host's sticky flags after it are the native instructions' own (the guest's are sticky too: OR-ing is exact).
+    void x87_enter() {
+        if (cw_active_) return;
+        guest_cw();
+        cw_active_ = true;
+    }
+    void x87_leave() {
+        if (!cw_active_) return;
+        default_cw();
+        cw_active_ = false;
+    }
+    void guest_cw() {
+        a.movzx(rax, 2, st_at(kFcw));
+        a.alu_imm(4, 4, rax, 0x0F00);
+        a.alu_imm(4, 1, rax, 0x3F);
+        a.mov(2, ctx_at(kCtxHostCw), rax);
+        a.x87_mem(0xD9, 5, ctx_at(kCtxHostCw));  // fldcw
+        a.fnclex();
+    }
+    void default_cw() { a.x87_mem(0xD9, 5, ctx_at(kCtxDefCw)); }
+    // R8 = TOP.
+    void x87_top() {
+        a.movzx(r8, 2, st_at(kFsw));
+        a.shift_imm(4, 5, r8, 11);
+        a.alu_imm(4, 4, r8, 7);
+    }
+    // dst = the physical register of ST(i) (TOP in R8).
+    void x87_phys(Reg dst, unsigned i) {
+        a.lea(4, dst, mem(r8, static_cast<i32>(i)));
+        a.alu_imm(4, 4, dst, 7);
+    }
+    // Jump to `fail` unless physical register `p` is empty (want_empty) or in use.
+    void x87_tag_test(Reg p, bool want_empty, Label fail) {
+        a.movzx(rdx, 2, st_at(kFtw));
+        a.lea(4, rcx, mem(p, p, 0, 0));
+        a.shift_cl(4, 5, rdx);
+        a.alu_imm(4, 4, rdx, 3);
+        a.alu_imm(4, 7, rdx, 3);
+        a.jcc(want_empty ? NE : E, fail);
+    }
+    // dst = the address of physical register `p`'s 80-bit value.
+    void x87_addr(Reg dst, Reg p) {
+        a.mov(4, dst, p);
+        a.shift_imm(8, 4, dst, 4);
+        a.lea(8, dst, mem(kSt, dst, 0, kSt0));
+    }
+    // Jump to `fail` unless the value at [addr] is a normal number or a zero (no operand check can fire).
+    void x87_operand_ok(Reg addr, Label fail) {
+        Label zero = a.label(), ok = a.label();
+        a.movzx(rdx, 2, mem(addr, 8));
+        a.alu_imm(4, 4, rdx, 0x7FFF);
+        a.jcc(E, zero);
+        a.alu_imm(4, 7, rdx, 0x7FFF);
+        a.jcc(E, fail);
+        a.test_imm(1, mem(addr, 7), 0x80);  // the integer bit
+        a.jcc(E, fail);
+        a.jmp(ok);
+        a.bind(zero);
+        a.alu_imm(8, 7, mem(addr, 0), 0);
+        a.jcc(NE, fail);
+        a.bind(ok);
+    }
+    // Jump to `fail` unless the single at [RSI] is a normal number or a zero.
+    void x87_m32_ok(Label fail) {
+        Label zero = a.label(), ok = a.label();
+        a.mov(4, rax, mem(rsi));
+        a.mov(4, rdx, rax);
+        a.alu_imm(4, 4, rdx, 0x7F800000);
+        a.jcc(E, zero);
+        a.alu_imm(4, 7, rdx, 0x7F800000);
+        a.jcc(E, fail);
+        a.jmp(ok);
+        a.bind(zero);
+        a.test_imm(4, rax, 0x7FFFFFFF);
+        a.jcc(NE, fail);
+        a.bind(ok);
+    }
+    // EDX = the tag of the value at [addr], as tag_of computes it: 0 valid, 1 zero, 2 special.
+    void x87_tag_of(Reg addr) {
+        Label zero_exp = a.label(), special = a.label(), done = a.label();
+        a.movzx(rdx, 2, mem(addr, 8));
+        a.alu_imm(4, 4, rdx, 0x7FFF);
+        a.jcc(E, zero_exp);
+        a.alu_imm(4, 7, rdx, 0x7FFF);
+        a.jcc(E, special);
+        a.test_imm(1, mem(addr, 7), 0x80);
+        a.jcc(E, special);
+        a.mov32(rdx, 0);
+        a.jmp(done);
+        a.bind(zero_exp);
+        a.mov32(rdx, 1);
+        a.alu_imm(8, 7, mem(addr, 0), 0);
+        a.jcc(E, done);
+        a.bind(special);
+        a.mov32(rdx, 2);
+        a.bind(done);
+    }
+    // Physical register `p`'s tag = EDX.
+    void x87_set_tag(Reg p) {
+        a.lea(4, rcx, mem(p, p, 0, 0));
+        a.mov32(rax, 3);
+        a.shift_cl(4, 4, rax);
+        a.unary(4, 2, rax);
+        a.alu(2, 4, st_at(kFtw), rax);
+        a.shift_cl(4, 4, rdx);
+        a.alu(2, 1, st_at(kFtw), rdx);
+    }
+    void x87_set_empty(Reg p) {
+        a.mov32(rdx, 3);
+        x87_set_tag(p);
+    }
+    void x87_set_top(Reg t) {
+        a.mov(4, rax, t);
+        a.shift_imm(4, 4, rax, 11);
+        a.alu_imm(2, 4, st_at(kFsw), 0xC7FF);
+        a.alu(2, 1, st_at(kFsw), rax);
+    }
+    void x87_clear_c1() { a.alu_imm(2, 4, st_at(kFsw), 0xFDFF); }
+    // After a host operation: its exception flags join the status word (all masked: no ES); C1 from it if asked.
+    void x87_status(bool c1) {
+        a.fnstsw_ax();
+        a.mov(4, rdx, rax);
+        a.alu_imm(4, 4, rdx, 0x3F);
+        a.alu(2, 1, st_at(kFsw), rdx);
+        if (c1) {
+            a.alu_imm(4, 4, rax, 0x200);
+            x87_clear_c1();
+            a.alu(2, 1, st_at(kFsw), rax);
+        }
+    }
+    // pop(): ST(0)'s register empty, TOP + 1 (TOP in R8).
+    void x87_pop() {
+        x87_set_empty(r8);
+        a.lea(4, r9, mem(r8, 1));
+        a.alu_imm(4, 4, r9, 7);
+        x87_set_top(r9);
+    }
+    // The last-instruction pointers run() keeps for a non-control instruction.
+    void x87_pointers(unsigned i, const Insn& in) {
+        a.mov_imm(4, st_at(kFip), eip_of(i));
+        a.movzx(rax, 2, st_at(seg_selector(kCs)));
+        a.mov(2, st_at(kFcs), rax);
+        a.mov_imm(2, st_at(kFop), static_cast<u32>(((in.opcode & 7) << 8) | in.modrm));
+        if (in.mem) {
+            a.mov(4, rax, ctx_at(kCtxEa));
+            a.mov(4, st_at(kFdp), rax);
+            a.movzx(rax, 2, st_at(seg_selector(in.mem_seg)));
+            a.mov(2, st_at(kFds), rax);
+        }
+    }
+    // #NM (CR0.EM/TS) and a pending #MF (ES) are the interpreter's; so is any unmasked exception.
+    void x87_preamble(Label f, bool control) {
+        a.test_imm(4, st_at(kCr0Off), cr0::EM | cr0::TS);
+        a.jcc(NE, f);
+        if (control) return;
+        a.test_imm(2, st_at(kFsw), 0x80);
+        a.jcc(NE, f);
+        a.movzx(rax, 2, st_at(kFcw));
+        a.alu_imm(4, 4, rax, 0x3F);
+        a.alu_imm(4, 7, rax, 0x3F);
+        a.jcc(NE, f);
+    }
+    // Copy the 80-bit value at [from] to [to].
+    void x87_copy(Reg to, Reg from) {
+        a.mov(8, rax, mem(from, 0));
+        a.mov(8, mem(to, 0), rax);
+        a.movzx(rax, 2, mem(from, 8));
+        a.mov(2, mem(to, 8), rax);
+    }
+
+    enum class X87Form { None, LoadM32, StoreM32, ArithM32, CompareM32, ArithD8, ArithDcDe, LoadReg, StoreReg, Exchange, Sign, LoadConst, StoreSw };
+
+    bool x87(unsigned i, const Insn& in, Label after) {
+        if (!kNativeX87) return false;
+        const u8 esc = in.opcode;
+        X87Form k = X87Form::None;
+        if (in.mem) {
+            if (esc == 0xD9 && in.reg == 0) k = X87Form::LoadM32;
+            else if (esc == 0xD9 && (in.reg == 2 || in.reg == 3)) k = X87Form::StoreM32;
+            else if (esc == 0xD8 && (in.reg == 2 || in.reg == 3)) k = X87Form::CompareM32;
+            else if (esc == 0xD8) k = X87Form::ArithM32;
+        } else {
+            if (esc == 0xD8 && in.reg != 2 && in.reg != 3) k = X87Form::ArithD8;
+            else if ((esc == 0xDC || esc == 0xDE) && in.reg != 2 && in.reg != 3) k = X87Form::ArithDcDe;
+            else if (esc == 0xD9 && in.modrm >= 0xC0 && in.modrm <= 0xC7) k = X87Form::LoadReg;
+            else if (esc == 0xD9 && in.modrm >= 0xC8 && in.modrm <= 0xCF) k = X87Form::Exchange;
+            else if (esc == 0xD9 && (in.modrm == 0xE0 || in.modrm == 0xE1)) k = X87Form::Sign;
+            else if (esc == 0xD9 && (in.modrm == 0xE8 || in.modrm == 0xEE)) k = X87Form::LoadConst;
+            else if (esc == 0xDD && (in.reg == 2 || in.reg == 3)) k = X87Form::StoreReg;
+            else if (esc == 0xDF && in.modrm == 0xE0) k = X87Form::StoreSw;
+        }
+        if (k == X87Form::None) return false;
+        const bool write = k == X87Form::StoreM32;
+        if (in.mem && !segment_ok(in.mem_seg, 4, write)) return false;
+        const bool host = k == X87Form::StoreM32 || k == X87Form::ArithM32 || k == X87Form::CompareM32 || k == X87Form::ArithD8 || k == X87Form::ArithDcDe ||
+                          k == X87Form::LoadM32;
+        const bool cw_before = cw_active_;
+        const Label f = fallback(i, after, cw_before, host || cw_before);
+        x87_preamble(f, k == X87Form::StoreSw);
+        if (k == X87Form::StoreSw) {
+            a.movzx(rax, 2, st_at(kFsw));
+            a.mov(2, greg(kEax, 2), rax);
+            host_flags_ = host_cf_ = false;  // the preamble's TEST took them
+            finish(i, false);
+            return true;
+        }
+        if (in.mem) {
+            effective_address(in);
+            a.mov(4, ctx_at(kCtxEa), rax);
+            access_checks(in.mem_seg, 4, write, f);
+            if (k != X87Form::StoreM32) x87_m32_ok(f);
+        }
+        // Every check before any effect: the stack, the operands' classes.
+        x87_top();
+        const unsigned ri = in.rm;
+        switch (k) {
+            case X87Form::LoadM32: case X87Form::LoadConst:
+                x87_phys(r9, 7);
+                x87_tag_test(r9, true, f);
+                break;
+            case X87Form::StoreM32:
+                x87_tag_test(r8, false, f);
+                break;
+            case X87Form::ArithM32: case X87Form::CompareM32: case X87Form::Sign: case X87Form::StoreReg:
+                x87_tag_test(r8, false, f);
+                x87_addr(r10, r8);
+                x87_operand_ok(r10, f);
+                break;
+            case X87Form::ArithD8: case X87Form::ArithDcDe: case X87Form::Exchange:
+                x87_phys(r9, ri);
+                x87_tag_test(r8, false, f);
+                x87_tag_test(r9, false, f);
+                x87_addr(r10, r8);
+                x87_addr(r11, r9);
+                x87_operand_ok(r10, f);
+                x87_operand_ok(r11, f);
+                break;
+            case X87Form::LoadReg:
+                x87_phys(r9, ri);
+                x87_tag_test(r9, false, f);
+                x87_addr(r11, r9);
+                x87_operand_ok(r11, f);
+                x87_phys(r9, 7);
+                x87_tag_test(r9, true, f);
+                break;
+            default: break;
+        }
+        if (in.mem) {
+            cache(i, write);  // the interpreter's one access (clobbers R8-R11)
+            x87_top();
+        }
+        x87_pointers(i, in);
+        if (host) x87_enter();
+        switch (k) {
+            case X87Form::LoadM32: {
+                x87_phys(r9, 7);
+                x87_addr(r10, r9);
+                a.x87_mem(0xD9, 0, mem(rsi));   // fld dword
+                a.x87_mem(0xDB, 7, mem(r10));   // fstp tbyte
+                x87_clear_c1();
+                x87_set_top(r9);
+                x87_tag_of(r10);
+                x87_set_tag(r9);
+                break;
+            }
+            case X87Form::LoadConst: {
+                x87_phys(r9, 7);
+                x87_addr(r10, r9);
+                const bool one = in.modrm == 0xE8;
+                a.mov64(rax, one ? 0x8000000000000000ull : 0);
+                a.mov(8, mem(r10, 0), rax);
+                a.mov_imm(2, mem(r10, 8), one ? 0x3FFF : 0);
+                x87_clear_c1();
+                x87_set_top(r9);
+                a.mov32(rdx, one ? 0 : 1);
+                x87_set_tag(r9);
+                break;
+            }
+            case X87Form::StoreM32: {
+                x87_addr(r10, r8);
+                a.x87_mem(0xDB, 5, mem(r10));   // fld tbyte
+                a.x87_mem(0xD9, 3, mem(rsi));   // fstp dword
+                x87_status(true);
+                if (in.reg == 3) x87_pop();
+                break;
+            }
+            case X87Form::ArithM32: {
+                x87_addr(r10, r8);
+                a.x87_mem(0xDB, 5, mem(r10));
+                a.x87_mem(0xD8, in.reg, mem(rsi));  // the operation with the single, as the interpreter's on its conversion
+                x87_status(true);
+                a.x87_mem(0xDB, 7, mem(r10));
+                x87_tag_of(r10);
+                x87_set_tag(r8);
+                break;
+            }
+            case X87Form::CompareM32: {
+                x87_addr(r10, r8);
+                a.x87_mem(0xDB, 5, mem(r10));
+                a.x87_mem(0xD8, 3, mem(rsi));  // fcomp dword: the host's C3 C2 C0 are the guest's for ordered operands
+                a.fnstsw_ax();
+                a.alu_imm(4, 4, rax, 0x4500);
+                a.alu_imm(2, 4, st_at(kFsw), 0xB8FF);  // C0 C1 C2 C3 cleared
+                a.alu(2, 1, st_at(kFsw), rax);
+                if (in.reg == 3) x87_pop();
+                break;
+            }
+            case X87Form::ArithD8: case X87Form::ArithDcDe: {
+                // D8: ST(0) = ST(0) op ST(i); DC/DE: ST(i) = ST(i) op' ST(0) (the reversed SUB/DIV encodings).
+                const bool d8 = k == X87Form::ArithD8;
+                static constexpr u8 kD8[8] = {0xC1, 0xC9, 0, 0, 0xE1, 0xE9, 0xF1, 0xF9};  // fadd fmul - - fsub fsubr fdiv fdivr st, st(1)
+                static constexpr u8 kDc[8] = {0xC1, 0xC9, 0, 0, 0xE9, 0xE1, 0xF9, 0xF1};
+                const Reg dst = d8 ? r10 : r11, src = d8 ? r11 : r10;
+                a.x87_mem(0xDB, 5, mem(src));  // the second operand (host ST(1))
+                a.x87_mem(0xDB, 5, mem(dst));  // the first (host ST(0))
+                a.x87_raw(0xD8, d8 ? kD8[in.reg] : kDc[in.reg]);
+                x87_status(true);
+                a.x87_mem(0xDB, 7, mem(dst));
+                a.x87_raw(0xDD, 0xD8);  // fstp st(0): drop the second
+                x87_tag_of(dst);
+                x87_set_tag(d8 ? r8 : r9);
+                if (esc == 0xDE) x87_pop();
+                break;
+            }
+            case X87Form::LoadReg: {
+                x87_phys(r9, 7);
+                x87_addr(r10, r9);
+                x87_copy(r10, r11);
+                x87_clear_c1();
+                x87_set_top(r9);
+                x87_tag_of(r10);
+                x87_set_tag(r9);
+                break;
+            }
+            case X87Form::StoreReg: {
+                x87_phys(r9, ri);
+                x87_addr(r11, r9);
+                x87_copy(r11, r10);
+                x87_tag_of(r11);
+                x87_set_tag(r9);
+                x87_clear_c1();
+                if (in.reg == 3) x87_pop();
+                break;
+            }
+            case X87Form::Exchange: {
+                // ST(0) and ST(i) swap; each register's tag from its new value.
+                a.mov(8, rax, mem(r10, 0));
+                a.mov(8, rcx, mem(r11, 0));
+                a.mov(8, mem(r10, 0), rcx);
+                a.mov(8, mem(r11, 0), rax);
+                a.movzx(rax, 2, mem(r10, 8));
+                a.movzx(rcx, 2, mem(r11, 8));
+                a.mov(2, mem(r10, 8), rcx);
+                a.mov(2, mem(r11, 8), rax);
+                x87_tag_of(r10);
+                x87_set_tag(r8);
+                x87_tag_of(r11);
+                x87_set_tag(r9);
+                x87_clear_c1();
+                break;
+            }
+            case X87Form::Sign: {
+                if (in.modrm == 0xE0) a.alu_imm(1, 6, mem(r10, 9), 0x80);  // FCHS: xor the sign
+                else a.alu_imm(1, 4, mem(r10, 9), 0x7F);                   // FABS: clear it
+                x87_tag_of(r10);
+                x87_set_tag(r8);
+                x87_clear_c1();
+                break;
+            }
+            default: break;
+        }
+        host_flags_ = host_cf_ = false;
+        finish(i, in.mem);
+        return true;
+    }
+
     // ---- instructions ----
     bool native(unsigned i, Label after) {
         const Insn& in = b_.insns[i];
@@ -449,7 +881,7 @@ private:
         switch (in.op) {
             case Op::Nop: case Op::NopEv: case Op::Prefetch:
                 if (in.mem) return false;
-                if (last(i)) leave(i, next_eip(i), kJitEnd);
+                if (last(i)) end(i, next_eip(i), 0);
                 return true;
             case Op::Mov: return mov(i, in, after);
             case Op::Movzx: case Op::Movsx: return extend(i, in, after);
@@ -466,12 +898,13 @@ private:
             case Op::Setcc: return setcc(i, in);
             case Op::Cmovcc: return cmov(i, in);
             case Op::Xchg: return xchg(i, in);
+            case Op::X87: return x87(i, in, after);
             default: return false;
         }
     }
     // The end of a native non-branch instruction: the last one leaves the block; others check the exit flag.
     void finish(unsigned i, bool touched_memory) {
-        if (last(i)) leave(i, next_eip(i), kJitEnd);
+        if (last(i)) end(i, next_eip(i), 0);
         else if (touched_memory) exit_check(i);
     }
 
@@ -732,14 +1165,16 @@ private:
         Label taken = a.label();
         a.test(4, rdx, rdx);
         a.jcc(NE, taken);
-        leave(i, next_eip(i), kJitEnd);
+        const bool cw = cw_active_;  // each path leaves the x87 control word itself
+        end(i, next_eip(i), 0);
         a.bind(taken);
-        leave(i, next_eip(i) + in.imm, kJitEnd);
+        cw_active_ = cw;
+        end(i, static_cast<u32>(next_eip(i) + in.imm), 1);
         return true;
     }
     bool jmp(unsigned i, const Insn& in) {
         if (!last(i) || in.size != 4) return false;
-        leave(i, next_eip(i) + in.imm, kJitEnd);
+        end(i, static_cast<u32>(next_eip(i) + in.imm), 0);
         return true;
     }
     bool call(unsigned i, const Insn& in, Label after) {
@@ -753,7 +1188,7 @@ private:
         a.mov_imm(4, mem(rsi), next_eip(i));
         a.mov(4, rcx, ctx_at(kCtxScratch + 24));
         a.mov(4, greg(kEsp, 4), rcx);
-        leave(i, next_eip(i) + in.imm, kJitEnd);
+        end(i, static_cast<u32>(next_eip(i) + in.imm), 0);
         return true;
     }
     bool ret(unsigned i, const Insn& in, Label after) {
@@ -768,8 +1203,7 @@ private:
         a.mov(4, rcx, ctx_at(kCtxScratch + 24));
         a.lea(4, rcx, mem(rcx, static_cast<i32>(4 + in.imm)));
         a.mov(4, greg(kEsp, 4), rcx);
-        a.mov32(rax, (i << 2) | kJitEnd);
-        a.jmp(epilogue_);
+        end(i, kNoEip, 0);
         return true;
     }
     bool setcc(unsigned i, const Insn& in) {
@@ -811,7 +1245,7 @@ private:
 bool Jit::compile(Block& b, Cpu& cpu) {
     if (!buffer_ || b.rep || b.mode != 3) return false;
     b.jit_eip = cpu.state().eip;
-    b.jit_segs = 0;
+    for (unsigned g = 0; g < kSegCount; ++g) b.jit_seg[g] = cpu.state().seg[g];
     b.jit_dirty = cpu.memory().dirty_tracking();
     Translator t(b, cpu);
     t.run();
@@ -820,6 +1254,7 @@ bool Jit::compile(Block& b, Cpu& cpu) {
     if (used_ + n > capacity_) return false;
     std::memcpy(buffer_ + used_, t.a.code.data(), n);
     b.native = buffer_ + used_;
+    b.native_body = buffer_ + used_ + t.body;
     used_ += (n + 15) & ~std::size_t{15};
     ++compiled_;
     return true;

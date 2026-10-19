@@ -47,6 +47,12 @@ bool ends_block(const Insn& in) {
     }
 }
 
+bool same_segments(const Block& a, const Block& b) {
+    for (unsigned g = 0; g < kSegCount; ++g)
+        if (a.jit_seg[g].base != b.jit_seg[g].base || a.jit_seg[g].limit != b.jit_seg[g].limit || a.jit_seg[g].ar != b.jit_seg[g].ar) return false;
+    return true;
+}
+
 BranchKind branch_kind(Op op) {
     switch (op) {
         case Op::Jcc: case Op::Loop: case Op::Loope: case Op::Loopne: case Op::Jcxz: return BranchKind::Conditional;
@@ -182,7 +188,7 @@ void BlockEngine::kill_page(u32 ram_page) {
     if (ram_page >= page_blocks_.size()) return;
     auto& list = page_blocks_[ram_page];
     for (Block* b : list) {
-        if (b == running_) running_dead_ = true;
+        if (b == running_ || (current_ && current_->block == b)) running_dead_ = true;
         const auto it = blocks_.find(key(b->ram_page, b->page_off, b->mode));
         if (it != blocks_.end()) {
             graveyard_.push_back(std::move(it->second));
@@ -193,6 +199,8 @@ void BlockEngine::kill_page(u32 ram_page) {
     list.clear();
     bus_.set_code_page(ram_page, false);
     ++epoch_;
+    ++link_epoch_;
+    pending_slot_ = nullptr;
     ++stats_.pages_written;
 }
 
@@ -321,12 +329,22 @@ unsigned BlockEngine::run(Block& b, u64 limit) {
                 if (!jit_->compile(b, cpu_)) b.jit_failed = true;
             }
             ++b.jit_compiles;
+            ++link_epoch_;
+        }
+        // The last native exit's slot learns where it led, when a chain there could be valid (same snapshot).
+        if (pending_slot_) {
+            if (b.native && b.jit_eip == r.entry_eip && b.jit_dirty == pending_from_->jit_dirty && same_segments(b, *pending_from_)) {
+                pending_slot_->to = &b;
+                pending_slot_->epoch = link_epoch_;
+            }
+            pending_slot_ = nullptr;
         }
         if (b.native && r.start + r.extra + b.cycles < r.limit) {
             if (Jit::eligible(b, cpu_)) return run_native(r);
             ++stats_.native_ineligible;
             if (b.jit_compiles < 4) b.native = nullptr;
             else b.jit_failed = true;
+            ++link_epoch_;
         }
     }
     unsigned i = 0;
@@ -338,63 +356,119 @@ unsigned BlockEngine::run(Block& b, u64 limit) {
 
 namespace mv::p6 {
 
-// A native run: the generated code executes the block (with the interpreter for what it does not cover) and returns
-// the instruction it ended at; the clock is then set exactly as `exec` would have set it.
+// A native run: the generated code executes the block (with the interpreter for what it does not cover), maybe
+// chaining into further blocks, and returns the instruction the last block ended at; the clock is then set exactly
+// as `exec` would have set it.
 unsigned BlockEngine::run_native(Run& r) {
-    Block& b = *r.b;
     Memory& mem = cpu_.memory();
     JitCtx c{};
     c.st = &cpu_.state();
     c.cpu = &cpu_;
     c.engine = this;
-    c.block = &b;
+    c.block = r.b;
     c.base = r.start + r.extra;
     c.limit = r.limit;
     c.devices = mem.device_events();
     c.error = &jit_error_;
+    c.entry_eip = r.entry_eip;
+    c.helper_ops = stats_.helper_ops.data();
+    c.chain_budget = chain_budget_;
     cpu_.clear_faulted();
-    running_ = &b;
+    running_ = r.b;
     running_dead_ = false;
-    const u32 result = Jit::entry(b)(&c);
+    current_ = &c;
+    const u32 result = Jit::entry(*r.b)(&c);
+    current_ = nullptr;
     running_ = nullptr;
     if (jit_error_) {
         const std::exception_ptr e = jit_error_;
         jit_error_ = nullptr;
         std::rethrow_exception(e);
     }
+    Block& b = *c.block;  // the block the run ended in
     const unsigned i = result >> 2;
     const unsigned kind = result & 3;
-    cpu_.add_instructions(i + 1 - c.helpers);
+    const u64 total = c.insns_done + i + 1;
+    cpu_.add_instructions(total - c.helpers);
     stats_.block_insns += i + 1;
     ++stats_.native_runs;
-    stats_.native_insns += i + 1 - c.helpers;
+    stats_.native_insns += total - c.helpers;
     stats_.native_helpers += c.helpers;
-    c.base += mem.take_penalty();
-    stats_.penalty_cycles += c.base - (r.start + r.extra);
+    const u64 left = mem.take_penalty();
+    c.base += left;
+    stats_.penalty_cycles += c.penalties + left;
     if (kind == kJitEnd) {
-        const u32 exit = exit_cost(b, r.entry_eip);
-        stats_.schedule_cycles += b.cycles;
-        stats_.exit_cycles += exit;
-        cpu_.set_cycles_only(c.base + b.cycles + exit);
+        if (c.ended) {
+            cpu_.set_cycles_only(c.end_cycles);  // the exit was costed where the chain stopped
+            pending_slot_ = c.last_slot;
+            pending_from_ = &b;
+        } else {
+            const u32 exit = exit_cost(b, c.entry_eip);
+            stats_.schedule_cycles += b.cycles;
+            stats_.exit_cycles += exit;
+            cpu_.set_cycles_only(c.base + b.cycles + exit);
+        }
     } else if (kind == kJitExit && c.exit == 2) {
         // The interpreter finishes the block from the next instruction, with the penalties so far.
         cpu_.set_cycles_only(c.base + b.after[i]);
-        Run rest = r;
-        rest.extra = c.base - r.start;
+        Run rest{&b, c.base, c.entry_eip, 0, c.limit};
         ++stats_.native_handoffs;
         unsigned j = i + 1;
         while (exec(rest, j) == Next::Continue) ++j;
-        return j + 1;
+        return static_cast<unsigned>(c.insns_done) + j + 1;
     } else {
         stats_.schedule_cycles += b.after[i];
         cpu_.set_cycles_only(c.base + b.after[i] + (kind == kJitFault ? tp::kInterruptDelivery : 0));
     }
-    return i + 1;
+    return static_cast<unsigned>(total);
+}
+
+// The end of a native block whose last instruction left normally. Its exit is costed as `exec` costs it. Then the run
+// goes on in the next block's native code only where the dispatcher would have done nothing in between: the next
+// deadline and the stop cycle lie past the next block even with the slowest code fetch (so no event fires and no
+// interrupt becomes deliverable — native code changes neither IF nor the PIC), no device wrote into code, the fetch
+// translation hits the TLB on the page the block came from (find() would walk nothing), it is not the idle loop, and
+// the link names that block's current translation with the same segments. Then its run begins as `begin` would.
+void* BlockEngine::chain(JitCtx& c, Block::Link* slot) {
+    Block& a = *c.block;
+    const u32 exit = exit_cost(a, c.entry_eip);
+    stats_.schedule_cycles += a.cycles;
+    stats_.exit_cycles += exit;
+    const u64 end = c.base + a.cycles + exit;
+    c.end_cycles = end;
+    c.ended = 1;
+    c.last_slot = slot;
+    Block* b = slot->to;
+    if (!b || slot->epoch != link_epoch_ || !b->native || c.chain_budget == 0) return nullptr;
+    const CpuState& s = cpu_.state();
+    if (b->jit_eip != s.eip || s.eip == idle_[0] || s.eip == idle_[1]) return nullptr;
+    constexpr u64 kSlowestFetch = tp::kL2Latency + tp::kDramLatency;
+    if (end + b->cycles + kSlowestFetch >= c.limit) return nullptr;
+    if (bus_.code_writes_pending() || cpu_.memory().penalty_pending()) return nullptr;
+    const u32 lin = s.seg[kCs].base + s.eip;
+    const Memory::TlbEntry& e = cpu_.memory().tlb()[(lin >> 12) & (Memory::kTlbSize - 1)];
+    if (e.tag != (lin >> 12) || !e.host || bus_.ram_page(e.host) != b->ram_page || (lin & 0xFFFu) != b->page_off) return nullptr;
+    --c.chain_budget;
+    ++b->runs;
+    ++stats_.whole_runs;
+    ++stats_.chains;
+    stats_.block_insns += a.n;
+    c.insns_done += a.n;
+    const PhysAddr code = static_cast<PhysAddr>(b->ram_page) * 4096u + b->page_off;
+    c.base = end + cpu_.cache_timing().code_fetch(code, b->bytes);
+    c.block = b;
+    c.entry_eip = s.eip;
+    c.ended = 0;
+    running_ = b;
+    cpu_.set_cycles_only(c.base);
+    return b->native_body;
 }
 
 void BlockEngine::disable_jit() { jit_.reset(); }
 
 void BlockEngine::drop_native() {
+    ++link_epoch_;
+    pending_slot_ = nullptr;
     for (auto& [k, b] : blocks_) b->native = nullptr;
     for (auto& b : graveyard_) b->native = nullptr;
 }

@@ -5,6 +5,7 @@
 #include <gtest/gtest.h>
 
 #include <cstring>
+#include <initializer_list>
 #include <vector>
 
 #include "core/bus.h"
@@ -61,7 +62,27 @@ void run_blocks(Rig& r, BlockEngine& e) {
     }
 }
 
-void expect_same(Rig& a, Rig& b, const char* what, bool cycles = false) {
+void expect_same(Rig& a, Rig& b, const char* what, bool cycles = false);
+
+// The recompiler in lock step with the block interpreter: after each of its dispatches (a chain of blocks), the
+// interpreter catches up to the same instruction count and the whole state must match — a fault a later
+// instruction would overwrite (a flag, C1) is seen where it happens.
+void run_lockstep(Rig& b, BlockEngine& eb, Rig& c, BlockEngine& ec, const char* what) {
+    for (unsigned n = 0; n < 100000 && !c.cpu.state().halted; ++n) {
+        ec.apply_device_writes();
+        if (Block* blk = ec.find()) ec.run(*blk, ~u64{0});
+        else c.cpu.step();
+        for (unsigned k = 0; k < 100000 && b.cpu.instructions() < c.cpu.instructions() && !b.cpu.state().halted; ++k) {
+            eb.apply_device_writes();
+            if (Block* blk = eb.find()) eb.run(*blk, ~u64{0});
+            else b.cpu.step();
+        }
+        expect_same(b, c, what, true);
+        if (::testing::Test::HasFailure()) return;
+    }
+}
+
+void expect_same(Rig& a, Rig& b, const char* what, bool cycles) {
     if (cycles) {
         EXPECT_EQ(a.cpu.cycles(), b.cpu.cycles()) << what << " cycles";
     }
@@ -69,6 +90,17 @@ void expect_same(Rig& a, Rig& b, const char* what, bool cycles = false) {
     EXPECT_EQ(a.cpu.state().eip, b.cpu.state().eip) << what;
     EXPECT_EQ(a.cpu.state().eflags(), b.cpu.state().eflags()) << what;
     EXPECT_EQ(a.cpu.instructions(), b.cpu.instructions()) << what;
+    const FpuState& fa = a.cpu.state().fpu;
+    const FpuState& fb = b.cpu.state().fpu;
+    for (unsigned r = 0; r < 8; ++r) EXPECT_EQ(0, std::memcmp(&fa.st[r], &fb.st[r], 10)) << what << " st phys " << r;
+    EXPECT_EQ(fa.fsw, fb.fsw) << what << " fsw";
+    EXPECT_EQ(fa.ftw, fb.ftw) << what << " ftw";
+    EXPECT_EQ(fa.fcw, fb.fcw) << what << " fcw";
+    EXPECT_EQ(fa.fop, fb.fop) << what << " fop";
+    EXPECT_EQ(fa.fip, fb.fip) << what << " fip";
+    EXPECT_EQ(fa.fdp, fb.fdp) << what << " fdp";
+    EXPECT_EQ(fa.fcs, fb.fcs) << what << " fcs";
+    EXPECT_EQ(fa.fds, fb.fds) << what << " fds";
     if (cycles) {
         const TimingStats& ta = a.cpu.cache_timing().stats();
         const TimingStats& tb = b.cpu.cache_timing().stats();
@@ -84,6 +116,8 @@ void expect_same(Rig& a, Rig& b, const char* what, bool cycles = false) {
 // memory at [EBX + d8], balanced pushes and pops, short forward branches.
 struct Gen {
     u32 seed;
+    bool x87{false};
+    int depth{0};  // the x87 stack depth the program believes in (overflow and underflow now and then on purpose)
     u32 next() {
         seed = seed * 1664525u + 1013904223u;
         return seed >> 8;
@@ -101,9 +135,87 @@ struct Gen {
         const u8 r = any();
         return r == 4 ? 3 : r;  // ESP's value differs per run only if pushed; keep it out of sources
     }
+    // x87 forms: loads, stores and arithmetic with singles at [EBX + d8], register forms, FNSTSW AX, and FILD/FISTP
+    // (interpreter-only) between them. Singles from the data area are random bits: NaNs and denormals appear.
+    void fpu(std::vector<u8>& c) {
+        const bool reckless = next() % 32 == 0;
+        const u8 d8 = static_cast<u8>(next() & 0xFC);
+        const u8 i = static_cast<u8>(next() % static_cast<u32>(depth > 1 ? depth : 2));
+        switch (next() % 14) {
+            case 0: case 1:
+                if (depth >= 8 && !reckless) return;
+                c.insert(c.end(), {0xD9, 0x43, d8});  // fld dword [ebx+d8]
+                ++depth;
+                return;
+            case 2:
+                if (depth <= 0 && !reckless) return;
+                c.insert(c.end(), {0xD9, static_cast<u8>(next() & 1 ? 0x5B : 0x53), d8});  // fstp / fst dword [ebx+d8]
+                if (c[c.size() - 2] == 0x5B) --depth;
+                return;
+            case 3: case 4: {
+                if (depth <= 0 && !reckless) return;
+                static constexpr u8 r[] = {0, 1, 4, 5, 6, 7};
+                c.insert(c.end(), {0xD8, static_cast<u8>(0x43 | r[next() % 6] << 3), d8});  // fadd/fmul/fsub/fsubr/fdiv/fdivr dword
+                return;
+            }
+            case 5:
+                if (depth <= 0 && !reckless) return;
+                c.insert(c.end(), {0xD8, static_cast<u8>(next() & 1 ? 0x5B : 0x53), d8});  // fcomp / fcom dword
+                if (c[c.size() - 2] == 0x5B) --depth;
+                return;
+            case 6: {
+                if (depth < 2 && !reckless) return;
+                static constexpr u8 r[] = {0, 1, 4, 5, 6, 7};
+                static constexpr u8 escs[] = {0xD8, 0xDC, 0xDE};
+                const u8 e = escs[next() % 3];
+                c.insert(c.end(), {e, static_cast<u8>(0xC0 | r[next() % 6] << 3 | i)});
+                if (e == 0xDE) --depth;
+                return;
+            }
+            case 7:
+                if ((depth <= 0 || depth >= 8) && !reckless) return;
+                c.insert(c.end(), {0xD9, static_cast<u8>(0xC0 | i)});  // fld st(i)
+                ++depth;
+                return;
+            case 8:
+                if (depth < 2 && !reckless) return;
+                c.insert(c.end(), {0xD9, static_cast<u8>(0xC8 | i)});  // fxch st(i)
+                return;
+            case 9:
+                if (depth <= 0 && !reckless) return;
+                c.insert(c.end(), {0xD9, static_cast<u8>(next() & 1 ? 0xE0 : 0xE1)});  // fchs / fabs
+                return;
+            case 10:
+                if (depth >= 8 && !reckless) return;
+                c.insert(c.end(), {0xD9, static_cast<u8>(next() & 1 ? 0xE8 : 0xEE)});  // fld1 / fldz
+                ++depth;
+                return;
+            case 11:
+                if (depth <= 0 && !reckless) return;
+                c.insert(c.end(), {0xDD, static_cast<u8>(next() & 1 ? 0xD8 | i : 0xD0 | i)});  // fstp / fst st(i)
+                if ((c.back() & 0xF8) == 0xD8) --depth;
+                return;
+            case 12: c.insert(c.end(), {0xDF, 0xE0}); return;  // fnstsw ax
+            case 13:
+                if (next() & 1) {
+                    if (depth >= 8 && !reckless) return;
+                    c.insert(c.end(), {0xDB, 0x43, d8});  // fild dword (the interpreter's)
+                    ++depth;
+                } else {
+                    if (depth <= 0 && !reckless) return;
+                    c.insert(c.end(), {0xDB, 0x5B, d8});  // fistp dword
+                    --depth;
+                }
+                return;
+        }
+    }
     void one(std::vector<u8>& c) {
         static constexpr u8 alu[] = {0x01, 0x09, 0x11, 0x19, 0x21, 0x29, 0x31, 0x39, 0x85};
         const u8 d = reg(), s = src();
+        if (x87 && next() % 3 == 0) {
+            fpu(c);
+            return;
+        }
         switch (next() % 30) {
             case 0: case 1: case 2: c.insert(c.end(), {alu[next() % 9], static_cast<u8>(0xC0 | s << 3 | d)}); break;
             case 3: c.insert(c.end(), {static_cast<u8>(alu[next() % 8] - 1), static_cast<u8>(0xC0 | reg8() << 3 | reg8())}); break;
@@ -158,6 +270,8 @@ TEST(P6Block, GeneratedProgramsMatchTheStep) {
     u64 native = 0, paged_insns = 0;
     for (u32 program = 0; program < 300; ++program) {
         Gen g{program * 7919u + 1};
+        g.x87 = program % 3 == 0;
+        static constexpr u16 kCw[] = {0x37F, 0x27F, 0x07F, 0xF7F, 0x77F};  // precisions and roundings, all masked
         std::vector<u8> code;
         while (code.size() < 900) g.one(code);
         code.push_back(0xF4);  // hlt
@@ -170,6 +284,7 @@ TEST(P6Block, GeneratedProgramsMatchTheStep) {
             r->cpu.state().gpr[kEax] = program * 0x01010101u;
             r->cpu.state().gpr[kEsi] = kData + 0x40;
             r->cpu.state().gpr[kEdi] = 0x10;
+            r->cpu.state().fpu.fcw = kCw[(program / 3) % 5];
         }
         run_steps(a);
         b.cpu.set_block_timing(true);
@@ -179,10 +294,23 @@ TEST(P6Block, GeneratedProgramsMatchTheStep) {
         expect_same(a, b, "block interpreter against the step");
         ASSERT_FALSE(::testing::Test::HasFailure()) << "program " << program;
         EXPECT_GT(e.stats().block_insns, a.cpu.instructions() / 2);  // blocks ran it, not the fallback
+        // Again, in lock step: a second block interpreter beside the recompiler.
+        Rig b2(paged);
+        b2.load(code);
+        b2.cpu.state().gpr[kEbx] = kData;
+        for (unsigned k = 0; k < 0x200; ++k) b2.bus.ram()[kData + k] = static_cast<u8>(k * 37 + program);
+        b2.cpu.state().gpr[kEax] = program * 0x01010101u;
+        b2.cpu.state().gpr[kEsi] = kData + 0x40;
+        b2.cpu.state().gpr[kEdi] = 0x10;
+        b2.cpu.state().fpu.fcw = kCw[(program / 3) % 5];
+        b2.cpu.set_block_timing(true);
+        BlockEngine e2(b2.cpu, b2.bus);
+        e2.disable_jit();
         c.cpu.set_block_timing(true);
         BlockEngine ej(c.cpu, c.bus);
         ej.set_jit_threshold(0);
-        run_blocks(c, ej);
+        ej.set_chain_budget(program % 2 ? 0 : 1024);  // one block a dispatch (compared after each) or chained
+        run_lockstep(b2, e2, c, ej, "recompiled against the block interpreter, in lock step");
         expect_same(b, c, "recompiled against the block interpreter", true);
         ASSERT_FALSE(::testing::Test::HasFailure()) << "program " << program << (paged ? " (paged)" : "");
         native += ej.stats().native_insns;
@@ -273,4 +401,43 @@ TEST(P6Block, ScheduleCountsDependencies) {
     EXPECT_GT(chain, independent);
     EXPECT_GE(chain, 12u);
     EXPECT_GE(cost({0x90}), 1u);
+}
+
+// Directed x87 cases where each result is observable at once (C1 right after the instruction that sets or clears
+// it, a stack fault, NaN and denormal operands, compares): the step against the recompiler under several control
+// words. Singles at [EBX]: +0 1/3, +4 3.0, +8 1.0, +12 a denormal, +16 a quiet NaN, +20 a signalling NaN, +24 1e38.
+TEST(P6Block, X87FormsMatchTheInterpreter) {
+    const std::vector<std::vector<u8>> snippets = {
+        {0xD9, 0xE8, 0xD9, 0x43, 0x04, 0xDE, 0xF9, 0xD9, 0xE0, 0xF4},              // fld1; fld 3.0; fdivp; fchs
+        {0xD9, 0x03, 0xD8, 0x0B, 0xD9, 0xE1, 0xF4},                                // fld 1/3; fmul 1/3; fabs
+        {0xD9, 0x03, 0xD8, 0x4B, 0x04, 0xD9, 0x5B, 0x40, 0xDF, 0xE0, 0xF4},        // fld; fmul 3.0; fstp [x]; fnstsw ax
+        {0xD9, 0xEE, 0xD9, 0xE8, 0xD9, 0xC9, 0xD8, 0x5B, 0x08, 0xDF, 0xE0, 0xF4},  // fldz; fld1; fxch; fcomp 1.0; fnstsw
+        {0xD9, 0x03, 0xD9, 0xC0, 0xDE, 0xC1, 0xDD, 0xD8, 0xF4},                    // fld; fld st0; faddp; fstp st0
+        {0xD9, 0xE8, 0xD9, 0xE8, 0xD9, 0xE8, 0xD9, 0xE8, 0xD9, 0xE8, 0xD9, 0xE8, 0xD9, 0xE8, 0xD9, 0xE8, 0xD9, 0xE8, 0xF4},  // 9 pushes
+        {0xD9, 0x43, 0x0C, 0xD8, 0x0B, 0xF4},                                      // fld denormal; fmul
+        {0xD9, 0x43, 0x10, 0xD8, 0x0B, 0xD9, 0x5B, 0x40, 0xF4},                    // fld qNaN; fmul; fstp
+        {0xD9, 0x43, 0x14, 0xF4},                                                  // fld sNaN
+        {0xD9, 0x43, 0x18, 0xD8, 0x4B, 0x18, 0xD9, 0x5B, 0x40, 0xDF, 0xE0, 0xF4},  // 1e38 * 1e38 -> fstp single: overflow
+        {0xDD, 0xD8, 0xF4},                                                        // fstp st0 on an empty stack
+        {0xD9, 0xE8, 0xD8, 0x73, 0x00, 0xD9, 0xEE, 0xDE, 0xF9, 0xDF, 0xE0, 0xF4},  // 1 / (1/3); fldz; fdivp: zero divide
+    };
+    const u32 singles[] = {0x3EAAAAABu, 0x40400000u, 0x3F800000u, 0x00000001u, 0x7FC00000u, 0x7F800001u, 0x7E967699u};
+    for (const u16 cw : std::initializer_list<u16>{0x037F, 0x027F, 0x007F, 0x0F7F, 0x077F}) {
+        for (std::size_t s = 0; s < snippets.size(); ++s) {
+            Rig a(true), c(true);
+            for (Rig* r : {&a, &c}) {
+                r->load(snippets[s]);
+                std::memcpy(r->bus.ram() + kData, singles, sizeof singles);
+                r->cpu.state().gpr[kEbx] = kData;
+                r->cpu.state().fpu.fcw = cw;
+            }
+            run_steps(a);
+            c.cpu.set_block_timing(true);
+            BlockEngine e(c.cpu, c.bus);
+            e.set_jit_threshold(0);
+            run_blocks(c, e);
+            expect_same(a, c, "x87 snippet");
+            ASSERT_FALSE(::testing::Test::HasFailure()) << "snippet " << s << " control word " << cw;
+        }
+    }
 }

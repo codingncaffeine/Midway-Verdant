@@ -42,10 +42,17 @@ struct Block {
     std::vector<Insn> insns;
     std::array<u16, kMaxBlockInsns> off{};  // each instruction's offset from the first byte
     void* native{nullptr};  // the recompiled form, when there is one
-    // The recompiled form's assumptions, checked before it runs: the entry EIP, the segments its memory accesses
-    // used (by base, limit and rights), whether write tracking was on.
+    // The recompiled form's assumptions, checked before it runs: the entry EIP, all six segment registers (base,
+    // limit and rights; native code never changes one, so a chain between blocks with equal snapshots needs no
+    // check), whether write tracking was on.
     u32 jit_eip{0};
-    u8 jit_segs{0};
+    void* native_body{nullptr};  // past the prologue: where a chain from another block enters
+    // Where each exit of the final instruction went last (a hint: every condition is checked when a chain is taken).
+    struct Link {
+        Block* to{nullptr};
+        u32 epoch{0};
+    };
+    std::array<Link, 2> links{};
     bool jit_dirty{false};
     bool jit_failed{false};
     u8 jit_compiles{0};
@@ -58,12 +65,14 @@ struct BlockStats {
     u64 built{0}, killed{0}, pages_written{0}, device_page_writes{0};
     u64 whole_runs{0}, fallback_steps{0}, block_insns{0};
     u64 mispredicts{0};
-    u64 native_runs{0}, native_insns{0}, native_helpers{0}, native_ineligible{0}, native_handoffs{0};
+    u64 native_runs{0}, native_insns{0}, native_helpers{0}, native_ineligible{0}, native_handoffs{0}, chains{0};
     // Where the cycles went: the schedules, the penalties (caches, devices), the exits' mispredicts, REP elements.
     u64 schedule_cycles{0}, penalty_cycles{0}, exit_cycles{0}, rep_cycles{0};
+    std::array<u64, 256 + 256> helper_ops{};  // instructions the interpreter ran inside native code, by operation; x87 by form
 };
 
 class Jit;
+struct JitCtx;
 
 class BlockEngine : public CodeWatcher {
 public:
@@ -109,9 +118,16 @@ public:
     void disable_jit();
     // Runs before a block is translated (tests use 0: translate at once).
     void set_jit_threshold(u64 runs) { hot_ = runs; }
+    // Blocks a native run may chain into (tests use 0: one block a dispatch, to compare after each).
+    void set_chain_budget(u32 blocks) { chain_budget_ = blocks; }
     bool running_dead() const { return running_dead_; }
     // Forget every block's native code (the code buffer was flushed).
     void drop_native();
+    // The end of a native block (the generated code calls it): its exit costed, then the next block's native entry if
+    // the run may go on there without the dispatcher, else null. See block.cpp.
+    void* chain(JitCtx& c, Block::Link* slot);
+    // The kernel idle loop's check addresses: never chained into (the dispatcher halts there).
+    void set_idle_eips(u32 a, u32 b) { idle_ = {a, b}; }
 
     void code_written(u32 ram_page) override;
     const BlockStats& stats() const { return stats_; }
@@ -141,6 +157,7 @@ private:
     std::unordered_map<u64, std::unique_ptr<Block>> blocks_;
     std::vector<FastEntry> fast_;
     u32 epoch_{1};  // a kill makes every fast entry stale at once
+    u32 link_epoch_{1};  // a kill or a new translation makes every chain link stale at once
     std::vector<std::vector<Block*>> page_blocks_;
     std::vector<std::unique_ptr<Block>> graveyard_;
     Block* running_{nullptr};
@@ -152,6 +169,11 @@ private:
     std::unique_ptr<Jit> jit_;
     std::exception_ptr jit_error_;
     u64 hot_{8};
+    u32 chain_budget_{1024};  // the dispatcher's batch and its lock are not kept waiting for long
+    std::array<u32, 2> idle_{};
+    JitCtx* current_{nullptr};  // the native run in progress
+    Block::Link* pending_slot_{nullptr};  // the last native exit's link slot, filled by the next block run
+    Block* pending_from_{nullptr};
     // MV_P6_BLOCK_LOG=FILE:FROM:TO: a line per block run whose start lies in the cycle window (its schedule; start,
     // EIP, a hash of the registers and flags, the cache counters, a hash of the caches' contents and order, the limit),
     // then every cache-model access it makes: to find where two executors part.
