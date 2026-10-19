@@ -405,6 +405,14 @@ int main(int argc, char** argv) {
                     static_cast<double>(st.ns_write_back) / 1e6, static_cast<double>(st.ns_write_back_gpu) / 1e6);
         if (st.batch_flushes) std::printf("gpu: %llu mid-frame batch submits (rings full)\n", static_cast<unsigned long long>(st.batch_flushes));
         for (const auto& e : st.errors) std::printf("gpu skipped a draw: %s\n", e.c_str());
+        // Where the display reads against where the GPU draws: a picture that never reaches the screen shows as a
+        // scanout start that no render target covers.
+        const mv::Nv2aStub& g = machine.nv2a();
+        std::printf("gpu scanout: start %08x, %ux%u, pitch %u, %u bytes a pixel%s\n", g.framebuffer_start(), g.scanout_width(), g.scanout_height(),
+                    g.scanout_pitch(), g.scanout_bytes_per_pixel(), g.scanout_bytes_per_pixel() == 2 ? (g.scanout_rgb565() ? " (R5G6B5)" : " (X1R5G5B5)") : "");
+        for (const auto& s : r->surfaces())
+            std::printf("gpu surface: %08x-%08x %ux%u pitch %u, %u bytes a pixel, format %u%s\n", s.phys, s.phys + s.pitch * s.height, s.width, s.height,
+                        s.pitch, s.bytes_per_pixel, s.color_format, s.swizzled ? ", swizzled" : "");
     }
     std::printf("milestones: rom hidden %s | smc challenge %s | bootloader %s | kernel %s | power off %s\n", ms(m.rom_hidden).c_str(),
                 ms(m.smc_challenge_answered).c_str(), ms(m.bootloader_magic).c_str(), ms(m.kernel_header).c_str(), ms(m.power_off).c_str());
