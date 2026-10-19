@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <format>
 #include <string>
@@ -116,11 +117,11 @@ bool SetupEngine::method(u32 offset, u32 value) {
             if (std::none_of(handles_started_.begin(), handles_started_.end(), [handle](const Started& s) { return s.handle == handle; }))
                 handles_started_.push_back({handle, trace::now()});
             if (trace::on(trace::Cat::Apu) && !(field(handle, kFieldFmt) & kFmtStream)) {
-                // What the voice will play: its buffer's level and peak over the first 4096 samples.
+                // What the voice will play: its buffer's level and peak, over the whole buffer up to a million samples.
                 const u32 fmt = field(handle, kFieldFmt);
                 Source src = source_for(fmt);
                 src.base = field(handle, kFieldPslStart) & kOffsetMask;
-                const u32 ebo = field(handle, kFieldNext) & kOffsetMask, n = std::min(ebo + 1, 4096u);
+                const u32 ebo = field(handle, kFieldNext) & kOffsetMask, n = std::min(ebo + 1, 1u << 20);
                 double sum = 0, peak = 0;
                 u32 crossings = 0, differ = 0;
                 float last = 0.0f;
@@ -135,6 +136,26 @@ bool SetupEngine::method(u32 offset, u32 value) {
                 }
                 trace::log(trace::Cat::Apu, "vp: voice {:x} on: buffer +{:x} ebo {:x} lbo {:x} fmt {:08x}: rms {:.1f} dB peak {:.1f} dB, {} zero crossings, L != R in {} of {} samples", handle,
                            src.base, ebo, field(handle, kFieldPshSample) & kOffsetMask, fmt, 10 * std::log10(sum / n + 1e-12), 20 * std::log10(peak + 1e-9), crossings, differ, n);
+                // Instrument: MV_DEBUG_VOICE_DUMP=HEX writes that voice's buffer, as decoded, to scratch/voice-HEX-N.wav
+                // (16-bit mono at the rate its pitch plays it), to hear or measure what the engine reads.
+                if (const char* d = std::getenv("MV_DEBUG_VOICE_DUMP"); d && std::strtoul(d, nullptr, 16) == handle) {
+                    static u32 dumps = 0;
+                    const i32 pitch = static_cast<i16>(field(handle, kFieldPitchLink) >> 16);
+                    const u32 rate = static_cast<u32>(48000.0 * std::exp2(pitch / 4096.0));
+                    if (std::FILE* w = std::fopen(std::format("scratch/voice-{:x}-{}.wav", handle, dumps++).c_str(), "wb")) {
+                        const u32 bytes = n * 2;
+                        const u32 hdr[11] = {0x46464952u, 36 + bytes, 0x45564157u, 0x20746D66u, 16, 0x00010001u, rate, rate * 2, 0x00100002u, 0x61746164u, bytes};
+                        std::fwrite(hdr, 4, 11, w);
+                        for (u32 i = 0; i < n; ++i) {
+                            float s[2];
+                            read_sample(handle, src, i, s);
+                            const i16 v = static_cast<i16>(std::clamp(s[0] * 32767.0f, -32768.0f, 32767.0f));
+                            std::fwrite(&v, 2, 1, w);
+                        }
+                        std::fclose(w);
+                    }
+                    trace::log(trace::Cat::Apu, "vp: voice {:x} dumped: {} samples at {} Hz", handle, n, rate);
+                }
                 b.adpcm_key = ~0ull;  // the reads above filled the ADPCM block cache; playback starts from a clean one
             }
             return true;
@@ -249,8 +270,9 @@ void SetupEngine::frame() {
         std::string line;
         for (u32 list = 0; list < kRegListTop.size(); ++list)
             for (u32 h = host_.global_reg(kRegListTop[list]) & kHandleMask, guard = 0; h < kMaxVoices && guard < kMaxVoices; h = field(h, kFieldPitchLink) & kHandleMask, ++guard)
-                line += std::format(" {:x}(cbo {} ea {} v0 {:x} v1 {:x}{})", h, field(h, kFieldOffset) & kOffsetMask, field(h, kFieldOffset) >> 24,
-                                    (field(h, kFieldVolA) >> 4) & 0xFFFu, field(h, kFieldVolA) >> 20, (field(h, kFieldState) & kStatePaused) ? " paused" : "");
+                line += std::format(" {:x}(cbo {} ea {} v0 {:x} v1 {:x} fmode {} fca {:08x} fcb {:08x}{})", h, field(h, kFieldOffset) & kOffsetMask, field(h, kFieldOffset) >> 24,
+                                    (field(h, kFieldVolA) >> 4) & 0xFFFu, field(h, kFieldVolA) >> 20, (field(h, kFieldMisc) >> 16) & 3u, field(h, kFieldFcA), field(h, kFieldFcB),
+                                    (field(h, kFieldState) & kStatePaused) ? " paused" : "");
         trace::log(trace::Cat::Apu, "vp: frame {} voices:{}", frames_, line.empty() ? " none" : line);
         // And the RMS level of each bin that carried sound over the half second, in dB of full scale.
         std::string bins;
