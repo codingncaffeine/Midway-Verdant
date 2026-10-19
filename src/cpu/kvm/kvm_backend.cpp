@@ -426,6 +426,7 @@ std::string KvmBackend::report() const {
             r += (top[i].first & 0x10000u) ? std::format(" port {:04x} x{}", top[i].first & 0xFFFFu, top[i].second)
                                            : std::format(" mmio {:08x} x{}", top[i].first, top[i].second);
     }
+    if (!stopped_at_.empty()) r += "\nkvm: the guest stopped: " + stopped_at_;
     if (!guest_clock_on_) return r;
     r += std::format("\nguest clock: TSC {} kHz on the host clock{}, {} rewinds ({:.3f} s of guest time), {} guest writes{}{}; TSC lead at frame ends (us): last {:.1f}, mean {:.1f}, min {:.1f}, max {:.1f} over {}",
                      clock_.tsc_khz(), tsc_scaled_ ? "" : " (NOT SCALED: the host has no TSC control)", tsc_rewinds_,
@@ -675,7 +676,17 @@ void KvmBackend::thread_main() {
                 // With the guest clock, an idle CPU skips guest time (the loop above); with interrupts off it has
                 // stopped for good, and only a device or a stop wakes it, as with the host clock.
                 if (guest_clock_on_ && run_->if_flag) halted_ = true;
-                else wait_for_interrupt();
+                else {
+                    // Interrupts off: the CPU stops until a reset (the kernel ends a bug check this way). The first
+                    // such stop is kept for the unload report, with the stack it stopped on.
+                    if (stopped_at_.empty()) {
+                        Regs r{};
+                        if (read_regs(r)) stopped_at_ = std::format("HLT with interrupts off at eip {:08x}\n{}", r.eip, debug::describe_stack(machine_->bus(), r, 32));
+                        else stopped_at_ = "HLT with interrupts off (registers unreadable)";
+                        trace::log(trace::Cat::Cpu, "the guest stopped: {}", stopped_at_);
+                    }
+                    wait_for_interrupt();
+                }
                 break;
             case KVM_EXIT_IRQ_WINDOW_OPEN: ++stats_.irq_window_exits; break;
             case KVM_EXIT_X86_WRMSR:

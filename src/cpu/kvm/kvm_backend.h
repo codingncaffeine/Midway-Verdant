@@ -112,6 +112,7 @@ private:
     u64 backstop_at_ns_{0};  // the host time it is armed for (machine lock)
     u64 backstop_shots_{0};
     bool halted_{false};    // HLT: the guest waits for an interrupt; guest time skips to each next event
+    std::string stopped_at_;  // the first HLT with interrupts off: where, and the stack (for the unload report)
     Cycles tsc_epoch_{0};   // guest time at which the TSC was zero
     u64 vblank_seen_{0};
     bool frame_tsc_due_{false};
