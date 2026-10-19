@@ -17,7 +17,6 @@ namespace mv::pgraph {
 namespace {
 
 constexpr VkDeviceSize kVertexRingBytes = 32u << 20, kIndexRingBytes = 8u << 20, kUniformRingBytes = 8u << 20, kStagingBytes = 16u << 20;
-constexpr u32 kVertexStride = kAttributes * 16;
 constexpr u32 kMaxDescriptorSets = 4096;
 
 VkFormat color_vk_format(u32 nv_format) {
@@ -1024,18 +1023,18 @@ VkShaderModule VulkanRenderer::fragment_shader(const psh::Key& key, std::array<p
     return m;
 }
 
-VkPipeline VulkanRenderer::pipeline(const KelvinState& s, VkShaderModule vs, VkShaderModule fs, VkPrimitiveTopology topology, Surface& t, std::string& error) {
+VkPipeline VulkanRenderer::pipeline(const KelvinState& s, VkShaderModule vs, VkShaderModule fs, VkPrimitiveTopology topology, Surface& t, u32 vertex_layout, std::string& error) {
     Timed timed(stats_.ns_pipeline);
     struct RasterKey {
         VkShaderModule vs, fs;
         VkRenderPass pass;
         u32 topology, blend_enable, sfactor, dfactor, equation, depth_test, depth_func, depth_write, cull_enable, cull_face, front_face,
             color_mask, stencil_enable, stencil_func, stencil_mask, stencil_write_mask, op_fail, op_zfail, op_zpass;
-        u32 unused;  // fills the last eight bytes: the key is its bytes, and a padding word held whatever the stack did
+        u32 vertex_layout;  // the attributes with per-vertex data (also fills the last eight bytes: the key is its bytes)
     } k{vs, fs, t.pass, static_cast<u32>(topology) | (debug_nocull_ ? 0x100u : 0u) | (debug_nodepth_ ? 0x200u : 0u) | (debug_noblend_ ? 0x400u : 0u), s.blend(), s.reg(mthd::kBlendSfactor), s.reg(mthd::kBlendDfactor), s.reg(mthd::kBlendEquation),
         s.depth_test(), s.reg(mthd::kDepthFunc), s.depth_write(), s.cull_face(), s.reg(mthd::kCullFace), s.reg(mthd::kFrontFace), s.color_mask(),
         s.stencil_test(), s.reg(mthd::kStencilFunc), s.reg(mthd::kStencilFuncMask), s.reg(mthd::kStencilMask), s.reg(mthd::kStencilOpFail),
-        s.reg(mthd::kStencilOpZfail), s.reg(mthd::kStencilOpZpass), 0u};
+        s.reg(mthd::kStencilOpZfail), s.reg(mthd::kStencilOpZpass), vertex_layout};
     static_assert(std::has_unique_object_representations_v<RasterKey>);
     std::string key(reinterpret_cast<const char*>(&k), sizeof k);
     if (auto it = pipelines_.find(key); it != pipelines_.end()) return it->second;
@@ -1049,12 +1048,17 @@ VkPipeline VulkanRenderer::pipeline(const KelvinState& s, VkShaderModule vs, VkS
     stages[1].module = fs;
     stages[1].pName = "main";
 
-    VkVertexInputBindingDescription binding{0, kVertexStride, VK_VERTEX_INPUT_RATE_VERTEX};
+    // The attributes with per-vertex data packed in order in binding 0; the others read their constant from binding 1,
+    // a block of all sixteen at a stride of zero.
+    const u32 per_vertex = static_cast<u32>(std::popcount(vertex_layout & 0xFFFFu));
+    VkVertexInputBindingDescription bindings[2] = {{0, std::max(per_vertex, 1u) * 16, VK_VERTEX_INPUT_RATE_VERTEX}, {1, 0, VK_VERTEX_INPUT_RATE_VERTEX}};
     VkVertexInputAttributeDescription attrs[kAttributes]{};
-    for (u32 i = 0; i < kAttributes; ++i) attrs[i] = {i, 0, VK_FORMAT_R32G32B32A32_SFLOAT, i * 16};
+    for (u32 i = 0, packed = 0; i < kAttributes; ++i)
+        attrs[i] = (vertex_layout >> i) & 1u ? VkVertexInputAttributeDescription{i, 0, VK_FORMAT_R32G32B32A32_SFLOAT, 16 * packed++}
+                                              : VkVertexInputAttributeDescription{i, 1, VK_FORMAT_R32G32B32A32_SFLOAT, i * 16};
     VkPipelineVertexInputStateCreateInfo vi{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
-    vi.vertexBindingDescriptionCount = 1;
-    vi.pVertexBindingDescriptions = &binding;
+    vi.vertexBindingDescriptionCount = 2;
+    vi.pVertexBindingDescriptions = bindings;
     vi.vertexAttributeDescriptionCount = kAttributes;
     vi.pVertexAttributeDescriptions = attrs;
     VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
@@ -2004,16 +2008,19 @@ void VulkanRenderer::draw(const KelvinState& s, const DrawBatch& batch) {
     }
 
     stats_.ns_indices += ns_since(t_part);
-    VkPipeline p = pipeline(s, vs, fs, topology, *t, error);
+    VkPipeline p = pipeline(s, vs, fs, topology, *t, v.enabled, error);
     if (!p) {
         note(error);
         ++stats_.skipped;
         return;
     }
 
-    // Vertex data: every attribute as a vec4; one without per-vertex data reads its constant value.
+    // Vertex data: the attributes with per-vertex data as vec4s packed in order, then the sixteen constants the others
+    // read (binding 1, a stride of zero). Writing every attribute for every vertex cost a draw-heavy title 3 ms a frame.
     t_part = std::chrono::steady_clock::now();
-    VkDeviceSize vbytes = static_cast<VkDeviceSize>(v.count) * kVertexStride, voffset = 0;
+    const u32 per_vertex = static_cast<u32>(std::popcount(static_cast<u32>(v.enabled)));
+    const VkDeviceSize vertex_bytes = static_cast<VkDeviceSize>(v.count) * per_vertex * 16;
+    VkDeviceSize vbytes = vertex_bytes + kAttributes * 16, voffset = 0;
     // The rings and the descriptor pool hold one batch of draws. A draw that no longer fits submits the batch so far
     // and moves to the next frame in flight's regions, so a frame can hold any number of draws (only a single draw
     // larger than a ring region is refused below).
@@ -2164,8 +2171,9 @@ void VulkanRenderer::draw(const KelvinState& s, const DrawBatch& batch) {
         fn_->vkCmdSetDepthBias(cb_, on ? std::bit_cast<float>(s.reg(mthd::kPolygonOffsetBias)) : 0.0f, 0.0f,
                                on ? std::bit_cast<float>(s.reg(mthd::kPolygonOffsetFactor)) : 0.0f);
     }
-    const VkDeviceSize vb_offset = voffset;
-    fn_->vkCmdBindVertexBuffers(cb_, 0, 1, &vertex_ring_.buffer.buffer, &vb_offset);
+    const VkDeviceSize vb_offsets[2] = {voffset, voffset + vertex_bytes};
+    const VkBuffer vbs[2] = {vertex_ring_.buffer.buffer, vertex_ring_.buffer.buffer};
+    fn_->vkCmdBindVertexBuffers(cb_, 0, 2, vbs, vb_offsets);
     if (!indices.empty()) {
         fn_->vkCmdBindIndexBuffer(cb_, index_ring_.buffer.buffer, ioffset, VK_INDEX_TYPE_UINT32);
         fn_->vkCmdDrawIndexed(cb_, static_cast<u32>(indices.size()), 1, 0, 0, 0);

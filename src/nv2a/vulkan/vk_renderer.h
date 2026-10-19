@@ -175,7 +175,7 @@ private:
     VkShaderModule module(const std::vector<u32>& spirv);
     VkShaderModule vertex_shader(const KelvinState& s, std::string& error);
     VkShaderModule fragment_shader(const psh::Key& key, std::array<psh::SamplerKind, 4>& kinds, std::string& error);
-    VkPipeline pipeline(const KelvinState& s, VkShaderModule vs, VkShaderModule fs, VkPrimitiveTopology topology, Surface& t, std::string& error);
+    VkPipeline pipeline(const KelvinState& s, VkShaderModule vs, VkShaderModule fs, VkPrimitiveTopology topology, Surface& t, u32 vertex_layout, std::string& error);
     // The pipeline of a clear that writes only some colour channels (the colour comes in as the blend constants).
     VkPipeline clear_pipeline(VkRenderPass pass, VkColorComponentFlags mask, std::string& error);
     const TextureEntry* texture(const KelvinState& s, u32 stage, std::string& error);
