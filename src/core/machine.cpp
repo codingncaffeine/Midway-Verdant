@@ -309,9 +309,13 @@ bool Machine::cpu_must_hold(Cycles now) const {
 bool Machine::pace_cpu(std::unique_lock<std::mutex>& lk, Cycles now, const std::atomic<bool>& stopping) {
     const auto released = [&] { return stopping.load() || reset_pending_ || power_off_; };
     if (config_.frame_step) {
-        if (nv2a_.vblanks() < frame_limit_) return true;
+        if (nv2a_.vblanks() < frame_limit_) {
+            cpu_at_frame_end_ = false;  // it runs on from here
+            return true;
+        }
         // The frame the front end asked for is complete: hold the CPU (its guest clock stands still) until the next.
         cpu_paused_ = true;
+        apply_pending_pads();
         frame_hold_at_ = std::chrono::steady_clock::now();
         io_cv_.notify_all();
         wake_cv_.wait(lk, [&] { return released() || nv2a_.vblanks() < frame_limit_; });
@@ -333,6 +337,23 @@ bool Machine::pace_cpu(std::unique_lock<std::mutex>& lk, Cycles now, const std::
         pace_wall_ = std::chrono::steady_clock::now();
     }
     return true;
+}
+
+void Machine::set_pad_input(unsigned front_port, const usb::PadState& s) {
+    if (front_port >= pads_.size()) return;
+    pending_pads_[front_port] = s;
+    // The fast mode is not deterministic anyway: its input lands at once, a pipelined frame gaining no lag from it.
+    // The accurate core between its stop at a frame's end and its hold (the lock is free between batches) is at the
+    // hold's boundary already: the input lands there too, never a frame later.
+    if (cpu_paused_ || cpu_at_frame_end_ || (cpu_ && cpu_->hardware_assisted())) apply_pending_pads();
+}
+
+void Machine::apply_pending_pads() {
+    for (std::size_t p = 0; p < pads_.size(); ++p)
+        if (pending_pads_[p]) {
+            pads_[p].gamepad.set_state(*pending_pads_[p]);
+            pending_pads_[p].reset();
+        }
 }
 
 void Machine::set_frame_limit(u64 vblanks) {

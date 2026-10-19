@@ -43,6 +43,8 @@ public:
 
     // Before every device access the owner is told, so the timeline can be brought up to date first.
     void set_device_hook(std::function<void()> hook) { device_hook_ = std::move(hook); }
+    // Instrument: called after every device access (kind r/w = memory-mapped, i/o = port; the value read or written).
+    void set_device_trace(std::function<void(char kind, u32 addr, unsigned size, u32 value)> trace) { device_trace_ = std::move(trace); }
     void set_code_watcher(CodeWatcher* w) { code_watch_ = w; }
 
     // Linear-address accesses (after segmentation). Sizes 1, 2, 4; `read_bytes`/`write_bytes` for the wide
@@ -164,6 +166,7 @@ private:
     CpuState& st_;
     std::array<TlbEntry, kTlbSize> tlb_{};
     std::function<void()> device_hook_;
+    std::function<void(char, u32, unsigned, u32)> device_trace_;
     CodeWatcher* code_watch_{nullptr};
     void check_code(const u8* p) {
         if (code_watch_) {

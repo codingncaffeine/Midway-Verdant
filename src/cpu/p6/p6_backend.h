@@ -80,6 +80,7 @@ private:
     u64 state_hash_{0xcbf29ce484222325ull};
     std::FILE* delivery_log_{nullptr};  // MV_P6_DELIVERY_LOG=FILE: a line per delivery (cycle, instructions, EIP, hash, state hash)
     void fold_delivery();
+    void note_hold();
     // The kernel idle loop halts (D22, here by address): found in RAM by its shape, a pass through it with no
     // interrupt delivered since the last pass halts the core to the next event. MV_IDLE_SKIP=0: it spins.
     void find_idle_loop();

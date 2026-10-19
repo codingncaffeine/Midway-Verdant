@@ -474,8 +474,12 @@ static void frame_log_line(double wait_ms) {
 RETRO_API void retro_run(void) {
     if (!machine) return;
     input_poll_cb();
-    for (unsigned p = 0; p < pads_plugged; ++p)
-        machine->pad(p).set_state(mv::libretro::map_retropad([p](unsigned device, unsigned index, unsigned id) { return input_state_cb(p, device, index, id); }));
+    {
+        // The guest sees the new state where the CPU holds for a frame (with pipelining, the end of the frame it runs).
+        std::lock_guard g(machine->lock());
+        for (unsigned p = 0; p < pads_plugged; ++p)
+            machine->set_pad_input(p, mv::libretro::map_retropad([p](unsigned device, unsigned index, unsigned id) { return input_state_cb(p, device, index, id); }));
+    }
     // One frame of the console's time: the CPU runs to the next vblank and holds there, however long the host takes
     // (a hung guest or a stalled host returns after a second without the vblank, and the report counts it). With
     // pipelining the CPU was let into this frame when the last call returned, so it may be done already.

@@ -177,6 +177,15 @@ public:
     bool pace_cpu(std::unique_lock<std::mutex>& lk, Cycles now, const std::atomic<bool>& stopping);
     // Frame steps: let the CPU run until the vblank count reaches `vblanks`. With the lock held; wakes the CPU.
     void set_frame_limit(u64 vblanks);
+    // Frame steps: the vblank the front end asked for has passed (the accurate core holds at once, at the boundary
+    // after the vblank's event, so a frame ends at the same instruction whichever way the core executes).
+    bool frame_hold_due() const { return config_.frame_step && nv2a_.vblanks() >= frame_limit_; }
+    // The accurate core stopped at that boundary (with the lock held): until it runs again, input lands there.
+    void note_frame_end() { cpu_at_frame_end_ = true; }
+    // A front end's pad state, with the lock held. The accurate core applies it where the CPU holds for a frame step
+    // (now, if it holds; else when it next comes to a hold), so the guest sees input change at a vblank, never at a
+    // host-timed instant; the fast mode applies it at once.
+    void set_pad_input(unsigned front_port, const usb::PadState& s);
     bool cpu_paused() const { return cpu_paused_; }
     // Instrument: when the CPU last came to a hold at a frame step's vblank (host clock).
     std::chrono::steady_clock::time_point frame_hold_at() const { return frame_hold_at_; }
@@ -235,6 +244,9 @@ private:
     // The pads on the front ports, plugged into USB0 at power-on (front ports 1-4 = root ports 3, 4, 1, 2).
     usb::FrontPanel front_panel_;
     std::array<usb::XboxPad, 4> pads_;
+    std::array<std::optional<usb::PadState>, 4> pending_pads_;
+    bool cpu_at_frame_end_{false};
+    void apply_pending_pads();
     IdeController ide_;
     NvNet nvnet_;
     DiskImage hdd_image_;

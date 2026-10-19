@@ -39,6 +39,27 @@ bool P6Backend::init(Machine& machine, std::string& error) {
     cpu_->memory().set_rom_range(Flash::kBase, Flash::kWindow);
     cpu_->memory().set_dirty_tracking(dirty_tracking_, selective_requested_);
     cpu_->memory().set_device_hook([this] { sync_time(); });
+    // Instrument: MV_P6_DEVICE_LOG=FILE[:FROM[:TO]] logs every device access whose cycle lies in [FROM, TO] (cycle,
+    // instructions, the instruction's EIP, kind r/w/i/o, address, size, value): two runs diff to the first access
+    // that differs.
+    if (const char* d = std::getenv("MV_P6_DEVICE_LOG"); d && *d) {
+        std::string spec = d;
+        u64 from = 0, to = ~u64{0};
+        if (const auto c1 = spec.find(':'); c1 != std::string::npos) {
+            const std::string rest = spec.substr(c1 + 1);
+            spec.resize(c1);
+            from = std::strtoull(rest.c_str(), nullptr, 0);
+            if (const auto c2 = rest.find(':'); c2 != std::string::npos) to = std::strtoull(rest.c_str() + c2 + 1, nullptr, 0);
+        }
+        if (std::FILE* f = std::fopen(spec.c_str(), "w")) {
+            cpu_->memory().set_device_trace([this, f, from, to](char kind, u32 addr, unsigned size, u32 value) {
+                const u64 now = cpu_->cycles();
+                if (now < from || now > to) return;
+                std::fprintf(f, "%llu %llu %08x %c %08x %u %08x\n", static_cast<unsigned long long>(now), static_cast<unsigned long long>(cpu_->instructions()),
+                             cpu_->last_eip(), kind, addr, size, value);
+            });
+        }
+    }
     cpu_->set_interrupt_source([this] { return machine_->pic().pending_vector(); }, [this] { return machine_->pic().acknowledge(); });
     // Trace lines carry the interpreter's own clock, exact to the instruction.
     trace::set_clock_source(cpu_->cycles_pointer());
@@ -105,6 +126,10 @@ void P6Backend::run_batch() {
     for (unsigned i = 0; i < kBatchInstructions && !stop_requested_; ++i) {
         // Events due at or before now fire first, so an interrupt they raise is seen at this boundary.
         if (cpu.cycles() >= sched.next_deadline()) sync_time();
+        if (machine_->frame_hold_due()) {  // the frame ends here, whichever way the core executes
+            note_hold();
+            break;
+        }
         if (cpu.take_interrupt()) {
             ++stats_.irq_injections;
             ++stats_.by_vector[cpu.last_vector()];
@@ -163,6 +188,10 @@ void P6Backend::run_batch_blocks() {
             return;
         }
         between_instructions();
+        if (machine_->frame_hold_due()) {  // the frame ends at the boundary after the vblank's event
+            note_hold();
+            break;
+        }
         if (idle_eips_[0]) idle_turn();
         if (cpu.state().halted) {
             ++stats_.hlt_exits;
@@ -250,8 +279,9 @@ void P6Backend::thread_main() {
         try {
             {
                 std::unique_lock lock(machine_->lock());
-                // Frame stepping (libretro) and real-time pacing: the CPU holds between batches (batches end on
-                // instruction counts, so a run stays deterministic; held, its clock stands still).
+                // Frame stepping (libretro) and real-time pacing: the CPU holds between batches; a frame step's
+                // batch ends at the boundary after the vblank (the same instruction for the block interpreter and
+                // the recompiler, where the pad input changes); held, its clock stands still.
                 if (!machine_->pace_cpu(lock, cpu_->cycles(), stop_requested_)) continue;
                 if (idle_skip_ && !idle_eips_[0] && idle_scans_ < 4000 && (stats_.exits % 64) == 0) find_idle_loop();
                 run_batch();
@@ -268,6 +298,14 @@ void P6Backend::thread_main() {
     machine_->wake();
 }
 
+// The delivery log's line for a frame step's hold (where the front end's input lands): "hold", cycle, instructions, EIP.
+void P6Backend::note_hold() {
+    machine_->note_frame_end();
+    if (delivery_log_)
+        std::fprintf(delivery_log_, "hold %llu %llu %08x\n", static_cast<unsigned long long>(cpu_->cycles()), static_cast<unsigned long long>(cpu_->instructions()),
+                     cpu_->state().eip);
+}
+
 void P6Backend::fold_delivery() {
     const p6::CpuState& s = cpu_->state();
     auto mix = [this](u64 v) {
@@ -278,6 +316,7 @@ void P6Backend::fold_delivery() {
     mix(s.eip);
     mix(s.eflags());
     for (u32 r : s.gpr) mix(r);
+    mix(cpu_->last_vector());
     auto mix_state = [this](u64 v) {
         state_hash_ ^= v;
         state_hash_ *= 0x100000001b3ull;
@@ -307,8 +346,8 @@ void P6Backend::fold_delivery() {
     mix_state(s.cr2 | (static_cast<u64>(s.cr4) << 32));
     ++deliveries_;
     if (delivery_log_)
-        std::fprintf(delivery_log_, "%llu %llu %08x %016llx %016llx\n", static_cast<unsigned long long>(cpu_->cycles()), static_cast<unsigned long long>(cpu_->instructions()), s.eip,
-                     static_cast<unsigned long long>(delivery_hash_), static_cast<unsigned long long>(state_hash_));
+        std::fprintf(delivery_log_, "%llu %llu %08x %016llx %016llx %02x\n", static_cast<unsigned long long>(cpu_->cycles()), static_cast<unsigned long long>(cpu_->instructions()), s.eip,
+                     static_cast<unsigned long long>(delivery_hash_), static_cast<unsigned long long>(state_hash_), cpu_->last_vector());
 }
 
 CpuBackend::Stats P6Backend::stats() const {

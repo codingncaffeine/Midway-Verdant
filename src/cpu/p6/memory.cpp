@@ -146,6 +146,7 @@ u32 Memory::read_phys(PhysAddr phys, unsigned size) {
     device_access(tp::kBlockDeviceLoad);
     const u32 v = bus_.read(phys, size);
     if (logging_) io_log_.push_back({false, true, phys, static_cast<u8>(size), v});
+    if (device_trace_) device_trace_('r', phys, size, v);
     return v;
 }
 
@@ -175,6 +176,7 @@ void Memory::write_phys(PhysAddr phys, unsigned size, u32 value) {
     device_access(tp::kBlockDeviceStore);
     if (logging_) io_log_.push_back({true, true, phys, static_cast<u8>(size), value});
     bus_.write(phys, size, value);
+    if (device_trace_) device_trace_('w', phys, size, value);
 }
 
 void Memory::commit_writes() {
@@ -270,6 +272,7 @@ u32 Memory::io_read(u16 port, unsigned size) {
     device_access(tp::kBlockPortIo);
     const u32 v = bus_.pio_read(port, size);
     if (logging_) io_log_.push_back({false, false, port, static_cast<u8>(size), v});
+    if (device_trace_) device_trace_('i', port, size, v);
     return v;
 }
 
@@ -279,6 +282,7 @@ void Memory::io_write(u16 port, unsigned size, u32 value) {
     device_access(tp::kBlockPortIo);
     if (logging_) io_log_.push_back({true, false, port, static_cast<u8>(size), value});
     bus_.pio_write(port, size, value);
+    if (device_trace_) device_trace_('o', port, size, value);
 }
 
 void Memory::set_dirty_tracking(bool on, bool selective) {
