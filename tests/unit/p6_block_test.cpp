@@ -4,6 +4,7 @@
 // rules are pinned on asymmetric cases.
 #include <gtest/gtest.h>
 
+#include <cstdlib>
 #include <cstring>
 #include <format>
 #include <initializer_list>
@@ -53,9 +54,22 @@ struct Rig {
     void load(const std::vector<u8>& code, u32 at = kCode) { std::memcpy(bus.ram() + at, code.data(), code.size()); }
 };
 
-// Run to the program's HLT (or a step budget) one instruction at a time.
+// Run to the program's HLT (or a step budget) one instruction at a time. Instrument: P6DBG=1 prints the first faults
+// (the handler they reach, the faulting bytes) and the wide test writes each program to p6-wide-N.bin in the working
+// directory (objdump -D -b binary -m i386 --adjust-vma=0x1000).
 void run_steps(Rig& r) {
-    for (unsigned i = 0; i < 100000 && !r.cpu.state().halted; ++i) r.cpu.step();
+    static const bool dbg = std::getenv("P6DBG") != nullptr;
+    unsigned shown = 0;
+    for (unsigned i = 0; i < 100000 && !r.cpu.state().halted; ++i) {
+        const u32 at = r.cpu.state().eip;
+        r.cpu.step();
+        if (dbg && r.cpu.last_faulted() && shown < 12) {
+            ++shown;
+            std::string bytes;
+            for (u32 k = 0; k < 8; ++k) bytes += std::format(" {:02x}", r.bus.ram()[at + k]);
+            std::printf("fault to %x at %x:%s\n", r.cpu.state().eip, at, bytes.c_str());
+        }
+    }
 }
 
 // The same through the block engine, as the backend's loop drives it (no events, no interrupts).
@@ -283,9 +297,137 @@ struct Gen {
                 return;
         }
     }
+    // The wide forms (the wide test): every remaining native integer form, SIB and absolute addressing, FS-relative
+    // accesses (FS = the data area, limit 0x1FF), x87 and SSE control changes inside a block, more x87 and SSE forms,
+    // and faults at fixed lengths the test's handlers skip: #DE (3 bytes), #UD (2), #GP by FS's limit (6), #PF (5).
+    bool wide{false};
+    void wide_one(std::vector<u8>& c) {
+        const u8 d = reg(), s = src(), d8 = static_cast<u8>(next() & 0xFC);
+        auto imm32 = [&](u32 v) { c.insert(c.end(), {static_cast<u8>(v), static_cast<u8>(v >> 8), static_cast<u8>(v >> 16), static_cast<u8>(v >> 24)}); };
+        switch (next() % 44) {
+            case 0: c.insert(c.end(), {0xF7, static_cast<u8>(0x43 | (next() & 1 ? 2 : 3) << 3), d8}); break;               // not/neg [ebx+d8]
+            case 1: c.insert(c.end(), {0xF7, static_cast<u8>(0xC0 | (next() & 1 ? 4 : 5) << 3 | s)}); break;               // mul/imul r (EDX:EAX)
+            case 2: c.insert(c.end(), {0xF7, static_cast<u8>(0x43 | (next() & 1 ? 4 : 5) << 3), d8}); break;               // mul/imul [ebx+d8]
+            case 3: c.insert(c.end(), {0x6B, static_cast<u8>(0xC0 | d << 3 | s), static_cast<u8>(next())}); break;         // imul r, r, imm8
+            case 4: c.insert(c.end(), {0x69, static_cast<u8>(0x43 | d << 3), d8}); imm32(next() * 2654435761u); break;     // imul r, [ebx+d8], imm32
+            case 5: c.insert(c.end(), {0x66, 0x69, static_cast<u8>(0xC0 | d << 3 | s), static_cast<u8>(next()), static_cast<u8>(next())}); break;
+            case 6: c.insert(c.end(), {static_cast<u8>(next() & 1 ? 0x11 : 0x19), static_cast<u8>(0x43 | s << 3), d8}); break;  // adc/sbb [ebx+d8], r
+            case 7: c.insert(c.end(), {static_cast<u8>(next() & 1 ? 0x13 : 0x1B), static_cast<u8>(0x43 | d << 3), d8}); break;  // adc/sbb r, [ebx+d8]
+            case 8: c.insert(c.end(), {0x0F, 0xC1, static_cast<u8>(0x43 | d << 3), d8}); break;                            // xadd [ebx+d8], r
+            case 9: c.insert(c.end(), {0x0F, static_cast<u8>(0xB6 + (next() & 1) + (next() & 1 ? 8 : 0)), static_cast<u8>(0x43 | d << 3), static_cast<u8>(next() & 0xFE)}); break;  // movzx/movsx mem
+            case 10: c.insert(c.end(), {0x0F, static_cast<u8>(0x90 + (next() & 15)), 0x43, static_cast<u8>(next())}); break;  // setcc [ebx+d8]
+            case 11: c.insert(c.end(), {0x0F, static_cast<u8>(0x40 + (next() & 15)), static_cast<u8>(0x43 | d << 3), d8}); break;  // cmovcc r, [ebx+d8]
+            case 12: c.insert(c.end(), {0xF7, static_cast<u8>(0xC0 | d)}); imm32(next() * 40503u); break;                // test r, imm32
+            case 13: c.insert(c.end(), {0xF6, 0x43, static_cast<u8>(next()), static_cast<u8>(next())}); break;            // test byte [ebx+d8], imm8
+            case 14: c.insert(c.end(), {0x0F, 0xBA, static_cast<u8>(0xC0 | (4 + next() % 4) << 3 | d), static_cast<u8>(next())}); break;  // bt/bts/btr/btc r, imm
+            case 15: c.insert(c.end(), {0x0F, 0xBA, static_cast<u8>(0x43 | (4 + next() % 4) << 3), d8, static_cast<u8>(next())}); break;  // the same on [ebx+d8]
+            case 16: c.insert(c.end(), {0x0F, static_cast<u8>(next() & 1 ? 0xA4 : 0xAC), static_cast<u8>(0xC0 | s << 3 | d), static_cast<u8>(next() % 40)}); break;  // shld/shrd imm
+            case 17: c.insert(c.end(), {0x0F, static_cast<u8>(next() & 1 ? 0xA5 : 0xAD), static_cast<u8>(0xC0 | s << 3 | d)}); break;  // shld/shrd cl
+            case 18: c.insert(c.end(), {0x0F, static_cast<u8>(next() & 1 ? 0xBC : 0xBD), static_cast<u8>(0xC0 | d << 3 | s)}); break;  // bsf/bsr
+            case 19: c.insert(c.end(), {0x0F, 0xB1, static_cast<u8>(next() & 1 ? (0x43 | s << 3) : (0xC0 | s << 3 | d))}); if ((c.back() & 0xC0) == 0x40) c.push_back(d8); break;  // cmpxchg
+            case 20: c.insert(c.end(), {0x87, static_cast<u8>(0x43 | d << 3), d8}); break;                                // xchg [ebx+d8], r
+            case 21: c.insert(c.end(), {0xC6, 0x43, static_cast<u8>(next()), static_cast<u8>(next())}); break;            // mov byte [ebx+d8], imm8
+            case 22: c.insert(c.end(), {0x66, static_cast<u8>(next() & 1 ? 0xF7 : 0xD1), static_cast<u8>(0xC0 | (next() & 1 ? 3 : 4) << 3 | d)}); break;  // neg r16 / shl r16,1
+            case 23: c.insert(c.end(), {0xF0, static_cast<u8>(next() & 1 ? 0x01 : 0x29), static_cast<u8>(0x43 | s << 3), d8}); break;  // lock add/sub
+            case 24: c.push_back(static_cast<u8>(0x9E + (next() & 1))); break;                                           // sahf/lahf
+            case 25: { static constexpr u8 f[] = {0xF8, 0xF9, 0xF5}; c.push_back(f[next() % 3]); break; }                 // clc/stc/cmc
+            case 26: c.insert(c.end(), {0xC1, static_cast<u8>(0xC0 | (next() & 1 ? 2 : 3) << 3 | d), static_cast<u8>(next() & 31)}); break;  // rcl/rcr imm
+            case 27: c.insert(c.end(), {0xD1, static_cast<u8>(0xC0 | (next() % 8) << 3 | d)}); break;                   // shifts and rotates by 1
+            case 28: {                                                                                                  // SIB: [ebx + edi*s + d8], EDI masked first
+                c.insert(c.end(), {0x83, 0xE7, 0x3C});
+                const u8 op = static_cast<u8>(next() & 1 ? 0x8B : 0x89);
+                c.insert(c.end(), {op, static_cast<u8>(0x44 | (op == 0x8B ? d : s) << 3), static_cast<u8>((next() % 4) << 6 | 7 << 3 | 3), d8});
+                break;
+            }
+            case 29: { const u8 op = static_cast<u8>(next() & 1 ? 0xA1 : 0xA3); c.push_back(op); imm32(0x20000u + (next() % 0x1FC)); break; }  // mov eax <-> [abs]
+            case 30: c.insert(c.end(), {0x8B, static_cast<u8>(0x05 | d << 3)}); imm32(0x20000u + (next() % 0x1FC)); break; // mov r, [abs]
+            case 31: { const u8 op = static_cast<u8>(next() & 1 ? 0x8B : 0x89); c.insert(c.end(), {0x64, op, static_cast<u8>(0x05 | (op == 0x8B ? d : s) << 3)}); imm32(next() % 0x1FC); break; }  // fs:[disp32]
+            case 32: c.insert(c.end(), {0x64, 0x01, static_cast<u8>(0x05 | s << 3)}); imm32(next() % 0x1FC); break;     // add fs:[disp32], r
+            case 33: c.insert(c.end(), {0xFF, 0x73, static_cast<u8>(next()), 0x8F, 0x43, d8}); break;                  // push [m]; pop [m]
+            case 34: c.insert(c.end(), {0x60, 0x61}); break;                                                             // pushad; popad
+            case 35: c.insert(c.end(), {0x6A, static_cast<u8>(next()), static_cast<u8>(0x58 + reg())}); break;           // push imm8; pop r
+            case 36: c.insert(c.end(), {0x0F, static_cast<u8>(0x80 + (next() & 15)), 0x01, 0x00, 0x00, 0x00, static_cast<u8>(0x40 + d)}); break;  // jcc rel32 over an inc
+            case 37:                                                                                                     // #DE: div by a zeroed dword
+                c.insert(c.end(), {0x31, 0xD2, 0xC7, 0x43, d8, 0, 0, 0, 0, 0xF7, 0x73, d8});
+                break;
+            case 38:                                                                                                     // #DE: idiv overflow
+                c.insert(c.end(), {0xB8, 0, 0, 0, 0x80, 0x99, 0xC7, 0x43, d8, 0xFF, 0xFF, 0xFF, 0xFF, 0xF7, 0x7B, d8});
+                break;
+            case 39: c.insert(c.end(), {0x0F, 0x0B}); break;                                                             // #UD
+            case 40: c.insert(c.end(), {0x64, 0xA1}); imm32(0x200u + next() % 0x100); break;                             // #GP: past FS's limit
+            case 41: c.push_back(static_cast<u8>(next() & 1 ? 0xA1 : 0xA3)); imm32(0x00800000u + (next() & 0xFFFC)); break;  // #PF: unmapped
+            case 42:                                                                                                     // fldcw: a new precision/rounding, all masked
+                if (!x87) break;
+                c.insert(c.end(), {0x66, 0xC7, 0x43, d8, static_cast<u8>(0x7F), static_cast<u8>((next() % 16) & 0x0F), 0xD9, 0x6B, d8});
+                break;
+            case 43:                                                                                                     // ldmxcsr: a new rounding/FZ, all masked
+                if (!simd) break;
+                c.insert(c.end(), {0xC7, 0x43, d8});
+                imm32(0x1F80u | (next() % 4) << 13 | (next() % 2) << 15 | (next() & 0x3F));
+                c.insert(c.end(), {0x0F, 0xAE, 0x53, d8});
+                if (next() & 1) c.insert(c.end(), {0x0F, 0xAE, 0x5B, static_cast<u8>(next() & 0xFC)});  // stmxcsr
+                break;
+        }
+    }
+    // More x87 forms for the wide test (the depth bookkeeping as fpu()).
+    void fpu_wide(std::vector<u8>& c) {
+        const u8 d8 = static_cast<u8>(next() & 0xF8);
+        const u8 i = static_cast<u8>(next() % static_cast<u32>(depth > 1 ? depth : 2));
+        switch (next() % 16) {
+            case 0: if (depth >= 8) return; c.insert(c.end(), {0xDF, static_cast<u8>(next() & 1 ? 0x43 : 0x6B), d8}); ++depth; return;  // fild m16 / m64
+            case 1: if (depth <= 0) return; c.insert(c.end(), {0xDF, static_cast<u8>(next() & 1 ? 0x5B : 0x7B), d8}); --depth; return;  // fistp m16 / m64
+            case 2: if (depth <= 0) return; c.insert(c.end(), {0xDB, 0x53, d8}); return;                                     // fist m32
+            case 3: if (depth < 2) return; c.insert(c.end(), {0xDD, static_cast<u8>(0xE0 | i)}); return;                       // fucom st(i)
+            case 4: if (depth < 2) return; c.insert(c.end(), {0xDB, static_cast<u8>((next() & 1 ? 0xF0 : 0xE8) | i)}); return;  // fcomi / fucomi
+            case 5: if (depth < 2) return; c.insert(c.end(), {0xDF, static_cast<u8>((next() & 1 ? 0xF0 : 0xE8) | i)}); --depth; return;  // fcomip / fucomip
+            case 6: if (depth < 2) return; c.insert(c.end(), {static_cast<u8>(next() & 1 ? 0xDA : 0xDB), static_cast<u8>(0xC0 | (next() % 4) << 3 | i)}); return;  // fcmovcc
+            case 7: if (depth <= 0) return; { static constexpr u8 u[] = {0xFA, 0xFC, 0xE4, 0xE5, 0xFD, 0xF8}; c.insert(c.end(), {0xD9, u[next() % 6]}); } return;  // fsqrt frndint ftst fxam fscale fprem
+            case 8: if (depth <= 0) return; c.insert(c.end(), {0xDC, static_cast<u8>(0x43 | (next() % 8) << 3), d8}); if (((c[c.size() - 2] >> 3) & 7) == 3) --depth; return;  // arith m64 (fcomp pops)
+            case 9: if (depth <= 0) return; c.insert(c.end(), {0xDA, static_cast<u8>(0x43 | (next() % 8) << 3), d8}); if (((c[c.size() - 2] >> 3) & 7) == 3) --depth; return;  // fiadd.. m32
+            case 10: if (depth <= 0) return; c.insert(c.end(), {0xDB, 0x7B, static_cast<u8>(next() % 0xF0)}); --depth; return;  // fstp m80
+            case 11: if (depth >= 8) return; c.insert(c.end(), {0xDB, 0x6B, static_cast<u8>(next() % 0xF0)}); ++depth; return;  // fld m80
+            case 12: if (depth < 2) return; c.insert(c.end(), {0xDA, 0xE9}); depth -= 2; return;                              // fucompp
+            case 13: if (depth >= 8) return; { static constexpr u8 k[] = {0xE9, 0xEA, 0xEB, 0xEC, 0xED}; c.insert(c.end(), {0xD9, k[next() % 5]}); } ++depth; return;  // constants
+            case 14: c.insert(c.end(), {0xD9, 0x7B, d8}); return;                                                             // fnstcw
+            case 15: c.insert(c.end(), {0xDB, 0xE2}); return;                                                                 // fnclex
+        }
+    }
+    // More SSE and MMX forms for the wide test.
+    void simd_wide(std::vector<u8>& c) {
+        const u8 x = static_cast<u8>(next() % 8), y = static_cast<u8>(next() % 8), d8 = static_cast<u8>(next() & 0xF0);
+        const bool m = next() % 3 == 0;
+        auto modrm = [&](u8 disp) {
+            if (m) c.insert(c.end(), {static_cast<u8>(0x43 | x << 3), disp});
+            else c.push_back(static_cast<u8>(0xC0 | x << 3 | y));
+        };
+        switch (next() % (kHostX87 ? 14u : 9u)) {
+            case 0: c.insert(c.end(), {0xF3, 0x0F, 0x2A}); if (m) c.insert(c.end(), {static_cast<u8>(0x43 | x << 3), d8}); else c.push_back(static_cast<u8>(0xC0 | x << 3 | src())); break;  // cvtsi2ss
+            case 1: c.insert(c.end(), {0xF3, 0x0F, static_cast<u8>(next() & 1 ? 0x2C : 0x2D), static_cast<u8>(0xC0 | reg() << 3 | y)}); break;  // cvt(t)ss2si
+            case 2: c.insert(c.end(), {0x0F, static_cast<u8>(next() & 1 ? 0x53 : 0x52)}); modrm(d8); break;             // rcpps/rsqrtps
+            case 3: c.insert(c.end(), {0xF3, 0x0F, static_cast<u8>(next() & 1 ? 0x53 : 0x52)}); modrm(d8); break;       // rcpss/rsqrtss
+            case 4: c.insert(c.end(), {0x0F, static_cast<u8>(next() & 1 ? 0x2E : 0x2F)}); modrm(d8); break;             // ucomiss/comiss
+            case 5: c.insert(c.end(), {0xF3, 0x0F, 0xC2}); modrm(d8); c.push_back(static_cast<u8>(next() % 8)); break;  // cmpss
+            case 6: c.insert(c.end(), {0x0F, 0x2B, static_cast<u8>(0x43 | x << 3), d8}); break;                        // movntps
+            case 7: c.insert(c.end(), {0x0F, 0xAE, 0xF8}); break;                                                      // sfence
+            case 8: c.insert(c.end(), {0x0F, 0x14}); modrm(d8); break;                                                 // unpcklps
+            // MMX-sharing forms (need the 80-bit registers)
+            case 9: c.insert(c.end(), {0x0F, 0x2A}); if (m) c.insert(c.end(), {static_cast<u8>(0x43 | x << 3), d8}); else c.push_back(static_cast<u8>(0xC0 | x << 3 | y)); break;  // cvtpi2ps
+            case 10: c.insert(c.end(), {0x0F, static_cast<u8>(next() & 1 ? 0x2C : 0x2D), static_cast<u8>(0xC0 | x << 3 | y)}); break;  // cvt(t)ps2pi
+            case 11: c.insert(c.end(), {0x0F, 0xC4, static_cast<u8>(0xC0 | x << 3 | src()), static_cast<u8>(next())}); break;  // pinsrw
+            case 12: c.insert(c.end(), {0x0F, static_cast<u8>(next() & 1 ? 0xC5 : 0xD7), static_cast<u8>(0xC0 | reg() << 3 | y)}); if (c[c.size() - 2] == 0xC5) c.push_back(static_cast<u8>(next())); break;  // pextrw / pmovmskb
+            case 13: { static constexpr u8 ops[] = {0xE0, 0xE3, 0xF6, 0xDA, 0xDE, 0xEA, 0xEE, 0xE4}; c.insert(c.end(), {0x0F, ops[next() % 8]}); modrm(d8); break; }  // pavg psadbw pmin pmax pmulhuw
+        }
+    }
     void one(std::vector<u8>& c) {
         static constexpr u8 alu[] = {0x01, 0x09, 0x11, 0x19, 0x21, 0x29, 0x31, 0x39, 0x85};
         const u8 d = reg(), s = src();
+        if (wide && next() % 3 == 0) {
+            const u32 k = next() % 4;
+            if (k == 0 && x87) fpu_wide(c);
+            else if (k == 1 && simd) simd_wide(c);
+            else wide_one(c);
+            return;
+        }
         if (x87 && next() % 3 == 0) {
             fpu(c);
             return;
@@ -871,4 +1013,153 @@ TEST(P6Block, PageStraddlingAccessesMatchTheStep) {
     expect_same(a, c, "page-straddling accesses");
     EXPECT_EQ(0, std::memcmp(a.bus.ram() + 0x20FF0, c.bus.ram() + 0x20FF0, 32));
     EXPECT_GT(e.stats().native_helpers, 2u);  // the straddling ones went to the interpreter
+}
+
+// The wide programs: the generator's wide forms (every native integer form, SIB, absolute and FS-relative addressing,
+// control-word and MXCSR changes inside blocks, more x87 and SSE forms) and faults inside blocks at fixed lengths —
+// #DE, #UD, #GP (FS's limit), #PF (an unmapped page) — whose handlers count them, record CR2 and skip the instruction.
+// The step against the block interpreter (architecture); the block interpreter against the recompiler in lock step
+// (state, clock, caches); then both again with a timer interrupt every 997 cycles: the same deliveries at the same
+// boundaries.
+namespace {
+constexpr u32 kFaultCounts = 0x2F00;
+void wide_setup(Rig& r, const std::vector<u8>& code, u32 program) {
+    r.load(code);
+    // GDT: null, code 0x08, data 0x10, FS 0x18 = the data area with a 0x1FF limit.
+    const u64 gdt[4] = {0, 0x00CF9B000000FFFFull, 0x00CF93000000FFFFull, 0x00409302000001FFull};
+    std::memcpy(r.bus.ram() + 0x5000, gdt, sizeof gdt);
+    r.cpu.state().gdtr = DescTable{0x5000, 0x1F};
+    r.cpu.state().seg[kFs] = Segment{0x18, kData, 0x1FF, 0x4093};
+    // Handlers at 0x2000 + 0x40 * n: (pop the error code), skip the faulting instruction, count, record CR2 for #PF.
+    struct H { u8 vector; bool code; u8 skip; };
+    static constexpr H hs[] = {{0, false, 3}, {6, false, 2}, {13, true, 6}, {14, true, 5}, {0x20, false, 0}};
+    for (unsigned n = 0; n < 5; ++n) {
+        const u32 at = 0x2000 + 0x40 * n;
+        std::vector<u8> h;
+        if (hs[n].code) h.insert(h.end(), {0x83, 0xC4, 0x04});
+        if (hs[n].skip) h.insert(h.end(), {0x83, 0x04, 0x24, hs[n].skip});
+        const u32 counter = kFaultCounts + 4 * n;
+        h.insert(h.end(), {0xFF, 0x05, static_cast<u8>(counter), static_cast<u8>(counter >> 8), static_cast<u8>(counter >> 16), static_cast<u8>(counter >> 24)});
+        if (hs[n].vector == 14) {
+            const u32 cr2 = kFaultCounts + 0x40;
+            h.insert(h.end(), {0x52, 0x0F, 0x20, 0xD2, 0x89, 0x15, static_cast<u8>(cr2), static_cast<u8>(cr2 >> 8), static_cast<u8>(cr2 >> 16), static_cast<u8>(cr2 >> 24), 0x5A});
+        }
+        h.push_back(0xCF);  // iret
+        r.load(h, at);
+        const u32 gate[2] = {(0x08u << 16) | at, 0x00008E00u};
+        std::memcpy(r.bus.ram() + 0x3000 + hs[n].vector * 8, gate, sizeof gate);
+    }
+    r.cpu.state().idtr = DescTable{0x3000, 0x7FF};
+    r.cpu.state().gpr[kEbx] = kData;
+    for (unsigned i = 0; i < 0x200; ++i) r.bus.ram()[kData + i] = static_cast<u8>(i * 37 + program);
+    r.cpu.state().gpr[kEax] = program * 0x01010101u;
+    r.cpu.state().gpr[kEsi] = kData + 0x40;
+    r.cpu.state().gpr[kEdi] = 0x10;
+    static constexpr u16 kCw[] = {0x37F, 0x27F, 0x07F, 0xF7F, 0x77F};
+    r.cpu.state().fpu.fcw = kCw[(program / 3) % 5];
+    r.cpu.state().fpu.mxcsr = 0x1F80u | ((program / 5) % 4) << 13 | ((program / 20) % 2) << 15;
+    r.cpu.state().cr4 |= cr4::OSFXSR | cr4::OSXMMEXCPT;
+    r.cpu.state().set_eflags(fl::IF);
+    r.cpu.set_block_timing(true);
+}
+// A run with the timer: at each event boundary vector 0x20 when IF is set; every delivery's point recorded.
+std::vector<std::string> run_with_timer(Rig& r, BlockEngine& e) {
+    std::vector<std::string> points;
+    u64 next_event = 997;
+    for (unsigned n = 0; n < 400000 && !r.cpu.state().halted; ++n) {
+        e.apply_device_writes();
+        if (r.cpu.cycles() >= next_event) {
+            next_event += 997;
+            if (r.cpu.state().flags & fl::IF) {
+                points.push_back(std::format("{} {} {:x} {:x}", r.cpu.instructions(), r.cpu.cycles(), r.cpu.state().eip, r.cpu.state().eflags()));
+                r.cpu.deliver_external(0x20);
+            }
+        }
+        if (Block* b = e.find()) e.run(*b, r.cpu.state().inhibit_interrupts ? r.cpu.cycles() : next_event);
+        else r.cpu.step();
+    }
+    return points;
+}
+void expect_same_wide(Rig& a, Rig& b, const char* what) {
+    EXPECT_EQ(0, std::memcmp(a.bus.ram() + kData, b.bus.ram() + kData, 0x400)) << what << " data and beyond";
+    EXPECT_EQ(0, std::memcmp(a.bus.ram() + kFaultCounts, b.bus.ram() + kFaultCounts, 0x80)) << what << " fault counts";
+    EXPECT_EQ(a.cpu.state().cr2, b.cpu.state().cr2) << what << " cr2";
+}
+}  // namespace
+
+TEST(P6Block, WideProgramsMatchTheInterpreter) {
+    u64 native = 0, insns = 0, faults[4] = {}, deliveries = 0;
+    for (u32 program = 0; program < 240; ++program) {
+        SCOPED_TRACE(std::format("wide program {}", program));
+        Gen g{program * 104729u + 7};
+        g.wide = true;
+        g.x87 = kHostX87 && program % 3 != 2;
+        g.simd = program % 4 != 3;
+        std::vector<u8> code = {0x6A, 0x05};  // push 5
+        while (code.size() < 900) g.one(code);
+        const i32 back = 2 - static_cast<i32>(code.size() + 3 + 6);
+        code.insert(code.end(), {0xFF, 0x0C, 0x24, 0x0F, 0x85, static_cast<u8>(back), static_cast<u8>(back >> 8), static_cast<u8>(back >> 16),
+                                 static_cast<u8>(back >> 24), 0x58, 0xF4});  // dec dword [esp]; jnz body; pop eax; hlt
+        if (std::getenv("P6DBG")) {
+            if (std::FILE* f = std::fopen(std::format("p6-wide-{}.bin", program).c_str(), "wb")) {
+                std::fwrite(code.data(), 1, code.size(), f);
+                std::fclose(f);
+            }
+        }
+        // The step and the block interpreter: the architecture.
+        Rig a(true), b(true);
+        wide_setup(a, code, program);
+        a.cpu.set_block_timing(false);
+        wide_setup(b, code, program);
+        run_steps(a);
+        BlockEngine eb(b.cpu, b.bus);
+        eb.disable_jit();
+        run_blocks(b, eb);
+        expect_same(a, b, "wide: block interpreter against the step");
+        expect_same_wide(a, b, "wide: block interpreter against the step");
+        ASSERT_FALSE(::testing::Test::HasFailure()) << "wide program " << program;
+        // The recompiler in lock step with a second block interpreter.
+        Rig b2(true), c(true);
+        wide_setup(b2, code, program);
+        wide_setup(c, code, program);
+        BlockEngine e2(b2.cpu, b2.bus);
+        e2.disable_jit();
+        BlockEngine ej(c.cpu, c.bus);
+        ej.set_jit_threshold(0);
+        ej.set_chain_budget(program % 2 ? 0 : 1024);
+        run_lockstep(b2, e2, c, ej, "wide: recompiled against the block interpreter, in lock step");
+        expect_same(b, c, "wide: recompiled against the block interpreter", true);
+        expect_same_wide(b, c, "wide: recompiled against the block interpreter");
+        ASSERT_FALSE(::testing::Test::HasFailure()) << "wide program " << program;
+        native += ej.stats().native_insns;
+        insns += c.cpu.instructions();
+        for (unsigned k = 0; k < 4; ++k) {
+            u32 n;
+            std::memcpy(&n, c.bus.ram() + kFaultCounts + 4 * k, 4);
+            faults[k] += n;
+        }
+        // Both again under the timer.
+        Rig t1(true), t2(true);
+        wide_setup(t1, code, program);
+        wide_setup(t2, code, program);
+        BlockEngine et1(t1.cpu, t1.bus);
+        et1.disable_jit();
+        BlockEngine et2(t2.cpu, t2.bus);
+        et2.set_jit_threshold(0);
+        const auto p1 = run_with_timer(t1, et1);
+        const auto p2 = run_with_timer(t2, et2);
+        ASSERT_EQ(p1.size(), p2.size()) << "deliveries";
+        for (std::size_t k = 0; k < p1.size(); ++k) ASSERT_EQ(p1[k], p2[k]) << "delivery " << k;
+        expect_same(t1, t2, "wide, timer: recompiled against the block interpreter", true);
+        expect_same_wide(t1, t2, "wide, timer: recompiled against the block interpreter");
+        ASSERT_FALSE(::testing::Test::HasFailure()) << "wide program " << program;
+        deliveries += p1.size();
+    }
+    EXPECT_GT(native * 3, insns);  // a good share ran natively
+    for (unsigned k = 0; k < 4; ++k) EXPECT_GT(faults[k], 20u) << "fault kind " << k;  // every fault kind happened
+    EXPECT_GT(deliveries, 1000u);
+    std::printf("wide programs: %llu native instructions of %llu; faults #DE %llu #UD %llu #GP %llu #PF %llu; %llu timer deliveries\n",
+                static_cast<unsigned long long>(native), static_cast<unsigned long long>(insns), static_cast<unsigned long long>(faults[0]),
+                static_cast<unsigned long long>(faults[1]), static_cast<unsigned long long>(faults[2]), static_cast<unsigned long long>(faults[3]),
+                static_cast<unsigned long long>(deliveries));
 }
