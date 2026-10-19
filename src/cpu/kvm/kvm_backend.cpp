@@ -408,9 +408,10 @@ std::string KvmBackend::report() const {
     const auto us = [](i64 cycles) { return static_cast<double>(cycles) / 733.333; };
     std::string r = !guest_clock_on_ ? std::string("guest clock: off, the host wall clock drives the timeline (MV_GUEST_CLOCK=wall)") : std::format(
         "guest clock: x{:g}, {:.3f} s of guest time = {:.3f} s in the guest + {:.3f} s of {} short exits (host time x{:g}); not counted: "
-        "{:.3f} s in {} long exits (longest {:.1f} ms), {:.3f} s preempted in the guest, {} cycles skipped at HLT",
+        "{:.3f} s in {} long exits (longest {:.1f} ms), {:.3f} s preempted in the guest, {:.3f} s of short exits off the CPU (both run the TSC ahead), "
+        "{} cycles skipped at HLT",
         scale, static_cast<double>(clock_.now()) / 733'333'333.0, sec(s.in_guest_ns), sec(s.out_counted_ns), s.short_exits, scale, sec(s.long_ns),
-        s.long_exits, static_cast<double>(s.longest_exit_ns) / 1e6, sec(s.preempted_ns), s.warped_cycles);
+        s.long_exits, static_cast<double>(s.longest_exit_ns) / 1e6, sec(s.preempted_ns), sec(s.short_excess_ns), s.warped_cycles);
     r += std::format("\nkvm: {} exits (mmio {}, pio {}, hlt {}, irq window {}, interrupted {}), {} kicks, {} interrupts injected",
                      stats_.exits, stats_.mmio_exits, stats_.pio_exits, stats_.hlt_exits, stats_.irq_window_exits, stats_.intr_exits, stats_.kicks,
                      stats_.irq_injections);

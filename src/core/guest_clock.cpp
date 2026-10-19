@@ -55,6 +55,8 @@ void GuestClock::entered(u64 cpu_ns, u64 wall_ns) {
         stats_.longest_exit_ns = std::max(stats_.longest_exit_ns, stretch);
     } else {
         ++stats_.short_exits;
+        const u64 stretch = wall_ns > out_since_ns_ ? wall_ns - out_since_ns_ : 0;
+        if (stretch > counted) stats_.short_excess_ns += stretch - counted;
     }
     stats_.out_counted_ns += counted;
     pending_long_ = false;

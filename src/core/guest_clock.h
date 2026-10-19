@@ -86,6 +86,7 @@ public:
         u64 longest_exit_ns{0};
         u64 preempted_ns{0};    // inside KVM_RUN on the wall clock but not on the CPU: the host ran something else
         u64 warped_cycles{0};
+        u64 short_excess_ns{0};  // short exits' wall time beyond their CPU time: the TSC ran through it, guest time did not
     };
     const Stats& stats() const { return stats_; }
 
