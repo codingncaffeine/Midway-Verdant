@@ -6,6 +6,7 @@
 
 #include <cstring>
 #include <initializer_list>
+#include <memory>
 #include <vector>
 
 #include "core/bus.h"
@@ -22,7 +23,9 @@ constexpr u32 kCode = 0x1000, kData = 0x20000, kStack = 0x8000;
 
 struct Rig {
     Bus bus{4u << 20};
-    Cpu cpu{bus};
+    // The CPU on the heap: it is ~380 KB, and tests keeping four rigs overflowed Windows' 1 MiB main-thread stack.
+    std::unique_ptr<Cpu> cpu_storage{std::make_unique<Cpu>(bus)};
+    Cpu& cpu{*cpu_storage};
     explicit Rig(bool paged = false) {
         cpu.reset(0x68A);
         // Big real mode with flat 32-bit code, stack and data (as the P6 unit tests), code at 0x1000.
