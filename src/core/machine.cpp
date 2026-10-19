@@ -236,12 +236,13 @@ bool Machine::init(std::string& error) {
         if (config_.shader_cache_dir) renderer_->open_disk_cache(*config_.shader_cache_dir);
         if (const char* w = std::getenv("MV_DEBUG_NO_WRITE_TRACKING"); !(w && *w == '1')) nv2a_.set_write_tracking(cpu_.get());  // 1: a measurement control (stale textures)
         nv2a_.set_renderer(renderer_.get());
-        // The pusher on its own thread (PLAN D21), opt-in with MV_FIFO_THREAD=1, in fast mode without a capture (which
-        // records RAM before each run). Off by default: with the kernel's idle loop halting, the titles measured gain
-        // nothing from it, and the GPU taking guest time slows what is paced by the GPU (the boot animation: 2853
-        // frames of 2947 in its 12 s).
+        // The pusher on its own thread (PLAN D21), in fast mode without a capture (which records RAM before each run);
+        // MV_FIFO_THREAD=0 runs it inline (the control). It was opt-in while the GPU thread read and re-protected the
+        // dirty-page log under the running guest (a title's CPU time doubled, the boot animation lost 4 % of its
+        // frames) and every DMA_GET read waited for the whole queue; with the log on the CPU's thread and GET
+        // reporting progress, the boot animation renders as without a GPU and the known-good list is unchanged.
         const char* ft = std::getenv("MV_FIFO_THREAD");
-        if (config_.cpu == "kvm" && !capture_ && ft && *ft == '1')
+        if (config_.cpu == "kvm" && !capture_ && !(ft && *ft == '0'))
             nv2a_.start_fifo_thread([this] {
                 nv2a_service_.store(true, std::memory_order_release);
                 if (cpu_) cpu_->kick();

@@ -100,6 +100,15 @@ private:
     std::vector<u64> dirty_bitmap_;
     bool selective_requested_{false}, selective_{false};
     std::vector<u64> watched_;  // selective tracking: the pages whose next write is reported
+    // Watches asked for on another thread (the FIFO thread's renderer) wait for the vCPU thread: a clear while the guest
+    // runs flushes its TLB and costs it guest time. Applied at the next exit, conservatively: a page already marked
+    // written then (perhaps after the texture read it) is reported as written.
+    std::mutex watch_mutex_;
+    std::vector<std::pair<u32, u32>> watch_queue_;
+    std::atomic<bool> watch_pending_{false};
+    std::vector<u32> watch_reported_;
+    void apply_watch(u32 first, u32 count, bool conservative);
+    void apply_pending_watches();
     u32 cpuid_signature_{0x0000068A};
     // --break-eip: hardware execution breakpoints, armed at init and dropped after the first debug exit.
     std::vector<u32> break_eips_;

@@ -668,6 +668,7 @@ void KvmBackend::thread_main() {
                 note_frame_tsc();
             }
         }
+        if (watch_pending_.load(std::memory_order_acquire)) apply_pending_watches();  // out of the guest: clears are cheap
         const bool gpu_busy = profile_eip_ && machine_->nv2a().fifo_busy_now();
         const u64 guest_before = clock_.stats().in_guest_ns;
         const int rc = ioctl(vcpu_fd_, KVM_RUN, 0);
@@ -848,6 +849,17 @@ void KvmBackend::arm_breakpoints() {
 
 void KvmBackend::take_dirty_pages(std::vector<u32>& pages) {
     if (!dirty_tracking_ || vm_fd_ < 0) return;
+    // Selective tracking reads the log on the vCPU thread only (between exits); another thread's harvest waits for
+    // the next one there (the log keeps its bits).
+    if (selective_ && std::this_thread::get_id() != thread_.get_id()) return;
+    if (selective_) {
+        if (watch_pending_.load(std::memory_order_acquire)) apply_pending_watches();
+        for (u32 p : watch_reported_) {
+            pages.push_back(p);
+            if (p / 64 < watched_.size()) watched_[p / 64] &= ~(u64{1} << (p % 64));
+        }
+        watch_reported_.clear();
+    }
     // Both RAM slots (direct and the GPU-side alias) back the same pages; the union of their logs is what changed.
     std::vector<u64> merged(dirty_bitmap_.size(), 0);
     for (u32 slot : {kSlotRam, kSlotRamAlias}) {
@@ -875,12 +887,44 @@ void KvmBackend::take_dirty_pages(std::vector<u32>& pages) {
 
 void KvmBackend::watch_pages(u32 first, u32 count) {
     if (!selective_ || count == 0 || vm_fd_ < 0) return;
+    if (std::this_thread::get_id() != thread_.get_id()) {
+        std::lock_guard g(watch_mutex_);
+        watch_queue_.emplace_back(first, count);
+        watch_pending_.store(true, std::memory_order_release);
+        return;
+    }
+    apply_watch(first, count, false);
+}
+
+void KvmBackend::apply_pending_watches() {
+    std::vector<std::pair<u32, u32>> queue;
+    {
+        std::lock_guard g(watch_mutex_);
+        queue.swap(watch_queue_);
+        watch_pending_.store(false, std::memory_order_relaxed);
+    }
+    for (const auto& [first, count] : queue) apply_watch(first, count, true);
+}
+
+void KvmBackend::apply_watch(u32 first, u32 count, bool conservative) {
     const u64 pages = static_cast<u64>(watched_.size()) * 64;
     if (first >= pages) return;
     count = static_cast<u32>(std::min<u64>(count, pages - first));
     // One clear per slot over the 64-page blocks the range touches, with bits for its own pages only: KVM
     // write-protects those pages again, and their next write sets their bits.
     const u32 block0 = first / 64, block1 = (first + count - 1) / 64;
+    if (conservative) {
+        // Pages the log already shows written are reported: the write may have come after the texture read them.
+        for (u32 slot : {kSlotRam, kSlotRamAlias}) {
+            std::fill(dirty_bitmap_.begin(), dirty_bitmap_.end(), 0);
+            kvm_dirty_log log{};
+            log.slot = slot;
+            log.dirty_bitmap = dirty_bitmap_.data();
+            if (ioctl(vm_fd_, KVM_GET_DIRTY_LOG, &log) < 0) continue;
+            for (u32 p = first; p < first + count; ++p)
+                if ((dirty_bitmap_[p / 64] >> (p % 64)) & 1u) watch_reported_.push_back(p);
+        }
+    }
     std::vector<u64> bits(block1 - block0 + 1, 0);
     for (u32 p = first; p < first + count; ++p) {
         const u64 bit = u64{1} << (p % 64);

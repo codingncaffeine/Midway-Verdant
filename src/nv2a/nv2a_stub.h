@@ -170,6 +170,7 @@ public:
     u32 newest_write(u32 phys, u32 len) const override;
     void watch_writes(u32 phys, u32 len) const override;
     void collect_writes();
+    void harvest_writes();  // the logs into dirty_pending_ (on the CPU's thread when the FIFO thread runs)
 
 protected:
     void on_bar_changed(int index, u32 old_base, u32 new_base) override;
@@ -262,12 +263,20 @@ private:
     capture::Writer* capture_{nullptr};
     CpuBackend* cpu_{nullptr};
     std::vector<u32> dirty_scratch_;
+    std::vector<u32> dirty_pending_;  // pages harvested, not yet applied
     bool write_tracking_{false};
     u32 write_generation_{1};
     std::vector<u32> page_generation_;  // per 4 KiB RAM page: the generation of the last write seen
     // The FIFO thread's state, all under gpu_mutex_ but the atomics.
     mutable std::mutex gpu_mutex_;
     mutable std::atomic<u32> gpu_waiters_{0};  // entry points waiting for the lock: the FIFO thread lets them in between chunks
+    mutable std::atomic<u64> lock_wait_ns_{0}, lock_waits_{0};  // instrument: the CPU side waiting for the FIFO thread's chunk
+    std::unordered_map<u32, std::pair<u64, u64>> idle_waits_;   // instrument: register -> (waits for the FIFO thread to go idle, ns)
+    void timed_wait_idle(std::unique_lock<std::mutex>& lock, u32 why);
+    // A read of DMA_GET while the FIFO thread works returns the progress published so far, as the hardware's does; a
+    // read that would see the value the last one saw (a poll) waits for the next chunk instead (not guest time).
+    void timed_wait_progress(std::unique_lock<std::mutex>& lock, u32 why);
+    u32 get_seen_{~0u};
     std::condition_variable fifo_cv_, idle_cv_;
     std::thread fifo_thread_;
     std::thread::id fifo_thread_id_{};
@@ -307,6 +316,7 @@ public:
     u64 fifo_lead_wait_ns() const { return lead_wait_ns_; }
     u64 fifo_vblank_waits() const { return vblank_waits_; }
     u64 fifo_vblank_wait_ns() const { return vblank_wait_ns_; }
+    std::string fifo_wait_report() const;
     u64 reports() const { return reports_; }
 };
 

@@ -442,15 +442,24 @@ u32 Nv2aStub::newest_write(u32 phys, u32 len) const {
     return newest;
 }
 
-void Nv2aStub::collect_writes() {
+// The logs read: the CPU's (KVM's dirty pages) and the bus's. With the FIFO thread this runs at the kick on the CPU's
+// thread, out of the guest: reading and re-protecting the log while the guest runs flushed its TLB and cost it
+// guest time (a racing title's CPU time per frame 2.4 -> 3.5 ms).
+void Nv2aStub::harvest_writes() {
     if (!write_tracking_ && !capture_) return;
     const auto harvest_t0 = std::chrono::steady_clock::now();
     ++collect_calls_;
-    // Everything written to RAM since the last run, by the guest (the backend's log) or by a device (the bus's).
-    dirty_scratch_.clear();
-    if (cpu_) cpu_->take_dirty_pages(dirty_scratch_);
-    bus_.take_dirty_pages(dirty_scratch_);
+    if (cpu_) cpu_->take_dirty_pages(dirty_pending_);
+    bus_.take_dirty_pages(dirty_pending_);
     collect_ns_ += static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - harvest_t0).count());
+}
+
+void Nv2aStub::collect_writes() {
+    if (!write_tracking_ && !capture_) return;
+    if (!fifo_threaded_) harvest_writes();
+    // What was written since the last run, by the guest or a device.
+    dirty_scratch_.swap(dirty_pending_);
+    dirty_pending_.clear();
     collect_pages_ += dirty_scratch_.size();
     if (dirty_scratch_.empty()) return;
     std::sort(dirty_scratch_.begin(), dirty_scratch_.end());
@@ -491,6 +500,7 @@ void Nv2aStub::run_pusher() {
         // A kick: the FIFO thread walks it; until it has, the registers that report progress wait when read.
         stuck_ = false;
         if (pusher_runnable()) {
+            harvest_writes();  // on the CPU's thread: the FIFO thread applies them
             fifo_busy_ = true;
             fifo_cv_.notify_one();
             if (lead_cycles_ && !lead_.scheduled()) sched_.schedule(lead_, sched_.now() + lead_cycles_);
@@ -539,7 +549,8 @@ u32 Nv2aStub::mmio_read(PhysAddr addr, unsigned size) {
     const u32 key = off & ~3u;
     auto gpu = lock_gpu();
     guest_now_.store(sched_.now(), std::memory_order_relaxed);
-    if (fifo_busy_ && reports_progress(key)) wait_idle(gpu);
+    if (fifo_busy_ && (key == kUser + 0x44 || key == kCache1DmaGet)) timed_wait_progress(gpu, key);
+    else if (fifo_busy_ && reports_progress(key)) timed_wait_idle(gpu, key);
     if (off == kPrmcioInputStatus1 && size == 1) {
         // Bit 3: vertical retrace in progress; bit 0: display inactive (blanking).
         const bool vr = in_vertical_retrace();
@@ -602,7 +613,7 @@ void Nv2aStub::mmio_write(PhysAddr addr, unsigned size, u32 value) {
     guest_now_.store(sched_.now(), std::memory_order_relaxed);
     // The FIFO's own registers change under a walk in progress only by a kick (PUT, the push enable); any other write
     // there (a rewound GET, a new DMA object) waits for it to finish.
-    if (fifo_busy_ && ((key >= 0x002000 && key < 0x004000 && key != kCache1DmaPut && key != kCache1DmaPush) || key == kUser + 0x44)) wait_idle(gpu);
+    if (fifo_busy_ && ((key >= 0x002000 && key < 0x004000 && key != kCache1DmaPut && key != kCache1DmaPush) || key == kUser + 0x44)) timed_wait_idle(gpu, key | 0x80000000u);
     u32 word;
     if (size == 4) {
         word = value;
@@ -876,7 +887,13 @@ Nv2aStub::~Nv2aStub() { stop_fifo_thread(); }
 std::unique_lock<std::mutex> Nv2aStub::lock_gpu() const {
     if (!fifo_threaded_) return {};
     gpu_waiters_.fetch_add(1, std::memory_order_acq_rel);
-    std::unique_lock l(gpu_mutex_);
+    std::unique_lock l(gpu_mutex_, std::try_to_lock);
+    if (!l.owns_lock()) {
+        const auto t0 = std::chrono::steady_clock::now();
+        l.lock();
+        lock_wait_ns_.fetch_add(static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count()), std::memory_order_relaxed);
+        lock_waits_.fetch_add(1, std::memory_order_relaxed);
+    }
     gpu_waiters_.fetch_sub(1, std::memory_order_acq_rel);
     return l;
 }
@@ -884,6 +901,35 @@ std::unique_lock<std::mutex> Nv2aStub::lock_gpu() const {
 void Nv2aStub::wait_idle(std::unique_lock<std::mutex>& lock) {
     if (!fifo_threaded_ || !lock.owns_lock()) return;
     idle_cv_.wait(lock, [this] { return !fifo_busy_; });
+}
+
+void Nv2aStub::timed_wait_progress(std::unique_lock<std::mutex>& lock, u32 why) {
+    const u32 seen = get_seen_;
+    if (reg(kCache1DmaGet) == seen) {
+        const auto t0 = std::chrono::steady_clock::now();
+        idle_cv_.wait(lock, [&] { return !fifo_busy_ || reg(kCache1DmaGet) != seen; });
+        auto& w = idle_waits_[why | 0x40000000u];
+        ++w.first;
+        w.second += static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
+    }
+    get_seen_ = reg(kCache1DmaGet);
+}
+
+void Nv2aStub::timed_wait_idle(std::unique_lock<std::mutex>& lock, u32 why) {
+    const auto t0 = std::chrono::steady_clock::now();
+    wait_idle(lock);
+    auto& w = idle_waits_[why];
+    ++w.first;
+    w.second += static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
+}
+
+std::string Nv2aStub::fifo_wait_report() const {
+    std::vector<std::pair<u32, std::pair<u64, u64>>> v(idle_waits_.begin(), idle_waits_.end());
+    std::ranges::sort(v, std::greater{}, [](const auto& e) { return e.second.second; });
+    std::string r = std::format("the lock {} times ({:.3f} s);", lock_waits_.load(), static_cast<double>(lock_wait_ns_.load()) / 1e9);
+    for (std::size_t i = 0; i < v.size() && i < 8; ++i)
+        r += std::format(" {} +{:06x} x{} {:.3f} s;", (v[i].first >> 31) ? "write" : (v[i].first & 0x40000000u) ? "poll" : "read", v[i].first & 0x3FFFFFFFu, v[i].second.first, static_cast<double>(v[i].second.second) / 1e9);
+    return r;
 }
 
 void Nv2aStub::wait_fifo_idle() {
@@ -957,7 +1003,9 @@ void Nv2aStub::fifo_main() {
         fifo_cv_.wait(g, [this] { return fifo_stop_ || pusher_runnable(); });
         if (fifo_stop_) break;
         fifo_busy_ = true;
+        const u32 get_before = reg(kCache1DmaGet);
         run_pusher_inline();
+        if (reg(kCache1DmaGet) != get_before) idle_cv_.notify_all();  // a poll of GET waits for progress
         if (!pusher_runnable()) {
             fifo_busy_ = false;
             idle_cv_.notify_all();
