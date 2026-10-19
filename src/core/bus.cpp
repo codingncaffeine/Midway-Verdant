@@ -58,7 +58,44 @@ bool Bus::write_ram(PhysAddr addr, const void* in, std::size_t len) {
     if (!p) return false;
     std::memcpy(p, in, len);
     if (dirty_tracking_) mark_dirty(addr, len);
+    if (code_tracking_) note_code_write(p, len);
     return true;
+}
+
+void Bus::set_code_tracking(bool on) {
+    code_tracking_ = on;
+    code_words_ = on ? (ram_size_ / kPageSize + 63) / 64 : 0;
+    code_ = code_words_ ? std::make_unique<std::atomic<u64>[]>(code_words_) : nullptr;
+    code_written_ = code_words_ ? std::make_unique<std::atomic<u64>[]>(code_words_) : nullptr;
+    for (std::size_t w = 0; w < code_words_; ++w) {
+        code_[w].store(0, std::memory_order_relaxed);
+        code_written_[w].store(0, std::memory_order_relaxed);
+    }
+}
+
+void Bus::note_code_write(const u8* p, std::size_t len) {
+    if (len == 0) return;
+    const u64 start = static_cast<u64>(p - ram_.data());
+    bool any = false;
+    for (u64 page = start / kPageSize; page <= (start + len - 1) / kPageSize; ++page) {
+        const u64 bit = u64{1} << (page % 64);
+        if (!(code_[page / 64].load(std::memory_order_relaxed) & bit)) continue;
+        code_written_[page / 64].fetch_or(bit, std::memory_order_relaxed);
+        any = true;
+    }
+    if (any) code_pending_.store(true, std::memory_order_release);
+}
+
+void Bus::take_code_writes(std::vector<u32>& pages) {
+    code_pending_.store(false, std::memory_order_relaxed);
+    for (std::size_t w = 0; w < code_words_; ++w) {
+        if (code_written_[w].load(std::memory_order_relaxed) == 0) continue;
+        u64 bits = code_written_[w].exchange(0, std::memory_order_acquire);
+        while (bits) {
+            pages.push_back(static_cast<u32>(w * 64 + static_cast<unsigned>(std::countr_zero(bits))));
+            bits &= bits - 1;
+        }
+    }
 }
 
 void Bus::set_dirty_tracking(bool on) {
@@ -105,6 +142,7 @@ void Bus::write(PhysAddr addr, unsigned size, u32 value) {
     if (u8* p = ram_pointer(addr, size)) {
         std::memcpy(p, &value, size);
         if (dirty_tracking_) mark_dirty(addr, size);
+        if (code_tracking_) note_code_write(p, size);
         return;
     }
     if (MmioHandler* h = mmio_at(addr)) {
@@ -127,6 +165,7 @@ void Bus::write64(PhysAddr addr, u64 value) {
     if (u8* p = ram_pointer(addr, 8)) {
         std::memcpy(p, &value, 8);
         if (dirty_tracking_) mark_dirty(addr, 8);
+        if (code_tracking_) note_code_write(p, 8);
         return;
     }
     write(addr, 4, static_cast<u32>(value));

@@ -98,7 +98,6 @@ void Cpu::reset(u32 cpuid_signature) {
 // ---------------------------------------------------------------------------------------------------------------
 // The cycle model's view of an instruction: the scoreboard registers it reads and writes.
 
-namespace {
 void regs_of(const Insn& in, unsigned top, u32& reads, u32& writes) {
     reads = writes = 0;
     auto gpr = [](unsigned r) { return 1u << (r & 7); };
@@ -247,9 +246,19 @@ void regs_of(const Insn& in, unsigned top, u32& reads, u32& writes) {
             break;
     }
 }
-}  // namespace
 
 void Cpu::account(bool interrupt_delivery) {
+    if (block_timing_) {
+        if (interrupt_delivery) {
+            cycles_ += tp::kInterruptDelivery;
+            return;
+        }
+        // The fallback step: its own one-instruction schedule plus the devices it reached.
+        const Insn* one = &insn_;
+        u16 after = 0;
+        cycles_ += schedule_block(sched_, &one, 1, &after) + mem_.take_penalty();
+        return;
+    }
     InsnTiming t{};
     t.in = &insn_;
     t.interrupt_delivery = interrupt_delivery;
@@ -403,6 +412,7 @@ bool Cpu::condition(u8 cc) const {
 // The step
 
 void Cpu::step() {
+    cur_insn_ = &insn_;
     last_rdtsc_ = last_cpuid_ = last_faulted_ = last_rep_step_ = last_delivered_ = false;
     st_.undefined_flags = 0;
     st_.inhibit_interrupts = false;
@@ -428,6 +438,29 @@ void Cpu::step() {
         account(false);
         fault_entry(fault);
         account(true);
+    }
+}
+
+bool Cpu::exec_decoded(const Insn& in) {
+    cur_insn_ = &in;
+    last_faulted_ = false;
+    rep_iterations_ = 0;
+    st_.undefined_flags = 0;
+    st_.inhibit_interrupts = false;
+    insn_eip_ = st_.eip;
+    insn_cs_ = st_.seg[kCs].selector;
+    try {
+        st_.eip += in.len;
+        if (!st_.code32()) st_.eip &= 0xFFFFu;
+        execute(in);
+        ++instructions_;
+        return true;
+    } catch (const Fault& fault) {
+        st_.eip = insn_eip_;
+        last_faulted_ = true;
+        ++instructions_;
+        fault_entry(fault);
+        return false;
     }
 }
 
@@ -474,7 +507,7 @@ std::string Cpu::last_bytes() {
     std::string s;
     // Re-read the bytes from memory without faulting (the page is mapped: it was just fetched).
     try {
-        for (unsigned i = 0; i < insn_.len; ++i) {
+        for (unsigned i = 0; i < cur_insn_->len; ++i) {
             const u32 lin = st_.seg[kCs].base + insn_eip_ + i;
             s += std::format("{:02x}", mem_.read(lin, 1));
         }

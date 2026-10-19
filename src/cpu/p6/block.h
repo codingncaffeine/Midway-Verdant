@@ -1,0 +1,130 @@
+#pragma once
+// The block engine (D26): the interpreted Pentium III run as translated blocks. A block is a straight run of decoded
+// instructions inside one RAM page, ending at a control transfer, at an instruction that can change what the next
+// one may assume (segments, interrupt flag, control registers, port I/O), at the page's end or after 32
+// instructions. Its cycles come from a schedule computed once (block timing); device latencies, REP element counts
+// and the final branch's prediction are added as they happen. The engine keeps the blocks by physical address,
+// drops a page's blocks when the CPU or a device writes into it, and runs a block's instructions through the
+// interpreter's own `execute` — the reference the native recompiler is checked against.
+#include <array>
+#include <string>
+#include <memory>
+#include <unordered_map>
+#include <vector>
+
+#include "core/bus.h"
+#include "core/types.h"
+#include "cpu/p6/cpu.h"
+#include "cpu/p6/decode.h"
+#include "cpu/p6/memory.h"
+
+namespace mv::p6 {
+
+inline constexpr unsigned kMaxBlockInsns = 32;
+
+enum class BranchKind : u8 { None, Conditional, Direct, Indirect, Return, Call, CallIndirect };
+
+struct Block {
+    u32 ram_page{0};   // RAM page index of the code (a block never leaves its page)
+    u16 page_off{0};   // offset of the first byte in the page
+    u8 mode{0};        // bit 0: 32-bit code; bit 1: 32-bit stack
+    u8 n{0};           // instructions
+    u16 bytes{0};      // length of the code
+    bool rep{false};   // a lone REP string instruction: costed per element
+    BranchKind branch{BranchKind::None};  // what the final instruction is
+    u8 exit_counter{1};  // the final conditional branch's two-bit predictor (taken at 2 and 3)
+    bool exit_seen{false};
+    u32 exit_target{0};  // the last target of an indirect final branch
+    u32 cycles{0};       // the schedule's total
+    std::array<u16, kMaxBlockInsns> after{};  // cycles from the start to each instruction's retirement
+    std::vector<Insn> insns;
+    void* native{nullptr};  // the recompiled form, when there is one
+    u64 runs{0};
+    u32 lin{0};  // the linear address it was first built at (reports)
+};
+
+struct BlockStats {
+    u64 built{0}, killed{0}, pages_written{0}, device_page_writes{0};
+    u64 whole_runs{0}, fallback_steps{0}, block_insns{0};
+    u64 mispredicts{0};
+    // Where the cycles went: the schedules, the penalties (caches, devices), the exits' mispredicts, REP elements.
+    u64 schedule_cycles{0}, penalty_cycles{0}, exit_cycles{0}, rep_cycles{0};
+};
+
+class BlockEngine : public CodeWatcher {
+public:
+    BlockEngine(Cpu& cpu, Bus& bus);
+    ~BlockEngine() override;
+
+    // The block that starts at the current CS:EIP, built if needed; nullptr when none can be (the code is outside
+    // RAM, crosses the code segment's limit, or its first instruction faults on fetch or decode): the caller steps.
+    Block* find();
+
+    enum class Next : u8 { Continue, Exit };
+    // One run of a block: where it started, the penalties (caches, devices) its instructions added so far, and the
+    // cycle it must not pass without returning to the caller (the next timeline deadline, the stop cycle).
+    struct Run {
+        Block* b;
+        u64 start;
+        u32 entry_eip;
+        u64 extra;
+        u64 limit;
+    };
+    // Start a run at the current clock and EIP: the code fetch is looked up in the instruction cache.
+    Run begin(Block& b, u64 limit);
+    // Execute instruction `i` of the run. Continue: the clock holds the next instruction's start, which is before the
+    // limit. Exit: the block is over (its last instruction, a fault, a device access, a write into its own page, the
+    // limit reached at the next boundary) and the clock holds the cycle it ended at. So the caller's checks between
+    // runs fall on the instruction boundaries a per-instruction loop would make them on.
+    Next exec(Run& r, unsigned i);
+    // Run a block until it exits; returns the instructions executed.
+    unsigned run(Block& b, u64 limit);
+
+    // A step outside any block (the fallback) ran: blocks keep no state across it.
+    void note_fallback() { ++stats_.fallback_steps; }
+
+    // Device writes into code pages, applied before the next block runs.
+    void apply_device_writes() {
+        if (bus_.code_writes_pending()) take_device_writes();
+    }
+    // Drop every block (a reset).
+    void clear();
+
+    void code_written(u32 ram_page) override;
+    const BlockStats& stats() const { return stats_; }
+    std::size_t live_blocks() const { return blocks_.size(); }
+    // The blocks that took the most cycles (runs x schedule), for reports.
+    std::string hottest(unsigned count) const;
+
+private:
+    Block* build(const u8* page, unsigned off, u32 ram_page, u8 mode);
+    void kill_page(u32 ram_page);
+    void take_device_writes();
+    u32 exit_cost(Block& b, u32 entry_eip);
+    static u64 key(u32 ram_page, unsigned off, u8 mode) { return (static_cast<u64>(ram_page) << 14) | (static_cast<u64>(off) << 2) | mode; }
+    static unsigned fast_index(u32 lin, u8 mode) { return ((lin ^ (lin >> 16)) * 2 + mode) & (kFastSize - 1); }
+
+    static constexpr unsigned kFastSize = 1u << 16;
+    struct FastEntry {
+        u32 lin{0xFFFFFFFFu};
+        u8 mode{0};
+        u32 epoch{0};
+        Block* block{nullptr};
+    };
+
+    Cpu& cpu_;
+    Bus& bus_;
+    std::unordered_map<u64, std::unique_ptr<Block>> blocks_;
+    std::vector<FastEntry> fast_;
+    u32 epoch_{1};  // a kill makes every fast entry stale at once
+    std::vector<std::vector<Block*>> page_blocks_;
+    std::vector<std::unique_ptr<Block>> graveyard_;
+    Block* running_{nullptr};
+    bool running_dead_{false};
+    std::array<u32, 16> rsb_{};
+    unsigned rsb_top_{0};
+    std::vector<u32> written_;
+    BlockStats stats_;
+};
+
+}  // namespace mv::p6

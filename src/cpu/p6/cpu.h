@@ -42,6 +42,20 @@ public:
     // Execute one instruction. Faults it raises are delivered through the IDT inside the call (a double
     // fault too); a triple fault sets `triple_fault()`. Throws `Unimplemented` for what the core lacks.
     void step();
+    // Block timing (D26): cycles come from block schedules; `step` (the fallback for what no block holds) costs its
+    // own one-instruction schedule, an interrupt or fault delivery a fixed latency.
+    void set_block_timing(bool on) {
+        block_timing_ = on;
+        mem_.set_cache_model(on ? &timing_ : nullptr);
+    }
+    Timing& cache_timing() { return timing_; }
+    bool block_timing() const { return block_timing_; }
+    // Execute one decoded instruction of a block at the current EIP: no decode, no cycle accounting (the block
+    // engine sets the clock). Returns false when it faulted; the fault was delivered (and cost its latency).
+    bool exec_decoded(const Insn& in);
+    void set_cycles_only(u64 c) { cycles_ = c; }
+    unsigned rep_iterations() const { return rep_iterations_; }
+    Timing& scheduler() { return sched_; }
     // Take a pending external interrupt if the core accepts one now (IF set, no inhibit): delivers it and
     // returns true. Wakes a halted core.
     bool take_interrupt();
@@ -63,7 +77,7 @@ public:
     void set_single_iteration(bool on) { single_iteration_ = on; }
 
     // The last instruction decoded (for reports), and where it started.
-    const Insn& last_insn() const { return insn_; }
+    const Insn& last_insn() const { return *cur_insn_; }
     u32 last_eip() const { return insn_eip_; }
     u16 last_cs() const { return insn_cs_; }
     // The bytes of the last instruction, as hex, for reports.
@@ -164,6 +178,9 @@ private:
     bool last_rdtsc_{false}, last_cpuid_{false}, last_faulted_{false}, last_rep_step_{false}, last_delivered_{false};
     u8 last_vector_{0};
     Timing timing_;
+    Timing sched_;  // the ideal pipeline block schedules are computed on
+    bool block_timing_{false};
+    const Insn* cur_insn_{&insn_};
     PhysAddr fetch_phys_{0};
     unsigned rep_iterations_{0};
     unsigned top_before_{0};

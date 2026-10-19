@@ -295,6 +295,19 @@ void Timing::reset() {
     stats_ = TimingStats{};
 }
 
+void Timing::reset_pipeline() {
+    decode_cycle_ = 0;
+    decode_slot_ = decode_bytes_ = 0;
+    front_end_restart_ = 0;
+    port_free_.fill(0);
+    reg_ready_.fill(0);
+    retire_cycle_ = 0;
+    retire_slot_ = 0;
+    rob_.fill(0);
+    rob_pos_ = 0;
+    int_div_free_ = fp_div_free_ = 0;
+}
+
 void Timing::skip_to(u64 cycle) {
     if (cycle <= retire_cycle_) return;
     decode_cycle_ = cycle;
@@ -314,6 +327,7 @@ u64 Timing::alloc_port(unsigned port, u64 earliest) {
 
 // The extra cycles a data access costs beyond the L1 hit latency.
 unsigned Timing::memory_penalty(PhysAddr phys, u64 now, bool store) {
+    if (ideal_) return 0;
     if (l1d_.access(phys, now)) return 0;
     ++stats_.l1d_misses;
     unsigned penalty = tp::kL2Latency;
@@ -326,6 +340,7 @@ unsigned Timing::memory_penalty(PhysAddr phys, u64 now, bool store) {
 }
 
 u64 Timing::fetch_ready(PhysAddr phys, unsigned len, u64 now) {
+    if (ideal_) return now;
     u64 ready = now;
     for (PhysAddr line = phys & ~31u; line <= ((phys + len - 1) & ~31u); line += 32) {
         if (l1i_.access(line, now)) continue;
@@ -496,7 +511,7 @@ u64 Timing::retire(const InsnTiming& t) {
         if (t.writes & (1u << r)) reg_ready_[r] = done;
 
     // ---- branches ----
-    if (t.is_branch) {
+    if (t.is_branch && !ideal_) {
         ++stats_.branches;
         bool predicted_taken;
         u32 predicted_target = 0;
@@ -555,6 +570,35 @@ u64 Timing::retire(const InsnTiming& t) {
     }
     stats_.cycles = retire_cycle_;
     return retire_cycle_;
+}
+
+}  // namespace mv::p6
+
+namespace mv::p6 {
+
+u32 schedule_block(Timing& ideal, const Insn* const* insns, unsigned n, u16* after) {
+    ideal.set_ideal(true);
+    ideal.reset_pipeline();
+    InsnTiming t{};
+    u64 first_pass_end = 0;
+    for (unsigned pass = 0; pass < 2; ++pass) {
+        for (unsigned i = 0; i < n; ++i) {
+            t = InsnTiming{};
+            t.in = insns[i];
+            t.len = insns[i]->len;
+            regs_of(*insns[i], 0, t.reads, t.writes);
+            const u64 r = ideal.retire(t);
+            if (pass == 1) after[i] = static_cast<u16>(std::min<u64>(r - first_pass_end, 0xFFFF));
+        }
+        if (pass == 0) {
+            first_pass_end = ideal.now();
+            ideal.clear_dependencies();
+        }
+    }
+    // A block costs at least a cycle (one taken branch a cycle at most); the offsets never pass the total.
+    const u32 total = std::max<u32>(1, n ? after[n - 1] : 0);
+    if (n) after[n - 1] = static_cast<u16>(total);
+    return total;
 }
 
 }  // namespace mv::p6

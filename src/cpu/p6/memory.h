@@ -9,6 +9,7 @@
 #include "core/bus.h"
 #include "core/types.h"
 #include "cpu/p6/state.h"
+#include "cpu/p6/timing.h"
 
 namespace mv::p6 {
 
@@ -29,12 +30,20 @@ struct IoRecord {
     u32 value;
 };
 
+// Told when the CPU writes into a RAM page that holds translated code (D26), before the write returns.
+class CodeWatcher {
+public:
+    virtual ~CodeWatcher() = default;
+    virtual void code_written(u32 ram_page) = 0;
+};
+
 class Memory {
 public:
     Memory(Bus& bus, CpuState& st);
 
     // Before every device access the owner is told, so the timeline can be brought up to date first.
     void set_device_hook(std::function<void()> hook) { device_hook_ = std::move(hook); }
+    void set_code_watcher(CodeWatcher* w) { code_watch_ = w; }
 
     // Linear-address accesses (after segmentation). Sizes 1, 2, 4; `read_bytes`/`write_bytes` for the wide
     // x87/SSE operands. They throw #PF.
@@ -98,6 +107,17 @@ public:
     void set_dirty_tracking(bool on);
     void take_dirty_pages(std::vector<u32>& pages);
 
+    // Block timing's device term (D26): a running count of the device and port accesses (a block ends after an
+    // instruction that reached a device); their latency adds up with the cache penalties until `take_penalty`.
+    u64 device_events() const { return device_events_; }
+    // Block timing's cache model: every RAM access is looked up in `model`'s caches; the penalties add up until taken.
+    void set_cache_model(Timing* model) { cache_model_ = model; }
+    u64 take_penalty() {
+        const u64 c = penalty_ + device_cycles_;
+        penalty_ = device_cycles_ = 0;
+        return c;
+    }
+
     Bus& bus() { return bus_; }
 
     u64 tlb_misses() const { return tlb_misses_; }
@@ -127,6 +147,13 @@ private:
     CpuState& st_;
     std::array<TlbEntry, kTlbSize> tlb_{};
     std::function<void()> device_hook_;
+    CodeWatcher* code_watch_{nullptr};
+    void check_code(const u8* p) {
+        if (code_watch_) {
+            const u32 page = bus_.ram_page(p);
+            if (bus_.code_page(page)) code_watch_->code_written(page);
+        }
+    }
     bool logging_{false};
     std::vector<WriteRecord> writes_;
     std::vector<IoRecord> io_log_;
@@ -138,7 +165,15 @@ private:
     bool in_rom(PhysAddr phys) const { return phys >= rom_base_ && phys - rom_base_ < rom_size_; }
     std::array<AccessRecord, kMaxAccesses> accesses_{};
     unsigned naccesses_{0};
+    u64 device_cycles_{0}, device_events_{0};
+    Timing* cache_model_{nullptr};
+    u64 penalty_{0};
+    void device_access(unsigned latency) {
+        device_cycles_ += latency;
+        ++device_events_;
+    }
     void note(PhysAddr phys, unsigned size, u8 kind) {
+        if (cache_model_ && kind < 2) penalty_ += cache_model_->data_access(phys, kind == 1);
         if (naccesses_ < kMaxAccesses) accesses_[naccesses_++] = AccessRecord{phys, static_cast<u8>(size), kind};
     }
 };

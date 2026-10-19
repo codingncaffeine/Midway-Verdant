@@ -1,5 +1,7 @@
 #include "cpu/p6/memory.h"
 
+#include "cpu/p6/timing.h"
+
 #include <bit>
 #include <cstring>
 
@@ -141,6 +143,7 @@ u32 Memory::read_phys(PhysAddr phys, unsigned size) {
     }
     if (device_hook_) device_hook_();
     note(phys, size, 2);
+    device_access(tp::kBlockDeviceLoad);
     const u32 v = bus_.read(phys, size);
     if (logging_) io_log_.push_back({false, true, phys, static_cast<u8>(size), v});
     return v;
@@ -164,10 +167,12 @@ void Memory::write_phys(PhysAddr phys, unsigned size, u32 value) {
         }
         std::memcpy(p, &value, size);
         if (dirty_tracking_) mark_dirty(phys, size);
+        check_code(p);
         return;
     }
     if (device_hook_) device_hook_();
     note(phys, size, 3);
+    device_access(tp::kBlockDeviceStore);
     if (logging_) io_log_.push_back({true, true, phys, static_cast<u8>(size), value});
     bus_.write(phys, size, value);
 }
@@ -220,6 +225,7 @@ void Memory::write(u32 lin, unsigned size, u32 value) {
     if (e.host && !logging_) {
         std::memcpy(e.host + (lin & kPageMask), &value, size);
         if (dirty_tracking_) mark_dirty(e.phys_page, 1);
+        check_code(e.host);
         note(e.phys_page | (lin & kPageMask), size, 1);
         return;
     }
@@ -261,6 +267,7 @@ void Memory::probe_write(u32 lin, unsigned n) {
 u32 Memory::io_read(u16 port, unsigned size) {
     if (device_hook_) device_hook_();
     note(port, size, 4);
+    device_access(tp::kBlockPortIo);
     const u32 v = bus_.pio_read(port, size);
     if (logging_) io_log_.push_back({false, false, port, static_cast<u8>(size), v});
     return v;
@@ -269,6 +276,7 @@ u32 Memory::io_read(u16 port, unsigned size) {
 void Memory::io_write(u16 port, unsigned size, u32 value) {
     if (device_hook_) device_hook_();
     note(port, size, 5);
+    device_access(tp::kBlockPortIo);
     if (logging_) io_log_.push_back({true, false, port, static_cast<u8>(size), value});
     bus_.pio_write(port, size, value);
 }

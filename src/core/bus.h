@@ -83,6 +83,22 @@ public:
     void take_dirty_pages(std::vector<u32>& pages);
     void mark_dirty(PhysAddr addr, std::size_t len);
 
+    // Pages holding translated code (D26), by RAM page index. A write into one through the bus (device DMA, a device's
+    // own RAM writes, from any thread) is recorded for the CPU thread, which invalidates the page's blocks before it
+    // runs another; the CPU's own writes are checked by its memory unit.
+    void set_code_tracking(bool on);
+    bool code_tracking() const { return code_tracking_; }
+    void set_code_page(u32 page, bool on) {
+        const u64 bit = u64{1} << (page % 64);
+        if (on) code_[page / 64].fetch_or(bit, std::memory_order_relaxed);
+        else code_[page / 64].fetch_and(~bit, std::memory_order_relaxed);
+    }
+    bool code_page(u32 page) const { return code_tracking_ && (code_[page / 64].load(std::memory_order_relaxed) & (u64{1} << (page % 64))) != 0; }
+    // The RAM page index of a host pointer into RAM.
+    u32 ram_page(const u8* p) const { return static_cast<u32>(static_cast<u64>(p - ram_.data()) / kPageSize); }
+    bool code_writes_pending() const { return code_pending_.load(std::memory_order_acquire); }
+    void take_code_writes(std::vector<u32>& pages);
+
     // Unknown-access bookkeeping: (page, is_write) -> count; printed by the runner at the end.
     struct Unknown {
         bool is_write;
@@ -95,6 +111,7 @@ public:
 private:
     void note_unknown_mmio(PhysAddr addr, unsigned size, bool is_write, u32 value);
     void note_unknown_pio(u16 port, unsigned size, bool is_write, u32 value);
+    void note_code_write(const u8* p, std::size_t len);
 
     AlignedBuffer ram_;
     std::size_t ram_size_;
@@ -105,6 +122,10 @@ private:
     bool dirty_tracking_{false};
     std::unique_ptr<std::atomic<u64>[]> dirty_;  // one bit per RAM page
     std::size_t dirty_words_{0};
+    bool code_tracking_{false};
+    std::unique_ptr<std::atomic<u64>[]> code_, code_written_;
+    std::size_t code_words_{0};
+    std::atomic<bool> code_pending_{false};
 };
 
 }  // namespace mv

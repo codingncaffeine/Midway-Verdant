@@ -68,6 +68,20 @@ public:
     void skip_to(u64 cycle);
     u64 now() const { return retire_cycle_; }
     const TimingStats& stats() const { return stats_; }
+    // Block timing (D26): an ideal pipeline (code and data hit L1, branches are predicted) that schedules a translated
+    // block once; its caches and predictor are never touched.
+    void set_ideal(bool on) { ideal_ = on; }
+    // The pipeline's clocks back to zero; caches, predictor and statistics kept.
+    void reset_pipeline();
+    // Block timing's cache terms (D26), on the same L1/L2 tag arrays: a load's penalty over an L1 hit (a store's is
+    // posted: 0), and a block's code fetch. LRU ages from an access count (deterministic).
+    unsigned data_access(PhysAddr phys, bool store) { return memory_penalty(phys, ++lru_clock_, store); }
+    unsigned code_fetch(PhysAddr phys, unsigned len) {
+        const u64 now = ++lru_clock_;
+        return static_cast<unsigned>(fetch_ready(phys, len, now) - now);
+    }
+    // Every register ready (the next instructions do not depend on the earlier ones).
+    void clear_dependencies() { reg_ready_.fill(0); }
 
 private:
     struct Cache {
@@ -103,6 +117,25 @@ private:
     std::array<u32, 16> rsb_{};
     unsigned rsb_top_{0};
     TimingStats stats_;
+    bool ideal_{false};
+    u64 lru_clock_{0};
 };
+
+// The scoreboard registers an instruction reads and writes (x87 registers by physical number from `top`).
+void regs_of(const Insn& in, unsigned top, u32& reads, u32& writes);
+
+// The block schedule (D26): `after[i]` = cycles from the block's start to instruction i's retirement in the steady
+// state (the block scheduled twice back to back on the ideal pipeline, the second pass measured with its registers
+// ready, so the first pass leaves only its use of the decoders, ports and reorder buffer behind; x87 registers by
+// stack position, the pushes and pops inside the block not followed). Returns the block's cost, at least one cycle.
+u32 schedule_block(Timing& ideal, const Insn* const* insns, unsigned n, u16* after);
+
+// Block timing's dynamic terms, added where the run time knows them (cycles at 733 MHz).
+namespace tp {
+inline constexpr unsigned kBlockDeviceLoad = kDeviceLoad - kLoadLatency;  // over the schedule's L1 hit
+inline constexpr unsigned kBlockDeviceStore = kDeviceStore;
+inline constexpr unsigned kBlockPortIo = kPortIo;
+inline constexpr unsigned kBlockMispredict = kMispredictBubble + kDecodeToIssue;  // [verify]
+}  // namespace tp
 
 }  // namespace mv::p6
