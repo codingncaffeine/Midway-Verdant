@@ -195,3 +195,32 @@ TEST(Texture, A8IsWhiteWithAlpha) {
         EXPECT_EQ((std::vector<u8>(img.begin(), img.end())), (std::vector<u8>{255, 255, 255, 0x40, 255, 255, 255, 0xC0}));
     }
 }
+
+TEST(Texture, DecodesCompressedVolumesWithTheSlicesBlocksTogether) {
+    // An 8x4x2 DXT1 volume: two block positions, two slices. In memory each position's slices come together:
+    // (x0 z0) red, (x0 z1) green, (x1 z0) blue, (x1 z1) white, every texel index 0 (colour 0).
+    const u16 colours[4] = {0xF800, 0x07E0, 0x001F, 0xFFFF};
+    u8 blocks[4 * 8] = {};
+    for (u32 i = 0; i < 4; ++i) std::memcpy(&blocks[i * 8], &colours[i], 2);
+    std::vector<u8> out(8 * 4 * 2 * 4);
+    decode_dxt_volume(0x0C, blocks, 8, 4, 2, out.data());
+    const auto texel = [&](u32 x, u32 y, u32 z) { return &out[((z * 4 + y) * 8 + x) * 4]; };
+    EXPECT_EQ(texel(0, 0, 0)[0], 255);  // slice 0, left block: red
+    EXPECT_EQ(texel(3, 3, 1)[1], 255);  // slice 1, left block: green
+    EXPECT_EQ(texel(1, 0, 1)[0], 0);
+    EXPECT_EQ(texel(4, 0, 0)[2], 255);  // slice 0, right block: blue
+    EXPECT_EQ(texel(4, 0, 0)[0], 0);
+    EXPECT_EQ(texel(7, 2, 1)[0], 255);  // slice 1, right block: white
+    EXPECT_EQ(texel(7, 2, 1)[1], 255);
+
+    // Through the stage decoder: the same bytes as a 3D DXT1 texture give the same slices (a flat reading of
+    // the blocks would put green beside red in slice 0).
+    std::vector<u8> ram(4096, 0);
+    std::memcpy(&ram[0x100], blocks, sizeof blocks);
+    const TextureStage vol = stage_of(fmt(0x0C, 3, 2, 1, false, 3, 1));
+    DecodedTexture d;
+    ASSERT_TRUE(decode_texture(vol, 0x100, MemoryView{ram.data(), 4096}, nullptr, d)) << d.error;
+    ASSERT_EQ(d.depth, 2u);
+    EXPECT_EQ(d.image(0, 0)[4 * 4 + 2], 255);  // slice 0, x 4: blue
+    EXPECT_EQ(d.image(0, 0)[(8 * 4 + 4) * 4 + 1], 255);  // slice 1, x 4: white
+}

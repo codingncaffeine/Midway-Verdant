@@ -45,5 +45,8 @@ bool decode_texture(const TextureStage& stage, u32 base, const MemoryView& memor
 void decode_dxt1(const u8* blocks, u32 w, u32 h, u8* out);
 void decode_dxt3(const u8* blocks, u32 w, u32 h, u8* out);
 void decode_dxt5(const u8* blocks, u32 w, u32 h, u8* out);
+// A compressed volume texture (format 0x0C, 0x0E or 0x0F; w x h x d RGBA8, slice after slice): the blocks of up
+// to four consecutive slices at one block position are stored together.
+void decode_dxt_volume(u32 format, const u8* blocks, u32 w, u32 h, u32 d, u8* out);
 
 }  // namespace mv::pgraph

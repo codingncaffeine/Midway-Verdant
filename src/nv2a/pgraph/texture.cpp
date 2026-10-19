@@ -189,45 +189,59 @@ u32 swizzled_offset(u32 x, u32 y, u32 z, u32 log_w, u32 log_h, u32 log_d) {
     return offset;
 }
 
-void decode_dxt1(const u8* blocks, u32 w, u32 h, u8* out) {
-    const u32 bw = (w + 3) / 4, bh = (h + 3) / 4;
+namespace {
+
+// One 4x4 block of a DXT1 (8 bytes), DXT3 or DXT5 (16) image into `out` (w x h RGBA8), at block (bx, by).
+void decode_dxt_block(u32 format, const u8* b, u32 bx, u32 by, u32 w, u32 h, u8* out) {
+    if (format == 0x0C) {
+        decode_dxt_colors(b, true, bx, by, w, h, out, nullptr);
+        return;
+    }
+    u8 alphas[16];
+    if (format == 0x0E) {
+        for (u32 i = 0; i < 16; ++i) alphas[i] = static_cast<u8>(expand4((b[i / 2] >> (4 * (i & 1))) & 15));
+    } else {
+        const u32 a0 = b[0], a1 = b[1];
+        u32 table[8] = {a0, a1, 0, 0, 0, 0, 0, 0};
+        if (a0 > a1) {
+            for (u32 i = 1; i < 7; ++i) table[i + 1] = ((7 - i) * a0 + i * a1) / 7;
+        } else {
+            for (u32 i = 1; i < 5; ++i) table[i + 1] = ((5 - i) * a0 + i * a1) / 5;
+            table[6] = 0;
+            table[7] = 255;
+        }
+        u64 bits = 0;
+        for (u32 i = 0; i < 6; ++i) bits |= static_cast<u64>(b[2 + i]) << (8 * i);
+        for (u32 i = 0; i < 16; ++i) alphas[i] = static_cast<u8>(table[(bits >> (3 * i)) & 7]);
+    }
+    decode_dxt_colors(b + 8, false, bx, by, w, h, out, alphas);
+}
+
+u32 dxt_block_bytes(u32 format) { return format == 0x0C ? 8u : 16u; }
+
+void decode_dxt(u32 format, const u8* blocks, u32 w, u32 h, u8* out) {
+    const u32 bw = (w + 3) / 4, bh = (h + 3) / 4, size = dxt_block_bytes(format);
     for (u32 by = 0; by < bh; ++by)
-        for (u32 bx = 0; bx < bw; ++bx) decode_dxt_colors(blocks + (by * bw + bx) * 8, true, bx, by, w, h, out, nullptr);
+        for (u32 bx = 0; bx < bw; ++bx) decode_dxt_block(format, blocks + (by * bw + bx) * size, bx, by, w, h, out);
 }
 
-void decode_dxt3(const u8* blocks, u32 w, u32 h, u8* out) {
-    const u32 bw = (w + 3) / 4, bh = (h + 3) / 4;
-    for (u32 by = 0; by < bh; ++by) {
-        for (u32 bx = 0; bx < bw; ++bx) {
-            const u8* b = blocks + (by * bw + bx) * 16;
-            u8 alphas[16];
-            for (u32 i = 0; i < 16; ++i) alphas[i] = static_cast<u8>(expand4((b[i / 2] >> (4 * (i & 1))) & 15));
-            decode_dxt_colors(b + 8, false, bx, by, w, h, out, alphas);
-        }
-    }
-}
+}  // namespace
 
-void decode_dxt5(const u8* blocks, u32 w, u32 h, u8* out) {
-    const u32 bw = (w + 3) / 4, bh = (h + 3) / 4;
-    for (u32 by = 0; by < bh; ++by) {
-        for (u32 bx = 0; bx < bw; ++bx) {
-            const u8* b = blocks + (by * bw + bx) * 16;
-            const u32 a0 = b[0], a1 = b[1];
-            u32 table[8] = {a0, a1, 0, 0, 0, 0, 0, 0};
-            if (a0 > a1) {
-                for (u32 i = 1; i < 7; ++i) table[i + 1] = ((7 - i) * a0 + i * a1) / 7;
-            } else {
-                for (u32 i = 1; i < 5; ++i) table[i + 1] = ((5 - i) * a0 + i * a1) / 5;
-                table[6] = 0;
-                table[7] = 255;
-            }
-            u64 bits = 0;
-            for (u32 i = 0; i < 6; ++i) bits |= static_cast<u64>(b[2 + i]) << (8 * i);
-            u8 alphas[16];
-            for (u32 i = 0; i < 16; ++i) alphas[i] = static_cast<u8>(table[(bits >> (3 * i)) & 7]);
-            decode_dxt_colors(b + 8, false, bx, by, w, h, out, alphas);
-        }
-    }
+void decode_dxt1(const u8* blocks, u32 w, u32 h, u8* out) { decode_dxt(0x0C, blocks, w, h, out); }
+void decode_dxt3(const u8* blocks, u32 w, u32 h, u8* out) { decode_dxt(0x0E, blocks, w, h, out); }
+void decode_dxt5(const u8* blocks, u32 w, u32 h, u8* out) { decode_dxt(0x0F, blocks, w, h, out); }
+
+void decode_dxt_volume(u32 format, const u8* blocks, u32 w, u32 h, u32 d, u8* out) {
+    // The slices go in groups of four; within a group each block position holds its slices' blocks one after
+    // another (slice 0, 1, 2, 3), then the next position in row order. Seen in a title's 512x512x2 DXT5 volume,
+    // whose two slices' blocks alternate in memory.
+    const u32 bw = (w + 3) / 4, bh = (h + 3) / 4, size = dxt_block_bytes(format);
+    const std::size_t slice = static_cast<std::size_t>(w) * h * 4;
+    const u8* b = blocks;
+    for (u32 z0 = 0; z0 < d; z0 += 4)
+        for (u32 by = 0; by < bh; ++by)
+            for (u32 bx = 0; bx < bw; ++bx)
+                for (u32 z = z0; z < std::min(z0 + 4, d); ++z, b += size) decode_dxt_block(format, b, bx, by, w, h, out + z * slice);
 }
 
 namespace {
@@ -324,7 +338,8 @@ bool decode_texture(const TextureStage& stage, u32 base, const MemoryView& memor
             }
             std::vector<u8> img(static_cast<std::size_t>(w) * h * d * texel);
             if (f.compressed) {
-                if (format == 0x0C) decode_dxt1(src, w, h, img.data());
+                if (d > 1) decode_dxt_volume(format, src, w, h, d, img.data());
+                else if (format == 0x0C) decode_dxt1(src, w, h, img.data());
                 else if (format == 0x0E) decode_dxt3(src, w, h, img.data());
                 else decode_dxt5(src, w, h, img.data());
             } else {
