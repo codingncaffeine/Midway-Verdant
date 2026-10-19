@@ -1496,7 +1496,7 @@ private:
     Mem xmm_at(unsigned r) { return st_at(kXmm + static_cast<i32>(16 * (r & 7))); }
     // A constant vector of four copies of `v`.
     Mem vconst(u32 v) {
-        static constexpr std::array<u32, 4 * 6> kConsts = {
+        alignas(16) static constexpr std::array<u32, 4 * 6> kConsts = {  // aligned: legacy SSE memory operands fault otherwise (MSVC aligns arrays to 4)
             0x7FFFFFFFu, 0x7FFFFFFFu, 0x7FFFFFFFu, 0x7FFFFFFFu,  // 0: abs
             0x7F800000u, 0x7F800000u, 0x7F800000u, 0x7F800000u,  // 1: infinity
             0x00800000u, 0x00800000u, 0x00800000u, 0x00800000u,  // 2: the smallest normal

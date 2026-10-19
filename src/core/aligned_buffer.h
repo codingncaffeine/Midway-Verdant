@@ -38,7 +38,7 @@ public:
         release();
         // Round the size up to the alignment: aligned_alloc wants a multiple on some platforms.
         const std::size_t rounded = (size + kAlignment - 1) / kAlignment * kAlignment;
-#if defined(_MSC_VER)
+#if defined(_WIN32)
         data_ = static_cast<u8*>(_aligned_malloc(rounded, kAlignment));
 #else
         data_ = static_cast<u8*>(std::aligned_alloc(kAlignment, rounded));
@@ -57,7 +57,7 @@ public:
 private:
     void release() {
         if (!data_) return;
-#if defined(_MSC_VER)
+#if defined(_WIN32)
         _aligned_free(data_);
 #else
         std::free(data_);

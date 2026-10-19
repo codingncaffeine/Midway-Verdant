@@ -15,7 +15,8 @@ namespace mv::p6 {
 
 // Whether the x87 unit runs on the host's own 80-bit x87 (GCC/Clang on x86). Elsewhere (MSVC, other hosts)
 // long double is a double and extended-precision results, their rounding and C1 are approximations.
-#if (defined(__x86_64__) || defined(__i386__)) && (defined(__GNUC__) || defined(__clang__))
+// MV_NO_HOST_X87 forces the second path on GCC/Clang, so MSVC's configuration can be tested on Linux.
+#if (defined(__x86_64__) || defined(__i386__)) && (defined(__GNUC__) || defined(__clang__)) && !defined(MV_NO_HOST_X87)
 inline constexpr bool kHostX87 = true;
 #else
 inline constexpr bool kHostX87 = false;
