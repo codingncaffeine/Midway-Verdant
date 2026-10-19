@@ -1,6 +1,8 @@
 #include "cpu/p6/jit/jit.h"
 
 #include <cstddef>
+#include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <exception>
@@ -558,15 +560,12 @@ private:
             a.jcc(A, fail);
         }
         if (s.base) a.lea(4, rax, mem(rax, static_cast<i32>(s.base)));
-        if (size > 1) {
-            a.mov(4, rdx, rax);
-            a.alu_imm(4, 4, rdx, 0xFFF);
-            a.alu_imm(4, 7, rdx, 0x1000 - size);
-            a.jcc(A, fail);
-        }
-        a.mov(4, rdx, rax);
-        a.shift_imm(4, 5, rdx, 12);  // the linear page
-        a.mov(4, rcx, rdx);
+        // The page of the access's last byte against the tag of the entry its first byte indexes: a page crossing
+        // (or a wrap past 4 GiB) cannot match.
+        a.lea(4, rdx, mem(rax, static_cast<i32>(size - 1)));
+        a.shift_imm(4, 5, rdx, 12);
+        a.mov(4, rcx, rax);
+        a.shift_imm(4, 5, rcx, 12);
         a.alu_imm(4, 4, rcx, Memory::kTlbSize - 1);
         a.shift_imm(4, 4, rcx, 5);
         a.alu(4, 7, rdx, mem(kTlb, rcx, 0, 0));  // tag
@@ -2347,6 +2346,16 @@ bool Jit::compile(Block& b, Cpu& cpu, BlockEngine& engine) {
     b.native = buffer_ + used_;
     b.entry.body = buffer_ + used_ + t.body;
     b.entry.jit_eip = b.jit_eip;
+    // MV_JIT_MAP=FILE: the generated code's ranges and their guest blocks, for a sampling profiler.
+    static std::FILE* map = [] {
+        const char* p = std::getenv("MV_JIT_MAP");
+        return p && *p ? std::fopen(p, "w") : nullptr;
+    }();
+    if (map) {
+        std::fprintf(map, "%llx %llx %08x %u\n", static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(b.native)),
+                     static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(b.native) + n), b.jit_eip, b.n);
+        std::fflush(map);
+    }
     used_ += (n + 15) & ~std::size_t{15};
     ++compiled_;
     return true;

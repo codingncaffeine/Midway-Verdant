@@ -833,3 +833,27 @@ TEST(P6Block, SpinSkipWithPeriodicMispredicts) {
                 static_cast<unsigned long long>(ec.stats().spin_cycles), static_cast<unsigned long long>(c.cpu.cycles()),
                 static_cast<unsigned long long>(eb.stats().mispredicts));
 }
+
+// Accesses that straddle a page (and ones that end exactly at its last byte): the recompiler's single tag compare
+// must send the straddling ones to the interpreter and keep the others native. Against the step.
+TEST(P6Block, PageStraddlingAccessesMatchTheStep) {
+    // EBX = 0x20FFC: mov eax, [ebx] (fits) / [ebx+1..3] (straddle); mov [ebx+3], ax (straddles); add [ebx+2], ecx;
+    // movzx edx, word [ebx+3]; mov [ebx+4], eax (next page); hlt.
+    const std::vector<u8> code = {0x8B, 0x03, 0x8B, 0x4B, 0x01, 0x8B, 0x53, 0x02, 0x8B, 0x73, 0x03, 0x66, 0x89, 0x43, 0x03, 0x01, 0x4B, 0x02,
+                                  0x0F, 0xB7, 0x53, 0x03, 0x89, 0x43, 0x04, 0xF4};
+    Rig a(true), c(true);
+    for (Rig* r : {&a, &c}) {
+        r->load(code);
+        r->cpu.state().gpr[kEbx] = 0x20FFC;
+        r->cpu.state().gpr[kEcx] = 0x01020304;
+        for (unsigned k = 0; k < 16; ++k) r->bus.ram()[0x20FF8 + k] = static_cast<u8>(0x11 * (k + 1));
+    }
+    run_steps(a);
+    c.cpu.set_block_timing(true);
+    BlockEngine e(c.cpu, c.bus);
+    e.set_jit_threshold(0);
+    run_blocks(c, e);
+    expect_same(a, c, "page-straddling accesses");
+    EXPECT_EQ(0, std::memcmp(a.bus.ram() + 0x20FF0, c.bus.ram() + 0x20FF0, 32));
+    EXPECT_GT(e.stats().native_helpers, 2u);  // the straddling ones went to the interpreter
+}
