@@ -92,6 +92,7 @@ void Nv2aStub::reset() {
     auto gpu = lock_gpu();
     wait_idle(gpu);
     regs_.clear();
+    wbc_.store(0, std::memory_order_relaxed);
     regs_[0x000000] = kPmcBoot0;
     regs_[kPtimerNumerator] = 1;
     regs_[kPtimerDenominator] = 1;
@@ -547,9 +548,16 @@ void Nv2aStub::run_pusher_inline() {
 u32 Nv2aStub::mmio_read(PhysAddr addr, unsigned size) {
     const u32 off = addr - mapped_at_;
     const u32 key = off & ~3u;
+    if (key == kPfbWbc) {
+        wbc_accesses_.fetch_add(1, std::memory_order_relaxed);
+        const u32 word = wbc_.load(std::memory_order_relaxed);
+        const unsigned shift = 8u * (off & 3u);
+        return size == 4 ? word : (size == 2 ? ((word >> shift) & 0xFFFFu) : ((word >> shift) & 0xFFu));
+    }
     auto gpu = lock_gpu();
     guest_now_.store(sched_.now(), std::memory_order_relaxed);
     if (fifo_busy_ && (key == kUser + 0x44 || key == kCache1DmaGet)) timed_wait_progress(gpu, key);
+    else if (fifo_busy_ && key == kPgraphPattColor0) timed_wait_change(gpu, key, patt_seen_, key);
     else if (fifo_busy_ && reports_progress(key)) timed_wait_idle(gpu, key);
     if (off == kPrmcioInputStatus1 && size == 1) {
         // Bit 3: vertical retrace in progress; bit 0: display inactive (blanking).
@@ -609,6 +617,18 @@ u32 Nv2aStub::mmio_read(PhysAddr addr, unsigned size) {
 void Nv2aStub::mmio_write(PhysAddr addr, unsigned size, u32 value) {
     const u32 off = addr - mapped_at_;
     const u32 key = off & ~3u;
+    if (key == kPfbWbc) {
+        // Bit 16 starts a frame-buffer cache operation and clears when it is done; done at once here.
+        wbc_accesses_.fetch_add(1, std::memory_order_relaxed);
+        u32 word = value;
+        if (size != 4) {
+            const unsigned shift = 8u * (off & 3u);
+            const u32 mask = (size == 2 ? 0xFFFFu : 0xFFu) << shift;
+            word = (wbc_.load(std::memory_order_relaxed) & ~mask) | ((value << shift) & mask);
+        }
+        wbc_.store(word & ~(1u << 16), std::memory_order_relaxed);
+        return;
+    }
     auto gpu = lock_gpu();
     guest_now_.store(sched_.now(), std::memory_order_relaxed);
     // The FIFO's own registers change under a walk in progress only by a kick (PUT, the push enable); any other write
@@ -654,10 +674,6 @@ void Nv2aStub::mmio_write(PhysAddr addr, unsigned size, u32 value) {
     // The scanout blocks (PCRTC, PRAMDAC) go into the capture: a replay needs to know which surface is displayed.
     if (capture_ && ((key >= 0x600000 && key < 0x601000) || (key >= 0x680000 && key < 0x681000))) capture_->reg(key, word);
     switch (key) {
-        case kPfbWbc:
-            // Bit 16 starts a frame-buffer cache operation and clears when it is done; done at once here.
-            regs_[key] = word & ~(1u << 16);
-            return;
         case kPcrtcIntr0:
         case kPtimerIntr0:
         case kPfifoIntr0:
@@ -860,6 +876,7 @@ std::string Nv2aStub::busiest_reads(std::size_t top, bool while_busy) const {
     std::ranges::sort(v, std::greater{}, [](const auto& e) { return e.second.first; });
     std::string r;
     for (std::size_t i = 0; i < v.size() && i < top; ++i) r += std::format(" +{:06x} x{} (last {:08x})", v[i].first, v[i].second.first, v[i].second.second);
+    if (!while_busy) r += std::format("; +{:06x} (lock-free) read and written x{}", kPfbWbc, wbc_accesses_.load(std::memory_order_relaxed));
     return r;
 }
 }  // namespace mv
@@ -903,16 +920,16 @@ void Nv2aStub::wait_idle(std::unique_lock<std::mutex>& lock) {
     idle_cv_.wait(lock, [this] { return !fifo_busy_; });
 }
 
-void Nv2aStub::timed_wait_progress(std::unique_lock<std::mutex>& lock, u32 why) {
-    const u32 seen = get_seen_;
-    if (reg(kCache1DmaGet) == seen) {
+void Nv2aStub::timed_wait_change(std::unique_lock<std::mutex>& lock, u32 key, u32& seen, u32 why) {
+    const u32 last = seen;
+    if (reg(key) == last) {
         const auto t0 = std::chrono::steady_clock::now();
-        idle_cv_.wait(lock, [&] { return !fifo_busy_ || reg(kCache1DmaGet) != seen; });
-        auto& w = idle_waits_[why | 0x40000000u];
+        idle_cv_.wait(lock, [&] { return !fifo_busy_ || reg(key) != last; });
+        auto& w = idle_waits_[why];
         ++w.first;
         w.second += static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
     }
-    get_seen_ = reg(kCache1DmaGet);
+    seen = reg(key);
 }
 
 void Nv2aStub::timed_wait_idle(std::unique_lock<std::mutex>& lock, u32 why) {

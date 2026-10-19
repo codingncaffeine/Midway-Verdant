@@ -275,8 +275,16 @@ private:
     void timed_wait_idle(std::unique_lock<std::mutex>& lock, u32 why);
     // A read of DMA_GET while the FIFO thread works returns the progress published so far, as the hardware's does; a
     // read that would see the value the last one saw (a poll) waits for the next chunk instead (not guest time).
-    void timed_wait_progress(std::unique_lock<std::mutex>& lock, u32 why);
-    u32 get_seen_{~0u};
+    void timed_wait_progress(std::unique_lock<std::mutex>& lock, u32 why) { timed_wait_change(lock, kCache1DmaGet, get_seen_, why | 0x40000000u); }
+    // The same for any register the pusher sets as it goes (PATT_COLOR0, Direct3D's fence): a poll that would see the
+    // value the last read saw waits until the pusher changes it or runs out of work — the hardware's poll ends when
+    // the GPU passes the fence, not when its queue is empty.
+    void timed_wait_change(std::unique_lock<std::mutex>& lock, u32 key, u32& seen, u32 why);
+    u32 get_seen_{~0u}, patt_seen_{~0u};
+    // PFB_WBC (the CPU's write-combining flush, polled after each kick) is answered without the lock: nothing the
+    // pusher does touches it, and taking the lock made each poll wait for the FIFO thread's chunk.
+    std::atomic<u32> wbc_{0};
+    std::atomic<u64> wbc_accesses_{0};
     std::condition_variable fifo_cv_, idle_cv_;
     std::thread fifo_thread_;
     std::thread::id fifo_thread_id_{};
