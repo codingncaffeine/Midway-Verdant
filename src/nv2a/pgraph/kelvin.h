@@ -23,6 +23,9 @@ public:
     // generation among the pages of a range. A source without tracking reports nothing written.
     virtual u32 write_generation() const { return 0; }
     virtual u32 newest_write(u32 phys, u32 len) const { (void)phys; (void)len; return 0; }
+    // The CPU writes into this range matter from now on (a texture just decoded or checked): with selective tracking
+    // only such ranges are watched, each until its next write is reported.
+    virtual void watch_writes(u32 phys, u32 len) const { (void)phys; (void)len; }
 };
 
 // Guest RAM as the engine reads it (through the direct window or the 0xF0000000 alias).

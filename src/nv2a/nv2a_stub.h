@@ -168,6 +168,7 @@ public:
     void set_write_tracking(CpuBackend* cpu);
     u32 write_generation() const override { return write_generation_; }
     u32 newest_write(u32 phys, u32 len) const override;
+    void watch_writes(u32 phys, u32 len) const override;
     void collect_writes();
 
 protected:

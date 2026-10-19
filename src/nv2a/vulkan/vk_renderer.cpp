@@ -573,6 +573,7 @@ VulkanRenderer::Surface* VulkanRenderer::target_for(const KelvinState& s) {
     fbi.height = height;
     fbi.layers = 1;
     fn_->vkCreateFramebuffer(dev_.device(), &fbi, nullptr, &t.framebuffer);
+    handles_.watch_writes(t.phys, t.bytes());  // a CPU write to its memory reloads it (cpu_wrote)
     Surface* raw = surf.get();
     surfaces_[phys] = std::move(surf);
     return raw;
@@ -859,6 +860,42 @@ void VulkanRenderer::invalidate(u32 phys, u32 len) {
             s->color_ram_newer = true;
             if (pass_open_ && pass_target_ == s.get()) end_pass();  // the next draw into it reopens the pass, reloaded
         }
+    }
+}
+
+// A render target lives on the GPU; the CPU may still write its memory (one title copies its last frame into both
+// buffers with the CPU when it pauses, then only draws its menu over them: drawing on over the GPU's own images
+// showed two different stale frames in turn). The reference emulator marks a surface for upload when the CPU writes
+// it. Here: the pages the CPU wrote keep what it wrote, the target's other pages get what the GPU rendered (written
+// back around them when the image is newer than RAM), and the image reloads from RAM before its next draw.
+void VulkanRenderer::cpu_wrote(const std::vector<u32>& pages) {
+    if (pages.empty()) return;
+    constexpr u32 kPage = 4096;
+    for (auto& [k, sp] : surfaces_) {
+        Surface& s = *sp;
+        const u32 first = s.phys / kPage, last = static_cast<u32>((static_cast<u64>(s.phys) + s.bytes() - 1) / kPage);
+        auto lo = std::lower_bound(pages.begin(), pages.end(), first);
+        if (lo == pages.end() || *lo > last) continue;
+        const auto hi = std::upper_bound(lo, pages.end(), last);
+        if (debug_tex_log_) std::fprintf(stderr, "texlog: cpu wrote %zu pages (first %05x) of target %08x %ux%u dirty %d\n", static_cast<std::size_t>(hi - lo), *lo, s.phys, s.width, s.height, s.dirty ? 1 : 0);
+        if (s.dirty) {
+            // Keep the CPU's pages across the write-back of the rest.
+            std::vector<u8> kept(static_cast<std::size_t>(hi - lo) * kPage);
+            std::size_t i = 0;
+            for (auto p = lo; p != hi; ++p, ++i)
+                if (static_cast<u64>(*p + 1) * kPage <= ram_size_) std::memcpy(kept.data() + i * kPage, ram_ + static_cast<std::size_t>(*p) * kPage, kPage);
+            wb_why_ = Stats::kWbRange;
+            write_back(s);
+            wb_why_ = Stats::kWbAll;
+            i = 0;
+            for (auto p = lo; p != hi; ++p, ++i)
+                if (static_cast<u64>(*p + 1) * kPage <= ram_size_) std::memcpy(ram_ + static_cast<std::size_t>(*p) * kPage, kept.data() + i * kPage, kPage);
+        }
+        s.color_ram_newer = true;
+        s.ram_newer = true;
+        if (pass_open_ && pass_target_ == &s) end_pass();
+        ++stats_.cpu_written_targets;
+        handles_.watch_writes(s.phys, s.bytes());  // the next write matters again
     }
 }
 
@@ -1170,6 +1207,8 @@ bool VulkanRenderer::texture_current(TextureEntry& e) {
     if (newest <= e.generation) return true;
     if (texture_content(e.phys, e.length, e.palette_phys) != e.content) return false;
     e.generation = handles_.write_generation();
+    handles_.watch_writes(e.phys, e.length);  // watched again: its next write is the one that matters
+    if (e.palette_phys) handles_.watch_writes(e.palette_phys, 256 * 4);
     ++stats_.textures_unchanged;
     return true;
 }
@@ -1231,6 +1270,9 @@ const VulkanRenderer::TextureEntry* VulkanRenderer::texture(const KelvinState& s
         palette = MemoryView{ram_, ram_size_}.at(pdma.base + (ts.palette & 0xFFFFFFC0u), 256 * 4);
         palette_phys = pdma.base + (ts.palette & 0xFFFFFFC0u);
     }
+    // Its pages are watched before they are read: a write from here on marks the texture stale.
+    handles_.watch_writes(phys, length);
+    if (palette_phys) handles_.watch_writes(palette_phys, 256 * 4);
     if (!decode_texture(ts, phys, MemoryView{ram_, ram_size_}, palette, d)) {
         error = d.error;
         return nullptr;
@@ -2034,12 +2076,15 @@ void VulkanRenderer::draw(const KelvinState& s, const DrawBatch& batch) {
         return;
     }
     float* vdst = reinterpret_cast<float*>(static_cast<u8*>(vertex_ring_.buffer.mapped) + voffset);
-    for (u32 n = 0; n < v.count; ++n) {
-        for (u32 a = 0; a < kAttributes; ++a) {
-            float* d = vdst + (static_cast<std::size_t>(n) * kAttributes + a) * 4;
-            if (v.enabled & (1u << a)) std::memcpy(d, &v.attribute[a][static_cast<std::size_t>(n) * 4], 16);
-            else std::memcpy(d, v.constant[a].data(), 16);
-        }
+    {
+        std::array<const float*, kAttributes> src{};
+        u32 n_src = 0;
+        for (u32 a = 0; a < kAttributes; ++a)
+            if (v.enabled & (1u << a)) src[n_src++] = v.attribute[a].data();
+        float* d = vdst;
+        for (u32 n = 0; n < v.count; ++n)
+            for (u32 i = 0; i < n_src; ++i, d += 4) std::memcpy(d, src[i] + static_cast<std::size_t>(n) * 4, 16);
+        for (u32 a = 0; a < kAttributes; ++a, d += 4) std::memcpy(d, v.constant[a].data(), 16);
     }
     VkDeviceSize ioffset = 0;
     if (!indices.empty()) {

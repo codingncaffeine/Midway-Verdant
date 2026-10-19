@@ -427,6 +427,12 @@ void Nv2aStub::set_write_tracking(CpuBackend* cpu) {
     page_generation_.assign(bus_.ram_size() / capture::kPageSize, 0u);
 }
 
+void Nv2aStub::watch_writes(u32 phys, u32 len) const {
+    if (!write_tracking_ || !cpu_ || len == 0) return;
+    const u32 first = phys / capture::kPageSize, last = static_cast<u32>((static_cast<u64>(phys) + len - 1) / capture::kPageSize);
+    cpu_->watch_pages(first, last - first + 1);
+}
+
 u32 Nv2aStub::newest_write(u32 phys, u32 len) const {
     if (!write_tracking_ || len == 0) return 0;
     const std::size_t pages = page_generation_.size();
@@ -449,6 +455,7 @@ void Nv2aStub::collect_writes() {
     if (dirty_scratch_.empty()) return;
     std::sort(dirty_scratch_.begin(), dirty_scratch_.end());
     dirty_scratch_.erase(std::unique(dirty_scratch_.begin(), dirty_scratch_.end()), dirty_scratch_.end());
+    if (renderer_) renderer_->cpu_wrote(dirty_scratch_);
     if (write_tracking_) {
         ++write_generation_;
         for (u32 p : dirty_scratch_)

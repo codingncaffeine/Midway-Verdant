@@ -81,6 +81,14 @@ public:
     // pages the guest writes; `take_dirty_pages` appends their indices (4 KiB pages) and clears the record.
     virtual void set_dirty_tracking(bool on) { (void)on; }
     virtual void take_dirty_pages(std::vector<u32>& pages) { (void)pages; }
+    // Selective tracking (the live GPU without a capture): asked for before `init`, only the pages `watch_pages` names
+    // are logged, and a page written once is reported once and then not watched until named again. Logging every
+    // page forced the guest's whole RAM to small pages and re-protected each page it wrote at every harvest, the
+    // faults counted as guest time (a CPU-heavy title's frame took 2.8x the CPU time). `selective_tracking`
+    // says whether the backend could (without it every written page is reported, as before).
+    virtual void request_selective_tracking() {}
+    virtual bool selective_tracking() const { return false; }
+    virtual void watch_pages(u32 first, u32 count) { (void)first; (void)count; }
 
     // Instrument: the first time execution reaches one of these linear addresses (up to four), log the registers
     // and the stack under the boot trace. The fast mode uses the hardware debug registers.

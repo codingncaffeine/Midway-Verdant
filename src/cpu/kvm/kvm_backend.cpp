@@ -165,11 +165,23 @@ bool KvmBackend::init(Machine& machine, std::string& error) {
     u64 identity = 0xFFFBC000;
     ioctl(vm_fd_, KVM_SET_IDENTITY_MAP_ADDR, &identity);
 
+    // Selective dirty tracking: the log starts all set and KVM protects a page only when we clear its bit, so the RAM
+    // keeps large pages except where a texture lies (KVM_CAP_MANUAL_DIRTY_LOG_PROTECT2).
+    if (dirty_tracking_ && selective_requested_) {
+        const int caps = ioctl(kvm_fd_, KVM_CHECK_EXTENSION, KVM_CAP_MANUAL_DIRTY_LOG_PROTECT2);
+        if (caps > 0 && (caps & KVM_DIRTY_LOG_MANUAL_PROTECT_ENABLE)) {
+            kvm_enable_cap cap{};
+            cap.cap = KVM_CAP_MANUAL_DIRTY_LOG_PROTECT2;
+            cap.args[0] = static_cast<__u64>(static_cast<unsigned>(KVM_DIRTY_LOG_MANUAL_PROTECT_ENABLE) | (static_cast<unsigned>(caps) & static_cast<unsigned>(KVM_DIRTY_LOG_INITIALLY_SET)));
+            selective_ = ioctl(vm_fd_, KVM_ENABLE_CAP, &cap) == 0;
+        }
+    }
     Bus& bus = machine.bus();
     Flash& flash = machine.flash();
     if (!set_slot(kSlotRam, 0, bus.ram_size(), bus.ram(), false, error, dirty_tracking_)) return false;
     if (!set_slot(kSlotRamAlias, Bus::kRamAliasBase, bus.ram_size(), bus.ram(), false, error, dirty_tracking_)) return false;
     if (dirty_tracking_) dirty_bitmap_.assign((bus.ram_size() / 4096 + 63) / 64, 0);
+    if (selective_) watched_.assign(dirty_bitmap_.size(), 0);
     if (!set_slot(kSlotFlash, Flash::kBase, Flash::kWindow - 4096, const_cast<u8*>(flash.window()), true, error)) return false;
     const void* top = flash.rom_visible() ? flash.overlay_page() : flash.window() + Flash::kWindow - 4096;
     if (!set_slot(kSlotTopPage, 0xFFFFF000u, 4096, const_cast<void*>(top), true, error)) return false;
@@ -846,6 +858,11 @@ void KvmBackend::take_dirty_pages(std::vector<u32>& pages) {
         if (ioctl(vm_fd_, KVM_GET_DIRTY_LOG, &log) < 0) continue;
         for (std::size_t i = 0; i < merged.size(); ++i) merged[i] |= dirty_bitmap_[i];
     }
+    if (selective_)
+        for (std::size_t w = 0; w < merged.size(); ++w) {
+            merged[w] &= watched_[w];
+            watched_[w] &= ~merged[w];  // reported once; named again when the texture is decoded or checked
+        }
     for (std::size_t w = 0; w < merged.size(); ++w) {
         u64 bits = merged[w];
         while (bits) {
@@ -853,6 +870,31 @@ void KvmBackend::take_dirty_pages(std::vector<u32>& pages) {
             pages.push_back(static_cast<u32>(w * 64 + bit));
             bits &= bits - 1;
         }
+    }
+}
+
+void KvmBackend::watch_pages(u32 first, u32 count) {
+    if (!selective_ || count == 0 || vm_fd_ < 0) return;
+    const u64 pages = static_cast<u64>(watched_.size()) * 64;
+    if (first >= pages) return;
+    count = static_cast<u32>(std::min<u64>(count, pages - first));
+    // One clear per slot over the 64-page blocks the range touches, with bits for its own pages only: KVM
+    // write-protects those pages again, and their next write sets their bits.
+    const u32 block0 = first / 64, block1 = (first + count - 1) / 64;
+    std::vector<u64> bits(block1 - block0 + 1, 0);
+    for (u32 p = first; p < first + count; ++p) {
+        const u64 bit = u64{1} << (p % 64);
+        bits[p / 64 - block0] |= bit;
+        watched_[p / 64] |= bit;
+    }
+    const u64 slot_pages = pages;
+    for (u32 slot : {kSlotRam, kSlotRamAlias}) {
+        kvm_clear_dirty_log clear{};
+        clear.slot = slot;
+        clear.first_page = static_cast<u64>(block0) * 64;
+        clear.num_pages = static_cast<u32>(std::min<u64>(static_cast<u64>(bits.size()) * 64, slot_pages - clear.first_page));
+        clear.dirty_bitmap = bits.data();
+        ioctl(vm_fd_, KVM_CLEAR_DIRTY_LOG, &clear);
     }
 }
 

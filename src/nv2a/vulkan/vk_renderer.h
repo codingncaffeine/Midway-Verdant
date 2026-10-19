@@ -45,6 +45,9 @@ public:
     void write_back_all();
     // Guest RAM in [phys, phys + len) was written: textures decoded from it are stale.
     void invalidate(u32 phys, u32 len);
+    // The guest CPU (or a device) wrote these RAM pages (4 KiB, sorted): a render target over them reloads from RAM
+    // before it is drawn into again, its own unwritten pages written back first.
+    void cpu_wrote(const std::vector<u32>& pages);
 
     struct SurfaceInfo {
         u32 phys{0}, width{0}, height{0}, pitch{0}, bytes_per_pixel{0}, color_format{0};
@@ -65,6 +68,7 @@ public:
         u64 surface_samples{0};  // textures bound straight to a render target's image
         u64 snapshots{0};  // copies of a target taken for draws that sample the target they draw into
         u64 zeta_conversions{0};  // depth buffers converted on the GPU for a colour texture at their address
+        u64 cpu_written_targets{0};  // render targets whose memory the CPU wrote: reloaded from RAM
         u64 shaders_from_disk{0};  // shader compiles the disk cache answered
         u64 textures_unchanged{0};
         u64 surface_reloads{0};  // render targets reloaded from RAM after another engine wrote them  // textures whose pages were written but whose bytes hashed the same: kept

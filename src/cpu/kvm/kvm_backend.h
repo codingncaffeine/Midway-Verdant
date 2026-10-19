@@ -41,6 +41,9 @@ public:
     bool read_regs(Regs& out) override;
     void set_dirty_tracking(bool on) override { dirty_tracking_ = on; }
     void take_dirty_pages(std::vector<u32>& pages) override;
+    void request_selective_tracking() override { selective_requested_ = true; }
+    bool selective_tracking() const override { return selective_; }
+    void watch_pages(u32 first, u32 count) override;
     void set_break_eips(const std::vector<u32>& eips) override { break_eips_ = eips; }
     bool owns_timeline() const override { return guest_clock_on_; }
     Cycles timeline_cycles() const override;
@@ -95,6 +98,8 @@ private:
     bool tsc_scaled_{false};
     bool dirty_tracking_{false};
     std::vector<u64> dirty_bitmap_;
+    bool selective_requested_{false}, selective_{false};
+    std::vector<u64> watched_;  // selective tracking: the pages whose next write is reported
     u32 cpuid_signature_{0x0000068A};
     // --break-eip: hardware execution breakpoints, armed at init and dropped after the first debug exit.
     std::vector<u32> break_eips_;

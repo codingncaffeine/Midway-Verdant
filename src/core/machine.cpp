@@ -223,6 +223,7 @@ bool Machine::init(std::string& error) {
     // The live GPU sees the CPU's writes to its textures and surfaces through the same logs.
     if (config_.gpu) {
         cpu_->set_dirty_tracking(true);
+        if (!capture_) cpu_->request_selective_tracking();  // only the pages under textures (a capture records them all)
         bus_.set_dirty_tracking(true);
     }
     if (!cpu_->init(*this, error)) return false;
@@ -233,7 +234,7 @@ bool Machine::init(std::string& error) {
         renderer_ = std::make_unique<pgraph::VulkanRenderer>(*gpu_device_, nv2a_, bus_.ram(), static_cast<u32>(bus_.ram_size()));
         if (!renderer_->init(error)) return false;
         if (config_.shader_cache_dir) renderer_->open_disk_cache(*config_.shader_cache_dir);
-        nv2a_.set_write_tracking(cpu_.get());
+        if (const char* w = std::getenv("MV_DEBUG_NO_WRITE_TRACKING"); !(w && *w == '1')) nv2a_.set_write_tracking(cpu_.get());  // 1: a measurement control (stale textures)
         nv2a_.set_renderer(renderer_.get());
         // The pusher on its own thread (PLAN D21), opt-in with MV_FIFO_THREAD=1, in fast mode without a capture (which
         // records RAM before each run). Off by default: with the kernel's idle loop halting, the titles measured gain
