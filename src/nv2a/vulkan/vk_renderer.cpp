@@ -498,6 +498,7 @@ VulkanRenderer::Surface* VulkanRenderer::target_for(const KelvinState& s) {
         if (pass_target_ == &s0) end_pass();
         wb_why_ = Stats::kWbRelayout;
         if (s0.dirty) write_back(s0);
+        release_depth(s0);
         wb_why_ = Stats::kWbAll;
         // Draws already recorded or still on the GPU may use the old images: they go once those are done.
         retire(s0.x8_view);
@@ -536,7 +537,7 @@ VulkanRenderer::Surface* VulkanRenderer::target_for(const KelvinState& s) {
     const VkFormat df = t.zeta_format == 1 ? VK_FORMAT_D16_UNORM : depth24_;
     if (!dev_.create_image(cf, width, height, 1, 1, 1, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
                            VK_IMAGE_ASPECT_COLOR_BIT, false, t.color, error) ||
-        !dev_.create_image(df, width, height, 1, 1, 1, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+        !dev_.create_image(df, width, height, 1, 1, 1, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
                                ((t.zeta_format == 1 ? depth16_sampled_ : depth24_sampled_) ? static_cast<u32>(VK_IMAGE_USAGE_SAMPLED_BIT) : 0u),
                            VK_IMAGE_ASPECT_DEPTH_BIT | (t.zeta_format == 1 ? 0u : static_cast<u32>(VK_IMAGE_ASPECT_STENCIL_BIT)), false, t.depth, error)) {
         note("surface images: " + error);
@@ -612,6 +613,7 @@ bool VulkanRenderer::ensure_pass(Surface& t) {
         t.color_ram_newer = false;
         ++stats_.surface_reloads;
     }
+    bind_depth(t);
     if (sampled_since_barrier_) surface_barrier();  // draws that sampled a target finish before it is drawn into again
     t.last_rendered_frame = frame_index_;
     t.ram_newer = false;
@@ -628,6 +630,135 @@ bool VulkanRenderer::ensure_pass(Surface& t) {
     t.zeta_dirty = true;
     t.rendered_this_frame = true;
     return true;
+}
+
+// The depth buffer at the target's zeta address, in its depth image before a pass: on the hardware the depth buffer is
+// memory, shared by every colour target that binds it; here each target has a depth image, so the contents follow the
+// address. The target that last drew with it owns them; another target binding it takes them (a GPU copy when the
+// shapes match, else through RAM), and a target whose image held another address hands that back to RAM first. Two
+// targets sharing one depth buffer each kept their own copy, and whichever reached RAM last won.
+void VulkanRenderer::bind_depth(Surface& t) {
+    const u32 z = t.zeta_phys;
+    if (t.zeta_format == 0 || z == 0) return;
+    const auto found = depth_owner_.find(z);
+    Surface* owner = found == depth_owner_.end() ? nullptr : found->second;
+    if (owner == &t && t.depth_holds == z) return;
+    end_pass();
+    if (t.depth_holds && t.depth_holds != z) {
+        // The image held another address's depth: it goes back to RAM when newer there.
+        const auto o = depth_owner_.find(t.depth_holds);
+        if (o != depth_owner_.end() && o->second == &t) {
+            if (t.zeta_dirty) {
+                const u32 bound = t.zeta_phys;
+                t.zeta_phys = t.depth_holds;
+                wb_why_ = Stats::kWbRange;
+                write_back_zeta(t);
+                wb_why_ = Stats::kWbAll;
+                t.zeta_phys = bound;
+            }
+            depth_owner_.erase(o);
+        }
+        t.depth_holds = 0;
+    }
+    if (owner && owner != &t && owner->depth_holds == z && owner->width == t.width && owner->height == t.height && owner->zeta_format == t.zeta_format) {
+        const VkImageAspectFlags aspects = VK_IMAGE_ASPECT_DEPTH_BIT | (t.zeta_format == 1 ? 0u : static_cast<u32>(VK_IMAGE_ASPECT_STENCIL_BIT));
+        VkMemoryBarrier before{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        before.srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+        before.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+        fn_->vkCmdPipelineBarrier(cb_, VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1,
+                                  &before, 0, nullptr, 0, nullptr);
+        VkImageCopy region{};
+        region.srcSubresource = {aspects, 0, 0, 1};
+        region.dstSubresource = region.srcSubresource;
+        region.extent = {t.width, t.height, 1};
+        fn_->vkCmdCopyImage(cb_, owner->depth.image, VK_IMAGE_LAYOUT_GENERAL, t.depth.image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+        VkMemoryBarrier after{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        after.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT;
+        after.dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT;
+        fn_->vkCmdPipelineBarrier(cb_, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &after,
+                                  0, nullptr, 0, nullptr);
+        t.zeta_dirty = owner->zeta_dirty;
+        owner->zeta_dirty = false;
+        owner->depth_holds = 0;
+        ++t.draw_serial;  // a depth-as-colour conversion of it is stale
+        ++stats_.depth_handovers;
+    } else {
+        if (owner && owner != &t) {
+            if (owner->zeta_dirty && owner->depth_holds == z) {
+                wb_why_ = Stats::kWbRange;
+                write_back_zeta(*owner);
+                wb_why_ = Stats::kWbAll;
+            }
+            owner->depth_holds = 0;
+            ++stats_.depth_handovers;
+        }
+        upload_depth_from_ram(t);
+    }
+    depth_owner_[z] = &t;
+    t.depth_holds = z;
+    handles_.watch_writes(z, t.zeta_bytes());  // a CPU write to the depth buffer's memory reloads it
+}
+
+// The depth image takes what RAM holds at the zeta address: Z16 words, or Z24S8 words (the depth in bits 31-8 above
+// the stencil byte) split into the depth aspect's 24-bit words (or floats) and the stencil aspect's bytes.
+void VulkanRenderer::upload_depth_from_ram(Surface& t) {
+    ++t.draw_serial;
+    const bool z16 = t.zeta_format == 1, float_depth = depth24_ == VK_FORMAT_D32_SFLOAT_S8_UINT;
+    const u32 bpp = z16 ? 2u : 4u;
+    if (static_cast<u64>(t.zeta_phys) + t.zeta_bytes() > ram_size_) return;
+    const std::size_t n = static_cast<std::size_t>(t.width) * t.height;
+    std::vector<u8> pixels(z16 ? n * 2 : n * 5, 0);
+    const u8* base = ram_ + t.zeta_phys;
+    for (u32 y = 0; y < t.height; ++y) {
+        for (u32 x = 0; x < t.width; ++x) {
+            const std::size_t off = t.swizzled ? static_cast<std::size_t>(swizzled_offset(x, y, 0, t.log_w, t.log_h, 0)) * bpp : static_cast<std::size_t>(y) * t.zeta_pitch + x * bpp;
+            const std::size_t i = static_cast<std::size_t>(y) * t.width + x;
+            if (z16) {
+                std::memcpy(&pixels[i * 2], base + off, 2);
+                continue;
+            }
+            u32 word;
+            std::memcpy(&word, base + off, 4);
+            const u32 depth = word >> 8;
+            if (float_depth) {
+                const float f = static_cast<float>(depth) / 16777215.0f;
+                std::memcpy(&pixels[i * 4], &f, 4);
+            } else {
+                std::memcpy(&pixels[i * 4], &depth, 4);
+            }
+            pixels[n * 4 + i] = static_cast<u8>(word);
+        }
+    }
+    VkDeviceSize offset = 0;
+    if (!staging_alloc(pixels.size(), offset)) return;
+    std::memcpy(static_cast<u8*>(staging_.buffer.mapped) + offset, pixels.data(), pixels.size());
+    VkBufferImageCopy regions[2]{};
+    regions[0].bufferOffset = offset;
+    regions[0].imageSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1};
+    regions[0].imageExtent = {t.width, t.height, 1};
+    regions[1] = regions[0];
+    regions[1].bufferOffset = offset + n * 4;
+    regions[1].imageSubresource.aspectMask = VK_IMAGE_ASPECT_STENCIL_BIT;
+    fn_->vkCmdCopyBufferToImage(cb_, staging_.buffer.buffer, t.depth.image, VK_IMAGE_LAYOUT_GENERAL, z16 ? 1 : 2, regions);
+    upload_barrier();
+    ++stats_.depth_uploads;
+}
+
+void VulkanRenderer::release_depth(Surface& s) {
+    if (!s.depth_holds) return;
+    const auto o = depth_owner_.find(s.depth_holds);
+    if (o != depth_owner_.end() && o->second == &s) {
+        if (s.zeta_dirty) {
+            const u32 bound = s.zeta_phys;
+            s.zeta_phys = s.depth_holds;
+            wb_why_ = Stats::kWbRelayout;
+            write_back_zeta(s);
+            wb_why_ = Stats::kWbAll;
+            s.zeta_phys = bound;
+        }
+        depth_owner_.erase(o);
+    }
+    s.depth_holds = 0;
 }
 
 namespace {
@@ -705,6 +836,7 @@ void VulkanRenderer::queue_write_back_zeta(Surface& s) {
     if (!s.zeta_dirty) return;
     s.zeta_dirty = false;
     if (s.zeta_format == 0 || s.zeta_phys == 0) return;  // no depth surface bound (an offset of zero is never a real one)
+    if (s.depth_holds != s.zeta_phys) return;  // its image holds another address's depth, or none (bind_depth)
     Timed timed(stats_.ns_write_back);
     const bool z16 = s.zeta_format == 1;
     // D16; a 24-bit or float depth copies as a 32-bit word, followed by the stencil bytes.
@@ -856,6 +988,7 @@ void VulkanRenderer::invalidate(u32 phys, u32 len) {
     for (auto& [k, s] : surfaces_) {
         const u64 a0 = s->phys, a1 = a0 + s->bytes(), z0 = s->zeta_phys, z1 = z0 + s->zeta_bytes();
         if ((a0 < b1 && b0 < a1) || (z0 < b1 && b0 < z1)) s->ram_newer = true;
+        if (s->depth_holds && s->depth_holds < b1 && b0 < static_cast<u64>(s->depth_holds) + s->zeta_bytes()) release_depth(*s);  // reloads from RAM
         if (a0 < b1 && b0 < a1) {
             s->color_ram_newer = true;
             if (pass_open_ && pass_target_ == s.get()) end_pass();  // the next draw into it reopens the pass, reloaded
@@ -896,6 +1029,26 @@ void VulkanRenderer::cpu_wrote(const std::vector<u32>& pages) {
         if (pass_open_ && pass_target_ == &s) end_pass();
         ++stats_.cpu_written_targets;
         handles_.watch_writes(s.phys, s.bytes());  // the next write matters again
+    }
+    // A depth buffer's memory written by the CPU: the contents go back to RAM around the CPU's pages, and the next
+    // target binding the address loads it from there.
+    for (auto& [k, sp] : surfaces_) {
+        Surface& s = *sp;
+        if (!s.depth_holds) continue;
+        const u32 first = s.depth_holds / kPage, last = static_cast<u32>((static_cast<u64>(s.depth_holds) + s.zeta_bytes() - 1) / kPage);
+        auto lo = std::lower_bound(pages.begin(), pages.end(), first);
+        if (lo == pages.end() || *lo > last) continue;
+        const auto hi = std::upper_bound(lo, pages.end(), last);
+        std::vector<u8> kept(static_cast<std::size_t>(hi - lo) * kPage);
+        std::size_t i = 0;
+        for (auto p = lo; p != hi; ++p, ++i)
+            if (static_cast<u64>(*p + 1) * kPage <= ram_size_) std::memcpy(kept.data() + i * kPage, ram_ + static_cast<std::size_t>(*p) * kPage, kPage);
+        if (pass_open_ && pass_target_ == &s) end_pass();
+        release_depth(s);
+        i = 0;
+        for (auto p = lo; p != hi; ++p, ++i)
+            if (static_cast<u64>(*p + 1) * kPage <= ram_size_) std::memcpy(ram_ + static_cast<std::size_t>(*p) * kPage, kept.data() + i * kPage, kPage);
+        ++stats_.cpu_written_targets;
     }
 }
 
@@ -1394,14 +1547,14 @@ VulkanRenderer::TextureEntry* VulkanRenderer::surface_texture(const TextureStage
         if (s.width != w || s.height != h) continue;
         const bool recent = !s.ram_newer && s.last_rendered_frame + 1 >= frame_index_;
         // The depth buffer read as colour at its own address: converted on the GPU (Z24S8 on a device with D24S8).
-        if (color && s.zeta_phys == phys && s.phys != phys && s.zeta_format == 2 && depth24_ == VK_FORMAT_D24_UNORM_S8_UINT && s.aa_x == 1 && s.aa_y == 1 &&
+        if (color && s.zeta_phys == phys && s.depth_holds == phys && s.phys != phys && s.zeta_format == 2 && depth24_ == VK_FORMAT_D24_UNORM_S8_UINT && s.aa_x == 1 && s.aa_y == 1 &&
             (s.zeta_dirty || recent) && linear == !s.swizzled && (!linear || ts.pitch() == s.zeta_pitch))
             return zeta_color_texture(s, ts, phys, w, h, linear, x8);
         if (color) {
             if (s.phys != phys || !(s.dirty || recent) || s.color_bytes() != 4 || color_vk_format(s.color_format) != VK_FORMAT_B8G8R8A8_UNORM) continue;
             if (linear && ts.pitch() != s.pitch) continue;
         } else {
-            if (s.zeta_phys != phys || !(s.zeta_dirty || recent) || (s.zeta_format == 1) != depth16) continue;
+            if (s.zeta_phys != phys || s.depth_holds != phys || !(s.zeta_dirty || recent) || (s.zeta_format == 1) != depth16) continue;
             if (!(depth16 ? depth16_sampled_ : depth24_sampled_) || (linear && ts.pitch() != s.zeta_pitch)) continue;
         }
         if (&s == draw_target_) {

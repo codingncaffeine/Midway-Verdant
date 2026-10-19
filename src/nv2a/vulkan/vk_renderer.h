@@ -69,6 +69,7 @@ public:
         u64 snapshots{0};  // copies of a target taken for draws that sample the target they draw into
         u64 zeta_conversions{0};  // depth buffers converted on the GPU for a colour texture at their address
         u64 cpu_written_targets{0};  // render targets whose memory the CPU wrote: reloaded from RAM
+        u64 depth_handovers{0}, depth_uploads{0};  // depth buffers moved between targets sharing an address; loaded from RAM
         u64 shaders_from_disk{0};  // shader compiles the disk cache answered
         u64 textures_unchanged{0};
         u64 surface_reloads{0};  // render targets reloaded from RAM after another engine wrote them  // textures whose pages were written but whose bytes hashed the same: kept
@@ -114,6 +115,7 @@ private:
         VkFramebuffer framebuffer{VK_NULL_HANDLE};
         bool dirty{false};           // colour rendered since the last write-back
         bool zeta_dirty{false};      // depth rendered since the last write-back of the zeta surface
+        u32 depth_holds{0};          // the zeta address whose contents the depth image holds (0: none, undefined)
         bool rendered_this_frame{false};
         u64 draws_this_frame{0}, clears_this_frame{0};
         // The target sampled in place: views for an X8 texture (alpha one) and for the depth aspect alone, and the
@@ -187,6 +189,12 @@ private:
     TextureEntry* surface_texture(const TextureStage& ts, u32 phys);
     TextureEntry* snapshot_texture(Surface& s, const TextureStage& ts, u32 phys, u32 w, u32 h, bool linear, bool x8);
     Surface* draw_target_{nullptr};  // the target of the draw whose textures are being looked up
+    // The depth buffer at each zeta address lives in one target's depth image at a time: the target that last drew with
+    // it. Another target binding the same address takes the contents first (a GPU copy, or through RAM).
+    std::unordered_map<u32, Surface*> depth_owner_;
+    void bind_depth(Surface& t);
+    void upload_depth_from_ram(Surface& t);
+    void release_depth(Surface& s);  // a target going away: its depth contents to RAM, its ownership dropped
     TextureEntry* zeta_color_texture(Surface& s, const TextureStage& ts, u32 phys, u32 w, u32 h, bool linear, bool x8);
     bool init_zeta_convert();
     // The depth-to-colour conversion: a compute pass over two device buffers (the copied depth words and stencil
