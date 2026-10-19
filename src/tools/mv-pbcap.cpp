@@ -438,6 +438,7 @@ struct RenderObserver : mv::pgraph::Replay::Observer {
                     static_cast<double>(st.ns_draw) / 1e6, static_cast<double>(st.ns_fetch) / 1e6, static_cast<double>(st.ns_texture) / 1e6,
                     static_cast<double>(st.ns_pipeline) / 1e6, static_cast<double>(st.ns_flush) / 1e6, static_cast<double>(st.ns_write_back) / 1e6);
         std::printf("   %llu textures sampled straight from a render target\n", static_cast<unsigned long long>(st.surface_samples));
+        std::printf("   %llu submissions, %llu waits for the GPU\n", static_cast<unsigned long long>(st.flushes), static_cast<unsigned long long>(st.waits));
         std::printf("   draw parts: shader compiles vs %.1f fs %.1f, indices %.1f, upload %.1f, descriptors %.1f, record %.1f ms\n", static_cast<double>(st.ns_vs) / 1e6, static_cast<double>(st.ns_fs) / 1e6,
                     static_cast<double>(st.ns_indices) / 1e6, static_cast<double>(st.ns_upload) / 1e6, static_cast<double>(st.ns_descriptors) / 1e6,
                     static_cast<double>(st.ns_record) / 1e6);

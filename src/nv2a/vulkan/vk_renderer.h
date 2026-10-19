@@ -54,10 +54,12 @@ public:
     struct Stats {
         u64 draws{0}, clears{0}, skipped{0}, pipelines{0}, shaders{0}, textures_decoded{0}, writebacks{0}, flushes{0};
         u64 batch_flushes{0};  // batches submitted mid-frame because the rings or the descriptor pool were full
+        u64 waits{0};          // times the CPU stopped for the GPU (a fence wait)
         u64 surface_samples{0};  // textures bound straight to a render target's image
         // Where the time goes, in nanoseconds: the whole draw and its parts (the texture part includes the
         // write-backs a sample forces; the shader parts are the compiles, a lookup costs nothing measurable); the
-        // submits that wait; the copies back to RAM (and the device copy inside them).
+        // submits and the fence waits; the copies back to RAM, colour and depth (and the wait for the device copy
+        // inside them).
         u64 ns_draw{0}, ns_fetch{0}, ns_texture{0}, ns_pipeline{0}, ns_flush{0}, ns_write_back{0}, ns_write_back_gpu{0};
         u64 ns_vs{0}, ns_fs{0}, ns_indices{0}, ns_upload{0}, ns_descriptors{0}, ns_record{0};
         u64 vs_memo_hits{0}, vs_cache_hits{0}, fs_memo_hits{0}, fs_cache_hits{0};
@@ -122,13 +124,22 @@ private:
     void end_pass();
     Surface* target_for(const KelvinState& s);
     bool ensure_pass(Surface& t);
-    void write_back(Surface& s);
+    // Write-backs come in batches: each queued surface records its copy after the frame's draws, and
+    // finish_write_backs() waits once for all of them, then stores each into guest RAM in the order queued.
+    void queue_write_back(Surface& s);
     // The depth buffer into guest RAM in the zeta format (Z16, or Z24S8: depth in bits 31-8, stencil in 7-0): a
     // shadow map the guest samples as a depth texture lives there.
-    void write_back_zeta(Surface& s);
-    // Copies one image into the read-back buffer and waits for it (depth and stencil together: the depth's words,
-    // then the stencil bytes). The copy follows the frame's draws in its command buffer.
-    void read_back(const vk::Image& image, VkImageAspectFlags aspect, u32 width, u32 height);
+    void queue_write_back_zeta(Surface& s);
+    void finish_write_backs();
+    void write_back(Surface& s);       // one surface's colour, queued and finished
+    void write_back_zeta(Surface& s);  // one surface's depth, queued and finished
+    void store_color(Surface& s, const u8* pixels);
+    void store_zeta(Surface& s, const u8* pixels);
+    // Records the copy of one image into the read-back buffer at offset (depth and stencil together: the depth's
+    // words, then the stencil bytes).
+    void read_back(const vk::Image& image, VkImageAspectFlags aspect, u32 width, u32 height, VkDeviceSize offset);
+    // Space in the read-back buffer for the batch, storing the batch so far first when the buffer is full.
+    bool readback_alloc(VkDeviceSize bytes, VkDeviceSize& offset);
     VkRenderPass render_pass(VkFormat color, VkFormat depth);
     VkShaderModule module(const std::vector<u32>& spirv);
     VkShaderModule vertex_shader(const KelvinState& s, std::string& error);
@@ -228,6 +239,13 @@ private:
     VkPipelineLayout pipeline_layout_{VK_NULL_HANDLE};
     Ring vertex_ring_, index_ring_, uniform_ring_, staging_;
     vk::Buffer readback_;
+    struct PendingWriteBack {
+        Surface* surface{nullptr};
+        bool zeta{false};
+        VkDeviceSize offset{0};  // where its copy lands in the read-back buffer
+    };
+    std::vector<PendingWriteBack> write_backs_;
+    VkDeviceSize readback_cursor_{0};
     u32 descriptor_sets_used_{0};  // from the recording frame's pool
     vk::Image dummy2d_, dummycube_, dummy3d_;
     VkSampler dummy_sampler_{VK_NULL_HANDLE};

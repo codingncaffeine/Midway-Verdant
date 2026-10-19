@@ -309,6 +309,7 @@ void VulkanRenderer::begin_frame(u32 slot) {
         // The GPU may still be executing this frame's last submission (its rings and descriptor sets are in use).
         f.vkWaitForFences(dev_.device(), 1, &fr.fence, VK_TRUE, ~0ull);
         completed_ = fr.serial;
+        ++stats_.waits;
     }
     for (vk::Image& i : fr.dead_images) dev_.destroy_image(i);
     for (VkImageView v : fr.dead_views) f.vkDestroyImageView(dev_.device(), v, nullptr);
@@ -391,6 +392,7 @@ void VulkanRenderer::finish() {
     if (fr.serial > completed_) {
         fn_->vkWaitForFences(dev_.device(), 1, &fr.fence, VK_TRUE, ~0ull);
         completed_ = fr.serial;
+        ++stats_.waits;
     }
 }
 
@@ -600,42 +602,102 @@ void scatter_swizzled(T* base, const T* rows, u32 width, u32 height, const std::
 
 }  // namespace
 
-void VulkanRenderer::read_back(const vk::Image& image, VkImageAspectFlags aspect, u32 width, u32 height) {
-    Timed timed_gpu(stats_.ns_write_back_gpu);
+void VulkanRenderer::read_back(const vk::Image& image, VkImageAspectFlags aspect, u32 width, u32 height, VkDeviceSize offset) {
     end_pass();
-    // The frame's attachment writes (and uploads) land before the copy reads the image.
-    VkMemoryBarrier before{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
-    before.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
-    before.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-    fn_->vkCmdPipelineBarrier(cb_, VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &before, 0, nullptr, 0, nullptr);
+    // The first copy of a batch waits for the frame's attachment writes (and uploads) before it reads the image.
+    if (write_backs_.empty()) {
+        VkMemoryBarrier before{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        before.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+        before.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        fn_->vkCmdPipelineBarrier(cb_, VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &before, 0, nullptr, 0, nullptr);
+    }
     // Depth and stencil are two copies: the depth's words first, then one stencil byte per texel after them.
     const bool both = (aspect & VK_IMAGE_ASPECT_DEPTH_BIT) && (aspect & VK_IMAGE_ASPECT_STENCIL_BIT);
     VkBufferImageCopy regions[2]{};
+    regions[0].bufferOffset = offset;
     regions[0].imageSubresource = {both ? static_cast<VkImageAspectFlags>(VK_IMAGE_ASPECT_DEPTH_BIT) : aspect, 0, 0, 1};
     regions[0].imageExtent = {width, height, 1};
     regions[1] = regions[0];
     regions[1].imageSubresource.aspectMask = VK_IMAGE_ASPECT_STENCIL_BIT;
-    regions[1].bufferOffset = static_cast<VkDeviceSize>(width) * height * 4;
+    regions[1].bufferOffset = offset + static_cast<VkDeviceSize>(width) * height * 4;
     fn_->vkCmdCopyImageToBuffer(cb_, image.image, VK_IMAGE_LAYOUT_GENERAL, readback_.buffer, both ? 2 : 1, regions);
-    // The copy is visible to the CPU once the fence signals.
-    VkMemoryBarrier after{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
-    after.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    after.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
-    fn_->vkCmdPipelineBarrier(cb_, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &after, 0, nullptr, 0, nullptr);
-    finish();
 }
 
-void VulkanRenderer::write_back(Surface& s) {
+bool VulkanRenderer::readback_alloc(VkDeviceSize bytes, VkDeviceSize& offset) {
+    if (bytes > readback_.size) return false;
+    // Sixteen bytes keep every copy's offset a multiple of its texel size.
+    const VkDeviceSize start = (readback_cursor_ + 15) / 16 * 16;
+    if (start + bytes > readback_.size) {
+        finish_write_backs();  // the batch so far fills the buffer: store it, then start over
+        return readback_alloc(bytes, offset);
+    }
+    offset = start;
+    readback_cursor_ = start + bytes;
+    return true;
+}
+
+void VulkanRenderer::queue_write_back(Surface& s) {
     if (!s.dirty) return;
     Timed timed(stats_.ns_write_back);
-    const u32 bpp = s.color_bytes();
-    const std::size_t bytes = static_cast<std::size_t>(s.width) * s.height * bpp;
-    if (bytes > kStagingBytes) {
+    const std::size_t bytes = static_cast<std::size_t>(s.width) * s.height * s.color_bytes();
+    VkDeviceSize offset = 0;
+    if (!readback_alloc(bytes, offset)) {
         note("surface too large to write back");
         return;
     }
-    read_back(s.color, VK_IMAGE_ASPECT_COLOR_BIT, s.width, s.height);
-    const u8* pixels = static_cast<const u8*>(readback_.mapped);
+    read_back(s.color, VK_IMAGE_ASPECT_COLOR_BIT, s.width, s.height, offset);
+    write_backs_.push_back({&s, false, offset});
+}
+
+void VulkanRenderer::queue_write_back_zeta(Surface& s) {
+    if (!s.zeta_dirty) return;
+    s.zeta_dirty = false;
+    if (s.zeta_format == 0 || s.zeta_phys == 0) return;  // no depth surface bound (an offset of zero is never a real one)
+    Timed timed(stats_.ns_write_back);
+    const bool z16 = s.zeta_format == 1;
+    // D16; a 24-bit or float depth copies as a 32-bit word, followed by the stencil bytes.
+    const std::size_t bytes = static_cast<std::size_t>(s.width) * s.height * (z16 ? 2u : 5u);
+    if (bytes > readback_.size) {
+        note("depth surface too large to write back");
+        return;
+    }
+    if (static_cast<u64>(s.zeta_phys) + s.zeta_bytes() > ram_size_) return;
+    VkDeviceSize offset = 0;
+    readback_alloc(bytes, offset);  // fits: checked above
+    read_back(s.depth, z16 ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT, s.width, s.height, offset);
+    write_backs_.push_back({&s, true, offset});
+}
+
+void VulkanRenderer::finish_write_backs() {
+    if (write_backs_.empty()) return;
+    Timed timed(stats_.ns_write_back);
+    {
+        Timed timed_gpu(stats_.ns_write_back_gpu);
+        // The copies are visible to the CPU once the fence signals.
+        VkMemoryBarrier after{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        after.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        after.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+        fn_->vkCmdPipelineBarrier(cb_, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &after, 0, nullptr, 0, nullptr);
+        finish();
+    }
+    // Into RAM in the order queued, which is the order the surfaces were written back one at a time before.
+    const u8* base = static_cast<const u8*>(readback_.mapped);
+    for (const PendingWriteBack& w : write_backs_) {
+        if (w.zeta) store_zeta(*w.surface, base + w.offset);
+        else store_color(*w.surface, base + w.offset);
+    }
+    write_backs_.clear();
+    readback_cursor_ = 0;
+}
+
+void VulkanRenderer::write_back(Surface& s) {
+    queue_write_back(s);
+    finish_write_backs();
+}
+
+void VulkanRenderer::store_color(Surface& s, const u8* pixels) {
+    const u32 bpp = s.color_bytes();
+    const std::size_t bytes = static_cast<std::size_t>(s.width) * s.height * bpp;
     if (!s.swizzled) {
         // Linear: a row at a time.
         const u32 row_bytes = s.width * bpp;
@@ -664,19 +726,12 @@ void VulkanRenderer::write_back(Surface& s) {
 }
 
 void VulkanRenderer::write_back_zeta(Surface& s) {
-    if (!s.zeta_dirty) return;
-    s.zeta_dirty = false;
-    if (s.zeta_format == 0 || s.zeta_phys == 0) return;  // no depth surface bound (an offset of zero is never a real one)
+    queue_write_back_zeta(s);
+    finish_write_backs();
+}
+
+void VulkanRenderer::store_zeta(Surface& s, const u8* px) {
     const bool z16 = s.zeta_format == 1;
-    // D16; a 24-bit or float depth copies as a 32-bit word, followed by the stencil bytes.
-    const std::size_t bytes = static_cast<std::size_t>(s.width) * s.height * (z16 ? 2u : 5u);
-    if (bytes > kStagingBytes) {
-        note("depth surface too large to write back");
-        return;
-    }
-    if (static_cast<u64>(s.zeta_phys) + s.zeta_bytes() > ram_size_) return;
-    read_back(s.depth, z16 ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT, s.width, s.height);
-    const u8* px = static_cast<const u8*>(readback_.mapped);
     const u8* stencil = px + static_cast<std::size_t>(s.width) * s.height * 4;
     std::vector<u32> xs, ys;
     if (s.swizzled) swizzle_tables(s.width, s.height, s.log_w, s.log_h, xs, ys);
@@ -720,19 +775,21 @@ void VulkanRenderer::write_back_zeta(Surface& s) {
 
 void VulkanRenderer::write_back_all() {
     for (auto& [k, s] : surfaces_) {
-        if (s->dirty) write_back(*s);
-        if (s->zeta_dirty) write_back_zeta(*s);
+        queue_write_back(*s);
+        queue_write_back_zeta(*s);
     }
+    finish_write_backs();
 }
 
 void VulkanRenderer::write_back_range(u32 phys, u32 len) {
     const u64 b0 = phys, b1 = static_cast<u64>(phys) + len;
     for (auto& [k, s] : surfaces_) {
         const u64 a0 = s->phys, a1 = static_cast<u64>(s->phys) + s->bytes();
-        if (s->dirty && a0 < b1 && b0 < a1) write_back(*s);
+        if (s->dirty && a0 < b1 && b0 < a1) queue_write_back(*s);
         const u64 z0 = s->zeta_phys, z1 = static_cast<u64>(s->zeta_phys) + s->zeta_bytes();
-        if (s->zeta_dirty && z0 < b1 && b0 < z1) write_back_zeta(*s);
+        if (s->zeta_dirty && z0 < b1 && b0 < z1) queue_write_back_zeta(*s);
     }
+    finish_write_backs();
 }
 
 // A GPU-side write to guest memory (a blit): decoded textures over it are stale, and so is any target's image
@@ -1026,10 +1083,11 @@ const VulkanRenderer::TextureEntry* VulkanRenderer::texture(const KelvinState& s
     // buffer when the texture is a shadow map.
     for (auto& [k, surf] : surfaces_) {
         const u64 a0 = surf->phys, a1 = static_cast<u64>(surf->phys) + surf->bytes();
-        if (surf->dirty && a0 < static_cast<u64>(phys) + length && static_cast<u64>(phys) < a1) write_back(*surf);
+        if (surf->dirty && a0 < static_cast<u64>(phys) + length && static_cast<u64>(phys) < a1) queue_write_back(*surf);
         const u64 z0 = surf->zeta_phys, z1 = static_cast<u64>(surf->zeta_phys) + surf->zeta_bytes();
-        if (surf->zeta_dirty && z0 < static_cast<u64>(phys) + length && static_cast<u64>(phys) < z1) write_back_zeta(*surf);
+        if (surf->zeta_dirty && z0 < static_cast<u64>(phys) + length && static_cast<u64>(phys) < z1) queue_write_back_zeta(*surf);
     }
+    finish_write_backs();
     // RAM is what the texture unit reads: an entry is stale once the CPU has rewritten its texels or its palette (a
     // movie frame decoded into the texture, glyphs drawn into a font page) since it was decoded.
     auto stale = [&](const TextureEntry& e) {
@@ -1685,10 +1743,9 @@ void VulkanRenderer::end_frame() {
     frame_draws_ = 0;
     ++frame_index_;
     // Colour reaches RAM every frame (the scanout and the CPU read it); depth only when a texture samples it.
-    const u64 submits = stats_.flushes;
-    for (auto& [k, s] : surfaces_)
-        if (s->dirty) write_back(*s);
-    if (stats_.flushes == submits) submit();  // nothing to copy: the frame runs on without a wait
+    for (auto& [k, s] : surfaces_) queue_write_back(*s);
+    if (write_backs_.empty()) submit();  // nothing to copy: the frame runs on without a wait
+    else finish_write_backs();
 }
 
 std::vector<VulkanRenderer::SurfaceInfo> VulkanRenderer::surfaces() const {
