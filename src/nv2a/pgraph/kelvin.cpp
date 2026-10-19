@@ -100,167 +100,212 @@ void Kelvin::begin_end(u32 value) {
     batch_ = DrawBatch{};
 }
 
+namespace {
+
+// What a method does, decided once per method slot: the checks below run in the order the methods overlap (the
+// streaming ranges first, then the data forms, the named immediates, the switch), so the table gives the first match
+// for every one of the 2048 slots and the per-word work is one lookup.
+enum class Op : u8 {
+    Plain, Program, Constant, XfContext, ArrayFormat, ArrayOffset, Data4f, Data2f, Data2s, Data4ub, Data4s, NamedFloat,
+    NamedS16, NamedUb4, FogCoord, ProgramLoad, ConstantLoad, BeginEnd, Element16, Element32, DrawArrays, InlineArray,
+    ClearSurface, SemaphoreRelease
+};
+struct Decoded {
+    Op op{Op::Plain};
+    u8 attr{0};
+    u8 a{0};       // the component, word or half the method writes
+    u8 b{0};       // the form's component count or word count
+    bool norm{false};
+    u16 slot{0};   // XF context: constant slot * 4 + component
+};
+
+Decoded decode(u32 method) {
+    using namespace mthd;
+    Decoded d;
+    auto in = [&](u32 base, u32 bytes) { return method >= base && method < base + bytes; };
+    if (in(kTransformProgram, 0x80)) return {Op::Program};
+    if (in(kTransformConstant, 0x80)) return {Op::Constant};
+    if (u32 slot_word; xf_context_slot(method, slot_word)) {
+        d.op = Op::XfContext;
+        d.slot = static_cast<u16>(slot_word);
+        return d;
+    }
+    if (in(kVertexDataArrayFormat, 0x40)) return {Op::ArrayFormat, static_cast<u8>((method - kVertexDataArrayFormat) >> 2)};
+    if (in(kVertexDataArrayOffset, 0x40)) return {Op::ArrayOffset, static_cast<u8>((method - kVertexDataArrayOffset) >> 2)};
+    if (in(kVertexData4fM, 0x100)) {
+        const u32 i = (method - kVertexData4fM) >> 2;
+        return {Op::Data4f, static_cast<u8>(i >> 2), static_cast<u8>(i & 3u)};
+    }
+    if (in(kVertexData2fM, 0x80)) {
+        const u32 i = (method - kVertexData2fM) >> 2;
+        return {Op::Data2f, static_cast<u8>(i >> 1), static_cast<u8>(i & 1u)};
+    }
+    if (in(kVertexData2s, 0x40)) return {Op::Data2s, static_cast<u8>((method - kVertexData2s) >> 2)};
+    if (in(kVertexData4ub, 0x40)) return {Op::Data4ub, static_cast<u8>((method - kVertexData4ub) >> 2)};
+    if (in(kVertexData4sM, 0x80)) {
+        const u32 i = (method - kVertexData4sM) >> 2;
+        return {Op::Data4s, static_cast<u8>(i >> 1), static_cast<u8>(i & 1u)};
+    }
+    // The named immediate methods, in the order they were matched.
+    auto named_float = [&](u32 base, u32 attr, u32 count) {
+        if (!in(base, count * 4)) return false;
+        d = {Op::NamedFloat, static_cast<u8>(attr), static_cast<u8>((method - base) >> 2), static_cast<u8>(count)};
+        return true;
+    };
+    auto named_s16x2 = [&](u32 base, u32 attr, u32 words, bool normalised) {
+        if (!in(base, words * 4)) return false;
+        d = {Op::NamedS16, static_cast<u8>(attr), static_cast<u8>((method - base) >> 2), static_cast<u8>(words), normalised};
+        return true;
+    };
+    auto named_ub4 = [&](u32 base, u32 attr) {
+        if (method != base) return false;
+        d = {Op::NamedUb4, static_cast<u8>(attr)};
+        return true;
+    };
+    if (named_float(kVertex3f, kAttrPosition, 3) || named_float(kVertex4f, kAttrPosition, 4) || named_float(kNormal3f, kAttrNormal, 3) ||
+        named_s16x2(kNormal3s, kAttrNormal, 2, true) || named_float(kDiffuse4f, kAttrDiffuse, 4) || named_float(kDiffuse3f, kAttrDiffuse, 3) ||
+        named_ub4(kDiffuse4ub, kAttrDiffuse) || named_float(kSpecular4f, kAttrSpecular, 4) || named_float(kSpecular3f, kAttrSpecular, 3) ||
+        named_ub4(kSpecular4ub, kAttrSpecular) || named_float(kWeight1f, kAttrWeight, 1) || named_float(kWeight2f, kAttrWeight, 2) ||
+        named_float(kWeight3f, kAttrWeight, 3) || named_float(kWeight4f, kAttrWeight, 4))
+        return d;
+    if (method == kFogCoord) return {Op::FogCoord};
+    static constexpr u32 kTex2f[4] = {kTexcoord0_2f, kTexcoord1_2f, kTexcoord2_2f, kTexcoord3_2f};
+    static constexpr u32 kTex2s[4] = {kTexcoord0_2s, kTexcoord1_2s, kTexcoord2_2s, kTexcoord3_2s};
+    static constexpr u32 kTex4f[4] = {kTexcoord0_4f, kTexcoord1_4f, kTexcoord2_4f, kTexcoord3_4f};
+    static constexpr u32 kTex4s[4] = {kTexcoord0_4s, kTexcoord1_4s, kTexcoord2_4s, kTexcoord3_4s};
+    for (u32 t = 0; t < 4; ++t) {
+        if (named_float(kTex2f[t], kAttrTexcoord0 + t, 2) || named_s16x2(kTex2s[t], kAttrTexcoord0 + t, 1, false) ||
+            named_float(kTex4f[t], kAttrTexcoord0 + t, 4) || named_s16x2(kTex4s[t], kAttrTexcoord0 + t, 2, false))
+            return d;
+    }
+    switch (method) {
+        case kTransformProgramLoad: return {Op::ProgramLoad};
+        case kTransformConstantLoad: return {Op::ConstantLoad};
+        case kBeginEnd: return {Op::BeginEnd};
+        case kArrayElement16: return {Op::Element16};
+        case kArrayElement32: return {Op::Element32};
+        case kDrawArrays: return {Op::DrawArrays};
+        case kInlineArray: return {Op::InlineArray};
+        case kClearSurface: return {Op::ClearSurface};
+        case kSemaphoreRelease: return {Op::SemaphoreRelease};
+        default: return {Op::Plain};
+    }
+}
+
+const std::array<Decoded, 0x800>& decoded_methods() {
+    static const std::array<Decoded, 0x800> table = [] {
+        std::array<Decoded, 0x800> t{};
+        for (u32 i = 0; i < t.size(); ++i) t[i] = decode(i << 2);
+        return t;
+    }();
+    return table;
+}
+
+}  // namespace
+
 void Kelvin::method(u32 method, u32 value) {
     method &= 0x1FFCu;
     ++methods_;
     ++histogram_[method >> 2];
     state_.r[method >> 2] = value;
-
-    // Streaming ranges first.
-    if (method >= mthd::kTransformProgram && method < mthd::kTransformProgram + 0x80) {
-        if (state_.program_load < kProgramSlots) state_.program[state_.program_load][state_.program_word] = value;
-        if (++state_.program_word == 4) {
-            state_.program_word = 0;
-            ++state_.program_load;
-        }
-        return;
-    }
-    if (method >= mthd::kTransformConstant && method < mthd::kTransformConstant + 0x80) {
-        if (state_.constant_load < kConstants) state_.constants[state_.constant_load][state_.constant_word] = value;
-        if (++state_.constant_word == 4) {
-            state_.constant_word = 0;
-            ++state_.constant_load;
-        }
-        return;
-    }
-    // The fixed-function transform registers live in the constant file too (the "XF context"): a program can read
-    // the viewport scale and offset as c[58] and c[59], the matrices from slot 0 on, and the XDK's programs do.
-    if (u32 slot_word; xf_context_slot(method, slot_word)) {
-        state_.constants[slot_word >> 2][slot_word & 3u] = value;
-        return;
-    }
-    if (method >= mthd::kVertexDataArrayFormat && method < mthd::kVertexDataArrayFormat + 0x40) {
-        VertexAttribute& a = state_.attributes[(method - mthd::kVertexDataArrayFormat) >> 2];
-        a.type = static_cast<AttribType>(value & 0xFu);
-        a.size = (value >> 4) & 0xFu;
-        a.stride = value >> 8;
-        return;
-    }
-    if (method >= mthd::kVertexDataArrayOffset && method < mthd::kVertexDataArrayOffset + 0x40) {
-        VertexAttribute& a = state_.attributes[(method - mthd::kVertexDataArrayOffset) >> 2];
-        a.offset = value & 0x7FFFFFFFu;
-        a.dma_b = (value >> 31) & 1u;
-        return;
-    }
-    if (method >= mthd::kVertexData4fM && method < mthd::kVertexData4fM + 0x100) {
-        const u32 i = (method - mthd::kVertexData4fM) >> 2;
-        immediate_component(i >> 2, i & 3u, as_float(value), (i & 3u) == 3);
-        return;
-    }
-    if (method >= mthd::kVertexData2fM && method < mthd::kVertexData2fM + 0x80) {
-        const u32 i = (method - mthd::kVertexData2fM) >> 2;
-        const u32 attr = i >> 1, comp = i & 1u;
-        if (comp == 0) {
-            state_.immediate[attr][2] = 0.0f;
-            state_.immediate[attr][3] = 1.0f;
-        }
-        immediate_component(attr, comp, as_float(value), comp == 1);
-        return;
-    }
-    if (method >= mthd::kVertexData2s && method < mthd::kVertexData2s + 0x40) {
-        const u32 attr = (method - mthd::kVertexData2s) >> 2;
-        state_.immediate[attr][2] = 0.0f;
-        state_.immediate[attr][3] = 1.0f;
-        immediate_component(attr, 0, s16_plain(value), false);
-        immediate_component(attr, 1, s16_plain(value >> 16), true);
-        return;
-    }
-    if (method >= mthd::kVertexData4ub && method < mthd::kVertexData4ub + 0x40) {
-        const u32 attr = (method - mthd::kVertexData4ub) >> 2;
-        for (u32 c = 0; c < 4; ++c) immediate_component(attr, c, static_cast<float>((value >> (8 * c)) & 0xFFu) / 255.0f, c == 3);
-        return;
-    }
-    if (method >= mthd::kVertexData4sM && method < mthd::kVertexData4sM + 0x80) {
-        const u32 i = (method - mthd::kVertexData4sM) >> 2;
-        const u32 attr = i >> 1, half = i & 1u;
-        immediate_component(attr, half * 2, s16_plain(value), false);
-        immediate_component(attr, half * 2 + 1, s16_plain(value >> 16), half == 1);
-        return;
-    }
-    // The named immediate methods.
-    // A short float form sets the components it leaves out as well, to those of (x, 0, 0, 1): a 2F texture
-    // coordinate after a 4F one has z = 0 and w = 1 again (a projective lookup divides by that w), a 3F colour has
-    // alpha 1, a 1F weight is (w, 0, 0, 1).
-    auto named_float = [&](u32 base, u32 attr, u32 count) -> bool {
-        if (method < base || method >= base + count * 4) return false;
-        const u32 comp = (method - base) >> 2;
-        for (u32 c = count; c < 4; ++c) state_.immediate[attr][c] = c == 3 ? 1.0f : 0.0f;
-        immediate_component(attr, comp, as_float(value), comp == count - 1);
-        return true;
-    };
-    auto named_s16x2 = [&](u32 base, u32 attr, u32 words, bool normalised) -> bool {
-        if (method < base || method >= base + words * 4) return false;
-        const u32 w = (method - base) >> 2;
-        if (w == 0 && words == 1) {
-            state_.immediate[attr][2] = 0.0f;
-            state_.immediate[attr][3] = 1.0f;
-        }
-        const float lo = normalised ? s16_norm(value) : s16_plain(value);
-        const float hi = normalised ? s16_norm(value >> 16) : s16_plain(value >> 16);
-        immediate_component(attr, w * 2, lo, false);
-        immediate_component(attr, w * 2 + 1, hi, w == words - 1);
-        return true;
-    };
-    auto named_ub4 = [&](u32 base, u32 attr) -> bool {
-        if (method != base) return false;
-        for (u32 c = 0; c < 4; ++c) immediate_component(attr, c, static_cast<float>((value >> (8 * c)) & 0xFFu) / 255.0f, c == 3);
-        return true;
-    };
-    if (named_float(mthd::kVertex3f, kAttrPosition, 3) || named_float(mthd::kVertex4f, kAttrPosition, 4) ||
-        named_float(mthd::kNormal3f, kAttrNormal, 3) || named_s16x2(mthd::kNormal3s, kAttrNormal, 2, true) ||
-        named_float(mthd::kDiffuse4f, kAttrDiffuse, 4) || named_float(mthd::kDiffuse3f, kAttrDiffuse, 3) ||
-        named_ub4(mthd::kDiffuse4ub, kAttrDiffuse) || named_float(mthd::kSpecular4f, kAttrSpecular, 4) ||
-        named_float(mthd::kSpecular3f, kAttrSpecular, 3) || named_ub4(mthd::kSpecular4ub, kAttrSpecular) ||
-        named_float(mthd::kWeight1f, kAttrWeight, 1) || named_float(mthd::kWeight2f, kAttrWeight, 2) ||
-        named_float(mthd::kWeight3f, kAttrWeight, 3) || named_float(mthd::kWeight4f, kAttrWeight, 4))
-        return;
-    if (method == mthd::kFogCoord) {
-        // The fog coordinate fills all four components of its attribute.
-        for (u32 c = 0; c < 4; ++c) immediate_component(kAttrFog, c, as_float(value), false);
-        return;
-    }
-    static constexpr u32 kTex2f[4] = {mthd::kTexcoord0_2f, mthd::kTexcoord1_2f, mthd::kTexcoord2_2f, mthd::kTexcoord3_2f};
-    static constexpr u32 kTex2s[4] = {mthd::kTexcoord0_2s, mthd::kTexcoord1_2s, mthd::kTexcoord2_2s, mthd::kTexcoord3_2s};
-    static constexpr u32 kTex4f[4] = {mthd::kTexcoord0_4f, mthd::kTexcoord1_4f, mthd::kTexcoord2_4f, mthd::kTexcoord3_4f};
-    static constexpr u32 kTex4s[4] = {mthd::kTexcoord0_4s, mthd::kTexcoord1_4s, mthd::kTexcoord2_4s, mthd::kTexcoord3_4s};
-    for (u32 t = 0; t < 4; ++t) {
-        if (named_float(kTex2f[t], kAttrTexcoord0 + t, 2) || named_s16x2(kTex2s[t], kAttrTexcoord0 + t, 1, false) ||
-            named_float(kTex4f[t], kAttrTexcoord0 + t, 4) || named_s16x2(kTex4s[t], kAttrTexcoord0 + t, 2, false))
+    const Decoded& d = decoded_methods()[method >> 2];
+    switch (d.op) {
+        case Op::Plain: return;
+        case Op::Program:
+            if (state_.program_load < kProgramSlots) state_.program[state_.program_load][state_.program_word] = value;
+            if (++state_.program_word == 4) {
+                state_.program_word = 0;
+                ++state_.program_load;
+            }
             return;
-    }
-
-    switch (method) {
-        case mthd::kTransformProgramLoad:
+        case Op::Constant:
+            if (state_.constant_load < kConstants) state_.constants[state_.constant_load][state_.constant_word] = value;
+            if (++state_.constant_word == 4) {
+                state_.constant_word = 0;
+                ++state_.constant_load;
+            }
+            return;
+        // The fixed-function transform registers live in the constant file too (the "XF context"): a program can
+        // read the viewport scale and offset as c[58] and c[59], the matrices from slot 0 on, and the XDK's programs do.
+        case Op::XfContext: state_.constants[d.slot >> 2][d.slot & 3u] = value; return;
+        case Op::ArrayFormat: {
+            VertexAttribute& a = state_.attributes[d.attr];
+            a.type = static_cast<AttribType>(value & 0xFu);
+            a.size = (value >> 4) & 0xFu;
+            a.stride = value >> 8;
+            return;
+        }
+        case Op::ArrayOffset: {
+            VertexAttribute& a = state_.attributes[d.attr];
+            a.offset = value & 0x7FFFFFFFu;
+            a.dma_b = (value >> 31) & 1u;
+            return;
+        }
+        case Op::Data4f: immediate_component(d.attr, d.a, as_float(value), d.a == 3); return;
+        case Op::Data2f:
+            if (d.a == 0) {
+                state_.immediate[d.attr][2] = 0.0f;
+                state_.immediate[d.attr][3] = 1.0f;
+            }
+            immediate_component(d.attr, d.a, as_float(value), d.a == 1);
+            return;
+        case Op::Data2s:
+            state_.immediate[d.attr][2] = 0.0f;
+            state_.immediate[d.attr][3] = 1.0f;
+            immediate_component(d.attr, 0, s16_plain(value), false);
+            immediate_component(d.attr, 1, s16_plain(value >> 16), true);
+            return;
+        case Op::Data4ub:
+        case Op::NamedUb4:
+            for (u32 c = 0; c < 4; ++c) immediate_component(d.attr, c, static_cast<float>((value >> (8 * c)) & 0xFFu) / 255.0f, c == 3);
+            return;
+        case Op::Data4s:
+            immediate_component(d.attr, d.a * 2u, s16_plain(value), false);
+            immediate_component(d.attr, d.a * 2u + 1, s16_plain(value >> 16), d.a == 1);
+            return;
+        // A short float form sets the components it leaves out as well, to those of (x, 0, 0, 1): a 2F texture
+        // coordinate after a 4F one has z = 0 and w = 1 again (a projective lookup divides by that w), a 3F colour
+        // has alpha 1, a 1F weight is (w, 0, 0, 1).
+        case Op::NamedFloat:
+            for (u32 c = d.b; c < 4; ++c) state_.immediate[d.attr][c] = c == 3 ? 1.0f : 0.0f;
+            immediate_component(d.attr, d.a, as_float(value), d.a == d.b - 1u);
+            return;
+        case Op::NamedS16: {
+            if (d.a == 0 && d.b == 1) {
+                state_.immediate[d.attr][2] = 0.0f;
+                state_.immediate[d.attr][3] = 1.0f;
+            }
+            const float lo = d.norm ? s16_norm(value) : s16_plain(value);
+            const float hi = d.norm ? s16_norm(value >> 16) : s16_plain(value >> 16);
+            immediate_component(d.attr, d.a * 2u, lo, false);
+            immediate_component(d.attr, d.a * 2u + 1, hi, d.a == d.b - 1u);
+            return;
+        }
+        case Op::FogCoord:
+            // The fog coordinate fills all four components of its attribute.
+            for (u32 c = 0; c < 4; ++c) immediate_component(kAttrFog, c, as_float(value), false);
+            return;
+        case Op::ProgramLoad:
             state_.program_load = value & 0xFFu;
             state_.program_word = 0;
             return;
-        case mthd::kTransformConstantLoad:
+        case Op::ConstantLoad:
             state_.constant_load = value & 0x1FFu;
             state_.constant_word = 0;
             return;
-        case mthd::kBeginEnd:
-            begin_end(value);
-            return;
-        case mthd::kArrayElement16:
+        case Op::BeginEnd: begin_end(value); return;
+        case Op::Element16:
             batch_.indices.push_back(value & 0xFFFFu);
             batch_.indices.push_back(value >> 16);
             return;
-        case mthd::kArrayElement32:
-            batch_.indices.push_back(value);
-            return;
-        case mthd::kDrawArrays:
-            batch_.ranges.emplace_back(value & 0xFFFFFFu, (value >> 24) + 1);
-            return;
-        case mthd::kInlineArray:
-            batch_.inline_words.push_back(value);
-            return;
-        case mthd::kClearSurface:
+        case Op::Element32: batch_.indices.push_back(value); return;
+        case Op::DrawArrays: batch_.ranges.emplace_back(value & 0xFFFFFFu, (value >> 24) + 1); return;
+        case Op::InlineArray: batch_.inline_words.push_back(value); return;
+        case Op::ClearSurface:
             if (sink_) sink_->clear(state_, value);
             return;
-        case mthd::kSemaphoreRelease:
+        case Op::SemaphoreRelease:
             if (sink_) sink_->semaphore_release(state_, value);
-            return;
-        default:
             return;
     }
 }
