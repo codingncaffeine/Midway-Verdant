@@ -321,6 +321,7 @@ void VulkanRenderer::begin_frame(u32 slot) {
     f.vkResetDescriptorPool(dev_.device(), fr.pool, 0);
     descriptor_sets_used_ = 0;
     for (Ring* r : {&vertex_ring_, &index_ring_, &uniform_ring_, &staging_}) r->begin = r->cursor = r->region * slot;
+    last_vs_upload_.valid = last_ps_upload_.valid = false;  // they lie in another frame's region
     slot_ = slot;
     cb_ = fr.cb;
     f.vkResetCommandBuffer(cb_, 0);
@@ -1623,16 +1624,11 @@ void VulkanRenderer::draw(const KelvinState& s, const DrawBatch& batch) {
         std::memcpy(static_cast<u8*>(index_ring_.buffer.mapped) + ioffset, indices.data(), indices.size() * 4);
     }
 
-    // Uniforms.
+    // Uniforms: built on the CPU, and uploaded only when they differ from the block the frame last uploaded (a
+    // run of draws under the same transforms and combiners binds the copy already in the ring).
     VkDeviceSize uoffset_vs = 0, uoffset_ps = 0;
-    const VkDeviceSize ualign = std::max<VkDeviceSize>(dev_.limits().minUniformBufferOffsetAlignment, 16);
-    if (!ring_alloc(uniform_ring_, vsh::kUniformBytes, ualign, uoffset_vs) || !ring_alloc(uniform_ring_, sizeof(psh::Uniforms), ualign, uoffset_ps)) {
-        note("uniform ring full for this frame");
-        ++stats_.skipped;
-        return;
-    }
     {
-        float* u = reinterpret_cast<float*>(static_cast<u8*>(uniform_ring_.buffer.mapped) + uoffset_vs);
+        float* u = vs_uniforms_.data();
         std::memcpy(u, s.constants.data(), kConstants * 16);
         u[kConstants * 4 + 0] = static_cast<float>(t->width / t->aa_x);  // the logical size the program maps to
         u[kConstants * 4 + 1] = static_cast<float>(t->height / t->aa_y);
@@ -1646,7 +1642,25 @@ void VulkanRenderer::draw(const KelvinState& s, const DrawBatch& batch) {
         vsh::fixed_function_uniforms(s, u + kConstants * 4 + 8);
         psh::Uniforms pu{};
         psh::uniforms_from_state(s, scales, pu);
-        std::memcpy(static_cast<u8*>(uniform_ring_.buffer.mapped) + uoffset_ps, &pu, sizeof pu);
+        const VkDeviceSize ualign = std::max<VkDeviceSize>(dev_.limits().minUniformBufferOffsetAlignment, 16);
+        auto upload = [&](UniformUpload& last, const void* block, std::size_t bytes, VkDeviceSize& offset) {
+            if (last.valid && std::memcmp(last.bytes.data(), block, bytes) == 0) {
+                offset = last.offset;
+                ++stats_.uniform_reuses;
+                return true;
+            }
+            if (!ring_alloc(uniform_ring_, bytes, ualign, offset)) return false;
+            std::memcpy(static_cast<u8*>(uniform_ring_.buffer.mapped) + offset, block, bytes);
+            last.bytes.assign(static_cast<const u8*>(block), static_cast<const u8*>(block) + bytes);
+            last.offset = offset;
+            last.valid = true;
+            return true;
+        };
+        if (!upload(last_vs_upload_, u, vsh::kUniformBytes, uoffset_vs) || !upload(last_ps_upload_, &pu, sizeof pu, uoffset_ps)) {
+            note("uniform ring full for this frame");
+            ++stats_.skipped;
+            return;
+        }
     }
 
     stats_.ns_upload += ns_since(t_part);

@@ -55,6 +55,7 @@ public:
         u64 draws{0}, clears{0}, skipped{0}, pipelines{0}, shaders{0}, textures_decoded{0}, writebacks{0}, flushes{0};
         u64 batch_flushes{0};  // batches submitted mid-frame because the rings or the descriptor pool were full
         u64 waits{0};          // times the CPU stopped for the GPU (a fence wait)
+        u64 uniform_reuses{0};  // uniform blocks equal to the frame's last upload, bound where that lies
         u64 surface_samples{0};  // textures bound straight to a render target's image
         // Where the time goes, in nanoseconds: the whole draw and its parts (the texture part includes the
         // write-backs a sample forces; the shader parts are the compiles, a lookup costs nothing measurable); the
@@ -247,6 +248,14 @@ private:
     std::vector<PendingWriteBack> write_backs_;
     VkDeviceSize readback_cursor_{0};
     u32 descriptor_sets_used_{0};  // from the recording frame's pool
+    // The vertex uniform block being built, and the last block of each kind uploaded in the recording frame.
+    std::array<float, vsh::kUniformBytes / 4> vs_uniforms_{};
+    struct UniformUpload {
+        std::vector<u8> bytes;
+        VkDeviceSize offset{0};
+        bool valid{false};
+    };
+    UniformUpload last_vs_upload_, last_ps_upload_;
     vk::Image dummy2d_, dummycube_, dummy3d_;
     VkSampler dummy_sampler_{VK_NULL_HANDLE};
     VkFormat depth24_{VK_FORMAT_D24_UNORM_S8_UINT};
