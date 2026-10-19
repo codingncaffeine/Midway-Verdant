@@ -13,6 +13,10 @@
 #include <thread>
 #include <vector>
 
+#if defined(__linux__)
+#include <sys/prctl.h>
+#endif
+
 #include "core/clock.h"
 #include "core/machine.h"
 #include "core/version.h"
@@ -98,6 +102,11 @@ int press_button(const std::string& name) {
 }
 
 int main(int argc, char** argv) {
+    // MV_ALLOW_PROFILER=1 lets a sampling profiler that is not our parent (eu-stack, gdb -p) attach under Yama's
+    // ptrace_scope 1, which otherwise allows only ancestors.
+#if defined(__linux__)
+    if (const char* p = std::getenv("MV_ALLOW_PROFILER"); p && *p == '1') prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY, 0, 0, 0);
+#endif
     mv::MachineConfig cfg;
     cfg.speed = 1.0;
     double seconds = 5.0;
