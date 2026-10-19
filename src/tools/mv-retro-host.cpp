@@ -233,17 +233,22 @@ int main(int argc, char** argv) {
     auto run = sym<void (*)()>(lib, "retro_run");
     const auto t0 = std::chrono::steady_clock::now();
     double call_ms_max = 0;
+    unsigned long long over17 = 0, over33 = 0;  // calls slower than a frame and than two (a frontend shows them as hitches)
     for (current_frame = 0; current_frame < frames; ++current_frame) {
         audio_this_call = 0;
         const auto c0 = std::chrono::steady_clock::now();
         run();
-        call_ms_max = std::max(call_ms_max, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - c0).count());
+        const double call_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - c0).count();
+        call_ms_max = std::max(call_ms_max, call_ms);
+        over17 += call_ms > 1000.0 / 60.0;
+        over33 += call_ms > 2000.0 / 60.0;
         ++audio_per_call[audio_this_call];
         if (png_every && (current_frame + 1) % png_every == 0) save_png(png_dir / std::format("frame-{:06}.png", current_frame + 1));
         if (frontend_ms > 0) std::this_thread::sleep_for(std::chrono::duration<double, std::milli>(frontend_ms));
         if (realtime) std::this_thread::sleep_until(t0 + std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>((current_frame + 1) / av.timing.fps)));
     }
     const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    std::printf("calls over one frame %llu, over two %llu\n", over17, over33);
     std::printf("ran %u frames in %.2f s (%.1f fps, slowest call %.1f ms); %llu video callbacks, last %ux%u; %llu audio frames, %llu non-zero samples\n", frames,
                 secs, frames / secs, call_ms_max, frames_seen, last_w, last_h, audio_frames, audio_nonzero);
     // The most common audio frame counts per call, most frequent first.
