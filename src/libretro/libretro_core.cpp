@@ -25,6 +25,7 @@
 #include "libretro/retropad_map.h"
 #include "nv2a/overlay.h"
 #include "nv2a/scanout.h"
+#include "nv2a/vulkan/vk_renderer.h"
 
 namespace {
 
@@ -334,6 +335,16 @@ RETRO_API void retro_unload_game(void) {
             static_cast<unsigned long long>(machine->nv2a().pusher_sync_points()));
         log(RETRO_LOG_INFO, "apu: %llu front-end memory fences written, %llu front-end traps raised", static_cast<unsigned long long>(machine->apu().fence_writes()),
             static_cast<unsigned long long>(machine->apu().traps()));
+        // The renderer's share of the pusher: draws and their parts, submits and fence waits, copies back to RAM.
+        if (const auto* r = machine->nv2a().renderer()) {
+            const auto& st = r->stats();
+            const auto ms = [](mv::u64 ns) { return static_cast<double>(ns) / 1e6; };
+            log(RETRO_LOG_INFO, "gpu time: %llu draws %.0f ms (fetch %.0f, indices %.0f, textures %.0f, pipelines %.0f, shader compiles %.0f, uploads %.0f, descriptors %.0f, record %.0f); %llu submits + %llu waits %.0f ms; %llu write-backs %.0f ms (device copies %.0f); %llu textures decoded",
+                static_cast<unsigned long long>(st.draws), ms(st.ns_draw), ms(st.ns_fetch), ms(st.ns_indices), ms(st.ns_texture), ms(st.ns_pipeline), ms(st.ns_vs + st.ns_fs),
+                ms(st.ns_upload), ms(st.ns_descriptors), ms(st.ns_record), static_cast<unsigned long long>(st.flushes), static_cast<unsigned long long>(st.waits),
+                ms(st.ns_flush), static_cast<unsigned long long>(st.writebacks), ms(st.ns_write_back), ms(st.ns_write_back_gpu),
+                static_cast<unsigned long long>(st.textures_decoded));
+        }
         log(RETRO_LOG_INFO, "device time: the frontend's thread fired events for %.3f s; the gpu pusher took %.3f s on the CPU thread",
             static_cast<double>(machine->io_event_ns()) / 1e9, static_cast<double>(machine->nv2a().pusher_wall_ns()) / 1e9);
         // Where the event time went: host time inside each device event (both threads), and the APU frame's parts.
