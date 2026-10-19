@@ -320,7 +320,7 @@ TEST(ApuVoices, ALoopingVoiceWrapsAndRetiresOnlyWhenTurnedOffAndQueuedTrapsWaitF
     EXPECT_FALSE(r.irq);
 
     // Both turned off in the same frame: off at the next frame and still listed; their idle reports come on the frame
-    // after, the 2D list's first (it is walked first), the other queued until the front end is free.
+    // after, the 2D list's first (it is walked first); the other is raised again once the front end is free.
     r.vp(SE::kMethodVoiceOff, 0x40);
     r.vp(SE::kMethodVoiceOff, 7);
     r.sched.advance_to(Rig::frame(2));
@@ -336,7 +336,7 @@ TEST(ApuVoices, ALoopingVoiceWrapsAndRetiresOnlyWhenTurnedOffAndQueuedTrapsWaitF
     r.service_trap();
     EXPECT_FALSE(r.irq);
     r.sched.advance_to(Rig::frame(4));
-    EXPECT_EQ(r.rd(Apu::kFeDecParam), 7u) << "the queued report is delivered once the front end is free";
+    EXPECT_EQ(r.rd(Apu::kFeDecParam), 7u) << "the other report comes once the front end is free";
     EXPECT_TRUE(r.irq);
     EXPECT_EQ(r.apu.traps(), 2u) << "and not raised twice while it is pending";
     r.take_off(7);
@@ -734,4 +734,30 @@ TEST(ApuRegisters, AFrontEndMemoryFenceStoresItsValueAtTheFenceAddress) {
     // Setting the address alone writes nothing.
     r.wr(Apu::kFeMemAddr, 0x3008);
     EXPECT_EQ(r.ram32(0x3008), 0u);
+}
+
+TEST(ApuVoices, AnIdleReportRaisedWhileTheFrontEndIsBusyNeverReachesAHostThatTookTheVoiceOffMeanwhile) {
+    using SE = apu::SetupEngine;
+    VoiceRig r;
+    for (u32 v : {0x40u, 7u}) {
+        r.vp(SE::kMethodSetCurrentVoice, v);
+        r.vp(0x304, 0x5200E0E6u);  // looping: it plays until turned off
+        r.vp(SE::kMethodBufEbo, 0x1F);
+        r.vp(SE::kMethodSetAntecedentVoice, v == 0x40u ? 0x1FFFFu : 0x2FFFFu);
+        r.vp(SE::kMethodVoiceOn, v);
+    }
+    r.sched.advance_to(Rig::frame(1));
+    r.vp(SE::kMethodVoiceOff, 0x40);
+    r.vp(SE::kMethodVoiceOff, 7);
+    r.sched.advance_to(Rig::frame(3));
+    EXPECT_EQ(r.rd(Apu::kFeDecParam), 0x40u) << "the 2D list's voice reports first";
+    EXPECT_EQ(r.apu.traps(), 1u);
+    // The host's handler takes both voices off (and frees what they played) before it frees the front end.
+    r.take_off(0x40);
+    r.take_off(7);
+    r.service_trap();
+    r.sched.advance_to(Rig::frame(5));
+    EXPECT_EQ(r.apu.traps(), 1u) << "a voice no longer listed is never reported: its handler would find no object";
+    EXPECT_FALSE(r.irq);
+    EXPECT_FALSE(r.apu.front_end_trapped());
 }

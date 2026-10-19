@@ -544,8 +544,13 @@ namespace mv {
 // ── the front end's traps ───────────────────────────────────────────────────────────────────────────────────────
 
 void Apu::front_end_trap(u32 method, u32 parameter) {
-    // A report the host already has pending, or queued, is not raised twice (an idle voice reports every frame).
+    // A report the host already has pending, or queued, is not raised twice.
     if (fe_trapped_ && regs_[kFeDecMethod / 4] == method && regs_[kFeDecParam / 4] == parameter) return;
+    // An idle report while the front end is busy is dropped, never queued: the voice reports again on the next frame
+    // it is still listed, and a queued report could reach the host after it took the voice off and freed it (one
+    // title's handler then read through a null object and bug-checked). The reference emulator re-walks the lists
+    // each frame and reports only what is listed then.
+    if (fe_trapped_ && method == apu::SetupEngine::kSe2FeIdleVoice && se_.repeats_idle_reports()) return;
     if (std::ranges::find(trap_queue_, std::pair{method, parameter}) != trap_queue_.end()) return;
     if (fe_trapped_) {
         trap_queue_.emplace_back(method, parameter);

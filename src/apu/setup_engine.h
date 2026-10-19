@@ -87,6 +87,8 @@ public:
     bool method(u32 offset, u32 value);
     // One audio frame: walk the lists, render and mix every active voice.
     void frame();
+    // Whether a turned-off voice stays listed and reports idle every frame (the host unlinks it), or is unlinked here.
+    bool repeats_idle_reports() const { return retrap_; }
     // The frame's mix bins (full scale = 1.0), what the global processor's MIXBUF receives.
     const Mix& mix() const { return mix_; }
 
