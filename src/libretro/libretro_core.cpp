@@ -61,6 +61,9 @@ constexpr unsigned kSampleRate = 48000;
 // retro_run's host time: how long the frames took, for the unload report.
 unsigned long long frames_run = 0, frames_capped = 0;
 double frame_ms_sum = 0, frame_ms_max = 0;
+// Each frame the CPU waits at its vblank until the picture is taken: how long the frontend's thread took to notice,
+// and the grab itself (with pipelining the CPU is released after it).
+double hold_wake_ms_sum = 0, hold_grab_ms_sum = 0, hold_wake_ms_max = 0;
 
 void log(retro_log_level level, const char* fmt, ...) {
     char buf[1024];
@@ -301,6 +304,7 @@ RETRO_API bool retro_load_game(const retro_game_info* game) {
     log(RETRO_LOG_INFO, "timeline: %s; one console frame per retro_run", machine->cpu()->clock_name().c_str());
     frames_run = frames_capped = 0;
     frame_ms_sum = frame_ms_max = 0;
+    hold_wake_ms_sum = hold_grab_ms_sum = hold_wake_ms_max = 0;
     machine->start();
     return true;
 }
@@ -329,10 +333,13 @@ RETRO_API void retro_unload_game(void) {
             frames_run ? frame_ms_sum / static_cast<double>(frames_run) : 0.0, frame_ms_max,
             frames_capped ? std::format(", {} cut at 1 s without a vblank", frames_capped).c_str() : "",
             static_cast<unsigned long long>(machine->pit().ticks_delayed()), static_cast<unsigned long long>(machine->pit().ticks_dropped()));
+        log(RETRO_LOG_INFO, "retro_run: the CPU held at each vblank for the picture: noticed after %.3f ms (max %.1f), grabbed in %.3f ms (means)",
+            frames_run ? hold_wake_ms_sum / static_cast<double>(frames_run) : 0.0, hold_wake_ms_max, frames_run ? hold_grab_ms_sum / static_cast<double>(frames_run) : 0.0);
         log(RETRO_LOG_INFO, "gpu: busiest register reads:%s", machine->nv2a().busiest_reads(6).c_str());
         log(RETRO_LOG_INFO, "gpu: a FIFO thread could have run %.3f s of the pusher's %.3f s alongside the guest (%llu points where the guest needed its result)",
             static_cast<double>(machine->nv2a().pusher_overlap_ns()) / 1e9, static_cast<double>(machine->nv2a().pusher_wall_ns()) / 1e9,
             static_cast<unsigned long long>(machine->nv2a().pusher_sync_points()));
+        log(RETRO_LOG_INFO, "gpu: what ended those runs' overlap (pusher time not hidden):%s", machine->nv2a().sync_reasons(8).c_str());
         log(RETRO_LOG_INFO, "apu: %llu front-end memory fences written, %llu front-end traps raised", static_cast<unsigned long long>(machine->apu().fence_writes()),
             static_cast<unsigned long long>(machine->apu().traps()));
         // The renderer's share of the pusher: draws and their parts, submits and fence waits, copies back to RAM.
@@ -405,11 +412,21 @@ RETRO_API void retro_run(void) {
         mv::Machine::StopReason::Duration) {
         if (frames_capped++ == 0) log(RETRO_LOG_WARN, "a frame took over a second of host time; returned without its vblank");
     }
-    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    const auto t1 = std::chrono::steady_clock::now();
+    const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
     ++frames_run;
     frame_ms_sum += ms;
     frame_ms_max = std::max(frame_ms_max, ms);
+    {
+        std::lock_guard g(machine->lock());
+        if (machine->cpu_paused() && machine->frame_hold_at() > t0) {
+            const double wake = std::chrono::duration<double, std::milli>(t1 - machine->frame_hold_at()).count();
+            hold_wake_ms_sum += wake;
+            hold_wake_ms_max = std::max(hold_wake_ms_max, wake);
+        }
+    }
     grab_frame();
+    hold_grab_ms_sum += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t1).count();
     if (pipeline) {
         // The picture is taken while the CPU holds at the vblank; now it runs the next frame while the frontend
         // shows this one and the input for it arrives at the next call.

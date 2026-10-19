@@ -292,6 +292,7 @@ bool Machine::pace_cpu(std::unique_lock<std::mutex>& lk, Cycles now, const std::
         if (nv2a_.vblanks() < frame_limit_) return true;
         // The frame the front end asked for is complete: hold the CPU (its guest clock stands still) until the next.
         cpu_paused_ = true;
+        frame_hold_at_ = std::chrono::steady_clock::now();
         io_cv_.notify_all();
         wake_cv_.wait(lk, [&] { return released() || nv2a_.vblanks() < frame_limit_; });
         cpu_paused_ = false;

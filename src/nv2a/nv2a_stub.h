@@ -216,7 +216,10 @@ private:
     u64 last_run_ns_{0}, overlap_ns_{0}, sync_points_{0};
     bool run_open_{false};
     std::unordered_map<u32, std::pair<u64, u32>> read_counts_;
-    void sync_point();
+    // `why`: the register offset (bit 31 set for a write), or one of the codes below.
+    static constexpr u32 kSyncVblank = 0xFFFFFFF0u, kSyncNextRun = 0xFFFFFFF1u;
+    void sync_point(u32 why);
+    std::unordered_map<u32, std::pair<u64, u64>> sync_reasons_;  // why -> (windows ended, pusher ns not overlapped)
     bool pgraph_stalled_{false};
     // FLIP_STALL: the puller waits until the display has taken the buffer just finished (the read index moves off
     // the write index).
@@ -238,6 +241,8 @@ public:
     u64 pusher_sync_points() const { return sync_points_; }
     // Instrument: register reads by offset, with the last value read, busiest first (a title spinning on a register).
     std::string busiest_reads(std::size_t top) const;
+    // Instrument: what ended the overlap windows, by the pusher time a FIFO thread could not have hidden, most first.
+    std::string sync_reasons(std::size_t top) const;
     u64 notifies() const { return notifies_; }
     u64 software_methods() const { return software_methods_; }
     bool pgraph_stalled() const { return pgraph_stalled_; }

@@ -176,6 +176,8 @@ public:
     // Frame steps: let the CPU run until the vblank count reaches `vblanks`. With the lock held; wakes the CPU.
     void set_frame_limit(u64 vblanks);
     bool cpu_paused() const { return cpu_paused_; }
+    // Instrument: when the CPU last came to a hold at a frame step's vblank (host clock).
+    std::chrono::steady_clock::time_point frame_hold_at() const { return frame_hold_at_; }
     // Guest time at which the PIC last raised INTR (an instrument: interrupt latency).
     Cycles intr_rose_at() const { return intr_rose_at_; }
     // Host time the io thread spent firing device events (an instrument: device work off the CPU thread).
@@ -247,6 +249,7 @@ private:
     // matched a host time; moved forward when the host falls behind, so the guest never races to catch up).
     u64 frame_limit_{0};
     bool cpu_paused_{false};
+    std::chrono::steady_clock::time_point frame_hold_at_{};
     Cycles intr_rose_at_{0};
     u64 io_event_ns_{0};
     std::chrono::steady_clock::time_point pace_wall_;
