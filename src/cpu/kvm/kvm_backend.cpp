@@ -540,6 +540,7 @@ void KvmBackend::handle_mmio() {
 }
 
 void KvmBackend::thread_main() {
+    pthread_setname_np(pthread_self(), "mv-vcpu");  // shows in top -H and profilers
     sigset_t unblock;
     sigemptyset(&unblock);
     sigaddset(&unblock, kKickSignal);

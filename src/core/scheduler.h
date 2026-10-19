@@ -39,6 +39,14 @@ public:
     Cycles next_deadline() const { return heap_.empty() ? ~Cycles{0} : heap_.front()->when; }
     std::size_t pending_count() const { return heap_.size(); }
 
+    // Host time spent inside each event's handler, by event name, in the order the names first fired.
+    struct EventCost {
+        std::string_view name;
+        u64 fired{0};
+        u64 host_ns{0};
+    };
+    const std::vector<EventCost>& event_costs() const { return costs_; }
+
 private:
     void sift_up(std::size_t i);
     void sift_down(std::size_t i);
@@ -46,6 +54,8 @@ private:
 
     Cycles now_{0};
     std::vector<TimerEvent*> heap_;
+    std::vector<EventCost> costs_;
+    EventCost& cost_of(std::string_view name);
 };
 
 }  // namespace mv

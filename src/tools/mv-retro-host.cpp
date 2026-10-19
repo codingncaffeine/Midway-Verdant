@@ -4,6 +4,9 @@
 //   mv-retro-host CORE.so SYSTEM_DIR [GAME] --frames N [--png-every K DIR] [--press BUTTON@FROM-TO ...]
 // Buttons: a b x y l r l2 r2 start select up down left right.
 #include <dlfcn.h>
+#if defined(__linux__)
+#include <sys/prctl.h>
+#endif
 
 #include <chrono>
 #include <cstdarg>
@@ -150,6 +153,11 @@ T sym(void* lib, const char* name) {
 }  // namespace
 
 int main(int argc, char** argv) {
+    // MV_ALLOW_PROFILER=1 lets a sampling profiler that is not our parent (eu-stack, gdb -p) attach under Yama's
+    // ptrace_scope 1, which otherwise allows only ancestors.
+#if defined(__linux__)
+    if (const char* p = std::getenv("MV_ALLOW_PROFILER"); p && *p == '1') prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY, 0, 0, 0);
+#endif
     if (argc < 3) {
         std::fprintf(stderr, "usage: mv-retro-host CORE.so SYSTEM_DIR [GAME] --frames N [--png-every K DIR] [--press BUTTON@FROM-TO ...] [--option KEY=VALUE ...] [--wav FILE]\n");
         return 2;

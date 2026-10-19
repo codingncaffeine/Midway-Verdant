@@ -1,5 +1,6 @@
 #include "core/scheduler.h"
 
+#include <chrono>
 #include <utility>
 
 namespace mv {
@@ -39,10 +40,21 @@ std::size_t Scheduler::advance_to(Cycles until) {
         now_ = ev->when > now_ ? ev->when : now_;
         cancel(*ev);
         ++fired;
+        const std::string_view name = ev->name;  // the handler may destroy or rename its event
+        const auto t0 = std::chrono::steady_clock::now();
         ev->fire(now_);
+        EventCost& c = cost_of(name);
+        ++c.fired;
+        c.host_ns += static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
     }
     if (until > now_) now_ = until;
     return fired;
+}
+
+Scheduler::EventCost& Scheduler::cost_of(std::string_view name) {
+    for (EventCost& c : costs_)
+        if (c.name.data() == name.data()) return c;
+    return costs_.emplace_back(EventCost{name});
 }
 
 void Scheduler::swap_nodes(std::size_t a, std::size_t b) {
