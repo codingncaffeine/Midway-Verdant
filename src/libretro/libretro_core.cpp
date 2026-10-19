@@ -379,11 +379,11 @@ RETRO_API void retro_unload_game(void) {
                 static_cast<unsigned long long>(st.textures_decoded), static_cast<unsigned long long>(st.textures_unchanged), static_cast<unsigned long long>(st.shaders_from_disk));
             // Draws the renderer could not draw, and why (the first of each distinct reason).
             if (st.skipped) log(RETRO_LOG_INFO, "gpu: %llu draws skipped", static_cast<unsigned long long>(st.skipped));
-            log(RETRO_LOG_INFO, "gpu: write-backs by cause: frame end %llu, texture %llu, scanout %llu, 2D/range %llu, relayout %llu, idle vblank %llu; %llu targets sampled in place, %llu snapshots for draws sampling their own target, %llu depth buffers converted to colour, %llu targets the CPU wrote reloaded, %llu depth buffers handed between targets, %llu loaded from RAM",
+            log(RETRO_LOG_INFO, "gpu: write-backs by cause: frame end %llu, texture %llu, scanout %llu, 2D/range %llu, relayout %llu, idle vblank %llu; %llu targets sampled in place, %llu snapshots for draws sampling their own target, %llu depth buffers converted to colour, %llu targets the CPU wrote reloaded, %llu depth buffers handed between targets, %llu loaded from RAM; %llu targets evicted by an overlapping one, %llu retired unused, %llu rectangles of a region copied for a texture",
                 static_cast<unsigned long long>(st.writebacks_by[0]), static_cast<unsigned long long>(st.writebacks_by[1]), static_cast<unsigned long long>(st.writebacks_by[2]),
                 static_cast<unsigned long long>(st.writebacks_by[3]), static_cast<unsigned long long>(st.writebacks_by[4]), static_cast<unsigned long long>(st.writebacks_by[5]),
                 static_cast<unsigned long long>(st.surface_samples), static_cast<unsigned long long>(st.snapshots), static_cast<unsigned long long>(st.zeta_conversions), static_cast<unsigned long long>(st.cpu_written_targets),
-                static_cast<unsigned long long>(st.depth_handovers), static_cast<unsigned long long>(st.depth_uploads));
+                static_cast<unsigned long long>(st.depth_handovers), static_cast<unsigned long long>(st.depth_uploads), static_cast<unsigned long long>(st.evicted), static_cast<unsigned long long>(st.retired_unused), static_cast<unsigned long long>(st.subrect_copies));
             if (st.surface_reloads) log(RETRO_LOG_INFO, "gpu: %llu render targets reloaded from RAM after a 2D write", static_cast<unsigned long long>(st.surface_reloads));
             for (const auto& e : st.errors) log(RETRO_LOG_INFO, "gpu: renderer note: %s", e.c_str());
         }

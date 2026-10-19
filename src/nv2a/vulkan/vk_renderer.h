@@ -70,6 +70,8 @@ public:
         u64 zeta_conversions{0};  // depth buffers converted on the GPU for a colour texture at their address
         u64 cpu_written_targets{0};  // render targets whose memory the CPU wrote: reloaded from RAM
         u64 depth_handovers{0}, depth_uploads{0};  // depth buffers moved between targets sharing an address; loaded from RAM
+        u64 evicted{0}, retired_unused{0};  // targets another target overlapped; targets nothing used for 10 s
+        u64 subrect_copies{0};  // rectangles of a pitch-linear region copied for a texture
         u64 shaders_from_disk{0};  // shader compiles the disk cache answered
         u64 textures_unchanged{0};
         u64 surface_reloads{0};  // render targets reloaded from RAM after another engine wrote them  // textures whose pages were written but whose bytes hashed the same: kept
@@ -116,6 +118,7 @@ private:
         bool dirty{false};           // colour rendered since the last write-back
         bool zeta_dirty{false};      // depth rendered since the last write-back of the zeta surface
         u32 depth_holds{0};          // the zeta address whose contents the depth image holds (0: none, undefined)
+        u64 last_used_vblank{0};     // the last vblank it was drawn into or sampled
         bool rendered_this_frame{false};
         u64 draws_this_frame{0}, clears_this_frame{0};
         // The target sampled in place: views for an X8 texture (alpha one) and for the depth aspect alone, and the
@@ -128,6 +131,15 @@ private:
         VkImageView snap_x8_view{VK_NULL_HANDLE};
         TextureEntry snap_tex, snap_x8_tex;
         u64 draw_serial{0}, snap_serial{~0ull};
+        // Copies of rectangles of a pitch-linear region that textures read (key: x, y, width, height), each retaken after
+        // the region was drawn into since.
+        struct SubCopy {
+            vk::Image image;
+            VkImageView x8_view{VK_NULL_HANDLE};
+            TextureEntry tex, x8_tex;
+            u64 serial{~0ull};
+        };
+        std::unordered_map<u64, SubCopy> subs;
         // The depth buffer read as a colour texture at its address (the Z24S8 words as A8R8G8B8 texels), converted on
         // the GPU; retaken whenever the target was drawn into or cleared since.
         vk::Image zcolor;
@@ -159,6 +171,12 @@ private:
     void retire(VkFramebuffer& framebuffer);
     void end_pass();
     Surface* target_for(const KelvinState& s);
+    // The rectangle of the target the current draw or clear uses (stored pixels): a pitch-linear target is memory, and
+    // a title may draw at an address inside it (a smaller shape at its base, a band further down) with the same pitch,
+    // which is a rectangle of the same image, as on the hardware.
+    struct View {
+        u32 x{0}, y{0}, w{0}, h{0};
+    } view_;
     bool ensure_pass(Surface& t);
     void upload_color_from_ram(Surface& t);
     // Write-backs come in batches: each queued surface records its copy after the frame's draws, and
@@ -188,6 +206,8 @@ private:
     // A render target the stage can sample in place (same address and size, a format of the same bytes), or null.
     TextureEntry* surface_texture(const TextureStage& ts, u32 phys);
     TextureEntry* snapshot_texture(Surface& s, const TextureStage& ts, u32 phys, u32 w, u32 h, bool linear, bool x8);
+    TextureEntry* subrect_texture(Surface& s, const TextureStage& ts, u32 phys, u32 x0, u32 y0, u32 w, u32 h, bool x8);
+    void retire_subs(Surface& s);
     Surface* draw_target_{nullptr};  // the target of the draw whose textures are being looked up
     // The depth buffer at each zeta address lives in one target's depth image at a time: the target that last drew with
     // it. Another target binding the same address takes the contents first (a GPU copy, or through RAM).
@@ -195,6 +215,10 @@ private:
     void bind_depth(Surface& t);
     void upload_depth_from_ram(Surface& t);
     void release_depth(Surface& s);  // a target going away: its depth contents to RAM, its ownership dropped
+    // Finishes with a target: what it rendered reaches RAM, its depth goes back to its address, its images retire once
+    // the GPU is done with them. Returns the next entry.
+    std::unordered_map<u32, std::unique_ptr<Surface>>::iterator erase_surface(std::unordered_map<u32, std::unique_ptr<Surface>>::iterator it);
+    u64 vblank_index_{0};  // vblanks seen (write_back_at), for retiring targets nothing uses
     TextureEntry* zeta_color_texture(Surface& s, const TextureStage& ts, u32 phys, u32 w, u32 h, bool linear, bool x8);
     bool init_zeta_convert();
     // The depth-to-colour conversion: a compute pass over two device buffers (the copied depth words and stencil

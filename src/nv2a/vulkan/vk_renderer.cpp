@@ -189,6 +189,10 @@ VulkanRenderer::~VulkanRenderer() {
         dev_.destroy_image(s->depth);
         dev_.destroy_image(s->snap);
         dev_.destroy_image(s->zcolor);
+        for (auto& [k2, c] : s->subs) {
+            if (c.x8_view) f.vkDestroyImageView(dev_.device(), c.x8_view, nullptr);
+            dev_.destroy_image(c.image);
+        }
     }
     for (auto& [k, p] : passes_) f.vkDestroyRenderPass(dev_.device(), p, nullptr);
     for (auto& [k, m] : vs_cache_) f.vkDestroyShaderModule(dev_.device(), m, nullptr);
@@ -476,6 +480,31 @@ VulkanRenderer::Surface* VulkanRenderer::target_for(const KelvinState& s) {
         note(std::format("surface at {:08x} has an unusable size {}x{} (format {:08x})", phys, width, height, d.format));
         return nullptr;
     }
+    view_ = {0, 0, width, height};
+    // A pitch-linear target inside an existing one of the same pitch, formats and anti-aliasing is a rectangle of its
+    // image (one title drew 640x480, 320x240 and 184x169 at one address and a 320x120 band 240 rows down each frame:
+    // as separate targets each was relaid out, written back and reloaded through RAM every time).
+    if (!d.swizzled()) {
+        const u32 pitch = d.color_pitch(), zeta = zeta_dma.base + d.zeta_offset;
+        for (auto& [k, sp] : surfaces_) {
+            Surface& r = *sp;
+            if (r.swizzled || r.pitch != pitch || r.color_format != d.color_format() || r.zeta_format != d.zeta_format() || r.aa_x != aa_x || r.aa_y != aa_y) continue;
+            if (phys < r.phys || phys >= static_cast<u64>(r.phys) + r.bytes()) continue;
+            const u32 off = phys - r.phys, bpp = r.color_bytes();
+            if ((off % pitch) % bpp) continue;
+            const u32 x0 = (off % pitch) / bpp, y0 = off / pitch;
+            if (x0 + width > r.width || y0 + height > r.height) continue;
+            if (x0 == 0 && y0 == 0) {
+                r.zeta_phys = zeta;  // at the base: the zeta it binds is its own (bind_depth follows a change)
+                r.zeta_pitch = d.zeta_pitch();
+            } else if (d.zeta_format() != 0 && zeta != 0 && (d.zeta_pitch() != r.zeta_pitch || zeta != r.zeta_phys + y0 * r.zeta_pitch + x0 * (r.zeta_format == 1 ? 2u : 4u))) {
+                continue;  // its depth buffer is not the matching rectangle of the region's
+            }
+            r.format_word = d.format;
+            view_ = {x0, y0, width, height};
+            return &r;
+        }
+    }
     auto it = surfaces_.find(phys);
     if (it != surfaces_.end()) {
         Surface& s0 = *it->second;
@@ -495,24 +524,7 @@ VulkanRenderer::Surface* VulkanRenderer::target_for(const KelvinState& s) {
         // The guest reuses the memory with another layout: finish with the old one.
         note(std::format("surface {:08x} relaid out: {}x{} {} format {:x} -> {}x{} {} format {:x}", phys, s0.width, s0.height, s0.swizzled ? "swizzled" : "pitch",
                          s0.color_format, width, height, d.swizzled() ? "swizzled" : "pitch", d.color_format()));
-        if (pass_target_ == &s0) end_pass();
-        wb_why_ = Stats::kWbRelayout;
-        if (s0.dirty) write_back(s0);
-        release_depth(s0);
-        wb_why_ = Stats::kWbAll;
-        // Draws already recorded or still on the GPU may use the old images: they go once those are done.
-        retire(s0.x8_view);
-        retire(s0.depth_view);
-        retire(s0.snap_x8_view);
-        retire(s0.zcolor_x8_view);
-        destroy_surface_views(s0);
-        retire(s0.framebuffer);
-        retire(s0.color);
-        retire(s0.depth);
-        retire(s0.snap);
-        retire(s0.zcolor);
-        surfaces_.erase(it);
-        stage_cache_.fill({});  // a stage may point at the erased target's entries
+        erase_surface(it);
     }
     if (debug_tex_log_)
         std::fprintf(stderr, "texlog: target %08x %ux%u %s colour %u zeta %u pitch %u\n", phys, width, height, d.swizzled() ? "swizzled" : "linear", d.color_format(), d.zeta_format(), d.color_pitch());
@@ -549,19 +561,22 @@ VulkanRenderer::Surface* VulkanRenderer::target_for(const KelvinState& s) {
     end_pass();
     fresh_image(t.color);
     fresh_image(t.depth);
-    // A target that another target's dirty colour or depth covers starts from what that one rendered: written back first
-    // (the memory is the truth; a target over another's depth buffer loaded stale RAM once depth read as colour stayed
-    // on the GPU).
+    // A target that another target's colour or depth covers starts from what that one rendered: written back first (the
+    // memory is the truth; a target over another's depth buffer loaded stale RAM once depth read as colour stayed on
+    // the GPU). A target whose colour it covers is finished with, as the reference emulator evicts the surfaces a new
+    // one overlaps: the boot animation's targets lingered into the games that reused their memory.
     {
         const u64 b0 = t.phys, b1 = static_cast<u64>(t.phys) + t.bytes();
-        wb_why_ = Stats::kWbRelayout;
-        for (auto& [k, o] : surfaces_) {
-            const u64 a0 = o->phys, a1 = a0 + o->bytes(), z0 = o->zeta_phys, z1 = z0 + o->zeta_bytes();
-            if (o->dirty && a0 < b1 && b0 < a1) queue_write_back(*o);
-            if (o->zeta_dirty && z0 < b1 && b0 < z1) queue_write_back_zeta(*o);
+        for (auto o = surfaces_.begin(); o != surfaces_.end();) {
+            Surface& other = *o->second;
+            if (other.depth_holds && other.depth_holds < b1 && b0 < static_cast<u64>(other.depth_holds) + other.zeta_bytes()) release_depth(other);
+            if (other.phys < b1 && b0 < static_cast<u64>(other.phys) + other.bytes()) {
+                ++stats_.evicted;
+                o = erase_surface(o);
+            } else {
+                ++o;
+            }
         }
-        finish_write_backs();
-        wb_why_ = Stats::kWbAll;
     }
     upload_color_from_ram(t);  // the guest may draw over an existing picture
     t.pass = render_pass(cf, df);
@@ -613,9 +628,9 @@ bool VulkanRenderer::ensure_pass(Surface& t) {
         t.color_ram_newer = false;
         ++stats_.surface_reloads;
     }
-    bind_depth(t);
     if (sampled_since_barrier_) surface_barrier();  // draws that sampled a target finish before it is drawn into again
     t.last_rendered_frame = frame_index_;
+    t.last_used_vblank = vblank_index_;
     t.ram_newer = false;
     attachments_written_ = true;
     VkRenderPassBeginInfo rbi{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
@@ -625,9 +640,8 @@ bool VulkanRenderer::ensure_pass(Surface& t) {
     fn_->vkCmdBeginRenderPass(cb_, &rbi, VK_SUBPASS_CONTENTS_INLINE);
     pass_open_ = true;
     pass_target_ = &t;
-    // A pass may write depth; whether it writes colour is the draw's or the clear's to say (the colour mask, the
-    // clear bits), so a depth-only pass over an unused colour target never lands in guest RAM.
-    t.zeta_dirty = true;
+    // Whether the pass writes colour or depth is the draw's or the clear's to say (the colour mask, the depth and stencil
+    // state, the clear bits), so a pass that never touches one never lands it in guest RAM.
     t.rendered_this_frame = true;
     return true;
 }
@@ -759,6 +773,31 @@ void VulkanRenderer::release_depth(Surface& s) {
         depth_owner_.erase(o);
     }
     s.depth_holds = 0;
+}
+
+std::unordered_map<u32, std::unique_ptr<VulkanRenderer::Surface>>::iterator VulkanRenderer::erase_surface(std::unordered_map<u32, std::unique_ptr<Surface>>::iterator it) {
+    Surface& s0 = *it->second;
+    if (pass_target_ == &s0) end_pass();
+    wb_why_ = Stats::kWbRelayout;
+    if (s0.dirty) write_back(s0);
+    release_depth(s0);
+    wb_why_ = Stats::kWbAll;
+    for (auto o = depth_owner_.begin(); o != depth_owner_.end();) o = o->second == &s0 ? depth_owner_.erase(o) : std::next(o);
+    if (draw_target_ == &s0) draw_target_ = nullptr;
+    // Draws already recorded or still on the GPU may use the old images: they go once those are done.
+    retire(s0.x8_view);
+    retire(s0.depth_view);
+    retire(s0.snap_x8_view);
+    retire(s0.zcolor_x8_view);
+    destroy_surface_views(s0);
+    retire(s0.framebuffer);
+    retire(s0.color);
+    retire(s0.depth);
+    retire(s0.snap);
+    retire(s0.zcolor);
+    retire_subs(s0);
+    stage_cache_.fill({});  // a stage may point at the erased target's entries
+    return surfaces_.erase(it);
 }
 
 namespace {
@@ -1542,6 +1581,14 @@ VulkanRenderer::TextureEntry* VulkanRenderer::surface_texture(const TextureStage
             std::fprintf(stderr, "texlog: stage %08x fmt %02x %ux%u %s pitch %u vs target %08x/%08x %ux%u %s pitch %u/%u colour %u zeta %u dirty %d/%d aa %ux%u open %d\n", phys, fmt, w, h,
                          linear ? "linear" : "swizzled", ts.pitch(), s.phys, s.zeta_phys, s.width, s.height, s.swizzled ? "swizzled" : "linear", s.pitch, s.zeta_pitch,
                          s.color_format, s.zeta_format, s.dirty ? 1 : 0, s.zeta_dirty ? 1 : 0, s.aa_x, s.aa_y, (pass_open_ && pass_target_ == &s) ? 1 : 0);
+        // A rectangle of a pitch-linear region (a view drawn inside it, or a smaller shape at its base): a copy of that
+        // rectangle taken on the GPU.
+        if (color && linear && !s.swizzled && (s.width != w || s.height != h || s.phys != phys) && ts.pitch() == s.pitch && s.color_bytes() == 4 &&
+            color_vk_format(s.color_format) == VK_FORMAT_B8G8R8A8_UNORM && phys >= s.phys && phys < static_cast<u64>(s.phys) + s.bytes() && !s.ram_newer && s.aa_x == 1 &&
+            s.aa_y == 1 && ((phys - s.phys) % s.pitch) % 4 == 0) {
+            const u32 x0 = ((phys - s.phys) % s.pitch) / 4, y0 = (phys - s.phys) / s.pitch;
+            if (x0 + w <= s.width && y0 + h <= s.height) return subrect_texture(s, ts, phys, x0, y0, w, h, x8);
+        }
         // The layout the target was last set up with does not matter: its image holds pixels, and the guest clears in
         // pitch layout (one colour, the same either way) and draws in the layout it samples.
         if (s.width != w || s.height != h) continue;
@@ -1588,6 +1635,7 @@ VulkanRenderer::TextureEntry* VulkanRenderer::surface_texture(const TextureStage
         if (attachments_written_) surface_barrier();
         sampled_since_barrier_ = true;
         ++stats_.surface_samples;
+        s.last_used_vblank = vblank_index_;
         return &e;
     }
     return nullptr;
@@ -1831,6 +1879,81 @@ VulkanRenderer::TextureEntry* VulkanRenderer::zeta_color_texture(Surface& s, con
     return &e;
 }
 
+// A texture over a rectangle of a pitch-linear region: the rectangle copied into an image of its own on the GPU (the
+// texture reads what the draws left in that memory), retaken only after the region was drawn into or cleared since.
+VulkanRenderer::TextureEntry* VulkanRenderer::subrect_texture(Surface& s, const TextureStage& ts, u32 phys, u32 x0, u32 y0, u32 w, u32 h, bool x8) {
+    const u64 key = static_cast<u64>(x0) | (static_cast<u64>(y0) << 16) | (static_cast<u64>(w) << 32) | (static_cast<u64>(h) << 48);
+    auto found = s.subs.find(key);
+    if (found == s.subs.end()) {
+        if (s.subs.size() >= 16) retire_subs(s);
+        Surface::SubCopy c;
+        std::string error;
+        if (!dev_.create_image(s.color.format, w, h, 1, 1, 1, VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, VK_IMAGE_ASPECT_COLOR_BIT, false, c.image, error)) {
+            note("sub-rectangle image: " + error);
+            return nullptr;
+        }
+        end_pass();
+        fresh_image(c.image);
+        found = s.subs.emplace(key, std::move(c)).first;
+    }
+    Surface::SubCopy& c = found->second;
+    if (c.serial != s.draw_serial) {
+        end_pass();
+        VkMemoryBarrier before{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        before.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+        before.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+        fn_->vkCmdPipelineBarrier(cb_, VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &before, 0, nullptr, 0,
+                                  nullptr);
+        VkImageCopy region{};
+        region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        region.dstSubresource = region.srcSubresource;
+        region.srcOffset = {static_cast<i32>(x0), static_cast<i32>(y0), 0};
+        region.extent = {w, h, 1};
+        fn_->vkCmdCopyImage(cb_, s.color.image, VK_IMAGE_LAYOUT_GENERAL, c.image.image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+        VkMemoryBarrier after{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        after.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT;
+        after.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        fn_->vkCmdPipelineBarrier(cb_, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT, 0, 1, &after, 0, nullptr, 0, nullptr);
+        c.serial = s.draw_serial;
+        ++stats_.subrect_copies;
+    }
+    TextureEntry& e = x8 ? c.x8_tex : c.tex;
+    if (!e.valid) {
+        VkImageView view = c.image.view;
+        if (x8) {
+            VkImageViewCreateInfo vci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+            vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+            vci.image = c.image.image;
+            vci.format = c.image.format;
+            vci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            vci.components.a = VK_COMPONENT_SWIZZLE_ONE;
+            if (fn_->vkCreateImageView(dev_.device(), &vci, nullptr, &view) != VK_SUCCESS) return nullptr;
+            c.x8_view = view;
+        }
+        e.image = c.image;
+        e.image.view = view;
+        e.image.levels = 1;
+        e.phys = phys;
+        e.width = w;
+        e.height = h;
+        e.linear = true;
+        e.surface = true;
+        e.valid = true;
+    }
+    e.length = texture_size_in_memory(ts);
+    s.last_used_vblank = vblank_index_;
+    return &e;
+}
+
+void VulkanRenderer::retire_subs(Surface& s) {
+    for (auto& [k, c] : s.subs) {
+        retire(c.x8_view);
+        retire(c.image);
+    }
+    s.subs.clear();
+    stage_cache_.fill({});  // a stage may point at a retired copy's entry
+}
+
 void VulkanRenderer::surface_barrier() {
     end_pass();
     VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
@@ -1926,7 +2049,11 @@ void VulkanRenderer::clear(const KelvinState& s, u32 bits) {
         ++stats_.skipped;
         return;
     }
+    // The depth buffer is bound only when the clear touches it: a target's passes that never use depth leave the
+    // buffer at its address where it is (a title drew three shapes at one address a frame, each binding it through RAM).
+    if (bits & 3u) bind_depth(*t);
     ensure_pass(*t);
+    if (bits & 3u) t->zeta_dirty = true;
     if (bits & 0xF0u) t->dirty = true;
     ++t->clears_this_frame;
     ++t->draw_serial;
@@ -1936,8 +2063,8 @@ void VulkanRenderer::clear(const KelvinState& s, u32 bits) {
     u32 x0 = rect_h & 0xFFFFu, x1 = rect_h >> 16, y0 = rect_v & 0xFFFFu, y1 = rect_v >> 16;
     if (x1 < x0 || y1 < y0 || (x0 == 0 && x1 == 0 && y0 == 0 && y1 == 0)) {
         x0 = y0 = 0;
-        x1 = t->width - 1;
-        y1 = t->height - 1;
+        x1 = view_.w - 1;
+        y1 = view_.h - 1;
     } else {
         // The clear rectangle is in logical pixels too.
         x0 *= t->aa_x;
@@ -1945,8 +2072,8 @@ void VulkanRenderer::clear(const KelvinState& s, u32 bits) {
         y0 *= t->aa_y;
         y1 = (y1 + 1) * t->aa_y - 1;
     }
-    x1 = std::min(x1, t->width - 1);
-    y1 = std::min(y1, t->height - 1);
+    x1 = std::min(x1, view_.w - 1);
+    y1 = std::min(y1, view_.h - 1);
     if (debug_draw_id_)
         std::fprintf(stderr, "drawid clear: surface %08x bits %02x colour %08x zstencil %08x rect %u,%u..%u,%u of %ux%u (registers %08x %08x)\n", t->phys, bits, s.clear_color(),
                      s.clear_zstencil(), x0, y0, x1, y1, t->width, t->height, rect_h, rect_v);
@@ -1971,7 +2098,7 @@ void VulkanRenderer::clear(const KelvinState& s, u32 bits) {
         }
     }
     VkClearRect rect{};
-    rect.rect = {{static_cast<i32>(x0), static_cast<i32>(y0)}, {x1 - x0 + 1, y1 - y0 + 1}};
+    rect.rect = {{static_cast<i32>(view_.x + x0), static_cast<i32>(view_.y + y0)}, {x1 - x0 + 1, y1 - y0 + 1}};  // within the view
     rect.layerCount = 1;
     if (n) fn_->vkCmdClearAttachments(cb_, n, att, 1, &rect);
     if (channels != 0 && channels != 0xFu) {
@@ -2255,8 +2382,8 @@ void VulkanRenderer::draw(const KelvinState& s, const DrawBatch& batch) {
     {
         float* u = vs_uniforms_.data();
         std::memcpy(u, s.constants.data(), kConstants * 16);
-        u[kConstants * 4 + 0] = static_cast<float>(t->width / t->aa_x);  // the logical size the program maps to
-        u[kConstants * 4 + 1] = static_cast<float>(t->height / t->aa_y);
+        u[kConstants * 4 + 0] = static_cast<float>(view_.w / t->aa_x);  // the logical size the program maps to (the view's)
+        u[kConstants * 4 + 1] = static_cast<float>(view_.h / t->aa_y);
         u[kConstants * 4 + 2] = 0.0f;
         u[kConstants * 4 + 3] = 0.0f;
         u[kConstants * 4 + 4] = 0.0f;
@@ -2330,7 +2457,10 @@ void VulkanRenderer::draw(const KelvinState& s, const DrawBatch& batch) {
     stats_.ns_descriptors += ns_since(t_part);
     t_part = std::chrono::steady_clock::now();
     // Record.
+    const bool uses_depth = s.depth_test() || s.stencil_test();
+    if (uses_depth) bind_depth(*t);  // only a draw that tests depth or stencil needs the buffer in place
     ensure_pass(*t);
+    if ((s.depth_test() && s.depth_write()) || s.stencil_test()) t->zeta_dirty = true;
     if (s.color_mask() != 0) t->dirty = true;
     ++t->draws_this_frame;
     ++t->draw_serial;
@@ -2340,13 +2470,17 @@ void VulkanRenderer::draw(const KelvinState& s, const DrawBatch& batch) {
         fn_->vkCmdBindDescriptorSets(cb_, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout_, 0, 1, &set, 0, nullptr);
         bound_set_ = set;
     }
-    VkViewport viewport{0.0f, 0.0f, static_cast<float>(t->width), static_cast<float>(t->height), 0.0f, 1.0f};
+    // The view's rectangle of the target's image (the whole image for a target of its own).
+    const View vw = view_;
+    VkViewport viewport{static_cast<float>(vw.x), static_cast<float>(vw.y), static_cast<float>(vw.w), static_cast<float>(vw.h), 0.0f, 1.0f};
     fn_->vkCmdSetViewport(cb_, 0, 1, &viewport);
     const SurfaceState sd = s.surface();
     const u32 cx = sd.clip_x() * t->aa_x, cy = sd.clip_y() * t->aa_y, cw = sd.clip_width() * t->aa_x, ch = sd.clip_height() * t->aa_y;
-    VkRect2D scissor{{static_cast<i32>(std::min(cx, t->width - 1)), static_cast<i32>(std::min(cy, t->height - 1))},
-                     {std::max(1u, std::min(cw, t->width - std::min(cx, t->width - 1))), std::max(1u, std::min(ch, t->height - std::min(cy, t->height - 1)))}};
-    if (sd.clip_width() == 0 || sd.clip_height() == 0) scissor = {{0, 0}, {t->width, t->height}};
+    VkRect2D scissor{{static_cast<i32>(std::min(cx, vw.w - 1)), static_cast<i32>(std::min(cy, vw.h - 1))},
+                     {std::max(1u, std::min(cw, vw.w - std::min(cx, vw.w - 1))), std::max(1u, std::min(ch, vw.h - std::min(cy, vw.h - 1)))}};
+    if (sd.clip_width() == 0 || sd.clip_height() == 0) scissor = {{0, 0}, {vw.w, vw.h}};
+    scissor.offset.x += static_cast<i32>(vw.x);
+    scissor.offset.y += static_cast<i32>(vw.y);
     fn_->vkCmdSetScissor(cb_, 0, 1, &scissor);
     const u32 bc = s.reg(mthd::kBlendColor);
     float constants[4] = {static_cast<float>((bc >> 16) & 0xFFu) / 255.0f, static_cast<float>((bc >> 8) & 0xFFu) / 255.0f,
@@ -2405,9 +2539,20 @@ void VulkanRenderer::write_descriptors(VkDescriptorSet set, VkDeviceSize uoffset
 void VulkanRenderer::flush_frame() { submit(); }
 
 bool VulkanRenderer::write_back_at(u32 phys) {
+    // Targets nothing has drawn into or sampled for ten seconds, and that hold nothing newer than RAM, retire.
+    if (++vblank_index_ % 60 == 0)
+        for (auto it = surfaces_.begin(); it != surfaces_.end();) {
+            const Surface& s = *it->second;
+            if ((phys < s.phys || phys >= static_cast<u64>(s.phys) + s.bytes()) && !s.dirty && !s.zeta_dirty && s.last_used_vblank + 600 < vblank_index_ && !(pass_open_ && pass_target_ == &s)) {
+                ++stats_.retired_unused;
+                it = erase_surface(it);
+            } else {
+                ++it;
+            }
+        }
     wb_why_ = Stats::kWbScanout;
     for (auto& [k, s] : surfaces_) {
-        if (s->phys != phys) continue;
+        if (phys < s->phys || phys >= static_cast<u64>(s->phys) + s->bytes()) continue;  // the region holding the scanout
         if (s->dirty) write_back(*s);
         wb_why_ = Stats::kWbAll;
         return true;
