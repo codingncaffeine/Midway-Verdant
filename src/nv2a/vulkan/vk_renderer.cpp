@@ -996,6 +996,7 @@ VkPipeline VulkanRenderer::pipeline(const KelvinState& s, VkShaderModule vs, VkS
         rs.cullMode = face == 0x404 ? VK_CULL_MODE_FRONT_BIT : (face == 0x408 ? VK_CULL_MODE_FRONT_AND_BACK : VK_CULL_MODE_BACK_BIT);
     }
     rs.frontFace = (s.reg(mthd::kFrontFace) == 0x900) != debug_flip_front_ ? VK_FRONT_FACE_CLOCKWISE : VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    rs.depthBiasEnable = VK_TRUE;  // the polygon offset, set per draw (zero when the draw has none)
     VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
     ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
     VkPipelineDepthStencilStateCreateInfo ds{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
@@ -1028,9 +1029,10 @@ VkPipeline VulkanRenderer::pipeline(const KelvinState& s, VkShaderModule vs, VkS
     VkPipelineColorBlendStateCreateInfo blend{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
     blend.attachmentCount = 1;
     blend.pAttachments = &cb;
-    const VkDynamicState dynamics[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_BLEND_CONSTANTS, VK_DYNAMIC_STATE_STENCIL_REFERENCE};
+    const VkDynamicState dynamics[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_BLEND_CONSTANTS, VK_DYNAMIC_STATE_STENCIL_REFERENCE,
+                                       VK_DYNAMIC_STATE_DEPTH_BIAS};
     VkPipelineDynamicStateCreateInfo dyn{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
-    dyn.dynamicStateCount = 4;
+    dyn.dynamicStateCount = 5;
     dyn.pDynamicStates = dynamics;
     VkGraphicsPipelineCreateInfo gpi{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
     gpi.stageCount = 2;
@@ -1731,6 +1733,17 @@ void VulkanRenderer::draw(const KelvinState& s, const DrawBatch& batch) {
     }
     fn_->vkCmdSetBlendConstants(cb_, constants);
     fn_->vkCmdSetStencilReference(cb_, VK_STENCIL_FACE_FRONT_AND_BACK, s.reg(mthd::kStencilRef) & 0xFFu);
+    {
+        // The polygon offset: bias + factor x the depth slope, in depth-buffer units, which are the attachment's own steps
+        // (depth reaches the host as z / the zeta format's maximum). It applies to triangle-class primitives, with the
+        // enable of the front polygon mode (we fill every mode). Per the method definitions and the reference emulator.
+        const u32 mode = s.reg(mthd::kFrontPolygonMode);
+        const u32 enable = mode == 0x1B00 ? mthd::kPolyOffsetPointEnable : mode == 0x1B01 ? mthd::kPolyOffsetLineEnable : mthd::kPolyOffsetFillEnable;
+        const bool triangles = v.primitive >= Primitive::Triangles;
+        const bool on = triangles && s.reg(enable) != 0;
+        fn_->vkCmdSetDepthBias(cb_, on ? std::bit_cast<float>(s.reg(mthd::kPolygonOffsetBias)) : 0.0f, 0.0f,
+                               on ? std::bit_cast<float>(s.reg(mthd::kPolygonOffsetFactor)) : 0.0f);
+    }
     const VkDeviceSize vb_offset = voffset;
     fn_->vkCmdBindVertexBuffers(cb_, 0, 1, &vertex_ring_.buffer.buffer, &vb_offset);
     if (!indices.empty()) {

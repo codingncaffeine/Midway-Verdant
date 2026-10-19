@@ -515,3 +515,52 @@ TEST(Vulkan, BumpEnvOffsetsTheLookupByTheMatrixTimesDuDv) {
     EXPECT_EQ(at(0x110000), 0xFF30600Du) << "red, green and blue times 0.75; alpha kept";
     EXPECT_EQ(at(0x120000), 0xFF408011u) << "the factor clamped to 1";
 }
+
+// The polygon offset moves a triangle's depth by bias + factor x slope (depth-buffer units) when the enable of the front
+// polygon mode is set: a decal drawn over the same plane passes a LESS test only with a negative bias. (Without it,
+// coplanar decals z-fight: shadows that flicker or vanish.)
+TEST(Vulkan, ThePolygonOffsetMovesACoplanarTriangleInFrontOnlyWhenEnabled) {
+    vk::Device device;
+    std::string error;
+    if (!device.init(error)) GTEST_SKIP() << "no Vulkan device: " << error;
+    std::vector<u8> ram(4u << 20, 0);
+    RamResolver handles;
+    handles.size = static_cast<u32>(ram.size());
+    VulkanRenderer renderer(device, handles, ram.data(), static_cast<u32>(ram.size()));
+    ASSERT_TRUE(renderer.init(error)) << error;
+    Kelvin k;
+    k.set_sink(&renderer);
+    setup_target(k);
+    k.method(mthd::kColorClear, 0xFF000080);
+    k.method(mthd::kZstencilClear, 0xFFFFFF00);
+    k.method(mthd::kClearRectH, 63u << 16);
+    k.method(mthd::kClearRectV, 63u << 16);
+    k.method(mthd::kClearSurface, 0xF3);
+    k.method(mthd::kDepthTestEnable, 1);
+    k.method(mthd::kDepthFunc, 0x201);  // LESS
+    k.method(mthd::kDepthMask, 1);
+    auto triangle = [&](u32 abgr, float depth) {  // over the whole target, at one depth (a fraction of the 24-bit range)
+        k.method(mthd::kBeginEnd, 5);
+        k.method(mthd::kDiffuse4ub, abgr);
+        for (const auto& p : {std::array<float, 2>{0.0f, 0.0f}, std::array<float, 2>{128.0f, 0.0f}, std::array<float, 2>{0.0f, 128.0f}}) {
+            k.method(mthd::kVertexData4fM + 0, bits(p[0]));
+            k.method(mthd::kVertexData4fM + 4, bits(p[1]));
+            k.method(mthd::kVertexData4fM + 8, bits(depth * 16777215.0f));
+            k.method(mthd::kVertexData4fM + 12, bits(1.0f));
+        }
+        k.method(mthd::kBeginEnd, 0);
+    };
+    triangle(0xFF00FF00, 0.5f);  // green floor
+    triangle(0xFF0000FF, 0.5f);  // red decal on the same plane, no offset: fails LESS
+    renderer.end_frame();
+    EXPECT_EQ(pixel_at(ram, 8, 8) & 0x00FFFFFFu, 0x00FF00u) << "a coplanar triangle without an offset stays behind";
+    k.method(mthd::kPolygonOffsetBias, bits(-16.0f));
+    triangle(0xFF0000FF, 0.5f);  // the bias is set but the fill enable is not
+    renderer.end_frame();
+    EXPECT_EQ(pixel_at(ram, 8, 8) & 0x00FFFFFFu, 0x00FF00u) << "the bias needs the fill enable";
+    k.method(mthd::kPolyOffsetFillEnable, 1);
+    triangle(0xFF0000FF, 0.5f);
+    renderer.end_frame();
+    for (const auto& e : renderer.stats().errors) ADD_FAILURE() << "renderer: " << e;
+    EXPECT_EQ(pixel_at(ram, 8, 8) & 0x00FFFFFFu, 0xFF0000u) << "pulled in front by 16 depth units";
+}

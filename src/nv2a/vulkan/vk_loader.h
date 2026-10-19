@@ -97,7 +97,8 @@ namespace mv::vk {
     X(vkCmdCopyImageToBuffer)       \
     X(vkCmdCopyBuffer)              \
     X(vkCmdSetStencilReference)     \
-    X(vkCmdSetBlendConstants)
+    X(vkCmdSetBlendConstants)       \
+    X(vkCmdSetDepthBias)
 
 struct Functions {
     PFN_vkGetInstanceProcAddr vkGetInstanceProcAddr{nullptr};

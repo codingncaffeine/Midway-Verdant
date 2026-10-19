@@ -27,6 +27,9 @@ constexpr u32 kAlphaTestEnable = 0x0300, kBlendEnable = 0x0304, kCullFaceEnable 
               kDepthMask = 0x035C, kStencilMask = 0x0360, kStencilFunc = 0x0364, kStencilRef = 0x0368, kStencilFuncMask = 0x036C,
               kStencilOpFail = 0x0370, kStencilOpZfail = 0x0374, kStencilOpZpass = 0x0378, kShadeModel = 0x037C, kClipMin = 0x0394,
               kClipMax = 0x0398, kCullFace = 0x039C, kFrontFace = 0x03A0;
+// The polygon offset: an enable per front polygon mode (point, line, fill), the slope factor and the bias (floats).
+constexpr u32 kPolyOffsetPointEnable = 0x0330, kPolyOffsetLineEnable = 0x0334, kPolyOffsetFillEnable = 0x0338,
+              kPolygonOffsetFactor = 0x0384, kPolygonOffsetBias = 0x0388, kFrontPolygonMode = 0x038C;
 constexpr u32 kViewportOffset = 0x0A20, kCombinerFactor0 = 0x0A60, kCombinerFactor1 = 0x0A80, kCombinerAlphaOcw = 0x0AA0,
               kCombinerColorIcw = 0x0AC0, kViewportScale = 0x0AF0;
 constexpr u32 kTransformProgram = 0x0B00, kTransformConstant = 0x0B80;  // 32 words each
