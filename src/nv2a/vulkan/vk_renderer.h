@@ -64,6 +64,7 @@ public:
         u64 descriptor_reuses{0};  // draws that kept the previous draw's descriptor set
         u64 surface_samples{0};  // textures bound straight to a render target's image
         u64 shaders_from_disk{0};  // shader compiles the disk cache answered
+        u64 textures_unchanged{0};  // textures whose pages were written but whose bytes hashed the same: kept
         // Where the time goes, in nanoseconds: the whole draw and its parts (the texture part includes the
         // write-backs a sample forces; the shader parts are the compiles, a lookup costs nothing measurable); the
         // submits and the fence waits; the copies back to RAM, colour and depth (and the wait for the device copy
@@ -83,8 +84,9 @@ private:
         u32 width{0}, height{0};
         bool linear{false};
         bool surface{false};  // a render target's own image, sampled in place (owned by the surface)
-        u32 generation{0};       // the RAM write generation its texels and palette were decoded at
+        u32 generation{0};       // the RAM write generation its texels and palette were decoded (or last checked) at
         u32 palette_phys{0};
+        u64 content{0};          // a hash of the texels and palette in RAM when decoded
     };
     struct Surface {
         u32 phys{0};
@@ -157,11 +159,13 @@ private:
     VkPipeline clear_pipeline(VkRenderPass pass, VkColorComponentFlags mask, std::string& error);
     const TextureEntry* texture(const KelvinState& s, u32 stage, std::string& error);
     // A render target the stage can sample in place (same address and size, a format of the same bytes), or null.
-    const TextureEntry* surface_texture(const TextureStage& ts, u32 phys);
+    TextureEntry* surface_texture(const TextureStage& ts, u32 phys);
     // Orders the attachment writes recorded so far before later sampling, and earlier sampling before later writes.
     void surface_barrier();
     void destroy_surface_views(Surface& s);
-    void invalidate_textures(u32 phys, u32 len);  // the decoded textures over a range (RAM now holds what a target wrote)
+    void invalidate_textures(u32 phys, u32 len);
+    u64 texture_content(u32 phys, u32 length, u32 palette_phys) const;  // the bytes a decode reads, hashed
+    bool texture_current(TextureEntry& e);  // RAM still holds what e was decoded from (rehashed when pages were written)  // the decoded textures over a range (RAM now holds what a target wrote)
     VkSampler sampler(const TextureStage& ts, u32 levels);
     // A host buffer with one region per frame in flight; the recording frame allocates from its own region only.
     struct Ring {
@@ -241,7 +245,7 @@ private:
     struct StageCache {
         std::array<u32, 11> regs{};
         u32 phys{0}, length{0};
-        const TextureEntry* entry{nullptr};
+        TextureEntry* entry{nullptr};
     };
     std::array<StageCache, 4> stage_cache_{};
     std::unordered_map<u64, VkSampler> samplers_;

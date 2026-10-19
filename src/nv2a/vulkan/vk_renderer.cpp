@@ -1071,6 +1071,40 @@ u32 VulkanRenderer::texture_phys(const KelvinState& s, const TextureStage& ts) c
     return dma.base + ts.offset;
 }
 
+// The bytes a decode reads (texels and palette), hashed eight at a time: a check for change, not a cryptographic hash.
+u64 VulkanRenderer::texture_content(u32 phys, u32 length, u32 palette_phys) const {
+    const MemoryView ram{ram_, ram_size_};
+    u64 h = 0x9E3779B97F4A7C15ull ^ length;
+    auto mix = [&h](const u8* p, u32 n) {
+        u32 i = 0;
+        for (; i + 8 <= n; i += 8) {
+            u64 w;
+            std::memcpy(&w, p + i, 8);
+            h = (h ^ w) * 0xFF51AFD7ED558CCDull;
+            h ^= h >> 32;
+        }
+        for (; i < n; ++i) h = (h ^ p[i]) * 0x100000001B3ull;
+    };
+    if (const u8* p = ram.at(phys, length)) mix(p, length);
+    if (palette_phys)
+        if (const u8* p = ram.at(palette_phys, 256 * 4)) mix(p, 256 * 4);
+    return h;
+}
+
+// RAM is what the texture unit reads: an entry is stale once the CPU has rewritten its texels or its palette (a movie
+// frame decoded into the texture, glyphs drawn into a font page) since it was decoded. Write tracking is per page, and
+// a texture shares its pages with whatever the title keeps beside it (one title rewrote such neighbours several times
+// a frame, and 70 % of its frame time went to decoding unchanged textures again), so a texture whose pages were
+// written is hashed before it is decoded again, and kept when its bytes are what they were.
+bool VulkanRenderer::texture_current(TextureEntry& e) {
+    const u32 newest = std::max(handles_.newest_write(e.phys, e.length), e.palette_phys ? handles_.newest_write(e.palette_phys, 256 * 4) : 0u);
+    if (newest <= e.generation) return true;
+    if (texture_content(e.phys, e.length, e.palette_phys) != e.content) return false;
+    e.generation = handles_.write_generation();
+    ++stats_.textures_unchanged;
+    return true;
+}
+
 const VulkanRenderer::TextureEntry* VulkanRenderer::texture(const KelvinState& s, u32 stage, std::string& error) {
     Timed timed(stats_.ns_texture);
     const TextureStage ts = s.texture(stage);
@@ -1091,7 +1125,7 @@ const VulkanRenderer::TextureEntry* VulkanRenderer::texture(const KelvinState& s
             return nullptr;
         }
     }
-    if (const TextureEntry* e = surface_texture(ts, phys)) {
+    if (TextureEntry* e = surface_texture(ts, phys)) {
         sc = StageCache{regs, phys, length, e};
         return e;
     }
@@ -1104,19 +1138,13 @@ const VulkanRenderer::TextureEntry* VulkanRenderer::texture(const KelvinState& s
         if (surf->zeta_dirty && z0 < static_cast<u64>(phys) + length && static_cast<u64>(phys) < z1) queue_write_back_zeta(*surf);
     }
     finish_write_backs();
-    // RAM is what the texture unit reads: an entry is stale once the CPU has rewritten its texels or its palette (a
-    // movie frame decoded into the texture, glyphs drawn into a font page) since it was decoded.
-    auto stale = [&](const TextureEntry& e) {
-        return handles_.newest_write(e.phys, e.length) > e.generation ||
-               (e.palette_phys && handles_.newest_write(e.palette_phys, 256 * 4) > e.generation);
-    };
-    if (same && sc.entry->valid && !sc.entry->surface && !stale(*sc.entry)) return sc.entry;
+    if (same && sc.entry->valid && !sc.entry->surface && texture_current(*sc.entry)) return sc.entry;
     struct Ident {
         u32 phys, format, control1, rect, palette;
     } id{phys, ts.format, ts.control1, ts.image_rect, ts.palette};
     std::string key(reinterpret_cast<const char*>(&id), sizeof id);
     auto it = textures_.find(key);
-    if (it != textures_.end() && it->second->valid && !stale(*it->second)) {
+    if (it != textures_.end() && it->second->valid && texture_current(*it->second)) {
         sc = StageCache{regs, phys, length, it->second.get()};
         return it->second.get();
     }
@@ -1213,6 +1241,7 @@ const VulkanRenderer::TextureEntry* VulkanRenderer::texture(const KelvinState& s
     entry->linear = format_info(ts.color_format()).linear;
     entry->generation = generation;
     entry->palette_phys = palette_phys;
+    entry->content = texture_content(phys, length, palette_phys);
     TextureEntry* raw = entry.get();
     textures_[key] = std::move(entry);
     sc = StageCache{regs, phys, length, raw};
@@ -1226,7 +1255,7 @@ const VulkanRenderer::TextureEntry* VulkanRenderer::texture(const KelvinState& s
 // and uploading it again (a full flush and a round trip each time, which held the CPU thread long enough to slow
 // the animation, and with it the boot sound's cues, to half speed). A clean target qualifies only if it was drawn
 // this frame or the last and no blit wrote over it since; an older one goes through RAM.
-const VulkanRenderer::TextureEntry* VulkanRenderer::surface_texture(const TextureStage& ts, u32 phys) {
+VulkanRenderer::TextureEntry* VulkanRenderer::surface_texture(const TextureStage& ts, u32 phys) {
     if (debug_roundtrip_ || ts.cubemap() || ts.dimensionality() != 2 || ts.mip_levels() > 1) return nullptr;
     const u32 fmt = ts.color_format();
     const bool color = fmt == 0x06 || fmt == 0x12 || fmt == 0x07 || fmt == 0x1E;  // A8R8G8B8 and X8R8G8B8
