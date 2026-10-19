@@ -94,6 +94,10 @@ constexpr i32 kCtxBlock = static_cast<i32>(offsetof(JitCtx, block)), kCtxBudget 
 constexpr i32 kCtxInsnsDone = static_cast<i32>(offsetof(JitCtx, insns_done)), kCtxEntryEip = static_cast<i32>(offsetof(JitCtx, entry_eip));
 constexpr i32 kCtxEnded = static_cast<i32>(offsetof(JitCtx, ended));
 constexpr i32 kCtxStores = static_cast<i32>(offsetof(JitCtx, stores)), kCtxMispredicts = static_cast<i32>(offsetof(JitCtx, mispredicts));
+constexpr i32 kCtxInlineChains = static_cast<i32>(offsetof(JitCtx, inline_chains)), kCtxInlineMispredicts = static_cast<i32>(offsetof(JitCtx, inline_mispredicts));
+constexpr i32 kCtxInlineSched = static_cast<i32>(offsetof(JitCtx, inline_sched)), kCtxInlineInsns = static_cast<i32>(offsetof(JitCtx, inline_insns));
+constexpr i32 kCtxLogging = static_cast<i32>(offsetof(JitCtx, logging)), kCtxLogCount = static_cast<i32>(offsetof(JitCtx, log_count));
+constexpr i32 kCtxLog = static_cast<i32>(offsetof(JitCtx, log));
 // The scratch slots, one owner each: the cache call's saved RSI RAX RDI; INC/DEC's CF; a new ESP; a computed
 // address or target; the x87 control words (the guest's for the host, C++'s); two pairs of saved RSI/RDI (an
 // instruction with two accesses) or DIV's operands.
@@ -487,16 +491,12 @@ private:
             a.alu_imm(4, 4, rsi, 15);
             a.mov(4, mem(rax), rsi);
         }
-        a.mov64(rax, reinterpret_cast<u64>(ev_.stats));
-        a.alu(8, 0, mem(rax, static_cast<i32>(offsetof(BlockStats, mispredicts))), r8);
+        // Statistics in the run's own context (the engine folds them in once the run is over).
         a.alu(4, 0, ctx_at(kCtxMispredicts), r8);
-        a.lea(4, rsi, mem(r8, r8, 1, 0));
-        a.shift_imm(4, 4, rsi, 2);
-        a.alu(8, 0, mem(rax, static_cast<i32>(offsetof(BlockStats, exit_cycles))), rsi);
-        a.alu_imm(8, 0, mem(rax, static_cast<i32>(offsetof(BlockStats, schedule_cycles))), b_.cycles);
-        a.alu_imm(8, 0, mem(rax, static_cast<i32>(offsetof(BlockStats, whole_runs))), 1);
-        a.alu_imm(8, 0, mem(rax, static_cast<i32>(offsetof(BlockStats, chains))), 1);
-        a.alu_imm(8, 0, mem(rax, static_cast<i32>(offsetof(BlockStats, block_insns))), b_.n);
+        a.alu(4, 0, ctx_at(kCtxInlineMispredicts), r8);
+        a.alu_imm(4, 0, ctx_at(kCtxInlineChains), 1);
+        a.alu_imm(8, 0, ctx_at(kCtxInlineSched), b_.cycles);
+        a.alu_imm(8, 0, ctx_at(kCtxInlineInsns), b_.n);
         a.alu_imm(4, 5, ctx_at(kCtxBudget), 1);
         a.alu_imm(8, 0, ctx_at(kCtxInsnsDone), b_.n);
         a.mov(8, ctx_at(kCtxBase), r10);
@@ -604,6 +604,34 @@ private:
         a.alu_imm(4, 4, rdx, 0xFFF);
         a.alu(4, 1, rdi, rdx);  // or: the physical address
         a.alu(8, 0, rsi, rdx);  // the host byte
+        if (write) log_store(size);
+    }
+    // The spin probe's store log (only when the context asks: two instructions otherwise). RSI = the host bytes.
+    void log_store(unsigned size) {
+        Label done = a.label();
+        a.alu_imm(1, 7, ctx_at(kCtxLogging), 0);
+        a.jcc(E, done);
+        for (unsigned part = 0; part < (size == 16 ? 2u : 1u); ++part) {
+            const unsigned n = size > 8 ? 8 : size;
+            Label over = a.label();
+            a.mov(4, rcx, ctx_at(kCtxLogCount));
+            a.alu_imm(4, 7, rcx, 256);
+            a.jcc(AE, over);
+            a.shift_imm(4, 4, rcx, 4);
+            a.lea(8, r10, mem(kCtx, rcx, 0, kCtxLog));
+            a.lea(8, r11, mem(rsi, static_cast<i32>(8 * part)));
+            a.mov64(rax, static_cast<u64>(n) << 56);
+            a.alu(8, 1, r11, rax);
+            a.mov(8, mem(r10, 0), r11);
+            const Mem at = mem(rsi, static_cast<i32>(8 * part));
+            if (n == 8) a.mov(8, rax, at);
+            else if (n == 4) a.mov(4, rax, at);
+            else a.movzx(rax, n, at);
+            a.mov(8, mem(r10, 8), rax);
+            a.bind(over);
+            a.alu_imm(4, 0, ctx_at(kCtxLogCount), 1);
+        }
+        a.bind(done);
     }
     // The cache model for an access at EDI (RSI, RAX and RDI are kept).
     void cache(unsigned i, bool store) {
@@ -1626,6 +1654,7 @@ private:
     void mm_load(unsigned x, const Mem& m) { a.sse(0xF3, 0x7E, x, m); }  // movq xmm, m64
 
     bool mmx(unsigned i, const Insn& in, Label after) {
+        if (!kNativeX87) return false;  // the MMX registers are the x87 slots: the same layout requirement
         const u8 op = in.opcode;
         const bool mmx_map = (op >= 0x60 && op <= 0x7F && op != 0x7A && op != 0x7B && op != 0x7C && op != 0x7D) || op == 0xC4 || op == 0xC5 ||
                              (op >= 0xD1 && op <= 0xFE && op != 0xD4 && op != 0xD6 && op != 0xE6 && op != 0xF4 && op != 0xFB);

@@ -92,7 +92,7 @@ void expect_same(Rig& a, Rig& b, const char* what, bool cycles) {
     EXPECT_EQ(a.cpu.instructions(), b.cpu.instructions()) << what;
     const FpuState& fa = a.cpu.state().fpu;
     const FpuState& fb = b.cpu.state().fpu;
-    for (unsigned r = 0; r < 8; ++r) EXPECT_EQ(0, std::memcmp(&fa.st[r], &fb.st[r], 10)) << what << " st phys " << r;
+    for (unsigned r = 0; kHostX87 && r < 8; ++r) EXPECT_EQ(0, std::memcmp(&fa.st[r], &fb.st[r], 10)) << what << " st phys " << r;
     EXPECT_EQ(fa.fsw, fb.fsw) << what << " fsw";
     EXPECT_EQ(fa.ftw, fb.ftw) << what << " ftw";
     EXPECT_EQ(fa.fcw, fb.fcw) << what << " fcw";
@@ -152,7 +152,8 @@ struct Gen {
             if (m) c.insert(c.end(), {static_cast<u8>(0x43 | x << 3), disp});
             else c.push_back(static_cast<u8>(0xC0 | x << 3 | y));
         };
-        switch (next() % 16) {
+        // MMX shares the x87 registers: without an 80-bit long double (MSVC) the interpreter cannot hold them.
+        switch (next() % (kHostX87 ? 16u : 10u)) {
             case 0: { static constexpr u8 ops[] = {0x58, 0x59, 0x5C, 0x5E, 0x5D, 0x5F, 0x51}; c.insert(c.end(), {0x0F, ops[next() % 7]}); modrm(a16); break; }
             case 1: { static constexpr u8 ops[] = {0x58, 0x59, 0x5C, 0x5E, 0x5D, 0x5F, 0x51}; c.insert(c.end(), {0xF3, 0x0F, ops[next() % 7]}); modrm(d8); break; }
             case 2: { static constexpr u8 ops[] = {0x54, 0x55, 0x56, 0x57, 0x14, 0x15}; c.insert(c.end(), {0x0F, ops[next() % 6]}); modrm(a16); break; }
@@ -380,7 +381,7 @@ TEST(P6Block, GeneratedProgramsMatchTheStep) {
     u64 native = 0, paged_insns = 0, chains = 0;
     for (u32 program = 0; program < 300; ++program) {
         Gen g{program * 7919u + 1};
-        g.x87 = program % 3 == 0;
+        g.x87 = kHostX87 && program % 3 == 0;  // MSVC: no 80-bit long double, the interpreter's x87 only approximates
         g.simd = program % 5 < 2;
         static constexpr u16 kCw[] = {0x37F, 0x27F, 0x07F, 0xF7F, 0x77F};  // precisions and roundings, all masked
         // Five passes over the body (a counter on the stack the forms leave alone): blocks run again and chain.
@@ -529,6 +530,8 @@ TEST(P6Block, ScheduleCountsDependencies) {
 // it, a stack fault, NaN and denormal operands, compares): the step against the recompiler under several control
 // words. Singles at [EBX]: +0 1/3, +4 3.0, +8 1.0, +12 a denormal, +16 a quiet NaN, +20 a signalling NaN, +24 1e38.
 TEST(P6Block, X87FormsMatchTheInterpreter) {
+    // Without an 80-bit long double (MSVC) the interpreter's x87 is an approximation, and native x87 is off.
+    if (!kHostX87) GTEST_SKIP() << "no 80-bit x87 type on this compiler";
     const std::vector<std::vector<u8>> snippets = {
         {0xD9, 0xE8, 0xD9, 0x43, 0x04, 0xDE, 0xF9, 0xD9, 0xE0, 0xF4},              // fld1; fld 3.0; fdivp; fchs
         {0xD9, 0x03, 0xD8, 0x0B, 0xD9, 0xE1, 0xF4},                                // fld 1/3; fmul 1/3; fabs
@@ -726,4 +729,107 @@ TEST(P6Block, SpinSkipIsExact) {
     EXPECT_GT(ec.stats().spin_skips, 10u);
     std::printf("spin skip: %llu skips over %llu cycles of %llu\n", static_cast<unsigned long long>(ec.stats().spin_skips),
                 static_cast<unsigned long long>(ec.stats().spin_cycles), static_cast<unsigned long long>(c.cpu.cycles()));
+}
+
+// The spin probe: a polling loop that calls a function each pass (a return address and a saved register on the
+// stack, a flag stored back with the value it holds) leaves memory as it found it; a loop that counts its passes in
+// memory does not. Both against the block interpreter; only the first is skipped.
+TEST(P6Block, SpinSkipWithStoresThatUndoThemselves) {
+    for (int counting = 0; counting < 2; ++counting) {
+        auto setup = [counting](Rig& r) {
+            // 0x1000: mov eax, [0x20000]; test eax, eax; jnz 0x1012 | call 0x1100 | jmp 0x1000
+            // 0x1012: inc ecx; mov dword [0x20000], 0; dec ebp; jnz 0x1000 | hlt
+            // 0x1100: push ebx; mov dword [0x20004], 7; (counting: inc dword [0x20008];) pop ebx; ret
+            r.load({0xA1, 0x00, 0x00, 0x02, 0x00, 0x85, 0xC0, 0x75, 0x09, 0xE8, 0xF2, 0x00, 0x00, 0x00, 0xEB, 0xF0, 0x90, 0x90});
+            r.load({0x41, 0xC7, 0x05, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x4D, 0x75, 0xE0, 0xF4}, 0x1012);
+            if (counting) r.load({0x53, 0xC7, 0x05, 0x04, 0x00, 0x02, 0x00, 0x07, 0x00, 0x00, 0x00, 0xFF, 0x05, 0x08, 0x00, 0x02, 0x00, 0x5B, 0xC3}, 0x1100);
+            else r.load({0x53, 0xC7, 0x05, 0x04, 0x00, 0x02, 0x00, 0x07, 0x00, 0x00, 0x00, 0x5B, 0xC3}, 0x1100);
+            const u32 seven = 7;
+            std::memcpy(r.bus.ram() + 0x20004, &seven, 4);
+            r.cpu.state().gpr[kEbp] = 12;
+        };
+        auto run = [](Rig& r, BlockEngine& e) {
+            u64 next_event = 30011;
+            for (unsigned n = 0; n < 3000000 && !r.cpu.state().halted; ++n) {
+                e.apply_device_writes();
+                if (r.cpu.cycles() >= next_event) {
+                    next_event += 30011;
+                    const u32 one = 1;
+                    std::memcpy(r.bus.ram() + 0x20000, &one, 4);
+                }
+                if (Block* b = e.find()) e.run(*b, next_event);
+                else r.cpu.step();
+            }
+        };
+        Rig b(true), c(true);
+        setup(b);
+        setup(c);
+        b.cpu.set_block_timing(true);
+        BlockEngine eb(b.cpu, b.bus);
+        eb.disable_jit();
+        run(b, eb);
+        c.cpu.set_block_timing(true);
+        BlockEngine ec(c.cpu, c.bus);
+        ec.set_jit_threshold(0);
+        run(c, ec);
+        EXPECT_EQ(b.cpu.state().gpr[kEcx], 12u);
+        expect_same(b, c, counting ? "a counting loop" : "a calling spin", true);
+        EXPECT_EQ(0, std::memcmp(b.bus.ram() + 0x20000, c.bus.ram() + 0x20000, 16));
+        if (counting) {
+            EXPECT_EQ(ec.stats().spin_skips, 0u);
+        } else {
+            EXPECT_GT(ec.stats().spin_skips, 5u);
+        }
+        std::printf("%s: %llu skips over %llu cycles of %llu\n", counting ? "counting" : "calling", static_cast<unsigned long long>(ec.stats().spin_skips),
+                    static_cast<unsigned long long>(ec.stats().spin_cycles), static_cast<unsigned long long>(c.cpu.cycles()));
+    }
+}
+
+// A polling loop whose inner scan mispredicts every pass in the same pattern (a 4-entry table, one entry differs):
+// the predictors end each pass as they began, so the probe lets it skip. Against the block interpreter.
+TEST(P6Block, SpinSkipWithPeriodicMispredicts) {
+    auto setup = [](Rig& r) {
+        // 0x1000: mov esi, 0x20100
+        // 0x1005: cmp dword [esi], 1; jne 0x100d; nop
+        // 0x100d: add esi, 4; cmp esi, 0x20110; jl 0x1005
+        // 0x1019: mov eax, [0x20000]; test eax, eax; jz 0x1000
+        // 0x1022: inc ecx; mov dword [0x20000], 0; dec ebp; jnz 0x1000; hlt
+        r.load({0xBE, 0x00, 0x01, 0x02, 0x00, 0x83, 0x3E, 0x01, 0x75, 0x03, 0x90, 0x90, 0x90, 0x83, 0xC6, 0x04, 0x81, 0xFE, 0x10, 0x01, 0x02, 0x00,
+                0x7C, 0xED, 0xA1, 0x00, 0x00, 0x02, 0x00, 0x85, 0xC0, 0x74, 0xDF, 0x41, 0xC7, 0x05, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x4D, 0x75, 0xD1, 0xF4});
+        const u32 table[4] = {1, 0, 0, 0};
+        std::memcpy(r.bus.ram() + 0x20100, table, sizeof table);
+        r.cpu.state().gpr[kEbp] = 10;
+    };
+    auto run = [](Rig& r, BlockEngine& e) {
+        u64 next_event = 40009;
+        for (unsigned n = 0; n < 3000000 && !r.cpu.state().halted; ++n) {
+            e.apply_device_writes();
+            if (r.cpu.cycles() >= next_event) {
+                next_event += 40009;
+                const u32 one = 1;
+                std::memcpy(r.bus.ram() + 0x20000, &one, 4);
+            }
+            if (Block* b = e.find()) e.run(*b, next_event);
+            else r.cpu.step();
+        }
+    };
+    Rig b(true), c(true);
+    setup(b);
+    setup(c);
+    b.cpu.set_block_timing(true);
+    BlockEngine eb(b.cpu, b.bus);
+    eb.disable_jit();
+    run(b, eb);
+    c.cpu.set_block_timing(true);
+    BlockEngine ec(c.cpu, c.bus);
+    ec.set_jit_threshold(0);
+    run(c, ec);
+    EXPECT_EQ(b.cpu.state().gpr[kEcx], 10u);
+    expect_same(b, c, "a spin with periodic mispredicts", true);
+    EXPECT_GT(ec.stats().spin_skips, 3u);
+    std::printf("refused: %llu %llu %llu %llu %llu %llu %llu\n", static_cast<unsigned long long>(ec.stats().spin_refused[0]), static_cast<unsigned long long>(ec.stats().spin_refused[1]), static_cast<unsigned long long>(ec.stats().spin_refused[2]), static_cast<unsigned long long>(ec.stats().spin_refused[3]), static_cast<unsigned long long>(ec.stats().spin_refused[4]), static_cast<unsigned long long>(ec.stats().spin_refused[5]), static_cast<unsigned long long>(ec.stats().spin_refused[6]));
+    std::printf("periodic: %llu skips over %llu cycles of %llu; mispredicts %llu\n", static_cast<unsigned long long>(ec.stats().spin_skips),
+                static_cast<unsigned long long>(ec.stats().spin_cycles), static_cast<unsigned long long>(c.cpu.cycles()),
+                static_cast<unsigned long long>(eb.stats().mispredicts));
 }

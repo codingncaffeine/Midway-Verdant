@@ -336,9 +336,10 @@ std::string P6Backend::report() const {
                          b.built, blocks_->live_blocks(), b.killed, b.pages_written, b.device_page_writes, b.whole_runs, b.fallback_steps,
                          b.block_insns, b.mispredicts, b.schedule_cycles, b.penalty_cycles, b.exit_cycles, b.rep_cycles);
         if (p6::Jit* j = blocks_->jit())
-            r += std::format("\ncpu p6 recompiler: {} blocks translated ({} KiB, {} flushes); {} native runs, {} native instructions, {} by the interpreter inside them; {} hand-offs, {} runs refused (assumptions changed); {} blocks entered by a chain; {} spin skips covering {} cycles",
+            r += std::format("\ncpu p6 recompiler: {} blocks translated ({} KiB, {} flushes); {} native runs, {} native instructions, {} by the interpreter inside them; {} hand-offs, {} runs refused (assumptions changed); {} blocks entered by a chain; {} spin skips covering {} cycles (refused: interpreted {}, penalty {}, mispredict {}, elsewhere {}, state {}, log full {}, stores {})",
                              j->compiled(), j->code_bytes() / 1024, j->flushes(), b.native_runs, b.native_insns, b.native_helpers, b.native_handoffs, b.native_ineligible, b.chains,
-                             b.spin_skips, b.spin_cycles);
+                             b.spin_skips, b.spin_cycles, b.spin_refused[0], b.spin_refused[1], b.spin_refused[2], b.spin_refused[3], b.spin_refused[4], b.spin_refused[5],
+                             b.spin_refused[6]);
         {
             std::vector<std::pair<u64, unsigned>> ops;
             for (unsigned k = 0; k < 256; ++k)

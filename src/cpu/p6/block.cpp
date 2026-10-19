@@ -227,6 +227,12 @@ void BlockEngine::take_device_writes() {
 
 u32 BlockEngine::exit_cost(Block& b, u32 entry_eip) {
     const CpuState& s = cpu_.state();
+    if (probing_ && b.branch != BranchKind::None) {
+        // A spin probe: each predictor's state before the pass first changes it.
+        bool seen = false;
+        for (const ProbedExit& p : probed_exits_) seen = seen || p.block == &b;
+        if (!seen) probed_exits_.push_back({&b, b.exit_counter, b.exit_seen, b.exit_target});
+    }
     const u32 fall = (entry_eip + b.bytes) & (s.code32() ? 0xFFFFFFFFu : 0xFFFFu);
     const u32 target = s.eip;
     bool mispredict = false;
@@ -390,8 +396,19 @@ unsigned BlockEngine::run_native(Run& r) {
     c.entry_eip = r.entry_eip;
     c.helper_ops = stats_.helper_ops.data();
     c.chain_budget = chain_budget_;
-    c.chain_extra = 256;
+    c.chain_extra = 4096;
     c.start_eip = r.entry_eip;
+    // A spin probe: about one pass (a short budget: the run goes on to where it began) with the stores logged.
+    if (probe_eip_ && probe_eip_ == r.entry_eip && chain_budget_ >= 64) {
+        // Every transition through the engine (a budget of 0: the generated code never commits a chain), one pass:
+        // the chain goes on until it is back where it began. The predictors and the return stack are recorded.
+        c.logging = 1;
+        c.chain_budget = 0;
+        probing_ = true;
+        probed_exits_.clear();
+        rsb_at_probe_ = rsb_;
+        rsb_top_at_probe_ = rsb_top_;
+    }
     // The state the run began from, for the spin skip (a copy of the registers; the run is long when it matters).
     const bool spin_watch = chain_budget_ >= 64;
     if (spin_watch) std::memcpy(&spin_start_, &cpu_.state(), sizeof spin_start_);  // bytes, padding too: compared as bytes
@@ -401,6 +418,7 @@ unsigned BlockEngine::run_native(Run& r) {
     current_ = &c;
     const u32 result = Jit::entry(*r.b)(&c);
     current_ = nullptr;
+    probing_ = false;
     running_ = nullptr;
     if (jit_error_) {
         const std::exception_ptr e = jit_error_;
@@ -414,8 +432,15 @@ unsigned BlockEngine::run_native(Run& r) {
     cpu_.add_instructions(total - c.helpers);
     stats_.block_insns += i + 1;
     ++stats_.native_runs;
+    if ((stats_.native_runs & 0xFFFF) == 0) not_fixed_.fill(0);  // a loop that warmed up gets another chance
     stats_.native_insns += total - c.helpers;
     stats_.native_helpers += c.helpers;
+    stats_.chains += c.inline_chains;
+    stats_.whole_runs += c.inline_chains;
+    stats_.mispredicts += c.inline_mispredicts;
+    stats_.exit_cycles += static_cast<u64>(c.inline_mispredicts) * tp::kBlockMispredict;
+    stats_.schedule_cycles += c.inline_sched;
+    stats_.block_insns += c.inline_insns;
     const u64 left = mem.take_penalty();
     c.base += left;
     stats_.penalty_cycles += c.penalties + left;
@@ -425,7 +450,7 @@ unsigned BlockEngine::run_native(Run& r) {
             pending_slot_ = c.last_slot;
             pending_target_ = c.last_target;
             pending_from_ = &b;
-            if (spin_watch && r.extra == 0) spin_skip(c, r.start, total - c.helpers);
+            if ((spin_watch || c.logging) && r.extra == 0) spin_skip(c, r.start, total - c.helpers);
         } else {
             const u32 exit = exit_cost(b, c.entry_eip);
             stats_.schedule_cycles += b.cycles;
@@ -467,7 +492,8 @@ void* BlockEngine::chain(JitCtx& c, Block::Link* slot) {
     if (exit) ++c.mispredicts;
     if (!b || slot->epoch != link_epoch_ || !b->native) return nullptr;
     // Past the budget a run goes on (a little) until it is back where it began: the spin skip compares the two.
-    if (c.chain_budget == 0 && (cpu_.state().eip == c.start_eip || c.chain_extra == 0)) return nullptr;
+    // (only while the run could still be a skippable pass, and not from where that already failed)
+    if (c.chain_budget == 0 && (back_at_start(c) || c.chain_extra == 0 || c.helpers || c.penalties || not_a_fixed_point(c.start_eip))) return nullptr;
     const CpuState& s = cpu_.state();
     if (b->jit_eip != s.eip || s.eip == idle_[0] || s.eip == idle_[1]) return nullptr;
     constexpr u64 kSlowestFetch = tp::kL2Latency + tp::kDramLatency;
@@ -516,10 +542,40 @@ namespace mv::p6 {
 // threads, whose timing is the host's either way). So the clock and the instruction count move on by whole passes,
 // stopping a pass short of the limit; the run after that reaches the limit's instruction boundary as it would have.
 void BlockEngine::spin_skip(const JitCtx& c, u64 start, u64 instructions) {
-    const u32 chained = chain_budget_ - c.chain_budget;
-    if (c.stores || c.helpers || c.penalties || c.mispredicts || chained < 64 || instructions == 0) return;
+    const bool probe = c.logging != 0;
+    if (probe) probe_eip_ = 0;  // one probe a candidate; a later run that qualifies arms another
+    const u32 chained = probe ? 1u : chain_budget_ - c.chain_budget;
+    if (!probe && chained < 64) return;
+    if (c.helpers) { ++stats_.spin_refused[0]; return; }
+    if (c.penalties) { ++stats_.spin_refused[1]; return; }
+    if (c.mispredicts && !probe) {
+        // Mispredicts: a periodic pattern leaves each predictor as it found it after a pass; a probe checks that.
+        ++stats_.spin_refused[2];
+        if (std::memcmp(&cpu_.state(), &spin_start_, sizeof(CpuState)) == 0 && cpu_.state().eip == c.start_eip) probe_eip_ = c.start_eip;
+        return;
+    }
+    if (probe && !predictors_undone()) { ++stats_.spin_refused[2]; return; }
+    if (instructions == 0) return;
     const CpuState& s = cpu_.state();
-    if (s.eip != c.start_eip || std::memcmp(&s, &spin_start_, sizeof s) != 0) return;
+    if (s.eip != c.start_eip) {
+        ++stats_.spin_refused[3];
+        return;
+    }
+    if (std::memcmp(&s, &spin_start_, sizeof s) != 0) {
+        ++stats_.spin_refused[4];
+        remember_not_fixed(c.start_eip);
+        return;
+    }
+    if (c.stores) {
+        // Stores: a pass that leaves memory as it found it is still a fixed point. A long run arms a probe; the
+        // probe checks every location its stores touched holds its first replaced bytes again.
+        if (!probe) {
+            probe_eip_ = c.start_eip;
+            return;
+        }
+        if (c.log_count > 256) { ++stats_.spin_refused[5]; return; }
+        if (!stores_undone(c)) { ++stats_.spin_refused[6]; return; }
+    }
     const u64 now = cpu_.cycles();
     const u64 period = now - start;
     if (period == 0 || now >= c.limit) return;
@@ -530,6 +586,48 @@ void BlockEngine::spin_skip(const JitCtx& c, u64 start, u64 instructions) {
     cpu_.add_instructions(k * instructions);
     ++stats_.spin_skips;
     stats_.spin_cycles += k * period;
+}
+
+}  // namespace mv::p6
+
+namespace mv::p6 {
+
+// Whether every byte the probe's stores touched holds the value it had before the first store to it.
+bool BlockEngine::stores_undone(const JitCtx& c) const {
+    // Each byte's value before the first store to it, from the log in order; then every such byte compared.
+    using Byte = ProbeByte;
+    std::vector<Byte>& bytes = probe_bytes_;
+    bytes.clear();
+    for (u32 i = 0; i < c.log_count; ++i) {
+        const u8* p = reinterpret_cast<const u8*>(c.log[i].where & 0x00FFFFFFFFFFFFFFull);
+        const unsigned n = static_cast<unsigned>(c.log[i].where >> 56);
+        for (unsigned k = 0; k < n; ++k) bytes.push_back({p + k, i, static_cast<u8>(c.log[i].old >> (8 * k))});
+    }
+    std::sort(bytes.begin(), bytes.end(), [](const Byte& a, const Byte& b) { return a.at != b.at ? a.at < b.at : a.order < b.order; });
+    for (std::size_t k = 0; k < bytes.size(); ++k)
+        if ((k == 0 || bytes[k].at != bytes[k - 1].at) && *bytes[k].at != bytes[k].original) return false;
+    return true;
+}
+
+}  // namespace mv::p6
+
+namespace mv::p6 {
+
+// Whether the probe's pass left every predictor it touched, and the return stack, as it found them.
+bool BlockEngine::predictors_undone() const {
+    for (const ProbedExit& p : probed_exits_)
+        if (p.block->exit_counter != p.counter || p.block->exit_seen != p.seen || p.block->exit_target != p.target) return false;
+    return rsb_ == rsb_at_probe_ && rsb_top_ == rsb_top_at_probe_;
+}
+
+}  // namespace mv::p6
+
+namespace mv::p6 {
+
+// Back where the run began: the same EIP and registers (a nested loop's inner block recurs before its period ends).
+bool BlockEngine::back_at_start(const JitCtx& c) const {
+    const CpuState& s = cpu_.state();
+    return s.eip == c.start_eip && s.gpr == spin_start_.gpr && s.eflags() == spin_start_.eflags();
 }
 
 }  // namespace mv::p6

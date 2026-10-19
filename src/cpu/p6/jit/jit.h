@@ -50,6 +50,19 @@ struct JitCtx {
     u32 mispredicts;
     u32 start_eip;
     u32 chain_extra;
+    // Statistics of the chains the generated code took (folded into the engine's after the run).
+    u32 inline_chains;
+    u32 inline_mispredicts;
+    u64 inline_sched;
+    u64 inline_insns;
+    // The spin probe: with `logging` set, each native store logs its host address, size and the bytes it replaces
+    // (16-byte stores as two entries); past 256 entries only the count grows.
+    u8 logging;
+    u32 log_count;
+    struct LogEntry {
+        u64 where;  // the host address, the size in the top byte
+        u64 old;
+    } log[256];
 };
 
 // The native function's result: (instruction index << 2) | kind.

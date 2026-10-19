@@ -76,6 +76,9 @@ struct BlockStats {
     u64 mispredicts{0};
     u64 native_runs{0}, native_insns{0}, native_helpers{0}, native_ineligible{0}, native_handoffs{0}, chains{0}, links_refused{0};
     u64 spin_skips{0}, spin_cycles{0};  // loops whose passes were skipped, and the cycles they covered
+    // Why a long run was not a skippable pass: an interpreted instruction, a cache penalty, a mispredict, ended
+    // elsewhere, the state changed, the probe's log overflowed, a store left memory changed.
+    std::array<u64, 7> spin_refused{};
     // Where the cycles went: the schedules, the penalties (caches, devices), the exits' mispredicts, REP elements.
     u64 schedule_cycles{0}, penalty_cycles{0}, exit_cycles{0}, rep_cycles{0};
     std::array<u64, 256 + 256 + 2048> helper_ops{};  // instructions the interpreter ran inside native code, by operation; x87 and SSE by form
@@ -163,6 +166,13 @@ private:
     u32 exit_cost(Block& b, u32 entry_eip);
     unsigned run_native(Run& r);
     void spin_skip(const JitCtx& c, u64 start, u64 instructions);
+    bool stores_undone(const JitCtx& c) const;
+    bool predictors_undone() const;
+    bool back_at_start(const JitCtx& c) const;
+    // Starting points whose runs did not come back to their state: no more chaining past the budget from there.
+    bool not_a_fixed_point(u32 eip) const { return not_fixed_[(eip ^ (eip >> 9)) & 255] == eip; }
+    void remember_not_fixed(u32 eip) { not_fixed_[(eip ^ (eip >> 9)) & 255] = eip; }
+    std::array<u32, 256> not_fixed_{};
     static u64 key(u32 ram_page, unsigned off, u8 mode) { return (static_cast<u64>(ram_page) << 14) | (static_cast<u64>(off) << 2) | mode; }
     static unsigned fast_index(u32 lin, u8 mode) { return ((lin ^ (lin >> 16)) * 2 + mode) & (kFastSize - 1); }
 
@@ -193,6 +203,23 @@ private:
     u64 hot_{8};
     u32 chain_budget_{1024};  // the dispatcher's batch and its lock are not kept waiting for long
     CpuState spin_start_{};
+    u32 probe_eip_{0};  // where the next run probes a spin loop with stores (0: none)
+    bool probing_{false};
+    struct ProbeByte {
+        const u8* at;
+        u32 order;
+        u8 original;
+    };
+    mutable std::vector<ProbeByte> probe_bytes_;
+    struct ProbedExit {
+        Block* block;
+        u8 counter;
+        bool seen;
+        u32 target;
+    };
+    std::vector<ProbedExit> probed_exits_;
+    std::array<u32, 16> rsb_at_probe_{};
+    unsigned rsb_top_at_probe_{0};
     std::array<u32, 2> idle_{};
     JitCtx* current_{nullptr};  // the native run in progress
     Block::Link* pending_slot_{nullptr};  // the last native exit's link slot, filled by the next block run
