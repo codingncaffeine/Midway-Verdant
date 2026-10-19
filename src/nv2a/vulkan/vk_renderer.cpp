@@ -1133,8 +1133,6 @@ const VulkanRenderer::TextureEntry* VulkanRenderer::texture(const KelvinState& s
     const VkFormat format = d.pixel == HostPixel::Rgba8 ? VK_FORMAT_R8G8B8A8_UNORM : (d.pixel == HostPixel::R16 ? VK_FORMAT_R16_UNORM : VK_FORMAT_R32_SFLOAT);
     auto entry = std::make_unique<TextureEntry>();
     if (it != textures_.end()) {
-        // Draws already recorded may still sample the old image: they go to the GPU before it is destroyed.
-        flush();
         entry = std::move(it->second);
         textures_.erase(it);
         retire(entry->image);  // draws recorded or in flight may still sample it
