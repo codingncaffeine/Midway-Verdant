@@ -101,6 +101,10 @@ void expect_same(Rig& a, Rig& b, const char* what, bool cycles) {
     EXPECT_EQ(fa.fdp, fb.fdp) << what << " fdp";
     EXPECT_EQ(fa.fcs, fb.fcs) << what << " fcs";
     EXPECT_EQ(fa.fds, fb.fds) << what << " fds";
+    EXPECT_EQ(fa.mxcsr, fb.mxcsr) << what << " mxcsr";
+    for (unsigned r = 0; r < 8; ++r) EXPECT_EQ(fa.xmm[r], fb.xmm[r]) << what << " xmm" << r;
+    EXPECT_EQ(fa.mxcsr, fb.mxcsr) << what << " mxcsr";
+    for (unsigned r = 0; r < 8; ++r) EXPECT_EQ(fa.xmm[r], fb.xmm[r]) << what << " xmm" << r;
     if (cycles) {
         const TimingStats& ta = a.cpu.cache_timing().stats();
         const TimingStats& tb = b.cpu.cache_timing().stats();
@@ -117,6 +121,7 @@ void expect_same(Rig& a, Rig& b, const char* what, bool cycles) {
 struct Gen {
     u32 seed;
     bool x87{false};
+    bool simd{false};
     int depth{0};  // the x87 stack depth the program believes in (overflow and underflow now and then on purpose)
     u32 next() {
         seed = seed * 1664525u + 1013904223u;
@@ -137,6 +142,60 @@ struct Gen {
     }
     // x87 forms: loads, stores and arithmetic with singles at [EBX + d8], register forms, FNSTSW AX, and FILD/FISTP
     // (interpreter-only) between them. Singles from the data area are random bits: NaNs and denormals appear.
+    // MMX and SSE forms on mm0-7 and xmm0-7, memory at [EBX + d8]: 16-aligned for the packed forms the interpreter
+    // checks (a misaligned one would fault there), any alignment for MOVUPS, MOVSS and the 64-bit moves.
+    void simd_one(std::vector<u8>& c) {
+        const u8 x = static_cast<u8>(next() % 8), y = static_cast<u8>(next() % 8);
+        const u8 a16 = static_cast<u8>((next() % 8) * 16), d8 = static_cast<u8>(next() & 0xF8);
+        const bool m = next() % 3 == 0;
+        auto modrm = [&](u8 disp) {
+            if (m) c.insert(c.end(), {static_cast<u8>(0x43 | x << 3), disp});
+            else c.push_back(static_cast<u8>(0xC0 | x << 3 | y));
+        };
+        switch (next() % 16) {
+            case 0: { static constexpr u8 ops[] = {0x58, 0x59, 0x5C, 0x5E, 0x5D, 0x5F, 0x51}; c.insert(c.end(), {0x0F, ops[next() % 7]}); modrm(a16); break; }
+            case 1: { static constexpr u8 ops[] = {0x58, 0x59, 0x5C, 0x5E, 0x5D, 0x5F, 0x51}; c.insert(c.end(), {0xF3, 0x0F, ops[next() % 7]}); modrm(d8); break; }
+            case 2: { static constexpr u8 ops[] = {0x54, 0x55, 0x56, 0x57, 0x14, 0x15}; c.insert(c.end(), {0x0F, ops[next() % 6]}); modrm(a16); break; }
+            case 3: c.insert(c.end(), {0x0F, 0xC6}); modrm(a16); c.push_back(static_cast<u8>(next())); break;      // shufps
+            case 4: c.insert(c.end(), {0x0F, 0xC2}); modrm(a16); c.push_back(static_cast<u8>(next() % 8)); break;  // cmpps
+            case 5: c.insert(c.end(), {0x0F, static_cast<u8>(next() & 1 ? 0x28 : 0x29)}); modrm(a16); break;     // movaps
+            case 6: c.insert(c.end(), {0x0F, static_cast<u8>(next() & 1 ? 0x10 : 0x11)}); modrm(d8); break;      // movups
+            case 7: c.insert(c.end(), {0xF3, 0x0F, static_cast<u8>(next() & 1 ? 0x10 : 0x11)}); modrm(d8); break; // movss
+            case 8: {                                                                                             // 64-bit moves
+                static constexpr u8 ops[] = {0x12, 0x13, 0x16, 0x17};
+                const u8 op = ops[next() % 4];
+                c.insert(c.end(), {0x0F, op});
+                if (m || op == 0x13 || op == 0x17) c.insert(c.end(), {static_cast<u8>(0x43 | x << 3), d8});
+                else c.push_back(static_cast<u8>(0xC0 | x << 3 | y));
+                break;
+            }
+            case 9: c.insert(c.end(), {0x0F, 0x50, static_cast<u8>(0xC0 | reg() << 3 | y)}); break;  // movmskps
+            case 10: {                                                                              // MMX arithmetic, logic
+                static constexpr u8 ops[] = {0xFD, 0xFE, 0xF9, 0xEC, 0xD9, 0xDB, 0xEB, 0xEF, 0xDF, 0xD5, 0xE5, 0xF5, 0x74, 0x65,
+                                             0x60, 0x69, 0x6A, 0x63, 0x67, 0x6B, 0xD1, 0xE2, 0xF3, 0xF6, 0xE0, 0xDA, 0xEE};
+                c.insert(c.end(), {0x0F, ops[next() % 27]});
+                modrm(d8);
+                break;
+            }
+            case 11: {                                                                              // MMX shifts by an immediate
+                static constexpr u8 g[] = {2, 4, 6};
+                const u8 op = static_cast<u8>(0x71 + next() % 3);
+                const u8 dg = op == 0x73 ? static_cast<u8>(next() & 1 ? 2 : 6) : g[next() % 3];
+                c.insert(c.end(), {0x0F, op, static_cast<u8>(0xC0 | dg << 3 | y), static_cast<u8>(next() % 40)});
+                break;
+            }
+            case 12: {                                                                              // movd in and out
+                const u8 op = static_cast<u8>(next() & 1 ? 0x6E : 0x7E);
+                c.insert(c.end(), {0x0F, op});
+                if (m) c.insert(c.end(), {static_cast<u8>(0x43 | x << 3), d8});
+                else c.push_back(static_cast<u8>(0xC0 | x << 3 | (op == 0x7E ? reg() : src())));
+                break;
+            }
+            case 13: c.insert(c.end(), {0x0F, static_cast<u8>(next() & 1 ? 0x6F : 0x7F)}); modrm(d8); break;  // movq
+            case 14: c.insert(c.end(), {0x0F, 0x70, static_cast<u8>(0xC0 | x << 3 | y), static_cast<u8>(next())}); break;  // pshufw
+            case 15: c.insert(c.end(), {0x0F, 0x77}); break;                                       // emms
+        }
+    }
     void fpu(std::vector<u8>& c) {
         const bool reckless = next() % 32 == 0;
         const u8 d8 = static_cast<u8>(next() & 0xFC);
@@ -214,6 +273,10 @@ struct Gen {
         const u8 d = reg(), s = src();
         if (x87 && next() % 3 == 0) {
             fpu(c);
+            return;
+        }
+        if (simd && next() % 3 == 0) {
+            simd_one(c);
             return;
         }
         switch (next() % 40) {
@@ -318,6 +381,7 @@ TEST(P6Block, GeneratedProgramsMatchTheStep) {
     for (u32 program = 0; program < 300; ++program) {
         Gen g{program * 7919u + 1};
         g.x87 = program % 3 == 0;
+        g.simd = program % 5 < 2;
         static constexpr u16 kCw[] = {0x37F, 0x27F, 0x07F, 0xF7F, 0x77F};  // precisions and roundings, all masked
         // Five passes over the body (a counter on the stack the forms leave alone): blocks run again and chain.
         std::vector<u8> code = {0x6A, 0x05};  // push 5
@@ -336,6 +400,8 @@ TEST(P6Block, GeneratedProgramsMatchTheStep) {
             r->cpu.state().gpr[kEsi] = kData + 0x40;
             r->cpu.state().gpr[kEdi] = 0x10;
             r->cpu.state().fpu.fcw = kCw[(program / 3) % 5];
+            r->cpu.state().fpu.mxcsr = 0x1F80u | ((program / 5) % 4) << 13 | ((program / 20) % 2) << 15;  // roundings, FZ
+            r->cpu.state().cr4 |= cr4::OSFXSR | cr4::OSXMMEXCPT;
         }
         run_steps(a);
         b.cpu.set_block_timing(true);
@@ -354,6 +420,8 @@ TEST(P6Block, GeneratedProgramsMatchTheStep) {
         b2.cpu.state().gpr[kEsi] = kData + 0x40;
         b2.cpu.state().gpr[kEdi] = 0x10;
         b2.cpu.state().fpu.fcw = kCw[(program / 3) % 5];
+        b2.cpu.state().fpu.mxcsr = 0x1F80u | ((program / 5) % 4) << 13 | ((program / 20) % 2) << 15;
+        b2.cpu.state().cr4 |= cr4::OSFXSR | cr4::OSXMMEXCPT;
         b2.cpu.set_block_timing(true);
         BlockEngine e2(b2.cpu, b2.bus);
         e2.disable_jit();
@@ -617,4 +685,45 @@ TEST(P6Block, ChainsDoNotSkipAStringBlock) {
     run_blocks(c, e);
     expect_same(a, c, "a REP block between an exit and the next block");
     EXPECT_GT(e.stats().chains, 100u);
+}
+
+// The spin skip: a loop polling a word that an "event" (the test's dispatcher, at fixed cycles, as a device would
+// at a deadline) sets; the recompiler skips whole passes, the block interpreter runs them all. Same state, clock and
+// instruction count; the skip happened.
+TEST(P6Block, SpinSkipIsExact) {
+    auto setup = [](Rig& r) {
+        // 0x1000: mov eax, [0x20000]; test eax, eax; jz 0x1000 | inc ecx; mov dword [0x20000], 0; dec ebp; jnz 0x1000 | hlt
+        r.load({0xA1, 0x00, 0x00, 0x02, 0x00, 0x85, 0xC0, 0x74, 0xF7, 0x41, 0xC7, 0x05, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x4D, 0x75,
+                0xE9, 0xF4});
+        r.cpu.state().gpr[kEbp] = 20;
+    };
+    auto run = [](Rig& r, BlockEngine& e) {
+        u64 next_event = 20011;
+        for (unsigned n = 0; n < 2000000 && !r.cpu.state().halted; ++n) {
+            e.apply_device_writes();
+            if (r.cpu.cycles() >= next_event) {
+                next_event += 20011;
+                const u32 one = 1;
+                std::memcpy(r.bus.ram() + 0x20000, &one, 4);
+            }
+            if (Block* b = e.find()) e.run(*b, next_event);
+            else r.cpu.step();
+        }
+    };
+    Rig b(true), c(true);
+    setup(b);
+    setup(c);
+    b.cpu.set_block_timing(true);
+    BlockEngine eb(b.cpu, b.bus);
+    eb.disable_jit();
+    run(b, eb);
+    c.cpu.set_block_timing(true);
+    BlockEngine ec(c.cpu, c.bus);
+    ec.set_jit_threshold(0);
+    run(c, ec);
+    EXPECT_EQ(b.cpu.state().gpr[kEcx], 20u);
+    expect_same(b, c, "a skipped spin", true);
+    EXPECT_GT(ec.stats().spin_skips, 10u);
+    std::printf("spin skip: %llu skips over %llu cycles of %llu\n", static_cast<unsigned long long>(ec.stats().spin_skips),
+                static_cast<unsigned long long>(ec.stats().spin_cycles), static_cast<unsigned long long>(c.cpu.cycles()));
 }

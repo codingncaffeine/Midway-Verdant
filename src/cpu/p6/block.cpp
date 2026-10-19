@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <cstring>
 #include <format>
 #include <string_view>
 
@@ -389,6 +390,11 @@ unsigned BlockEngine::run_native(Run& r) {
     c.entry_eip = r.entry_eip;
     c.helper_ops = stats_.helper_ops.data();
     c.chain_budget = chain_budget_;
+    c.chain_extra = 256;
+    c.start_eip = r.entry_eip;
+    // The state the run began from, for the spin skip (a copy of the registers; the run is long when it matters).
+    const bool spin_watch = chain_budget_ >= 64;
+    if (spin_watch) std::memcpy(&spin_start_, &cpu_.state(), sizeof spin_start_);  // bytes, padding too: compared as bytes
     cpu_.clear_faulted();
     running_ = r.b;
     running_dead_ = false;
@@ -419,6 +425,7 @@ unsigned BlockEngine::run_native(Run& r) {
             pending_slot_ = c.last_slot;
             pending_target_ = c.last_target;
             pending_from_ = &b;
+            if (spin_watch && r.extra == 0) spin_skip(c, r.start, total - c.helpers);
         } else {
             const u32 exit = exit_cost(b, c.entry_eip);
             stats_.schedule_cycles += b.cycles;
@@ -457,7 +464,10 @@ void* BlockEngine::chain(JitCtx& c, Block::Link* slot) {
     c.last_slot = slot;
     c.last_target = cpu_.state().eip;
     Block* b = slot->to;
-    if (!b || slot->epoch != link_epoch_ || !b->native || c.chain_budget == 0) return nullptr;
+    if (exit) ++c.mispredicts;
+    if (!b || slot->epoch != link_epoch_ || !b->native) return nullptr;
+    // Past the budget a run goes on (a little) until it is back where it began: the spin skip compares the two.
+    if (c.chain_budget == 0 && (cpu_.state().eip == c.start_eip || c.chain_extra == 0)) return nullptr;
     const CpuState& s = cpu_.state();
     if (b->jit_eip != s.eip || s.eip == idle_[0] || s.eip == idle_[1]) return nullptr;
     constexpr u64 kSlowestFetch = tp::kL2Latency + tp::kDramLatency;
@@ -466,14 +476,17 @@ void* BlockEngine::chain(JitCtx& c, Block::Link* slot) {
     const u32 lin = s.seg[kCs].base + s.eip;
     const Memory::TlbEntry& e = cpu_.memory().tlb()[(lin >> 12) & (Memory::kTlbSize - 1)];
     if (e.tag != (lin >> 12) || !e.host || bus_.ram_page(e.host) != b->ram_page || (lin & 0xFFFu) != b->page_off) return nullptr;
-    --c.chain_budget;
+    if (c.chain_budget) --c.chain_budget;
+    else --c.chain_extra;
     ++b->entry.runs;
     ++stats_.whole_runs;
     ++stats_.chains;
     stats_.block_insns += a.n;
     c.insns_done += a.n;
     const PhysAddr code = static_cast<PhysAddr>(b->ram_page) * 4096u + b->page_off;
-    c.base = end + cpu_.cache_timing().code_fetch(code, b->bytes);
+    const u64 fetch = cpu_.cache_timing().code_fetch(code, b->bytes);
+    c.penalties += fetch;
+    c.base = end + fetch;
     c.block = b;
     c.entry_eip = s.eip;
     c.ended = 0;
@@ -489,6 +502,34 @@ void BlockEngine::drop_native() {
     pending_slot_ = nullptr;
     for (auto& [k, b] : blocks_) b->native = b->entry.body = nullptr;
     for (auto& b : graveyard_) b->native = b->entry.body = nullptr;
+}
+
+}  // namespace mv::p6
+
+namespace mv::p6 {
+
+// The spin skip (Dolphin's idle skipping, made exact). A native run that wrote no memory, ran no instruction through
+// the interpreter (so reached no device and walked no page), took no cache penalty (every access hit: the caches'
+// contents and LRU order end each pass as they began) and no mispredict (the predictors are saturated), and ended
+// at the EIP it began at with the whole CPU state as it began, is a pass of a loop that repeats exactly until
+// something outside the CPU changes memory or raises an interrupt — which only events do (and the devices' own
+// threads, whose timing is the host's either way). So the clock and the instruction count move on by whole passes,
+// stopping a pass short of the limit; the run after that reaches the limit's instruction boundary as it would have.
+void BlockEngine::spin_skip(const JitCtx& c, u64 start, u64 instructions) {
+    const u32 chained = chain_budget_ - c.chain_budget;
+    if (c.stores || c.helpers || c.penalties || c.mispredicts || chained < 64 || instructions == 0) return;
+    const CpuState& s = cpu_.state();
+    if (s.eip != c.start_eip || std::memcmp(&s, &spin_start_, sizeof s) != 0) return;
+    const u64 now = cpu_.cycles();
+    const u64 period = now - start;
+    if (period == 0 || now >= c.limit) return;
+    const u64 passes = (c.limit - now) / period;
+    if (passes < 2) return;
+    const u64 k = passes - 1;
+    cpu_.set_cycles_only(now + k * period);
+    cpu_.add_instructions(k * instructions);
+    ++stats_.spin_skips;
+    stats_.spin_cycles += k * period;
 }
 
 }  // namespace mv::p6

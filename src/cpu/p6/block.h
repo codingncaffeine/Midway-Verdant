@@ -75,9 +75,10 @@ struct BlockStats {
     u64 whole_runs{0}, fallback_steps{0}, block_insns{0};
     u64 mispredicts{0};
     u64 native_runs{0}, native_insns{0}, native_helpers{0}, native_ineligible{0}, native_handoffs{0}, chains{0}, links_refused{0};
+    u64 spin_skips{0}, spin_cycles{0};  // loops whose passes were skipped, and the cycles they covered
     // Where the cycles went: the schedules, the penalties (caches, devices), the exits' mispredicts, REP elements.
     u64 schedule_cycles{0}, penalty_cycles{0}, exit_cycles{0}, rep_cycles{0};
-    std::array<u64, 256 + 256> helper_ops{};  // instructions the interpreter ran inside native code, by operation; x87 by form
+    std::array<u64, 256 + 256 + 2048> helper_ops{};  // instructions the interpreter ran inside native code, by operation; x87 and SSE by form
 };
 
 class Jit;
@@ -161,6 +162,7 @@ private:
     void take_device_writes();
     u32 exit_cost(Block& b, u32 entry_eip);
     unsigned run_native(Run& r);
+    void spin_skip(const JitCtx& c, u64 start, u64 instructions);
     static u64 key(u32 ram_page, unsigned off, u8 mode) { return (static_cast<u64>(ram_page) << 14) | (static_cast<u64>(off) << 2) | mode; }
     static unsigned fast_index(u32 lin, u8 mode) { return ((lin ^ (lin >> 16)) * 2 + mode) & (kFastSize - 1); }
 
@@ -190,6 +192,7 @@ private:
     std::exception_ptr jit_error_;
     u64 hot_{8};
     u32 chain_budget_{1024};  // the dispatcher's batch and its lock are not kept waiting for long
+    CpuState spin_start_{};
     std::array<u32, 2> idle_{};
     JitCtx* current_{nullptr};  // the native run in progress
     Block::Link* pending_slot_{nullptr};  // the last native exit's link slot, filled by the next block run

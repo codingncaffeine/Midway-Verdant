@@ -44,6 +44,12 @@ struct JitCtx {
     Block::Link* last_slot;
     u32 last_target;
     u64 penalties;
+    // The spin skip's evidence (see BlockEngine::run_native): stores the native code made, mispredicts, where the
+    // run began, the blocks a run may chain past its budget to end where it began.
+    u32 stores;
+    u32 mispredicts;
+    u32 start_eip;
+    u32 chain_extra;
 };
 
 // The native function's result: (instruction index << 2) | kind.

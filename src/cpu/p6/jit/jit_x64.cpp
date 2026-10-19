@@ -93,6 +93,7 @@ constexpr i32 kCtxBase = static_cast<i32>(offsetof(JitCtx, base)), kCtxLimit = s
 constexpr i32 kCtxBlock = static_cast<i32>(offsetof(JitCtx, block)), kCtxBudget = static_cast<i32>(offsetof(JitCtx, chain_budget));
 constexpr i32 kCtxInsnsDone = static_cast<i32>(offsetof(JitCtx, insns_done)), kCtxEntryEip = static_cast<i32>(offsetof(JitCtx, entry_eip));
 constexpr i32 kCtxEnded = static_cast<i32>(offsetof(JitCtx, ended));
+constexpr i32 kCtxStores = static_cast<i32>(offsetof(JitCtx, stores)), kCtxMispredicts = static_cast<i32>(offsetof(JitCtx, mispredicts));
 // The scratch slots, one owner each: the cache call's saved RSI RAX RDI; INC/DEC's CF; a new ESP; a computed
 // address or target; the x87 control words (the guest's for the host, C++'s); two pairs of saved RSI/RDI (an
 // instruction with two accesses) or DIV's operands.
@@ -100,6 +101,7 @@ constexpr i32 slot(unsigned n) { return kCtxScratch + static_cast<i32>(8 * n); }
 constexpr i32 kSaveRsi = slot(0), kSaveRax = slot(1), kSaveRdi = slot(2), kIncCf = slot(3), kNewEsp = slot(4), kCtxEa = slot(5);
 constexpr i32 kCtxHostCw = slot(6), kCtxDefCw = slot(6) + 2;
 constexpr i32 kTmp0 = slot(7), kTmp1 = slot(8), kTmp2 = slot(9), kTmp3 = slot(10);
+constexpr i32 kCtxSseHost = slot(6) + 4, kCtxSseDef = slot(11);  // u32 each: the guest's MXCSR for the host, C++'s
 constexpr i32 kCr0Off = static_cast<i32>(offsetof(CpuState, cr0));
 constexpr i32 kFpuOff = static_cast<i32>(offsetof(CpuState, fpu));
 constexpr i32 kSt0 = kFpuOff + static_cast<i32>(offsetof(FpuState, st));
@@ -111,6 +113,9 @@ constexpr i32 kFip = kFpuOff + static_cast<i32>(offsetof(FpuState, fip));
 constexpr i32 kFdp = kFpuOff + static_cast<i32>(offsetof(FpuState, fdp));
 constexpr i32 kFcs = kFpuOff + static_cast<i32>(offsetof(FpuState, fcs));
 constexpr i32 kFds = kFpuOff + static_cast<i32>(offsetof(FpuState, fds));
+constexpr i32 kMxcsr = kFpuOff + static_cast<i32>(offsetof(FpuState, mxcsr));
+constexpr i32 kXmm = kFpuOff + static_cast<i32>(offsetof(FpuState, xmm));
+constexpr i32 kCr4Off = static_cast<i32>(offsetof(CpuState, cr4));
 constexpr i32 seg_selector(unsigned s) { return static_cast<i32>(offsetof(CpuState, seg) + s * sizeof(Segment) + offsetof(Segment, selector)); }
 // Native x87 needs the interpreter's 80-bit registers in 16-byte slots (GCC/Clang on x86-64).
 constexpr bool kNativeX87 = kHostX87 && sizeof(long double) == 16;
@@ -150,6 +155,12 @@ u32 h_exec(JitCtx* c, u32 i) {
         // Form: escape (0-7), then the ModRM reg field, memory or register; register forms of D9/DB keep the low bits.
         const unsigned form = (x.opcode - 0xD8u) * 32u + (x.mem ? 16u : 0u) + (x.mem ? x.reg : ((x.opcode == 0xD9 || x.opcode == 0xDB) ? (x.modrm & 0x3F) >> 2 : x.reg)) ;
         ++c->helper_ops[256 + (form & 255)];
+    }
+    if (b.insns[i].op == Op::Simd) {
+        const Insn& x = b.insns[i];
+        // Form: the opcode, the prefix (none, 66, F3, F2), memory or register.
+        const unsigned pfx = x.prefix_66 ? 1u : x.rep == 1 ? 2u : x.rep == 2 ? 3u : 0u;
+        ++c->helper_ops[512 + (x.opcode * 4u + pfx) * 2u + (x.mem ? 1u : 0u)];
     }
     bool ok;
     try {
@@ -220,12 +231,14 @@ public:
         for (const Stub& s : stubs_) {
             a.bind(s.entry);
             if (s.cw_before) default_cw();
+            if (s.sse_before) sse_flush();
             call_helper(s.index);
             if (s.index + 1 == b_.n) a.jmp(epilogue_);
             else {
                 a.test(4, rax, rax);
                 a.jcc(NE, epilogue_);
                 if (s.cw_after) guest_cw();
+                if (s.sse_after) sse_load();
                 a.jmp(s.resume);
             }
         }
@@ -236,6 +249,7 @@ private:
         Label entry, resume;
         unsigned index;
         bool cw_before, cw_after;  // the host x87 control word was the guest's at the jump / must be at the resume
+        bool sse_before, sse_after;  // the same for the host MXCSR
     };
 
     Block& b_;
@@ -249,6 +263,7 @@ private:
     bool host_flags_{false};   // the host flags hold the last flag writer's result
     bool host_cf_{false};      // ... including CF (not after INC/DEC)
     bool cw_active_{false};    // the host x87 runs under the guest's control word (see x87_enter)
+    bool sse_active_{false};   // the host SSE runs under the guest's MXCSR (see sse_enter)
 
     u32 eip_of(unsigned i) const { return b_.jit_eip + b_.off[i]; }
     u32 next_eip(unsigned i) const { return eip_of(i) + b_.insns[i].len; }
@@ -271,6 +286,9 @@ private:
         a.mov(8, kCtx, kArg0);
         a.mov(8, kSt, ctx_at(kCtxSt));
         a.x87_mem(0xD9, 7, ctx_at(kCtxDefCw));  // fnstcw: the control word C++ code runs under
+        a.stmxcsr(ctx_at(kCtxSseDef));  // and C++'s MXCSR, its sticky flags cleared
+        a.alu_imm(4, 4, ctx_at(kCtxSseDef), ~0x3Fu);
+        a.ldmxcsr(ctx_at(kCtxSseDef));
         Memory& m = cpu_.memory();
         a.mov64(kTlb, reinterpret_cast<u64>(m.tlb()));
         a.mov64(kRam, reinterpret_cast<u64>(m.bus().ram()));
@@ -279,6 +297,7 @@ private:
     }
     void epilogue() {
         a.x87_mem(0xD9, 5, ctx_at(kCtxDefCw));  // fldcw: back to it
+        a.ldmxcsr(ctx_at(kCtxSseDef));
 #if defined(_WIN32)
         a.alu_imm(8, 0, rsp, 40);
         a.pop(rdi);
@@ -302,6 +321,7 @@ private:
     }
     void inline_helper(unsigned i) {
         x87_leave();
+        sse_leave();
         call_helper(i);
         if (last(i)) a.jmp(epilogue_);
         else {
@@ -313,8 +333,9 @@ private:
     }
     // A fallback for instruction i: its native checks jump here; the interpreter executes it from the start.
     Label fallback(unsigned i, Label resume) { return fallback(i, resume, cw_active_, cw_active_); }
-    Label fallback(unsigned i, Label resume, bool cw_before, bool cw_after) {
-        Stub s{a.label(), resume, i, cw_before, cw_after};
+    Label fallback(unsigned i, Label resume, bool cw_before, bool cw_after) { return fallback(i, resume, cw_before, cw_after, sse_active_, sse_active_); }
+    Label fallback(unsigned i, Label resume, bool cw_before, bool cw_after, bool sse_before, bool sse_after) {
+        Stub s{a.label(), resume, i, cw_before, cw_after, sse_before, sse_after};
         stubs_.push_back(s);
         return s.entry;
     }
@@ -323,6 +344,7 @@ private:
     static constexpr u64 kNoEip = ~u64{0};
     void end(unsigned i, u64 eip, unsigned slot) {
         x87_leave();
+        sse_leave();
         if (eip != kNoEip) a.mov_imm(4, st_at(kEipOff), static_cast<u32>(eip));
         Label slow = a.label();
         const BranchKind kind = b_.branch;
@@ -467,6 +489,7 @@ private:
         }
         a.mov64(rax, reinterpret_cast<u64>(ev_.stats));
         a.alu(8, 0, mem(rax, static_cast<i32>(offsetof(BlockStats, mispredicts))), r8);
+        a.alu(4, 0, ctx_at(kCtxMispredicts), r8);
         a.lea(4, rsi, mem(r8, r8, 1, 0));
         a.shift_imm(4, 4, rsi, 2);
         a.alu(8, 0, mem(rax, static_cast<i32>(offsetof(BlockStats, exit_cycles))), rsi);
@@ -489,6 +512,7 @@ private:
         return mem(scratch);
     }
     void leave(unsigned i, u32 eip, u32 kind) {
+        if (sse_active_) sse_flush();  // (code only: other paths go on with it active)
         a.mov_imm(4, st_at(kEipOff), eip);
         a.mov32(rax, (i << 2) | kind);
         a.jmp(epilogue_);
@@ -562,6 +586,7 @@ private:
             a.shift_imm(8, 5, rdx, 12);
             a.bt(8, mem(kCodeMap), rdx);
             a.jcc(B, fail);
+            a.alu_imm(4, 0, ctx_at(kCtxStores), 1);  // the spin skip's evidence
             // Write tracking: a watched page's first write is the interpreter's (it reports and unwatches the page);
             // with every page logged, the page is marked here (twice is the same if a later check fails).
             Memory& m = cpu_.memory();
@@ -1381,6 +1406,344 @@ private:
         return true;
     }
 
+    // ---- SSE (the Pentium III's: no 66/F2 forms) ----
+    // The host runs the guest's arithmetic under the MXCSR the interpreter's HostSse uses (the guest's rounding and
+    // flush-to-zero, every exception masked, no DAZ), set once per straight run. The host's sticky flags since then
+    // join the guest's MXCSR before any C++ code runs and at every exit (the guest's are sticky too; they are seen
+    // only through STMXCSR/FXSAVE, which are the interpreter's). Lanes holding a NaN or a denormal, unmasked
+    // exceptions, a misaligned or page-crossing operand, CR4.OSFXSR clear or CR0.EM/TS set: the interpreter.
+    void sse_enter() {
+        if (sse_active_) return;
+        sse_load();
+        sse_active_ = true;
+    }
+    void sse_load() {
+        a.mov(4, rax, st_at(kMxcsr));
+        a.alu_imm(4, 4, rax, 0xE000);
+        a.alu_imm(4, 1, rax, 0x1F80);
+        a.mov(4, ctx_at(kCtxSseHost), rax);
+        a.ldmxcsr(ctx_at(kCtxSseHost));
+    }
+    // The flags since sse_enter join the guest's; C++'s MXCSR comes back. Emits code only (`sse_leave` also forgets).
+    void sse_flush() {
+        a.stmxcsr(ctx_at(kCtxSseHost));
+        a.mov(4, rax, ctx_at(kCtxSseHost));
+        a.alu_imm(4, 4, rax, 0x3F);
+        a.alu(4, 1, st_at(kMxcsr), rax);
+        a.ldmxcsr(ctx_at(kCtxSseDef));
+    }
+    void sse_leave() {
+        if (!sse_active_) return;
+        sse_flush();
+        sse_active_ = false;
+    }
+    Mem xmm_at(unsigned r) { return st_at(kXmm + static_cast<i32>(16 * (r & 7))); }
+    // A constant vector of four copies of `v`.
+    Mem vconst(u32 v) {
+        static constexpr std::array<u32, 4 * 6> kConsts = {
+            0x7FFFFFFFu, 0x7FFFFFFFu, 0x7FFFFFFFu, 0x7FFFFFFFu,  // 0: abs
+            0x7F800000u, 0x7F800000u, 0x7F800000u, 0x7F800000u,  // 1: infinity
+            0x00800000u, 0x00800000u, 0x00800000u, 0x00800000u,  // 2: the smallest normal
+            0, 0, 0, 0,                                          // 3: zero
+        };
+        unsigned k = v == 0x7FFFFFFFu ? 0 : v == 0x7F800000u ? 1 : v == 0x00800000u ? 2 : 3;
+        a.mov64(r11, reinterpret_cast<u64>(kConsts.data() + 4 * k));
+        return mem(r11);
+    }
+    // Jump to `fail` when a lane of xmm `x` selected by `lanes` (bit per lane) is a NaN or a denormal. Uses xmm4/5.
+    void sse_lanes_ok(unsigned x, unsigned lanes, Label fail) {
+        a.sse_rr(0, 0x28, 4, x);                       // movaps xmm4, x
+        a.sse(0x66, 0xDB, 4, vconst(0x7FFFFFFFu));     // pand: |lane|
+        a.sse(0, 0x28, 5, vconst(0x00800000u));        // xmm5 = smallest normal
+        a.sse_rr(0x66, 0x66, 5, 4);                    // pcmpgtd xmm5, xmm4: |lane| < smallest normal
+        a.sse(0x66, 0x76, 4, vconst(0u));              // pcmpeqd xmm4, 0... (xmm4 is clobbered: recompute)
+        // xmm5 = denormal or zero; xmm4 = zero. Denormal = xmm5 & ~xmm4 (pandn: xmm4 = ~xmm4 & xmm5).
+        a.sse_rr(0x66, 0xDF, 4, 5);                    // pandn xmm4, xmm5
+        a.movmskps(rax, 4);
+        a.alu_imm(4, 4, rax, lanes);
+        a.jcc(NE, fail);
+        a.sse_rr(0, 0x28, 4, x);
+        a.sse(0x66, 0xDB, 4, vconst(0x7FFFFFFFu));
+        a.sse(0x66, 0x66, 4, vconst(0x7F800000u));     // pcmpgtd xmm4, inf: a NaN
+        a.movmskps(rax, 4);
+        a.alu_imm(4, 4, rax, lanes);
+        a.jcc(NE, fail);
+    }
+    // The guards every SSE form shares: CR4.OSFXSR, CR0.EM/TS, every MXCSR exception masked.
+    void sse_preamble(Label f) {
+        a.test_imm(4, st_at(kCr4Off), cr4::OSFXSR);
+        a.jcc(E, f);
+        a.test_imm(4, st_at(kCr0Off), cr0::EM | cr0::TS);
+        a.jcc(NE, f);
+        a.mov(4, rax, st_at(kMxcsr));
+        a.alu_imm(4, 4, rax, 0x1F80);
+        a.alu_imm(4, 7, rax, 0x1F80);
+        a.jcc(NE, f);
+    }
+    // The memory operand for an SSE form: RSI = the host bytes, EDI = the physical address; `align` 16 checks the
+    // offset as the interpreter does (#GP: its own), else the linear address must be aligned to `align` (the
+    // interpreter's element accesses then stay in one cache line).
+    void sse_memory(const Insn& in, unsigned size, bool write, unsigned align, bool offset_align, Label f) {
+        effective_address(in);
+        if (offset_align) {
+            a.test_imm(4, rax, align - 1);
+            a.jcc(NE, f);
+        }
+        access_checks(in.mem_seg, size, write, f);
+        if (!offset_align && align > 1) {
+            a.test_imm(4, rsi, align - 1);  // the host page is aligned: the host address carries the linear offset
+            a.jcc(NE, f);
+        }
+    }
+
+    bool sse(unsigned i, const Insn& in, Label after) {
+        if (in.prefix_66 || in.rep == 2 || in.lock) return false;
+        const bool scalar = in.rep == 1;
+        const u8 op = in.opcode;
+        const unsigned d = in.reg;
+        enum class K { None, Load, Store, Arith, Logic, Shuf, Unpack, Cmp, MovMsk, LoadLow64, StoreLow64, LoadHigh64, StoreHigh64 } k = K::None;
+        switch (op) {
+            case 0x10: case 0x28: k = K::Load; break;
+            case 0x11: case 0x29: k = K::Store; break;
+            case 0x2B: if (!scalar && in.mem) k = K::Store; break;
+            case 0x51: case 0x58: case 0x59: case 0x5C: case 0x5D: case 0x5E: case 0x5F: k = K::Arith; break;
+            case 0x54: case 0x55: case 0x56: case 0x57: if (!scalar) k = K::Logic; break;
+            case 0xC6: if (!scalar) k = K::Shuf; break;
+            case 0x14: case 0x15: if (!scalar) k = K::Unpack; break;
+            case 0xC2: if ((in.imm & 0xFF) <= 7) k = K::Cmp; break;
+            case 0x50: if (!scalar && !in.mem) k = K::MovMsk; break;
+            case 0x12: if (!scalar) k = K::LoadLow64; break;   // MOVLPS xmm, m64 | MOVHLPS
+            case 0x13: if (!scalar && in.mem) k = K::StoreLow64; break;
+            case 0x16: if (!scalar) k = K::LoadHigh64; break;  // MOVHPS xmm, m64 | MOVLHPS
+            case 0x17: if (!scalar && in.mem) k = K::StoreHigh64; break;
+            default: break;
+        }
+        if (k == K::None) return false;
+        const bool store = k == K::Store || k == K::StoreLow64 || k == K::StoreHigh64;
+        const unsigned size = (k == K::LoadLow64 || k == K::StoreLow64 || k == K::LoadHigh64 || k == K::StoreHigh64) ? 8 : scalar ? 4 : 16;
+        if (in.mem && !segment_ok(in.mem_seg, size, store)) return false;
+        const bool host_math = k == K::Arith || k == K::Cmp;
+        const bool sse_before = sse_active_;
+        const Label f = fallback(i, after, cw_active_, cw_active_, sse_before, host_math || sse_before);
+        sse_preamble(f);
+        // The second operand into xmm1 (memory: checked here, read after the cache lookup below).
+        if (in.mem) {
+            // Packed forms the interpreter checks for alignment (MOVAPS, arithmetic, logic, ...) fault there; MOVUPS
+            // and the 64-bit moves are only native when their elements stay in one line.
+            const bool checked = !scalar && size == 16 && op != 0x10 && op != 0x11;
+            sse_memory(in, size, store, size == 16 ? 16 : 8, checked, f);
+        }
+        a.sse(0, 0x10, 0, xmm_at(d));  // xmm0 = the destination register (movups)
+        if (k == K::Arith || k == K::Cmp) {
+            const unsigned lanes = scalar ? 1 : 15;
+            if (in.mem) a.sse(scalar ? 0xF3 : 0, 0x10, 1, mem(rsi));  // movss/movups xmm1, [rsi]
+            else a.sse(0, 0x10, 1, xmm_at(in.rm));
+            if (op != 0x51) sse_lanes_ok(0, lanes, f);  // SQRT reads only its source
+            sse_lanes_ok(1, lanes, f);
+        }
+        if (in.mem) {
+            cache(i, store);  // keeps RSI and RDI
+        }
+        if (host_math) sse_enter();
+        switch (k) {
+            case K::Load:
+                if (scalar) {
+                    if (in.mem) a.sse(0xF3, 0x10, 0, mem(rsi));            // movss: the upper lanes cleared
+                    else a.sse(0xF3, 0x10, 0, xmm_at(in.rm));            // movss xmm0, m32 would clear: use the register form
+                    if (!in.mem) {
+                        a.sse(0, 0x10, 0, xmm_at(d));
+                        a.sse(0, 0x10, 1, xmm_at(in.rm));
+                        a.sse_rr(0xF3, 0x10, 0, 1);                       // movss xmm0, xmm1: the low lane only
+                    }
+                } else {
+                    a.sse(0, 0x10, 0, in.mem ? mem(rsi) : xmm_at(in.rm));
+                }
+                a.sse(0, 0x11, 0, xmm_at(d));
+                break;
+            case K::Store:
+                if (in.mem) a.sse(scalar ? 0xF3 : 0, 0x11, 0, mem(rsi));
+                else if (scalar) {
+                    a.sse(0, 0x10, 1, xmm_at(in.rm));
+                    a.sse_rr(0xF3, 0x10, 1, 0);
+                    a.sse(0, 0x11, 1, xmm_at(in.rm));
+                } else {
+                    a.sse(0, 0x11, 0, xmm_at(in.rm));
+                }
+                break;
+            case K::Arith:
+                a.sse_rr(scalar ? 0xF3 : 0, op, 0, 1);
+                a.sse(0, 0x11, 0, xmm_at(d));
+                break;
+            case K::Cmp:
+                a.sse_rr(scalar ? 0xF3 : 0, 0xC2, 0, 1);
+                a.byte(static_cast<u8>(in.imm & 7));
+                a.sse(0, 0x11, 0, xmm_at(d));
+                break;
+            case K::Logic: case K::Shuf: case K::Unpack:
+                // The source into a register: a memory operand of these must be 16-aligned, the state's are not.
+                a.sse(0, 0x10, 1, in.mem ? mem(rsi) : xmm_at(in.rm));
+                a.sse_rr(0, op, 0, 1);
+                if (k == K::Shuf) a.byte(static_cast<u8>(in.imm));
+                a.sse(0, 0x11, 0, xmm_at(d));
+                break;
+            case K::MovMsk:
+                a.sse(0, 0x10, 1, xmm_at(in.rm));
+                a.movmskps(rax, 1);
+                a.mov(4, greg(static_cast<u8>(d), 4), rax);
+                break;
+            case K::LoadLow64: case K::LoadHigh64:
+                // Memory: the 64 bits into the low (high) half. Register: MOVHLPS (MOVLHPS) from the source.
+                if (in.mem) a.sse(0, op, 0, mem(rsi));
+                else {
+                    a.sse(0, 0x10, 1, xmm_at(in.rm));
+                    a.sse_rr(0, op, 0, 1);
+                }
+                a.sse(0, 0x11, 0, xmm_at(d));
+                break;
+            case K::StoreLow64: case K::StoreHigh64:
+                a.sse(0, op, 0, mem(rsi));
+                break;
+            default: break;
+        }
+        host_flags_ = host_cf_ = false;
+        finish(i, in.mem);
+        return true;
+    }
+
+    // ---- MMX, as SSE2 on the low 64 bits of an xmm register (the integer lanes are the same operations; the high
+    // unpacks first move the high halves down, the packs first join both operands). The interpreter's effects on
+    // the x87 state: TOP = 0 and every tag valid (mmx_touch), a written register's exponent bits all ones. EMMS
+    // empties the tags. CR0.EM/TS and a pending x87 exception are the interpreter's.
+    Mem mm_at(unsigned r) { return st_at(kSt0 + static_cast<i32>(16 * (r & 7))); }
+    void mm_touch() {
+        a.alu_imm(2, 4, st_at(kFsw), 0xC7FF);
+        a.mov_imm(2, st_at(kFtw), 0);
+    }
+    void mm_store_xmm0(unsigned r) {
+        a.sse(0x66, 0xD6, 0, mm_at(r));  // movq m64, xmm0
+        a.mov_imm(2, st_at(kSt0 + static_cast<i32>(16 * (r & 7)) + 8), 0xFFFF);
+    }
+    void mm_load(unsigned x, const Mem& m) { a.sse(0xF3, 0x7E, x, m); }  // movq xmm, m64
+
+    bool mmx(unsigned i, const Insn& in, Label after) {
+        const u8 op = in.opcode;
+        const bool mmx_map = (op >= 0x60 && op <= 0x7F && op != 0x7A && op != 0x7B && op != 0x7C && op != 0x7D) || op == 0xC4 || op == 0xC5 ||
+                             (op >= 0xD1 && op <= 0xFE && op != 0xD4 && op != 0xD6 && op != 0xE6 && op != 0xF4 && op != 0xFB);
+        if (!mmx_map || in.prefix_66 || in.rep == 2 || in.lock) return false;
+        const unsigned d = in.reg;
+        enum class K { None, Emms, MovdIn, MovdOut, MovqIn, MovqOut, Shift, Shuffle, Binary } k = K::None;
+        bool high_unpack = false, pack = false;
+        switch (op) {
+            case 0x77: k = K::Emms; break;
+            case 0x6E: k = K::MovdIn; break;
+            case 0x7E: k = K::MovdOut; break;
+            case 0x6F: k = K::MovqIn; break;
+            case 0x7F: k = K::MovqOut; break;
+            case 0xE7: if (in.mem) k = K::MovqOut; break;
+            case 0x71: case 0x72: case 0x73:
+                if (!in.mem && (in.reg == 2 || in.reg == 6 || (in.reg == 4 && op != 0x73))) k = K::Shift;
+                break;
+            case 0x70: k = K::Shuffle; break;
+            case 0x68: case 0x69: case 0x6A: high_unpack = true; k = K::Binary; break;
+            case 0x63: case 0x67: case 0x6B: pack = true; k = K::Binary; break;
+            case 0x60: case 0x61: case 0x62: case 0x64: case 0x65: case 0x66: case 0x74: case 0x75: case 0x76:
+            case 0xD1: case 0xD2: case 0xD3: case 0xD5: case 0xD8: case 0xD9: case 0xDA: case 0xDB: case 0xDC: case 0xDD: case 0xDE: case 0xDF:
+            case 0xE0: case 0xE1: case 0xE2: case 0xE3: case 0xE4: case 0xE5: case 0xE8: case 0xE9: case 0xEA: case 0xEB: case 0xEC: case 0xED:
+            case 0xEE: case 0xEF: case 0xF1: case 0xF2: case 0xF3: case 0xF5: case 0xF6: case 0xF8: case 0xF9: case 0xFA: case 0xFC: case 0xFD:
+            case 0xFE:
+                k = K::Binary;
+                break;
+            default: break;
+        }
+        if (k == K::None) return false;
+        const bool store = k == K::MovqOut || (k == K::MovdOut && in.mem);
+        const unsigned size = (k == K::MovdIn || k == K::MovdOut) ? 4 : 8;
+        if (in.mem && !segment_ok(in.mem_seg, size, store)) return false;
+        const Label f = fallback(i, after);
+        a.test_imm(4, st_at(kCr0Off), cr0::EM | cr0::TS);
+        a.jcc(NE, f);
+        a.test_imm(2, st_at(kFsw), 0x80);  // a pending x87 exception: #MF first
+        a.jcc(NE, f);
+        if (in.mem) {
+            effective_address(in);
+            access_checks(in.mem_seg, size, store, f);
+            if (size == 8) {
+                // The interpreter reads or writes the two halves: native when they share a cache line.
+                a.mov(4, rax, rsi);
+                a.alu_imm(4, 4, rax, 31);
+                a.alu_imm(4, 7, rax, 24);
+                a.jcc(A, f);
+            }
+            cache(i, store);
+        }
+        switch (k) {
+            case K::Emms:
+                a.mov_imm(2, st_at(kFtw), 0xFFFF);
+                break;
+            case K::MovdIn:
+                mm_touch();
+                if (in.mem) a.mov(4, rax, mem(rsi));
+                else a.mov(4, rax, greg(in.rm, 4));
+                a.mov(4, mm_at(d), rax);
+                a.mov_imm(4, st_at(kSt0 + static_cast<i32>(16 * (d & 7)) + 4), 0);
+                a.mov_imm(2, st_at(kSt0 + static_cast<i32>(16 * (d & 7)) + 8), 0xFFFF);
+                break;
+            case K::MovdOut:
+                mm_touch();
+                a.mov(4, rax, mm_at(d));
+                if (in.mem) a.mov(4, mem(rsi), rax);
+                else a.mov(4, greg(in.rm, 4), rax);
+                break;
+            case K::MovqIn:
+                mm_touch();
+                mm_load(0, in.mem ? mem(rsi) : mm_at(in.rm));
+                mm_store_xmm0(d);
+                break;
+            case K::MovqOut:
+                mm_touch();
+                mm_load(0, mm_at(d));
+                if (in.mem) a.sse(0x66, 0xD6, 0, mem(rsi));
+                else mm_store_xmm0(in.rm);
+                break;
+            case K::Shift:
+                mm_touch();
+                mm_load(0, mm_at(in.rm));
+                a.sse_rr(0x66, op, in.reg, 0);  // 66 0F 71/72/73 /reg ib on xmm0
+                a.byte(static_cast<u8>(in.imm));
+                mm_store_xmm0(in.rm);
+                break;
+            case K::Shuffle:
+                mm_touch();
+                mm_load(1, in.mem ? mem(rsi) : mm_at(in.rm));
+                a.sse_rr(0xF2, 0x70, 0, 1);  // pshuflw xmm0, xmm1: the low four words as PSHUFW
+                a.byte(static_cast<u8>(in.imm));
+                mm_store_xmm0(d);
+                break;
+            case K::Binary:
+                mm_touch();
+                mm_load(0, mm_at(d));
+                mm_load(1, in.mem ? mem(rsi) : mm_at(in.rm));
+                if (high_unpack) {
+                    a.sse_rr(0x66, 0x73, 2, 0);  // psrlq xmm0, 32
+                    a.byte(32);
+                    a.sse_rr(0x66, 0x73, 2, 1);
+                    a.byte(32);
+                    a.sse_rr(0x66, static_cast<u8>(op - 8), 0, 1);  // the low unpack of the high halves
+                } else if (pack) {
+                    a.sse_rr(0x66, 0x6C, 0, 1);  // punpcklqdq: a in the low half, b in the high
+                    a.sse_rr(0x66, op, 0, 0);    // pack the eight elements: the low 64 bits are MMX's result
+                } else {
+                    a.sse_rr(0x66, op, 0, 1);
+                }
+                mm_store_xmm0(d);
+                break;
+            default: break;
+        }
+        host_flags_ = host_cf_ = false;
+        finish(i, in.mem);
+        return true;
+    }
+
     // ---- instructions ----
     bool native(unsigned i, Label after) {
         const Insn& in = b_.insns[i];
@@ -1406,6 +1769,7 @@ private:
             case Op::Cmovcc: return cmov(i, in);
             case Op::Xchg: return xchg(i, in);
             case Op::X87: return x87(i, in, after);
+            case Op::Simd: return mmx(i, in, after) || sse(i, in, after);
             case Op::Shl: case Op::Shr: case Op::Sar: return shift(i, in, after);
             case Op::Rol: case Op::Ror: return rotate(i, in);
             case Op::Cwd: case Op::Cbw: return convert(i, in);
@@ -1678,10 +2042,11 @@ private:
         Label taken = a.label();
         a.test(4, rdx, rdx);
         a.jcc(NE, taken);
-        const bool cw = cw_active_;  // each path leaves the x87 control word itself
+        const bool cw = cw_active_, sse_on = sse_active_;  // each path leaves the host x87 and SSE states itself
         end(i, next_eip(i), 0);
         a.bind(taken);
         cw_active_ = cw;
+        sse_active_ = sse_on;
         end(i, static_cast<u32>(next_eip(i) + in.imm), 1);
         return true;
     }

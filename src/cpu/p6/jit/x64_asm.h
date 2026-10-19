@@ -185,6 +185,37 @@ public:
     void cmov(unsigned size, Cond c, Reg dst, Reg src) { op_rr(size, {0x0F, static_cast<u8>(0x40 + c)}, dst, src); }
     void bt(unsigned size, const Mem& m, Reg bit) { op_rm(size, {0x0F, 0xA3}, bit, m); }
     void xchg(unsigned size, Reg a, Reg b) { op_rr(size, {static_cast<u8>(size == 1 ? 0x86 : 0x87)}, a, b); }
+    // ---- SSE (xmm0-xmm5 only: the scratch registers of both ABIs) ----
+    // An SSE instruction with an xmm register and a memory operand: optional prefix (0x66/0xF3/0xF2, 0 = none), 0F op.
+    void sse(u8 prefix, u8 op, unsigned xreg, const Mem& m) {
+        if (prefix) byte(prefix);
+        rex(false, xreg, m.index == 0xFF ? 0 : m.index, m.base);
+        byte(0x0F);
+        byte(op);
+        modrm_mem(xreg, m);
+    }
+    void sse_rr(u8 prefix, u8 op, unsigned xreg, unsigned xrm) {
+        if (prefix) byte(prefix);
+        rex(false, xreg, 0, xrm);
+        byte(0x0F);
+        byte(op);
+        modrm_reg(xreg, xrm);
+    }
+    // MOVMSKPS r32, xmm.
+    void movmskps(Reg dst, unsigned xrm) { sse_rr(0, 0x50, dst, xrm); }
+    void ldmxcsr(const Mem& m) {
+        rex(false, 0, m.index == 0xFF ? 0 : m.index, m.base);
+        byte(0x0F);
+        byte(0xAE);
+        modrm_mem(2, m);
+    }
+    void stmxcsr(const Mem& m) {
+        rex(false, 0, m.index == 0xFF ? 0 : m.index, m.base);
+        byte(0x0F);
+        byte(0xAE);
+        modrm_mem(3, m);
+    }
+
     // ---- x87 ----
     // An x87 instruction with a memory operand: escape byte and ModRM reg digit.
     void x87_mem(u8 escape, unsigned digit, const Mem& m) { op_rm(4, {escape}, digit, m); }

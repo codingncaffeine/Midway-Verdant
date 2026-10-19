@@ -336,8 +336,9 @@ std::string P6Backend::report() const {
                          b.built, blocks_->live_blocks(), b.killed, b.pages_written, b.device_page_writes, b.whole_runs, b.fallback_steps,
                          b.block_insns, b.mispredicts, b.schedule_cycles, b.penalty_cycles, b.exit_cycles, b.rep_cycles);
         if (p6::Jit* j = blocks_->jit())
-            r += std::format("\ncpu p6 recompiler: {} blocks translated ({} KiB, {} flushes); {} native runs, {} native instructions, {} by the interpreter inside them; {} hand-offs, {} runs refused (assumptions changed); {} blocks entered by a chain",
-                             j->compiled(), j->code_bytes() / 1024, j->flushes(), b.native_runs, b.native_insns, b.native_helpers, b.native_handoffs, b.native_ineligible, b.chains);
+            r += std::format("\ncpu p6 recompiler: {} blocks translated ({} KiB, {} flushes); {} native runs, {} native instructions, {} by the interpreter inside them; {} hand-offs, {} runs refused (assumptions changed); {} blocks entered by a chain; {} spin skips covering {} cycles",
+                             j->compiled(), j->code_bytes() / 1024, j->flushes(), b.native_runs, b.native_insns, b.native_helpers, b.native_handoffs, b.native_ineligible, b.chains,
+                             b.spin_skips, b.spin_cycles);
         {
             std::vector<std::pair<u64, unsigned>> ops;
             for (unsigned k = 0; k < 256; ++k)
@@ -352,6 +353,14 @@ std::string P6Backend::report() const {
             r += "\ncpu p6 x87 forms inside native code (escape/mem/reg):";
             for (std::size_t k = 0; k < x87.size() && k < 24; ++k)
                 r += std::format(" {:02x}{}{:x} {}", 0xD8 + x87[k].second / 32, (x87[k].second & 16) ? "m" : "r", x87[k].second & 15, x87[k].first);
+            std::vector<std::pair<u64, unsigned>> sse;
+            for (unsigned k = 0; k < 2048; ++k)
+                if (b.helper_ops[512 + k]) sse.emplace_back(b.helper_ops[512 + k], k);
+            std::sort(sse.rbegin(), sse.rend());
+            static constexpr const char* kPfx[4] = {"", "66.", "F3.", "F2."};
+            r += "\ncpu p6 SSE/MMX forms inside native code (prefix.0F opcode, m/r):";
+            for (std::size_t k = 0; k < sse.size() && k < 24; ++k)
+                r += std::format(" {}{:02x}{} {}", kPfx[(sse[k].second / 2) % 4], (sse[k].second / 8) % 256, (sse[k].second & 1) ? "m" : "r", sse[k].first);
         }
         r += "\ncpu p6 hottest blocks (address x instructions: cycles * runs):" + blocks_->hottest(12);
     }
