@@ -279,6 +279,8 @@ void Apu::apply_reset(apu::Processor& p, u32& reset_word, u32 value, std::string
     } else if (!release && p.running()) {
         p.hold_reset();
         trace::log(trace::Cat::Apu, "{}: reset held ({:x})", which, value);
+    } else if (!release) {
+        p.dma().reset();  // a held reset holds the DMA engine too (the memories keep what the host loads into them)
     }
 }
 

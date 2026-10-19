@@ -169,6 +169,41 @@ TEST(ApuGp, ReleasingTheResetLoadsTheProgramFromScratchAndEveryFrameRunsItIntoTh
     EXPECT_EQ(r.apu.frames(), 3u) << "the frame clock runs regardless";
 }
 
+TEST(ApuGp, ADmaListThatNeverEndsRunsOnOverTimeInsteadOfHangingAndTheResetStopsIt) {
+    // One title's list reaches a block whose next word is sample data pointing back at itself. The hardware keeps
+    // moving data while the processor runs; walking such a list to its end at once never returned.
+    auto setup = [](Rig& r, u32 next) {
+        r.table(0x2000, {0x4000});
+        r.wr(Apu::kGpFifoTable, 0x2000);
+        r.wr(Apu::kGpFifoMaxSge, 0);
+        r.wr(Apu::kGpFifoRegs + Apu::kFifoBase, 0);
+        r.wr(Apu::kGpFifoRegs + Apu::kFifoEnd, 0x1000);
+        r.wr(Apu::kGpFifoRegs + Apu::kFifoCurrent, 0);
+        auto& core = r.apu.gp().core();
+        const u32 block[] = {next, (1u << 1) | (6u << 10), 1, 0x200, 0, 0, 0};
+        for (u32 i = 0; i < 7; ++i) core.write_x(0x40 + i, block[i]);
+        r.apu.gp().dma().write(dsp::Dma::NextBlock, 0x40);
+        r.apu.gp().dma().write(dsp::Dma::Control, 1);
+    };
+    {
+        Rig control;  // the same block with end-of-list: the list ends, nothing is left to walk
+        setup(control, 0x4000);
+        EXPECT_TRUE(control.apu.gp().dma().last_error().empty()) << control.apu.gp().dma().last_error();
+        EXPECT_EQ(control.apu.gp().dma().bytes_moved(), 4u);
+    }
+    Rig r;
+    setup(r, 0x40);  // the block names itself next
+    auto& dma = r.apu.gp().dma();
+    EXPECT_NE(dma.last_error().find("not ended"), std::string::npos) << dma.last_error();
+    EXPECT_EQ(dma.bytes_moved(), 4u * dsp::Dma::kStretchBlocks) << "one stretch of the list, the rest later";
+    EXPECT_NE(dma.read(dsp::Dma::Control) & dsp::Dma::kControlRunning, 0u) << "still running";
+    EXPECT_FALSE(dma.eol());
+    EXPECT_NE(dma.eol_due(), 0u) << "the processor's poll knows when the next stretch is due";
+    r.wr(Apu::kGpBlock + Apu::kReset, Apu::kResetBlock);
+    EXPECT_EQ(dma.read(dsp::Dma::Control), 0u) << "the reset stops the engine";
+    EXPECT_EQ(dma.eol_due(), 0u);
+}
+
 TEST(ApuGp, AnOutputFifoWhoseCurrentPointerIsPastTheEndRefusesTheTransferAndNamesIt) {
     Rig r;
     r.table(0x2000, {0x4000});

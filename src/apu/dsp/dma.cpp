@@ -47,9 +47,20 @@ void Dma::write_dsp(u32 address, u32 value) {
 void Dma::settle() {
     if (pending_eol_ && core_.cycles() >= busy_until_) {
         pending_eol_ = false;
+        if (walk_pending_) {
+            walk_pending_ = false;
+            run();  // the list goes on: the next stretch of it
+            return;
+        }
         eol_ = true;
         control_ = (control_ | kControlStopped) & ~kControlRunning;
     }
+}
+
+void Dma::reset() {
+    next_block_ = start_block_ = control_ = configuration_ = 0;
+    eol_ = pending_eol_ = walk_pending_ = false;
+    busy_until_ = 0;
 }
 
 bool Dma::eol() {
@@ -100,14 +111,25 @@ void Dma::write(Reg r, u32 value) {
 void Dma::run() {
     if (!(control_ & kControlRunning) || (control_ & kControlFrozen)) return;
     const u64 bytes_before = bytes_;
-    while (!(next_block_ & kEol)) {
+    // The engine walks the list over time, a byte a cycle: a stretch of it at once, then the rest once the processor
+    // has run that long. A list need not end (one title's points at a block whose next word is sample data, itself),
+    // and then the engine keeps moving data while the processor runs on, until it is stopped, aborted or reset.
+    u32 blocks = 0;
+    while (!(next_block_ & kEol) && bytes_ - bytes_before < kStretchBytes && blocks < kStretchBlocks) {
         const u32 block = next_block_ & 0x3FFFu;
+        ++blocks;
         if (!run_block(block)) break;
     }
-    // A finished list: the engine stays busy for the transfer time, then stops and raises end-of-list.
     const u64 moved = bytes_ - bytes_before;
+    walk_pending_ = !(next_block_ & kEol);
+    if (walk_pending_ && !unended_logged_) {
+        unended_logged_ = true;
+        if (error_.empty()) error_ = std::format("DMA list not ended after {} blocks, next {:06x}: it runs on over time", blocks, next_block_);
+    }
+    // A finished list: the engine stays busy for the transfer time, then stops and raises end-of-list.
     // Even an empty list is observed running for a few cycles: the kernel's program waits to see the bit.
-    busy_until_ = core_.cycles() + std::max<u64>(moved, 16);
+    // A stretch that did not end costs at least a cycle a block, so a list of empty blocks still takes time.
+    busy_until_ = core_.cycles() + std::max<u64>(moved, walk_pending_ ? std::max<u64>(blocks, 16) : 16);
     pending_eol_ = true;
 }
 

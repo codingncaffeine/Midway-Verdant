@@ -40,6 +40,10 @@ public:
     void clear_eol() { eol_ = false; }
     // While a list is still moving: the core cycle at which it reports its end of list (and stops), else 0.
     u64 eol_due() const { return pending_eol_ ? busy_until_ : 0; }
+    void reset();  // the processor's reset: the engine stops, its registers clear
+    // How much of a list one walk covers before the processor runs on (the rest follows once it has run that long).
+    static constexpr u64 kStretchBytes = 64 * 1024;
+    static constexpr u32 kStretchBlocks = 256;
     const std::string& last_error() const { return error_; }
     u64 transfers() const { return transfers_; }
     u64 bytes_moved() const { return bytes_; }
@@ -60,6 +64,8 @@ private:
     // the transfer time has passed on the core's clock: one cycle per byte, the first timing model.
     u64 busy_until_{0};
     bool pending_eol_{false};
+    bool walk_pending_{false};  // the list did not end in the last walk: settle() walks on at busy_until_
+    bool unended_logged_{false};
     std::string error_;
     u64 transfers_{0}, bytes_{0};
     std::vector<u8> buffer_;

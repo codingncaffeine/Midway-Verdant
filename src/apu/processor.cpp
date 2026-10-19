@@ -11,11 +11,13 @@ Processor::Processor(const dsp::Core::Config& config, dsp::DmaMemory& memory) : 
 void Processor::hold_reset() {
     running_ = false;
     core_.reset();
+    dma_.reset();
     interrupts_ = 0;
 }
 
 void Processor::release_reset() {
     core_.reset();
+    dma_.reset();
     interrupts_ = 0;
     // The boot ROM: the first 0x800 words of scratch (32-bit each, the word in the low 24 bits) into P memory.
     std::vector<u8> image(0x800 * 4, 0);
