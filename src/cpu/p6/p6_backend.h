@@ -36,6 +36,11 @@ public:
     bool read_regs(Regs& out) override;
     void set_dirty_tracking(bool on) override { dirty_tracking_ = on; }
     void take_dirty_pages(std::vector<u32>& pages) override;
+    void request_selective_tracking() override { selective_requested_ = true; }
+    bool selective_tracking() const override { return cpu_ && cpu_->memory().selective(); }
+    void watch_pages(u32 first, u32 count) override {
+        if (cpu_) cpu_->memory().watch(first, count);
+    }
     bool owns_timeline() const override { return true; }
     Cycles timeline_cycles() const override { return cycles_.load(std::memory_order_relaxed); }
     std::string report() const override;
@@ -63,6 +68,7 @@ private:
     std::string stop_detail_;
     Stats stats_;
     bool dirty_tracking_{false};
+    bool selective_requested_{false};
     u32 cpuid_signature_{0x0000068Au};
     // Instruments: MV_P6_STOP_CYCLES=N stops the core at the first instruction boundary at or past cycle N (a run's end
     // the io thread does not pick); the delivery hash folds the state at every interrupt and fault delivery, so two

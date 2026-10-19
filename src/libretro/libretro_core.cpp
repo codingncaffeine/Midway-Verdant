@@ -193,6 +193,7 @@ RETRO_API void retro_set_environment(retro_environment_t cb) {
         {"midway_verdant_pads", "Controllers plugged in; 1|2|3|4"},
         {"midway_verdant_drive", "Hard drive; Drive 1|Drive 2|Drive 3"},
         {"midway_verdant_pipeline", "Run the next frame while the frontend shows this one (faster, up to a frame more input lag); enabled|disabled"},
+        {"midway_verdant_cpu", "CPU; fast (hardware virtualization)|accurate (cycle-counted, recompiled)"},
         {nullptr, nullptr},
     };
     cb(RETRO_ENVIRONMENT_SET_VARIABLES, const_cast<retro_variable*>(vars));
@@ -291,6 +292,7 @@ RETRO_API bool retro_load_game(const retro_game_info* game) {
     // Compiled shaders persist beside the console's files, so a scene seen in an earlier session does not stall again.
     cfg.shader_cache_dir = files.eeprom.parent_path() / "shader-cache";
     cfg.cpu = "kvm";
+    if (const char* c = option("midway_verdant_cpu"); c && std::strncmp(c, "accurate", 8) == 0) cfg.cpu = "p6";
     cfg.frame_step = true;
     cfg.pads = pads_plugged;
     if (game && game->path && *game->path) cfg.dvd_image = game->path;

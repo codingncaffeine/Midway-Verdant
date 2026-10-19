@@ -397,6 +397,17 @@ private:
             a.shift_imm(8, 5, rdx, 12);
             a.bt(8, mem(kCodeMap), rdx);
             a.jcc(B, fail);
+            // Write tracking: a watched page's first write is the interpreter's (it reports and unwatches the page);
+            // with every page logged, the page is marked here (twice is the same if a later check fails).
+            Memory& m = cpu_.memory();
+            if (m.dirty_tracking() && m.selective()) {
+                a.mov64(r11, reinterpret_cast<u64>(m.watched_map()));
+                a.bt(8, mem(r11), rdx);
+                a.jcc(B, fail);
+            } else if (m.dirty_tracking()) {
+                a.mov64(r11, reinterpret_cast<u64>(m.dirty_map()));
+                a.op_rm(8, {0x0F, 0xAB}, rdx, mem(r11));  // bts
+            }
         }
         a.mov(4, rdi, mem(kTlb, rcx, 0, 4));  // physical page
         a.mov(4, rdx, rax);
@@ -873,6 +884,104 @@ private:
         return true;
     }
 
+    // SHL/SHR/SAR by an immediate or CL: the interpreter's formulas (its values for the undefined OF and AF too):
+    // CF = SHL: bit `bits` of a << n; SHR: bit n-1 of a; SAR: bit n-1 of a sign-extended. OF = SHL: msb(r) ^ CF;
+    // SHR: msb(a) ^ msb(r); SAR: 0. A count of zero changes nothing (the destination is read, not written).
+    bool shift(unsigned i, const Insn& in, Label after) {
+        const unsigned size = in.size, bits = size * 8;
+        const bool m = in.dst.kind == OpndKind::Mem;
+        if (!m && in.dst.kind != OpndKind::Reg) return false;
+        const bool by_cl = in.src.kind == OpndKind::Reg;
+        if (!by_cl && in.src.kind != OpndKind::Imm) return false;
+        if (by_cl && in.src.reg != 1) return false;  // CL
+        const unsigned imm = by_cl ? 0 : (in.imm & 0x1F);
+        if (m && !segment_ok(in.mem_seg, size, true)) return false;
+        if (m) {
+            const Label f = fallback(i, after);
+            effective_address(in);
+            access_checks(in.mem_seg, size, true, f);
+            cache(i, false);  // the interpreter reads the destination before it looks at the count
+        }
+        Label done = a.label();
+        if (!by_cl && imm == 0) {
+            if (m) host_flags_ = host_cf_ = false;
+            finish(i, m);
+            return true;
+        }
+        if (by_cl) {
+            a.movzx(rcx, 1, greg(1, 1));
+            a.alu_imm(4, 4, rcx, 0x1F);
+            a.jcc(E, done);  // count 0: no write, no flags
+        } else {
+            a.mov32(rcx, imm);
+        }
+        if (m) {
+            cache(i, true);  // keeps RSI, RAX, RDI; RCX is reloaded below
+            if (by_cl) {
+                a.movzx(rcx, 1, greg(1, 1));
+                a.alu_imm(4, 4, rcx, 0x1F);
+            } else {
+                a.mov32(rcx, imm);
+            }
+            load_host(rax, size);
+        } else {
+            load_greg(rax, in.dst.reg, size);
+        }
+        // EAX = a (zero-extended), ECX = n (1..31). EDX = r, R9D = CF, R10D = OF.
+        switch (in.op) {
+            case Op::Shl:
+                a.mov(8, rdx, rax);
+                a.shift_cl(8, 4, rdx);
+                a.mov(8, r9, rdx);
+                a.shift_imm(8, 5, r9, static_cast<u8>(bits));
+                a.alu_imm(4, 4, r9, 1);
+                a.alu_imm(4, 4, rdx, mask_of(size));
+                a.mov(4, r10, rdx);
+                a.shift_imm(4, 5, r10, static_cast<u8>(bits - 1));
+                a.alu(4, 6, r10, r9);
+                break;
+            case Op::Shr:
+                a.mov(4, rdx, rax);
+                a.shift_cl(4, 5, rdx);
+                a.lea(4, rcx, mem(rcx, -1));
+                a.mov(4, r9, rax);
+                a.shift_cl(4, 5, r9);
+                a.alu_imm(4, 4, r9, 1);
+                a.mov(4, r10, rax);
+                a.alu(4, 6, r10, rdx);
+                a.shift_imm(4, 5, r10, static_cast<u8>(bits - 1));
+                a.alu_imm(4, 4, r10, 1);
+                break;
+            case Op::Sar:
+                if (size == 4) a.mov(4, rdx, rax);
+                else a.movsx(rdx, size, rax);
+                a.mov(4, r9, rdx);
+                a.shift_cl(4, 7, rdx);
+                a.alu_imm(4, 4, rdx, mask_of(size));
+                a.lea(4, rcx, mem(rcx, -1));
+                a.shift_cl(4, 7, r9);
+                a.alu_imm(4, 4, r9, 1);
+                a.mov32(r10, 0);
+                break;
+            default: return false;
+        }
+        if (m) a.mov(size, mem(rsi), rdx);
+        else a.mov(size, greg(in.dst.reg, size), rdx);
+        a.mov(4, st_at(kLazyR), rdx);
+        a.mov(1, st_at(kLazyC), r9);
+        a.mov(1, st_at(kLazyOf), r10);
+        a.mov_imm(1, st_at(kLazyAf), 0);
+        a.mov_imm(2, st_at(kLazyOp), static_cast<u32>(LazyOp::Result) | (size << 8));
+        a.bind(done);
+        // After a count of zero the flags are the previous instruction's: the record stays what it was, so what the
+        // translator knew of it no longer holds on both paths.
+        known_ = by_cl ? Known::Unknown : Known::Result;
+        known_size_ = size;
+        host_flags_ = host_cf_ = false;
+        finish(i, m);
+        return true;
+    }
+
     // ---- instructions ----
     bool native(unsigned i, Label after) {
         const Insn& in = b_.insns[i];
@@ -899,6 +1008,7 @@ private:
             case Op::Cmovcc: return cmov(i, in);
             case Op::Xchg: return xchg(i, in);
             case Op::X87: return x87(i, in, after);
+            case Op::Shl: case Op::Shr: case Op::Sar: return shift(i, in, after);
             default: return false;
         }
     }

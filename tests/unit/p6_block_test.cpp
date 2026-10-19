@@ -216,7 +216,7 @@ struct Gen {
             fpu(c);
             return;
         }
-        switch (next() % 30) {
+        switch (next() % 32) {
             case 0: case 1: case 2: c.insert(c.end(), {alu[next() % 9], static_cast<u8>(0xC0 | s << 3 | d)}); break;
             case 3: c.insert(c.end(), {static_cast<u8>(alu[next() % 8] - 1), static_cast<u8>(0xC0 | reg8() << 3 | reg8())}); break;
             case 4: c.insert(c.end(), {0x66, alu[next() % 9], static_cast<u8>(0xC0 | s << 3 | d)}); break;
@@ -258,6 +258,19 @@ struct Gen {
             case 27: c.insert(c.end(), {0x83, static_cast<u8>(0x43 | (next() % 8) << 3), static_cast<u8>(next()), static_cast<u8>(next())}); break;  // alu [ebx+d8], imm8
             case 28: c.insert(c.end(), {0x66, 0x89, static_cast<u8>(0x43 | s << 3), static_cast<u8>(next())}); break;  // mov [ebx+d8], r16
             case 29: c.insert(c.end(), {0x66, 0x8B, static_cast<u8>(0x43 | d << 3), static_cast<u8>(next() & 0xFE)}); break;  // mov r16, [ebx+d8]
+            case 30: {
+                static constexpr u8 sh[] = {4, 5, 7};
+                c.insert(c.end(), {0xC1, static_cast<u8>(0x43 | sh[next() % 3] << 3), static_cast<u8>(next()), static_cast<u8>(next() & 31)});  // shift [ebx+d8], imm
+                break;
+            }
+            case 31: {
+                static constexpr u8 sh[] = {4, 5, 7};
+                const u8 op = static_cast<u8>(next() % 3 == 0 ? 0xD2 : 0xD3);  // byte or dword
+                const u8 r = op == 0xD2 ? reg8() : reg();  // byte registers for the byte form, never ESP
+                c.insert(c.end(), {op, static_cast<u8>(next() & 1 ? (0x43 | sh[next() % 3] << 3) : (0xC0 | sh[next() % 3] << 3 | r)), static_cast<u8>(next())});
+                if ((c[c.size() - 2] & 0xC0) == 0xC0) c.pop_back();  // the register form has no displacement
+                break;
+            }
         }
     }
 };
@@ -438,6 +451,40 @@ TEST(P6Block, X87FormsMatchTheInterpreter) {
             run_blocks(c, e);
             expect_same(a, c, "x87 snippet");
             ASSERT_FALSE(::testing::Test::HasFailure()) << "snippet " << s << " control word " << cw;
+        }
+    }
+}
+
+// Write tracking under the recompiler: a watched page reports its first write once, then is not watched; every
+// written page is reported when every page is logged. Native and interpreted runs report the same pages.
+TEST(P6Block, WriteTrackingMatchesTheInterpreter) {
+    // A loop writing [ebx] and [ebx+0x1000] eight times: mov [ebx], eax; mov [ebx+0x1000], eax; dec ecx; jnz.
+    const std::vector<u8> code = {0x89, 0x03, 0x89, 0x83, 0x00, 0x10, 0x00, 0x00, 0x49, 0x75, 0xF5, 0xF4};
+    for (bool selective : {true, false}) {
+        std::vector<u32> pages[2];
+        for (int jit = 0; jit < 2; ++jit) {
+            Rig r(true);
+            r.load(code);
+            r.cpu.state().gpr[kEbx] = kData;
+            r.cpu.state().gpr[kEcx] = 8;
+            r.cpu.memory().set_dirty_tracking(true, selective);
+            r.cpu.memory().watch(kData / 4096, 1);  // only the first page is watched (selective)
+            r.cpu.set_block_timing(true);
+            BlockEngine e(r.cpu, r.bus);
+            if (!jit) e.disable_jit();
+            e.set_jit_threshold(0);
+            run_blocks(r, e);
+            EXPECT_EQ(r.cpu.state().gpr[kEcx], 0u);
+            r.cpu.memory().take_dirty_pages(pages[jit]);
+            if (jit) {
+                EXPECT_GT(e.stats().native_insns, 0u);
+            }
+        }
+        EXPECT_EQ(pages[0], pages[1]) << (selective ? "selective" : "every page");
+        if (selective) {
+            EXPECT_EQ(pages[1], std::vector<u32>{kData / 4096});
+        } else {
+            EXPECT_EQ(pages[1], (std::vector<u32>{kData / 4096, kData / 4096 + 1, 0x100000 / 4096}));  // + the walk's A/D bits
         }
     }
 }

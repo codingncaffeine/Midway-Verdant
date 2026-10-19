@@ -37,7 +37,7 @@ bool P6Backend::init(Machine& machine, std::string& error) {
     machine_ = &machine;
     cpu_ = std::make_unique<p6::Cpu>(machine.bus());
     cpu_->memory().set_rom_range(Flash::kBase, Flash::kWindow);
-    cpu_->memory().set_dirty_tracking(dirty_tracking_);
+    cpu_->memory().set_dirty_tracking(dirty_tracking_, selective_requested_);
     cpu_->memory().set_device_hook([this] { sync_time(); });
     cpu_->set_interrupt_source([this] { return machine_->pic().pending_vector(); }, [this] { return machine_->pic().acknowledge(); });
     // Trace lines carry the interpreter's own clock, exact to the instruction.
@@ -249,7 +249,10 @@ void P6Backend::thread_main() {
     while (!stop_requested_) {
         try {
             {
-                std::lock_guard lock(machine_->lock());
+                std::unique_lock lock(machine_->lock());
+                // Frame stepping (libretro) and real-time pacing: the CPU holds between batches (batches end on
+                // instruction counts, so a run stays deterministic; held, its clock stands still).
+                if (!machine_->pace_cpu(lock, cpu_->cycles(), stop_requested_)) continue;
                 if (idle_skip_ && !idle_eips_[0] && idle_scans_ < 4000 && (stats_.exits % 64) == 0) find_idle_loop();
                 run_batch();
                 ++stats_.exits;

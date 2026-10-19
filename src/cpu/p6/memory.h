@@ -104,7 +104,13 @@ public:
     unsigned access_count() const { return naccesses_; }
 
     // Dirty-page tracking for the capture instruments (RAM pages the CPU wrote).
-    void set_dirty_tracking(bool on);
+    // `selective`: only pages named by `watch` are logged, each reported once (the live GPU's write watches).
+    void set_dirty_tracking(bool on, bool selective = false);
+    void watch(u32 first_page, u32 count);
+    bool selective() const { return selective_; }
+    // The bitmaps the recompiler's generated code tests and sets (RAM page bits; stable once tracking is set).
+    u64* dirty_map() { return dirty_.data(); }
+    const u64* watched_map() const { return watched_.data(); }
     void take_dirty_pages(std::vector<u32>& pages);
 
     // Block timing's device term (D26): a running count of the device and port accesses (a block ends after an
@@ -168,6 +174,8 @@ private:
     std::vector<IoRecord> io_log_;
     bool dirty_tracking_{false};
     std::vector<u64> dirty_;
+    bool selective_{false};
+    std::vector<u64> watched_;
     u64 tlb_misses_{0}, page_walks_{0};
     PhysAddr rom_base_{0xFF000000u};
     u64 rom_size_{16u * 1024 * 1024};

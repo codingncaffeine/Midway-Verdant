@@ -281,9 +281,16 @@ void Memory::io_write(u16 port, unsigned size, u32 value) {
     bus_.pio_write(port, size, value);
 }
 
-void Memory::set_dirty_tracking(bool on) {
+void Memory::set_dirty_tracking(bool on, bool selective) {
     dirty_tracking_ = on;
+    selective_ = on && selective;
     dirty_.assign(on ? (bus_.ram_size() / 4096 + 63) / 64 : 0, 0);
+    watched_.assign(selective_ ? dirty_.size() : 0, 0);
+}
+
+void Memory::watch(u32 first_page, u32 count) {
+    if (!selective_) return;
+    for (u32 p = first_page; p < first_page + count && p / 64 < watched_.size(); ++p) watched_[p / 64] |= u64{1} << (p % 64);
 }
 
 void Memory::mark_dirty(PhysAddr phys, unsigned n) {
@@ -292,7 +299,15 @@ void Memory::mark_dirty(PhysAddr phys, unsigned n) {
     const u64 start = static_cast<u64>(p - bus_.ram());
     const u64 first = start / 4096;
     const u64 last = (start + n - 1) / 4096;
-    for (u64 page = first; page <= last; ++page) dirty_[page / 64] |= u64{1} << (page % 64);
+    for (u64 page = first; page <= last; ++page) {
+        const u64 bit = u64{1} << (page % 64);
+        if (selective_) {
+            // A watched page's first write is reported, and it is not watched again until named again.
+            if (!(watched_[page / 64] & bit)) continue;
+            watched_[page / 64] &= ~bit;
+        }
+        dirty_[page / 64] |= bit;
+    }
 }
 
 void Memory::take_dirty_pages(std::vector<u32>& pages) {
