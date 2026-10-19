@@ -33,8 +33,13 @@ constexpr int kKickSignal = SIGUSR1;
 // The kick: the handler marks the run area so a KVM_RUN entered after the signal leaves at once (the race the
 // KVM documentation describes for immediate_exit), and the signal itself breaks a KVM_RUN already in progress.
 std::atomic<kvm_run*> g_kick_target{nullptr};
+// The flag is shared by this handler, kick() on other threads and the vCPU thread's reset: atomic stores, and the
+// handler keeps errno as it found it (it can land between a failing call and the read of errno).
+void set_immediate_exit(kvm_run* r, u8 v) { std::atomic_ref<u8>(r->immediate_exit).store(v, std::memory_order_relaxed); }
 void kick_handler(int) {
-    if (kvm_run* r = g_kick_target.load(std::memory_order_relaxed)) r->immediate_exit = 1;
+    const int saved = errno;
+    if (kvm_run* r = g_kick_target.load(std::memory_order_relaxed)) set_immediate_exit(r, 1);
+    errno = saved;
 }
 
 constexpr u32 kSlotRam = 0, kSlotRamAlias = 1, kSlotFlash = 2, kSlotTopPage = 3;
@@ -453,7 +458,7 @@ void KvmBackend::join() {
 
 void KvmBackend::kick() {
     ++stats_.kicks;
-    if (run_) run_->immediate_exit = 1;
+    if (run_) set_immediate_exit(run_, 1);
     if (thread_.joinable()) pthread_kill(thread_.native_handle(), kKickSignal);
     machine_->wake_cpu();
 }
@@ -566,7 +571,7 @@ void KvmBackend::thread_main() {
 
     while (!stop_requested_) {
         // From here a kick makes the coming KVM_RUN return at once (the check below runs after it, under the lock).
-        run_->immediate_exit = 0;
+        set_immediate_exit(run_, 0);
         {
             std::unique_lock lock(machine_->lock());
             const u64 t0 = mono_ns();
