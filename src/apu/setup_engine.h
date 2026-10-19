@@ -2,6 +2,7 @@
 #include <vector>
 #include <array>
 #include <cstddef>
+#include <cstdlib>
 
 #include "core/bus.h"
 #include "core/types.h"
@@ -78,7 +79,9 @@ public:
     using Mix = std::array<std::array<float, kSamplesPerFrame>, kBins>;
     using Frame = std::array<std::array<float, 2>, kSamplesPerFrame>;  // left, right per sample
 
-    SetupEngine(Bus& bus, SetupEngineHost& host) : bus_(bus), host_(host) {}
+    SetupEngine(Bus& bus, SetupEngineHost& host) : bus_(bus), host_(host) {
+        if (const char* r = std::getenv("MV_IDLE_RETRAP"); r && *r == '0') retrap_ = false;
+    }
 
     // A method written to the voice processor's window; true when the engine consumed it.
     bool method(u32 offset, u32 value);
@@ -130,7 +133,12 @@ private:
     void link_on(u32 handle);
     bool on_a_list(u32 handle) const;  // whether the voice is on one of the three lists
     void walk(u32 list);
-    void retire(u32 handle, u32 list, u32 prev, u32 next, u32 state);
+    // Turns a voice off; true when it stays on its list for the host to take off.
+    bool retire(u32 handle, u32 list, u32 prev, u32 next, u32 state);
+    // A turned-off voice stays listed, inactive, and reports idle every frame until the host takes it off its list, as
+    // the reference emulator's hardware does: a report the host consumed early (one title turns a voice off twice and
+    // waits on the second) is raised again. MV_IDLE_RETRAP=0: the engine unlinks the voice and reports once (old).
+    bool retrap_{true};
     // A voice's frame of samples; false when the voice ends during it (the rest of the frame is silence).
     bool render_buffer(u32 handle, u32 fmt, double step, Frame& out);
     bool render_stream(u32 handle, u32 fmt, double step, Frame& out);

@@ -544,6 +544,9 @@ namespace mv {
 // ── the front end's traps ───────────────────────────────────────────────────────────────────────────────────────
 
 void Apu::front_end_trap(u32 method, u32 parameter) {
+    // A report the host already has pending, or queued, is not raised twice (an idle voice reports every frame).
+    if (fe_trapped_ && regs_[kFeDecMethod / 4] == method && regs_[kFeDecParam / 4] == parameter) return;
+    if (std::ranges::find(trap_queue_, std::pair{method, parameter}) != trap_queue_.end()) return;
     if (fe_trapped_) {
         trap_queue_.emplace_back(method, parameter);
         return;

@@ -265,9 +265,12 @@ void SetupEngine::frame() {
     }
 }
 
-void SetupEngine::retire(u32 handle, u32 list, u32 prev, u32 next, u32 state) {
-    if (prev == kNoVoice) host_.set_global_reg(kRegListTop[list], next);
-    else set_field(prev, kFieldPitchLink, (field(prev, kFieldPitchLink) & 0xFFFF0000u) | next);
+bool SetupEngine::retire(u32 handle, u32 list, u32 prev, u32 next, u32 state) {
+    const bool host_unlinks = retrap_ && (host_.global_reg(kRegTrapForce1) & kTrapForceIdleVoice);
+    if (!host_unlinks) {
+        if (prev == kNoVoice) host_.set_global_reg(kRegListTop[list], next);
+        else set_field(prev, kFieldPitchLink, (field(prev, kFieldPitchLink) & 0xFFFF0000u) | next);
+    }
     set_field(handle, kFieldState, state & ~(kStateActive | kStateNew));
     book_[handle].off_pending = false;
     // Turning a voice off (VOICE_OFF, the end of its release, a stream run dry) reports it done through its notifier:
@@ -276,7 +279,9 @@ void SetupEngine::retire(u32 handle, u32 list, u32 prev, u32 next, u32 state) {
     write_notifier(handle, (field(handle, kFieldFmt) & kFmtStream) ? book_[handle].ssl_index : 0u);
     trace::log(trace::Cat::Apu, "vp: voice {:x} off, notifier {} done", handle, (field(handle, kFieldFmt) & kFmtStream) ? book_[handle].ssl_index : 0u);
     ++retired_;
-    if (host_.global_reg(kRegTrapForce1) & kTrapForceIdleVoice) host_.front_end_trap(kSe2FeIdleVoice, handle);
+    // With the host unlinking, the walk raises the idle report from the next frame on, every frame it is still listed.
+    if (!host_unlinks && (host_.global_reg(kRegTrapForce1) & kTrapForceIdleVoice)) host_.front_end_trap(kSe2FeIdleVoice, handle);
+    return host_unlinks;
 }
 
 void SetupEngine::walk(u32 list) {
@@ -287,6 +292,12 @@ void SetupEngine::walk(u32 list) {
         const u32 next = link & kHandleMask;
         u32 state = field(handle, kFieldState);
         bool retire_now = book_[handle].off_pending;
+        if (retrap_ && !(state & kStateActive) && !retire_now && (host_.global_reg(kRegTrapForce1) & kTrapForceIdleVoice)) {
+            host_.front_end_trap(kSe2FeIdleVoice, handle);  // an idle voice the host has not taken off yet
+            prev = handle;
+            handle = next;
+            continue;
+        }
         if (!retire_now && (state & kStateActive) && !(state & kStatePaused)) {
             bool ended = false;
             const float ef = step_envelope(handle, false, ended);
@@ -314,8 +325,7 @@ void SetupEngine::walk(u32 list) {
                 set_field(handle, kFieldState, state);
             }
         }
-        if (retire_now) retire(handle, list, prev, next, state);
-        else prev = handle;
+        if (!retire_now || retire(handle, list, prev, next, state)) prev = handle;
         handle = next;
     }
 }

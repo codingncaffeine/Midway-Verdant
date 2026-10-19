@@ -332,7 +332,8 @@ RETRO_API void retro_unload_game(void) {
         log(RETRO_LOG_INFO, "gpu: a FIFO thread could have run %.3f s of the pusher's %.3f s alongside the guest (%llu points where the guest needed its result)",
             static_cast<double>(machine->nv2a().pusher_overlap_ns()) / 1e9, static_cast<double>(machine->nv2a().pusher_wall_ns()) / 1e9,
             static_cast<unsigned long long>(machine->nv2a().pusher_sync_points()));
-        log(RETRO_LOG_INFO, "apu: %llu front-end memory fences written", static_cast<unsigned long long>(machine->apu().fence_writes()));
+        log(RETRO_LOG_INFO, "apu: %llu front-end memory fences written, %llu front-end traps raised", static_cast<unsigned long long>(machine->apu().fence_writes()),
+            static_cast<unsigned long long>(machine->apu().traps()));
         log(RETRO_LOG_INFO, "device time: the frontend's thread fired events for %.3f s; the gpu pusher took %.3f s on the CPU thread",
             static_cast<double>(machine->io_event_ns()) / 1e9, static_cast<double>(machine->nv2a().pusher_wall_ns()) / 1e9);
         // Where the event time went: host time inside each device event (both threads), and the APU frame's parts.

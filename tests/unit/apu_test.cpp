@@ -209,6 +209,19 @@ struct VoiceRig : Rig {
     u32 field(u32 handle, u32 off) { return apu.setup_engine().field(handle, off); }
     u32 cbo(u32 handle) { return field(handle, apu::SetupEngine::kFieldOffset) & apu::SetupEngine::kOffsetMask; }
     u32 next_of(u32 handle) { return field(handle, apu::SetupEngine::kFieldPitchLink) & 0xFFFFu; }
+    // The host's answer to an idle report: it takes the voice off its list (the top register or the previous voice's link).
+    void take_off(u32 handle) {
+        using SE = apu::SetupEngine;
+        for (u32 top : SE::kRegListTop) {
+            u32 prev = SE::kNoVoice;
+            for (u32 h = rd(top) & 0xFFFFu, guard = 0; h != SE::kNoVoice && guard < 256; prev = h, h = next_of(h), ++guard) {
+                if (h != handle) continue;
+                if (prev == SE::kNoVoice) wr(top, next_of(h));
+                else apu.setup_engine().set_field(prev, SE::kFieldPitchLink, (field(prev, SE::kFieldPitchLink) & 0xFFFF0000u) | next_of(h));
+                return;
+            }
+        }
+    }
     // The kernel's way out of a trap: acknowledge the status, then halt and free the front end.
     void service_trap() {
         wr(Apu::kIsts, rd(Apu::kIsts));
@@ -219,7 +232,7 @@ struct VoiceRig : Rig {
 };
 }  // namespace
 
-TEST(ApuVoices, VoiceOnLinksAtTheTopOfItsListAndAOneShotThatPlaysToItsEndRetiresWithItsNotifierAndATrap) {
+TEST(ApuVoices, AOneShotThatPlaysToItsEndTurnsOffAndReportsIdleEveryFrameUntilTheHostTakesItOff) {
     using SE = apu::SetupEngine;
     VoiceRig r;
     r.vp(SE::kMethodSetCurrentVoice, 5);
@@ -239,8 +252,8 @@ TEST(ApuVoices, VoiceOnLinksAtTheTopOfItsListAndAOneShotThatPlaysToItsEndRetires
     EXPECT_EQ(r.rd(Apu::kIsts), 0u);
     r.sched.advance_to(Rig::frame(3));
     EXPECT_EQ(r.cbo(5), 63u) << "stopped at its last sample";
-    EXPECT_EQ(r.rd(SE::kRegListTop[0]), SE::kNoVoice) << "played to its end: retired and off the list";
-    EXPECT_FALSE(r.field(5, SE::kFieldState) & SE::kStateActive);
+    EXPECT_FALSE(r.field(5, SE::kFieldState) & SE::kStateActive) << "played to its end: turned off";
+    EXPECT_EQ(r.rd(SE::kRegListTop[0]), 5u) << "still listed: the host takes it off";
     EXPECT_EQ(r.rd(Apu::kFectl) & (Apu::kFectlMethodMode | Apu::kFectlTrapReason), Apu::kFectlTrapped | Apu::kFectlTrapRequested);
     EXPECT_EQ(r.rd(Apu::kFeDecMethod), SE::kSe2FeIdleVoice);
     EXPECT_EQ(r.rd(Apu::kFeDecParam), 5u);
@@ -252,9 +265,21 @@ TEST(ApuVoices, VoiceOnLinksAtTheTopOfItsListAndAOneShotThatPlaysToItsEndRetires
     }
     EXPECT_TRUE(r.irq);
     EXPECT_TRUE(r.apu.front_end_trapped());
+    // A host that frees the front end without taking the voice off hears about it again on the next frame.
     r.service_trap();
     EXPECT_FALSE(r.irq);
     EXPECT_FALSE(r.apu.front_end_trapped());
+    const u64 traps = r.apu.traps();
+    r.sched.advance_to(Rig::frame(4));
+    EXPECT_EQ(r.apu.traps(), traps + 1) << "reported again while it stays listed";
+    EXPECT_EQ(r.rd(Apu::kFeDecParam), 5u);
+    // Taken off its list, it is reported no more.
+    r.take_off(5);
+    r.service_trap();
+    r.sched.advance_to(Rig::frame(6));
+    EXPECT_EQ(r.apu.traps(), traps + 1);
+    EXPECT_EQ(r.rd(SE::kRegListTop[0]), SE::kNoVoice);
+    EXPECT_FALSE(r.irq);
     EXPECT_EQ(r.apu.setup_engine().voices_retired(), 1u);
 
     // Pitch: one octave up doubles the step.
@@ -264,7 +289,7 @@ TEST(ApuVoices, VoiceOnLinksAtTheTopOfItsListAndAOneShotThatPlaysToItsEndRetires
     r.vp(0x37C, 4096u << 16);
     r.vp(SE::kMethodVoiceOn, 6);
     EXPECT_EQ(r.rd(SE::kRegListTop[0]), 6u);
-    r.sched.advance_to(Rig::frame(4));
+    r.sched.advance_to(Rig::frame(7));
     EXPECT_EQ(r.cbo(6), 64u);
 }
 
@@ -294,24 +319,34 @@ TEST(ApuVoices, ALoopingVoiceWrapsAndRetiresOnlyWhenTurnedOffAndQueuedTrapsWaitF
     EXPECT_EQ(r.rd(SE::kRegListTop[1]), 7u) << "the one-shot plays on";
     EXPECT_FALSE(r.irq);
 
-    // Both turned off in the same frame: the 2D list is walked first, so its report comes first.
+    // Both turned off in the same frame: off at the next frame and still listed; their idle reports come on the frame
+    // after, the 2D list's first (it is walked first), the other queued until the front end is free.
     r.vp(SE::kMethodVoiceOff, 0x40);
     r.vp(SE::kMethodVoiceOff, 7);
     r.sched.advance_to(Rig::frame(2));
-    EXPECT_EQ(r.rd(SE::kRegListTop[0]), SE::kNoVoice) << "turned off: retired at the next frame";
-    EXPECT_EQ(r.rd(SE::kRegListTop[1]), SE::kNoVoice);
+    EXPECT_FALSE(r.field(0x40, SE::kFieldState) & SE::kStateActive) << "turned off at the next frame";
+    EXPECT_FALSE(r.field(7, SE::kFieldState) & SE::kStateActive);
+    EXPECT_EQ(r.rd(SE::kRegListTop[0]), 0x40u) << "and still listed";
+    EXPECT_EQ(r.rd(SE::kRegListTop[1]), 7u);
+    r.sched.advance_to(Rig::frame(3));
     EXPECT_EQ(r.rd(Apu::kFeDecParam), 0x40u);
     EXPECT_TRUE(r.irq);
     EXPECT_EQ(r.apu.traps(), 1u) << "the second report waits for the front end";
+    r.take_off(0x40);
     r.service_trap();
     EXPECT_FALSE(r.irq);
-    r.sched.advance_to(Rig::frame(3));
+    r.sched.advance_to(Rig::frame(4));
     EXPECT_EQ(r.rd(Apu::kFeDecParam), 7u) << "the queued report is delivered once the front end is free";
     EXPECT_TRUE(r.irq);
+    EXPECT_EQ(r.apu.traps(), 2u) << "and not raised twice while it is pending";
+    r.take_off(7);
+    r.service_trap();
+    r.sched.advance_to(Rig::frame(5));
     EXPECT_EQ(r.apu.traps(), 2u);
+    EXPECT_EQ(r.rd(SE::kRegListTop[0]), SE::kNoVoice);
+    EXPECT_EQ(r.rd(SE::kRegListTop[1]), SE::kNoVoice);
     EXPECT_EQ(r.apu.setup_engine().voices_started(), 2u);
     EXPECT_EQ(r.apu.setup_engine().voices_retired(), 2u);
-    r.service_trap();
     EXPECT_FALSE(r.irq);
 }
 
@@ -452,8 +487,12 @@ TEST(ApuSynthesis, ProgrammingAPlayingOneShotsEndStartsItAgainAndAReplayedVoiceI
     EXPECT_EQ(r.field(SynthRig::kVoice, SE::kFieldPitchLink) & 0xFFFFu, SE::kNoVoice) << "not linked to itself";
     r.sched.advance_to(Rig::frame(3));
     EXPECT_FLOAT_EQ(r.bin(0, 3), SynthRig::pcm(3) / 32768.0f);
-    // Played to its end, it is off its list; VOICE_ON links it again and it plays from its start.
+    // Played to its end, it reports idle and the host takes it off its list; VOICE_ON links it again and it plays from
+    // its start.
     r.sched.advance_to(Rig::frame(5));
+    EXPECT_FALSE(r.field(SynthRig::kVoice, SE::kFieldState) & SE::kStateActive);
+    r.take_off(SynthRig::kVoice);
+    r.service_trap();
     EXPECT_EQ(r.rd(SE::kRegListTop[0]), SE::kNoVoice);
     r.vp(SE::kMethodVoiceOn, SynthRig::kVoice);
     EXPECT_EQ(r.rd(SE::kRegListTop[0]), SynthRig::kVoice);
