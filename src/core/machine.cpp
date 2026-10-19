@@ -54,6 +54,7 @@ Machine::Machine(const MachineConfig& config)
     pci_.add({1, 0, 0}, nv2a_);
     pci_.add({0, 5, 0}, apu_);
     pci_.add({0, 6, 0}, aci_);
+    aci_.set_before_read([this] { apu_.dsp_sync(); });  // the EP writes the output ring from its own thread
     pci_.add({0, 9, 0}, ide_);
     auto placeholder = [this](PciAddress at, std::string_view name, u16 device, u32 class_code, u8 rev, u8 header = 0) {
         auto d = std::make_unique<PciPlaceholder>(name, device, class_code, rev, header);

@@ -1,8 +1,12 @@
 #pragma once
+#include <atomic>
+#include <condition_variable>
 #include <deque>
 #include <functional>
+#include <mutex>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -62,6 +66,12 @@ public:
     static constexpr u32 kEpFrameDivider = 8;
 
     Apu(Bus& bus, Scheduler& sched, std::function<void(bool)> irq);
+    ~Apu() override;
+    Apu(const Apu&) = delete;
+    Apu& operator=(const Apu&) = delete;
+    // The processors' frame runs on its own thread: wait until the one in flight (if any) has finished. Everything
+    // that reads or writes their memories, their DMA or the FIFO registers from the machine's side calls it first.
+    void dsp_sync() const;
     std::string_view name() const override { return PciDevice::name(); }
     u32 mmio_read(PhysAddr addr, unsigned size) override;
     void mmio_write(PhysAddr addr, unsigned size, u32 value) override;
@@ -69,17 +79,32 @@ public:
     void reset();
 
     // A register word as the kernel would read it (offset into the window, 4-byte aligned).
-    u32 reg(u32 offset);
+    u32 reg(u32 offset) {
+        if (!in_vp_window(offset)) dsp_sync();
+        return read_word(offset & ~3u);
+    }
     // Raise interrupt status bits from a device-side event.
     void raise(u32 bits);
     bool irq_level() const { return irq_level_; }
     u64 reads() const { return reads_; }
     u64 writes() const { return writes_; }
     u64 frames() const { return frames_; }
-    apu::Processor& gp() { return gp_; }
-    apu::Processor& ep() { return ep_; }
-    u64 fifo_out_bytes(bool ep, u32 fifo) const { return (ep ? ep_memory_ : gp_memory_).fifo_out_bytes(fifo); }
-    u64 fifo_in_bytes(bool ep, u32 fifo) const { return (ep ? ep_memory_ : gp_memory_).fifo_in_bytes(fifo); }
+    apu::Processor& gp() {
+        dsp_sync();
+        return gp_;
+    }
+    apu::Processor& ep() {
+        dsp_sync();
+        return ep_;
+    }
+    u64 fifo_out_bytes(bool ep, u32 fifo) const {
+        dsp_sync();
+        return (ep ? ep_memory_ : gp_memory_).fifo_out_bytes(fifo);
+    }
+    u64 fifo_in_bytes(bool ep, u32 fifo) const {
+        dsp_sync();
+        return (ep ? ep_memory_ : gp_memory_).fifo_in_bytes(fifo);
+    }
     apu::SetupEngine& setup_engine() { return se_; }
     u64 traps() const { return traps_; }
     bool front_end_trapped() const { return fe_trapped_; }
@@ -91,9 +116,20 @@ public:
     // The last frame's cycle use and the longest so far, per processor.
     struct FrameStats {
         u64 last_cycles{0}, max_cycles{0}, frames_run{0};
+        u64 host_ns{0};       // host time inside the processor's frames
+        u64 total_cycles{0};  // DSP cycles they used (idle-wait skips included)
     };
-    const FrameStats& gp_stats() const { return gp_stats_; }
-    const FrameStats& ep_stats() const { return ep_stats_; }
+    const FrameStats& gp_stats() const {
+        dsp_sync();
+        return gp_stats_;
+    }
+    const FrameStats& ep_stats() const {
+        dsp_sync();
+        return ep_stats_;
+    }
+    u64 setup_engine_host_ns() const { return se_host_ns_; }  // host time inside the setup engine's frames
+    // MV_DEBUG_DSP_PCHIST=gp,ep: the program addresses each processor spent its executed cycles at, busiest first.
+    std::string pc_histogram_report(std::size_t top) const;
 
 protected:
     void on_bar_changed(int index, u32 old_base, u32 new_base) override;
@@ -135,6 +171,9 @@ private:
     bool processor_write(apu::Processor& p, u32 offset, u32 value);
     void apply_reset(apu::Processor& p, u32& reset_word, u32 value, std::string_view which);
     void run_frame(apu::Processor& p, FrameStats& stats, std::string_view which, bool start_of_frame);
+    void run_processors(u64 frame, bool ep_start);
+    void dsp_worker();
+    static bool in_vp_window(u32 offset) { return offset >= kVpBlock && offset < kGpBlock; }
     void update_frame_clock();
     void on_frame(Cycles now);
     void update_irq();
@@ -151,6 +190,17 @@ private:
     apu::Processor gp_, ep_;
     apu::SetupEngine se_;
     FrameStats gp_stats_, ep_stats_;
+    u64 se_host_ns_{0};
+    // The processors' thread: a frame posted by on_frame (dsp_busy_ while it runs), its number and EP start flag.
+    bool dsp_threaded_{true};
+    mutable std::mutex dsp_mutex_;
+    mutable std::condition_variable dsp_cv_;
+    std::atomic<bool> dsp_busy_{false};
+    bool dsp_stop_{false};
+    u64 dsp_job_frame_{0};
+    bool dsp_job_ep_start_{false};
+    std::thread dsp_thread_;  // started in the constructor's body, joined in the destructor's
+    std::vector<u64> gp_hist_, ep_hist_;
     std::deque<std::pair<u32, u32>> trap_queue_;
     bool fe_trapped_{false};
     u64 traps_{0};

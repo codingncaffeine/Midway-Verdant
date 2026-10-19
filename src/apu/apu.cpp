@@ -1,11 +1,15 @@
 #include "apu/apu.h"
 
+#include <chrono>
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <format>
+#if defined(__linux__)
+#include <pthread.h>
+#endif
 
 #include "core/clock.h"
 #include "debug/trace.h"
@@ -39,6 +43,53 @@ Apu::Apu(Bus& bus, Scheduler& sched, std::function<void(bool)> irq)
     set_cfg8(0x3D, 1);
     frame_.name = "apu.frame";
     frame_.fire = [this](Cycles now) { on_frame(now); };
+    if (const char* t = std::getenv("MV_APU_THREAD"); t && *t == '0') dsp_threaded_ = false;
+    if (dsp_threaded_) dsp_thread_ = std::thread([this] { dsp_worker(); });
+    if (const char* h = std::getenv("MV_DEBUG_DSP_PCHIST")) {
+        if (std::strstr(h, "gp")) {
+            gp_hist_.assign(gp_.core().p_memory().size(), 0);
+            gp_.core().set_pc_histogram(&gp_hist_);
+        }
+        if (std::strstr(h, "ep")) {
+            ep_hist_.assign(ep_.core().p_memory().size(), 0);
+            ep_.core().set_pc_histogram(&ep_hist_);
+        }
+    }
+}
+
+Apu::~Apu() {
+    if (dsp_thread_.joinable()) {
+        {
+            std::lock_guard g(dsp_mutex_);
+            dsp_stop_ = true;
+        }
+        dsp_cv_.notify_all();
+        dsp_thread_.join();
+    }
+}
+
+void Apu::dsp_sync() const {
+    if (!dsp_busy_.load(std::memory_order_acquire)) return;
+    std::unique_lock l(dsp_mutex_);
+    dsp_cv_.wait(l, [this] { return !dsp_busy_.load(std::memory_order_relaxed); });
+}
+
+void Apu::dsp_worker() {
+#if defined(__linux__)
+    pthread_setname_np(pthread_self(), "mv-apu-dsp");
+#endif
+    std::unique_lock l(dsp_mutex_);
+    for (;;) {
+        dsp_cv_.wait(l, [this] { return dsp_stop_ || dsp_busy_.load(std::memory_order_relaxed); });
+        if (dsp_stop_) return;
+        const u64 frame = dsp_job_frame_;
+        const bool ep_start = dsp_job_ep_start_;
+        l.unlock();
+        run_processors(frame, ep_start);
+        l.lock();
+        dsp_busy_.store(false, std::memory_order_release);
+        dsp_cv_.notify_all();
+    }
 }
 
 void Apu::on_bar_changed(int index, u32 old_base, u32 new_base) {
@@ -51,6 +102,7 @@ void Apu::on_bar_changed(int index, u32 old_base, u32 new_base) {
 }
 
 void Apu::reset() {
+    dsp_sync();
     apply_reset(gp_, gp_reset_, 0, "gp");
     apply_reset(ep_, ep_reset_, 0, "ep");
     for (auto& r : regs_) r = 0;
@@ -63,7 +115,6 @@ void Apu::reset() {
 
 // ── the register window ─────────────────────────────────────────────────────────────────────────────────────────
 
-u32 Apu::reg(u32 offset) { return read_word(offset & ~3u); }
 
 u32 Apu::processor_word(apu::Processor& p, u32 offset, u32 reset_word) {
     auto& core = p.core();
@@ -163,6 +214,7 @@ void Apu::write_word(u32 offset, u32 value) {
 
 u32 Apu::mmio_read(PhysAddr addr, unsigned size) {
     const u32 off = addr - mapped_at_;
+    if (!in_vp_window(off)) dsp_sync();
     const u32 word = read_word(off & ~3u);
     const unsigned shift = 8u * (off & 3u);
     const u32 v = size == 4 ? word : (size == 2 ? ((word >> shift) & 0xFFFFu) : ((word >> shift) & 0xFFu));
@@ -173,6 +225,7 @@ u32 Apu::mmio_read(PhysAddr addr, unsigned size) {
 
 void Apu::mmio_write(PhysAddr addr, unsigned size, u32 value) {
     const u32 off = addr - mapped_at_;
+    if (!in_vp_window(off)) dsp_sync();
     const u32 key = off & ~3u;
     u32 word = value;
     if (size != 4) {
@@ -240,8 +293,11 @@ void Apu::update_frame_clock() {
 
 void Apu::run_frame(apu::Processor& p, FrameStats& stats, std::string_view which, bool start_of_frame) {
     if (!p.running()) return;
+    const auto t0 = std::chrono::steady_clock::now();
     const u64 used = p.run_frame(kDspHz / clk::kApuFramesPerSecond, start_of_frame);
+    stats.host_ns += static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
     stats.last_cycles = used;
+    stats.total_cycles += used;
     stats.max_cycles = std::max(stats.max_cycles, used);
     ++stats.frames_run;
     bool& logged = &p == &gp_ ? gp_problem_logged_ : ep_problem_logged_;
@@ -253,9 +309,14 @@ void Apu::run_frame(apu::Processor& p, FrameStats& stats, std::string_view which
 
 void Apu::on_frame(Cycles now) {
     (void)now;
+    dsp_sync();  // the last frame's processor run, before this frame touches their memories
     ++frames_;
     // The setup engine walks the voice lists first; its idle reports trap to the host once the front end is free.
-    se_.frame();
+    {
+        const auto t0 = std::chrono::steady_clock::now();
+        se_.frame();
+        se_host_ns_ += static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
+    }
     if (!fe_trapped_ && !trap_queue_.empty()) {
         const auto [method, parameter] = trap_queue_.front();
         trap_queue_.pop_front();
@@ -296,10 +357,30 @@ void Apu::on_frame(Cycles now) {
         mix_differ_ = mix_samples_ = 0;
         gp_memory_.out0_differ_ = gp_memory_.out0_frames_ = ep_memory_.out0_differ_ = ep_memory_.out0_frames_ = 0;
     }
+    // The processors run on their own thread, beside the CPU (the hardware runs them alongside it too): anything that
+    // reads or writes their state from here on waits for this frame first (dsp_sync), so what the CPU observes is
+    // what it observed when the frame ran inline. MV_APU_THREAD=0 runs them inline.
+    const bool ep_start = (xgscnt_ / apu::SetupEngine::kSamplesPerFrame) % kEpFrameDivider == 0;
+    if (dsp_threaded_) {
+        std::lock_guard g(dsp_mutex_);
+        dsp_job_frame_ = frames_;
+        dsp_job_ep_start_ = ep_start;
+        dsp_busy_.store(true, std::memory_order_release);
+        dsp_cv_.notify_all();
+    } else {
+        run_processors(frames_, ep_start);
+    }
+    xgscnt_ += apu::SetupEngine::kSamplesPerFrame;
+    ++epoch_frames_;
+    sched_.schedule(frame_, frame_epoch_ + cycles_from_ticks(epoch_frames_ + 1, clk::kApuFramesPerSecond));
+}
+
+// One frame of the global processor, then the encode processor (on the processors' thread unless MV_APU_THREAD=0).
+void Apu::run_processors(u64 frame, bool ep_start) {
     // Instrument: MV_DEBUG_GP_FRAME=N writes the GP's instructions during frame N to scratch/gp-frame-N.trace.
     static const long debug_frame = std::getenv("MV_DEBUG_GP_FRAME") ? std::atol(std::getenv("MV_DEBUG_GP_FRAME")) : -1;
     std::FILE* gp_trace = nullptr;
-    if (debug_frame >= 0 && frames_ == static_cast<u64>(debug_frame)) {
+    if (debug_frame >= 0 && frame == static_cast<u64>(debug_frame)) {
         gp_trace = std::fopen(std::format("scratch/gp-frame-{}.trace", debug_frame).c_str(), "w");
         gp_.core().set_trace(gp_trace);
         gp_.dma().set_trace(gp_trace);
@@ -322,7 +403,7 @@ void Apu::on_frame(Cycles now) {
     static const long debug_ep_runs = std::getenv("MV_DEBUG_EP_RUNS") ? std::atol(std::getenv("MV_DEBUG_EP_RUNS")) : 0;
     std::FILE* ep_trace = nullptr;
     std::string trace_name;
-    if (debug_ep_frame >= 0 && frames_ == static_cast<u64>(debug_ep_frame)) trace_name = std::format("scratch/ep-frame-{}", debug_ep_frame);
+    if (debug_ep_frame >= 0 && frame == static_cast<u64>(debug_ep_frame)) trace_name = std::format("scratch/ep-frame-{}", debug_ep_frame);
     if (ep_.running() && ep_runs_since_release_ < static_cast<u64>(debug_ep_runs))
         trace_name = std::format("scratch/ep-run-{}-{}", ep_releases_, ep_runs_since_release_);
     if (ep_.running()) ++ep_runs_since_release_;
@@ -347,15 +428,12 @@ void Apu::on_frame(Cycles now) {
         ep_.core().set_trace(ep_trace);
         ep_.dma().set_trace(ep_trace);
     }
-    run_frame(ep_, ep_stats_, "ep", (xgscnt_ / apu::SetupEngine::kSamplesPerFrame) % kEpFrameDivider == 0);
+    run_frame(ep_, ep_stats_, "ep", ep_start);
     if (ep_trace) {
         ep_.core().set_trace(nullptr);
         ep_.dma().set_trace(nullptr);
         std::fclose(ep_trace);
     }
-    xgscnt_ += apu::SetupEngine::kSamplesPerFrame;
-    ++epoch_frames_;
-    sched_.schedule(frame_, frame_epoch_ + cycles_from_ticks(epoch_frames_ + 1, clk::kApuFramesPerSecond));
 }
 
 // ── scratch and FIFO spaces ─────────────────────────────────────────────────────────────────────────────────────
@@ -473,6 +551,33 @@ void Apu::deliver_trap(u32 method, u32 parameter) {
     ++traps_;
     trace::log(trace::Cat::Apu, "fe: trap method {:04x} parameter {:x} (frame {})", method, parameter, frames_);
     raise(kIstsFrontEndTrap);
+}
+
+}  // namespace mv
+
+namespace mv {
+
+std::string Apu::pc_histogram_report(std::size_t top) const {
+    std::string r;
+    const auto one = [&](std::string_view which, const std::vector<u64>& hist, const apu::Processor& p, const FrameStats& st) {
+        if (hist.empty()) return;
+        u64 total = 0;
+        std::vector<u32> order;
+        for (u32 a = 0; a < hist.size(); ++a)
+            if (hist[a]) {
+                total += hist[a];
+                order.push_back(a);
+            }
+        std::ranges::sort(order, std::greater{}, [&](u32 a) { return hist[a]; });
+        r += std::format("{}: {} frames, {:.0f} cycles a frame ({:.0f} executed, the rest idle-wait skips)\n", which, st.frames_run,
+                         st.frames_run ? static_cast<double>(st.total_cycles) / static_cast<double>(st.frames_run) : 0.0,
+                         st.frames_run ? static_cast<double>(total) / static_cast<double>(st.frames_run) : 0.0);
+        for (std::size_t i = 0; i < order.size() && i < top; ++i)
+            r += std::format("  P:{:04x} {:5.2f}%  {}\n", order[i], 100.0 * static_cast<double>(hist[order[i]]) / static_cast<double>(total), p.core().disassemble_at(order[i]));
+    };
+    one("gp", gp_hist_, gp_, gp_stats_);
+    one("ep", ep_hist_, ep_, ep_stats_);
+    return r;
 }
 
 }  // namespace mv

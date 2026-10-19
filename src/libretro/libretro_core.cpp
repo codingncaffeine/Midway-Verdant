@@ -323,6 +323,22 @@ RETRO_API void retro_unload_game(void) {
             static_cast<unsigned long long>(machine->pit().ticks_delayed()), static_cast<unsigned long long>(machine->pit().ticks_dropped()));
         log(RETRO_LOG_INFO, "device time: the frontend's thread fired events for %.3f s; the gpu pusher took %.3f s on the CPU thread",
             static_cast<double>(machine->io_event_ns()) / 1e9, static_cast<double>(machine->nv2a().pusher_wall_ns()) / 1e9);
+        // Where the event time went: host time inside each device event (both threads), and the APU frame's parts.
+        {
+            auto costs = machine->scheduler().event_costs();
+            std::ranges::sort(costs, std::greater{}, &mv::Scheduler::EventCost::host_ns);
+            std::string by_event;
+            for (const auto& c : costs)
+                by_event += std::format(" {} {:.3f} s/{}", c.name, static_cast<double>(c.host_ns) / 1e9, c.fired);
+            const auto& apu = machine->apu();
+            log(RETRO_LOG_INFO, "event host time (s/fired):%s; apu frame = setup engine %.3f s + gp %.3f s + ep %.3f s", by_event.c_str(),
+                static_cast<double>(apu.setup_engine_host_ns()) / 1e9, static_cast<double>(apu.gp_stats().host_ns) / 1e9, static_cast<double>(apu.ep_stats().host_ns) / 1e9);
+            for (std::string r = apu.pc_histogram_report(24); !r.empty();) {
+                const auto nl = r.find('\n');
+                log(RETRO_LOG_INFO, "%s", r.substr(0, nl).c_str());
+                r = nl == std::string::npos ? std::string() : r.substr(nl + 1);
+            }
+        }
     }
     machine->finish();
     if (trace_file) {
