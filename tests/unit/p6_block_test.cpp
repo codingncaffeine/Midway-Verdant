@@ -5,8 +5,10 @@
 #include <gtest/gtest.h>
 
 #include <cstring>
+#include <format>
 #include <initializer_list>
 #include <memory>
+#include <string>
 #include <vector>
 
 #include "core/bus.h"
@@ -73,6 +75,8 @@ void expect_same(Rig& a, Rig& b, const char* what, bool cycles = false);
 void run_lockstep(Rig& b, BlockEngine& eb, Rig& c, BlockEngine& ec, const char* what) {
     for (unsigned n = 0; n < 100000 && !c.cpu.state().halted; ++n) {
         ec.apply_device_writes();
+        const u32 at = c.cpu.state().eip;
+        const u32 mxcsr_before = c.cpu.state().fpu.mxcsr;
         if (Block* blk = ec.find()) ec.run(*blk, ~u64{0});
         else c.cpu.step();
         for (unsigned k = 0; k < 100000 && b.cpu.instructions() < c.cpu.instructions() && !b.cpu.state().halted; ++k) {
@@ -81,7 +85,14 @@ void run_lockstep(Rig& b, BlockEngine& eb, Rig& c, BlockEngine& ec, const char* 
             else b.cpu.step();
         }
         expect_same(b, c, what, true);
-        if (::testing::Test::HasFailure()) return;
+        if (::testing::Test::HasFailure()) {
+            // Where: the dispatch's start and its first bytes (the code is identity-mapped at its linear address).
+            std::string bytes;
+            for (u32 i = 0; i < 48 && at + i < c.bus.ram_size(); ++i) bytes += std::format(" {:02x}", c.bus.ram()[at + i]);
+            ADD_FAILURE() << what << ": dispatch " << n << " from eip " << std::hex << at << " (mxcsr before " << mxcsr_before << ", after " << c.cpu.state().fpu.mxcsr
+                          << " vs " << b.cpu.state().fpu.mxcsr << "), native instructions so far " << std::dec << ec.stats().native_insns << "; bytes" << bytes;
+            return;
+        }
     }
 }
 
@@ -383,6 +394,7 @@ struct Gen {
 TEST(P6Block, GeneratedProgramsMatchTheStep) {
     u64 native = 0, paged_insns = 0, chains = 0;
     for (u32 program = 0; program < 300; ++program) {
+        SCOPED_TRACE(std::format("program {}", program));
         Gen g{program * 7919u + 1};
         g.x87 = kHostX87 && program % 3 == 0;  // MSVC: no 80-bit long double, the interpreter's x87 only approximates
         g.simd = program % 5 < 2;
