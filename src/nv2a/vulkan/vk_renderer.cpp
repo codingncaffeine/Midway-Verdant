@@ -952,22 +952,31 @@ const VulkanRenderer::TextureEntry* VulkanRenderer::texture(const KelvinState& s
         const u64 z0 = surf->zeta_phys, z1 = static_cast<u64>(surf->zeta_phys) + surf->zeta_bytes();
         if (surf->zeta_dirty && z0 < static_cast<u64>(phys) + length && static_cast<u64>(phys) < z1) write_back_zeta(*surf);
     }
-    if (same && sc.entry->valid && !sc.entry->surface) return sc.entry;
+    // RAM is what the texture unit reads: an entry is stale once the CPU has rewritten its texels or its palette (a
+    // movie frame decoded into the texture, glyphs drawn into a font page) since it was decoded.
+    auto stale = [&](const TextureEntry& e) {
+        return handles_.newest_write(e.phys, e.length) > e.generation ||
+               (e.palette_phys && handles_.newest_write(e.palette_phys, 256 * 4) > e.generation);
+    };
+    if (same && sc.entry->valid && !sc.entry->surface && !stale(*sc.entry)) return sc.entry;
     struct Ident {
         u32 phys, format, control1, rect, palette;
     } id{phys, ts.format, ts.control1, ts.image_rect, ts.palette};
     std::string key(reinterpret_cast<const char*>(&id), sizeof id);
     auto it = textures_.find(key);
-    if (it != textures_.end() && it->second->valid) {
+    if (it != textures_.end() && it->second->valid && !stale(*it->second)) {
         sc = StageCache{regs, phys, length, it->second.get()};
         return it->second.get();
     }
 
     DecodedTexture d;
+    const u32 generation = handles_.write_generation();
+    u32 palette_phys = 0;
     const u8* palette = nullptr;
     if (ts.color_format() == 0x0B) {
         const DmaObject pdma = handles_.resolve(s.dma_handle((ts.palette & 1u) ? mthd::kDmaB : mthd::kDmaA));
         palette = MemoryView{ram_, ram_size_}.at(pdma.base + (ts.palette & 0xFFFFFFC0u), 256 * 4);
+        palette_phys = pdma.base + (ts.palette & 0xFFFFFFC0u);
     }
     if (!decode_texture(ts, phys, MemoryView{ram_, ram_size_}, palette, d)) {
         error = d.error;
@@ -983,6 +992,8 @@ const VulkanRenderer::TextureEntry* VulkanRenderer::texture(const KelvinState& s
     const VkFormat format = d.pixel == HostPixel::Rgba8 ? VK_FORMAT_R8G8B8A8_UNORM : (d.pixel == HostPixel::R16 ? VK_FORMAT_R16_UNORM : VK_FORMAT_R32_SFLOAT);
     auto entry = std::make_unique<TextureEntry>();
     if (it != textures_.end()) {
+        // Draws already recorded may still sample the old image: they go to the GPU before it is destroyed.
+        flush();
         entry = std::move(it->second);
         textures_.erase(it);
         dev_.destroy_image(entry->image);
@@ -1021,6 +1032,8 @@ const VulkanRenderer::TextureEntry* VulkanRenderer::texture(const KelvinState& s
     entry->width = d.width;
     entry->height = d.height;
     entry->linear = format_info(ts.color_format()).linear;
+    entry->generation = generation;
+    entry->palette_phys = palette_phys;
     TextureEntry* raw = entry.get();
     textures_[key] = std::move(entry);
     sc = StageCache{regs, phys, length, raw};

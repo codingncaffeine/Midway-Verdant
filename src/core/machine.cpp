@@ -218,6 +218,11 @@ bool Machine::init(std::string& error) {
         cpu_->set_dirty_tracking(true);
         bus_.set_dirty_tracking(true);
     }
+    // The live GPU sees the CPU's writes to its textures and surfaces through the same logs.
+    if (config_.gpu) {
+        cpu_->set_dirty_tracking(true);
+        bus_.set_dirty_tracking(true);
+    }
     if (!cpu_->init(*this, error)) return false;
     if (capture_) nv2a_.set_capture(capture_.get(), cpu_.get());
     if (config_.gpu) {
@@ -225,6 +230,7 @@ bool Machine::init(std::string& error) {
         if (!gpu_device_->init(error)) return false;
         renderer_ = std::make_unique<pgraph::VulkanRenderer>(*gpu_device_, nv2a_, bus_.ram(), static_cast<u32>(bus_.ram_size()));
         if (!renderer_->init(error)) return false;
+        nv2a_.set_write_tracking(cpu_.get());
         nv2a_.set_renderer(renderer_.get());
         trace::log(trace::Cat::Boot, "live GPU on {}", gpu_device_->name());
     }

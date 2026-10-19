@@ -19,6 +19,10 @@ class HandleResolver {
 public:
     virtual ~HandleResolver() = default;
     virtual DmaObject resolve(u32 handle) const = 0;
+    // CPU writes since a cache was built (see Nv2aStub::newest_write): the current write generation, and the newest
+    // generation among the pages of a range. A source without tracking reports nothing written.
+    virtual u32 write_generation() const { return 0; }
+    virtual u32 newest_write(u32 phys, u32 len) const { (void)phys; (void)len; return 0; }
 };
 
 // Guest RAM as the engine reads it (through the direct window or the 0xF0000000 alias).

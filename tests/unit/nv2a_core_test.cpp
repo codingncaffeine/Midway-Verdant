@@ -187,3 +187,22 @@ TEST(Nv2aTimer, TheAlarmRaisesItsInterruptWhenTheTimeReachesIt) {
     gpu.mmio_write(Nv2aStub::kPtimerIntr0, 4, 1);
     EXPECT_FALSE(irq);
 }
+
+// A write to RAM between two pusher runs makes the pages it touched newer than any cache built before it; pages it
+// did not touch keep their generation, and reading changes nothing.
+TEST(Nv2aWrites, APusherRunStampsThePagesWrittenSinceTheLastOne) {
+    Channel c;
+    c.bus.set_dirty_tracking(true);
+    c.gpu.set_write_tracking(nullptr);
+    c.method(0x0050, 1);
+    c.kick();
+    const u32 built = c.gpu.write_generation();
+    EXPECT_LE(c.gpu.newest_write(0x20000, 0x2000), built);
+    const u32 texel = 0xFFFFFFFF;
+    c.bus.write_ram(0x21000, &texel, 4);
+    c.method(0x0050, 2);
+    c.kick();
+    EXPECT_GT(c.gpu.newest_write(0x20000, 0x2000), built) << "the texture's second page was written";
+    EXPECT_LE(c.gpu.newest_write(0x20000, 0x1000), built) << "its first page was not";
+    EXPECT_GT(c.gpu.newest_write(0x21000, 4), built) << "a second reader still sees it";
+}

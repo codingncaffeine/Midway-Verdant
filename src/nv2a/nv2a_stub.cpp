@@ -372,14 +372,37 @@ void Nv2aStub::capture_object(u32 handle) {
     capture_->object(handle, dw);
 }
 
-void Nv2aStub::capture_dirty_pages() {
-    // Everything written to RAM since the last run, by the guest (the backend's log) or by a device (the bus's),
-    // coalesced into contiguous runs of pages.
+void Nv2aStub::set_write_tracking(CpuBackend* cpu) {
+    cpu_ = cpu;
+    write_tracking_ = true;
+    page_generation_.assign(bus_.ram_size() / capture::kPageSize, 0u);
+}
+
+u32 Nv2aStub::newest_write(u32 phys, u32 len) const {
+    if (!write_tracking_ || len == 0) return 0;
+    const std::size_t pages = page_generation_.size();
+    const std::size_t first = phys / capture::kPageSize, last = (static_cast<std::size_t>(phys) + len - 1) / capture::kPageSize;
+    u32 newest = 0;
+    for (std::size_t p = first; p <= last && p < pages; ++p) newest = std::max(newest, page_generation_[p]);
+    return newest;
+}
+
+void Nv2aStub::collect_writes() {
+    if (!write_tracking_ && !capture_) return;
+    // Everything written to RAM since the last run, by the guest (the backend's log) or by a device (the bus's).
     dirty_scratch_.clear();
     if (cpu_) cpu_->take_dirty_pages(dirty_scratch_);
     bus_.take_dirty_pages(dirty_scratch_);
+    if (dirty_scratch_.empty()) return;
     std::sort(dirty_scratch_.begin(), dirty_scratch_.end());
     dirty_scratch_.erase(std::unique(dirty_scratch_.begin(), dirty_scratch_.end()), dirty_scratch_.end());
+    if (write_tracking_) {
+        ++write_generation_;
+        for (u32 p : dirty_scratch_)
+            if (p < page_generation_.size()) page_generation_[p] = write_generation_;
+    }
+    if (!capture_) return;
+    // The capture records them coalesced into contiguous runs of pages.
     const u32 page_count = static_cast<u32>(bus_.ram_size() / capture::kPageSize);
     std::size_t i = 0;
     while (i < dirty_scratch_.size()) {
@@ -407,10 +430,8 @@ void Nv2aStub::run_pusher() {
         trace::log(trace::Cat::Gpu, "pusher: no DMA object bound (instance {:04x})", reg(kCache1DmaInstance));
         return;
     }
-    if (capture_) {
-        capture_dirty_pages();
-        capture_->run(sched_.now(), get, put);
-    }
+    collect_writes();
+    if (capture_) capture_->run(sched_.now(), get, put);
     const auto t0 = std::chrono::steady_clock::now();
     get = walker_.run(dma, get, put);
     pusher_wall_ns_ += static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());

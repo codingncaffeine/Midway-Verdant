@@ -72,6 +72,8 @@ private:
         u32 width{0}, height{0};
         bool linear{false};
         bool surface{false};  // a render target's own image, sampled in place (owned by the surface)
+        u32 generation{0};       // the RAM write generation its texels and palette were decoded at
+        u32 palette_phys{0};
     };
     struct Surface {
         u32 phys{0};

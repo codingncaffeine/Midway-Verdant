@@ -136,6 +136,14 @@ public:
         capture_ = writer;
         cpu_ = cpu;
     }
+    // CPU writes the GPU must see: with tracking on, every pusher run first drains the CPU backend's and the bus's
+    // dirty-page logs and stamps each written 4 KiB page with a new generation. A cache built from RAM (a decoded
+    // texture, a palette, a surface's upload) remembers the generation it was built at and is stale when any page of
+    // its range is newer. Several entries may share a page, so nothing is ever cleared by a reader.
+    void set_write_tracking(CpuBackend* cpu);
+    u32 write_generation() const override { return write_generation_; }
+    u32 newest_write(u32 phys, u32 len) const override;
+    void collect_writes();
 
 protected:
     void on_bar_changed(int index, u32 old_base, u32 new_base) override;
@@ -155,7 +163,7 @@ private:
     void schedule_alarm();
     void run_pusher();
     void on_method(const PushbufferMethod& m);
-    void capture_dirty_pages();
+
     void capture_object(u32 handle);
 
     Bus& bus_;
@@ -209,6 +217,9 @@ private:
     capture::Writer* capture_{nullptr};
     CpuBackend* cpu_{nullptr};
     std::vector<u32> dirty_scratch_;
+    bool write_tracking_{false};
+    u32 write_generation_{1};
+    std::vector<u32> page_generation_;  // per 4 KiB RAM page: the generation of the last write seen
 public:
     u64 semaphore_releases() const { return semaphore_releases_; }
     u64 pusher_wall_ns() const { return pusher_wall_ns_; }  // instrument: host time the vCPU spent inside the pusher (methods + renderer)
