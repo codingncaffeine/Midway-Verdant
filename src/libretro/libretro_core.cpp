@@ -490,9 +490,16 @@ RETRO_API void retro_run(void) {
         machine->set_frame_limit(target);
     }
     const auto t0 = std::chrono::steady_clock::now();
-    if (machine->pump(t0 + std::chrono::seconds(1), [target](mv::Machine& m) { return m.nv2a().vblanks() >= target; }) ==
+    // MV_FRAME_WAIT_MS=0 waits for the vblank however long it takes (oracle and benchmark runs: a call returned
+    // without its vblank shifts the front end's frame count, and with it scripted input, against the guest's).
+    static const long wait_ms = [] {
+        const char* w = std::getenv("MV_FRAME_WAIT_MS");
+        return w && *w ? std::strtol(w, nullptr, 10) : 1000L;
+    }();
+    const auto cap = wait_ms > 0 ? std::chrono::milliseconds(wait_ms) : std::chrono::hours(24 * 365);
+    if (machine->pump(t0 + cap, [target](mv::Machine& m) { return m.nv2a().vblanks() >= target; }) ==
         mv::Machine::StopReason::Duration) {
-        if (frames_capped++ == 0) log(RETRO_LOG_WARN, "a frame took over a second of host time; returned without its vblank");
+        if (frames_capped++ == 0) log(RETRO_LOG_WARN, "a frame took longer than the wait cap (MV_FRAME_WAIT_MS, default 1000) of host time; returned without its vblank");
     }
     const auto t1 = std::chrono::steady_clock::now();
     const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();

@@ -29,7 +29,7 @@ run() {  # run JIT [mv-retro-host args]
     mkdir -p "$d/sys/midway-verdant"
     cp "$sys"/midway-verdant/*.bin "$d/sys/midway-verdant/"
     cp --reflink=auto "$disk" "$d/sys/midway-verdant/xbox_hdd.raw"
-    MV_RTC_TIME=1000000000 MV_P6_JIT=$j MV_P6_STOP_CYCLES=$stop MV_P6_DELIVERY_LOG="$d/deliveries.txt" timeout "${TMO:-7200}" \
+    MV_FRAME_WAIT_MS=0 MV_RTC_TIME=1000000000 MV_P6_JIT=$j MV_P6_STOP_CYCLES=$stop MV_P6_DELIVERY_LOG="$d/deliveries.txt" timeout "${TMO:-7200}" \
         "$build/src/mv-retro-host" "$build/src/midway_verdant_libretro.so" "$d/sys" "$disc" --frames "$frames" \
         --option midway_verdant_cpu=accurate --option midway_verdant_pipeline=disabled --png-every 600 "$d/png" "$@" > "$d/log" 2>&1
     echo $? > "$d/exit"
