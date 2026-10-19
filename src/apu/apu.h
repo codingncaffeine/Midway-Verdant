@@ -40,6 +40,9 @@ public:
     // (bits 11:8; all set = requested); the trapped method and its parameter.
     static constexpr u32 kFectlMethodMode = 0xE0, kFectlTrapped = 0xE0, kFectlTrapReason = 0xF00, kFectlTrapRequested = 0xF00;
     static constexpr u32 kFeDecMethod = 0x1300, kFeDecParam = 0x1304;
+    // The front end's memory fence: a write of FEMEMDATA stores its value at the physical address in FEMEMADDR, so
+    // the host can wait for the methods it queued before it to have been taken (DirectSound does).
+    static constexpr u32 kFeMemAddr = 0x1324, kFeMemData = 0x1334;
     static constexpr u32 kGpScratchTable = 0x2040, kGpFifoTable = 0x2044, kEpScratchTable = 0x2048, kEpFifoTable = 0x204C;
     // Each holds the highest valid entry index of its table.
     static constexpr u32 kGpScratchMaxSge = 0x20D4, kGpFifoMaxSge = 0x20D8, kEpScratchMaxSge = 0x20DC, kEpFifoMaxSge = 0x20E0;
@@ -107,6 +110,7 @@ public:
     }
     apu::SetupEngine& setup_engine() { return se_; }
     u64 traps() const { return traps_; }
+    u64 fence_writes() const { return fence_writes_; }
     bool front_end_trapped() const { return fe_trapped_; }
     // SetupEngineHost.
     u32 global_reg(u32 offset) override { return regs_[offset / 4]; }
@@ -204,6 +208,7 @@ private:
     std::deque<std::pair<u32, u32>> trap_queue_;
     bool fe_trapped_{false};
     u64 traps_{0};
+    u64 fence_writes_{0};
     TimerEvent frame_;
     u64 frames_{0};
     u64 mix_samples_{0}, mix_differ_{0};  // instrument: MIXBUF bin 0/1 samples with sound, and those where the two differ

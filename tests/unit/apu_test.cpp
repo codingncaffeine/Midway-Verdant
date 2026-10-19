@@ -680,3 +680,22 @@ TEST(ApuSynthesis, AMultipassVoiceReadsItsSubmixBinAndClearMixEmptiesIt) {
         EXPECT_FLOAT_EQ(r.bin(20, i), SynthRig::pcm(32 + i) / 32768.0f) << "without CLEAR_MIX the bin keeps its sum";
     }
 }
+
+TEST(ApuRegisters, AFrontEndMemoryFenceStoresItsValueAtTheFenceAddress) {
+    // The host queues voice methods, sets FEMEMADDR, writes a token to FEMEMDATA and waits for the token in RAM.
+    Rig r;
+    r.ram32(0x3000, 0xDEADBEEF);
+    r.ram32(0x3004, 0x11111111);
+    r.wr(Apu::kFeMemAddr, 0x3000);
+    r.wr(Apu::kFeMemData, 0x00000042);
+    EXPECT_EQ(r.ram32(0x3000), 0x42u);
+    EXPECT_EQ(r.ram32(0x3004), 0x11111111u) << "only the word at the fence address";
+    r.wr(Apu::kFeMemAddr, 0x3004);
+    r.wr(Apu::kFeMemData, 0x00000043);
+    EXPECT_EQ(r.ram32(0x3004), 0x43u);
+    EXPECT_EQ(r.ram32(0x3000), 0x42u);
+    EXPECT_EQ(r.apu.fence_writes(), 2u);
+    // Setting the address alone writes nothing.
+    r.wr(Apu::kFeMemAddr, 0x3008);
+    EXPECT_EQ(r.ram32(0x3008), 0u);
+}

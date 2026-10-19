@@ -180,6 +180,12 @@ void Apu::write_word(u32 offset, u32 value) {
         if (offset == kIen) update_irq();
         if (offset == kSectl) update_frame_clock();
         if (offset == kXgsCnt) xgscnt_ = value;
+        if (offset == kFeMemData) {
+            // The setup engine takes each voice method as it is written, so every method before the fence is done.
+            const u32 at = regs_[kFeMemAddr / 4];
+            if (!bus_.write_ram(at, &value, 4)) trace::log(trace::Cat::Apu, "fe: memory fence at {:08x} is outside RAM", at);
+            ++fence_writes_;
+        }
         // The host resumes a trapped front end by writing any other method mode.
         if (offset == kFectl && (value & kFectlMethodMode) != kFectlTrapped && fe_trapped_) {
             fe_trapped_ = false;

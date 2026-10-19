@@ -321,6 +321,7 @@ RETRO_API void retro_unload_game(void) {
             frames_run ? frame_ms_sum / static_cast<double>(frames_run) : 0.0, frame_ms_max,
             frames_capped ? std::format(", {} cut at 1 s without a vblank", frames_capped).c_str() : "",
             static_cast<unsigned long long>(machine->pit().ticks_delayed()), static_cast<unsigned long long>(machine->pit().ticks_dropped()));
+        log(RETRO_LOG_INFO, "apu: %llu front-end memory fences written", static_cast<unsigned long long>(machine->apu().fence_writes()));
         log(RETRO_LOG_INFO, "device time: the frontend's thread fired events for %.3f s; the gpu pusher took %.3f s on the CPU thread",
             static_cast<double>(machine->io_event_ns()) / 1e9, static_cast<double>(machine->nv2a().pusher_wall_ns()) / 1e9);
         // Where the event time went: host time inside each device event (both threads), and the APU frame's parts.
