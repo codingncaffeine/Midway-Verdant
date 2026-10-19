@@ -51,9 +51,6 @@ public:
 
     // Samples consumed by a channel's buffers, in the order they were played; the host's audio output.
     void set_sample_sink(SampleSink sink) { sink_ = std::move(sink); }
-    // Called before the controller reads a buffer's samples from RAM: whoever writes them asynchronously (the APU's
-    // processors' thread) finishes first.
-    void set_before_read(std::function<void()> f) { before_read_ = std::move(f); }
     // The reset line: every channel halted, the mixer and the global control cleared.
     void reset();
 
@@ -101,7 +98,6 @@ private:
     Scheduler& sched_;
     std::function<void(bool)> irq_;
     SampleSink sink_;
-    std::function<void()> before_read_;
     u32 mmio_at_{0};
     u16 mixer_io_{0}, bus_master_io_{0};
     std::array<u16, kMixerSize / 2> mixer_{};

@@ -366,6 +366,9 @@ void Apu::on_frame(Cycles now) {
     // The processors run on their own thread, beside the CPU (the hardware runs them alongside it too): anything that
     // reads or writes their state from here on waits for this frame first (dsp_sync), so what the CPU observes is
     // what it observed when the frame ran inline. MV_APU_THREAD=0 runs them inline.
+    // Their output to RAM is not waited for: the AC'97 plays the EP's ring milliseconds behind where the EP writes it
+    // (the hardware runs the processors alongside the CPU too, so titles keep that lead), and every frame before
+    // this one has finished.
     const bool ep_start = (xgscnt_ / apu::SetupEngine::kSamplesPerFrame) % kEpFrameDivider == 0;
     if (dsp_threaded_) {
         std::lock_guard g(dsp_mutex_);

@@ -325,7 +325,6 @@ void Aci::deliver(Channel c, u32 upto) {
     ChannelState& s = ch_[c];
     if (upto <= s.buffer_fetched) return;
     if (sink_) {
-        if (before_read_) before_read_();
         std::vector<u8> data(static_cast<std::size_t>(upto - s.buffer_fetched) * 2);
         if (bus_.read_ram(s.buffer_address + s.buffer_fetched * 2u, data.data(), data.size())) sink_(c, data.data(), static_cast<u32>(data.size()));
     }
