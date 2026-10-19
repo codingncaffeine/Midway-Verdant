@@ -356,6 +356,10 @@ RETRO_API void retro_unload_game(void) {
                 ms(st.ns_upload), ms(st.ns_descriptors), ms(st.ns_record), static_cast<unsigned long long>(st.flushes), static_cast<unsigned long long>(st.waits),
                 ms(st.ns_flush), static_cast<unsigned long long>(st.writebacks), ms(st.ns_write_back), ms(st.ns_write_back_gpu),
                 static_cast<unsigned long long>(st.textures_decoded), static_cast<unsigned long long>(st.textures_unchanged), static_cast<unsigned long long>(st.shaders_from_disk));
+            // Draws the renderer could not draw, and why (the first of each distinct reason).
+            if (st.skipped) log(RETRO_LOG_INFO, "gpu: %llu draws skipped", static_cast<unsigned long long>(st.skipped));
+            if (st.surface_reloads) log(RETRO_LOG_INFO, "gpu: %llu render targets reloaded from RAM after a 2D write", static_cast<unsigned long long>(st.surface_reloads));
+            for (const auto& e : st.errors) log(RETRO_LOG_INFO, "gpu: renderer note: %s", e.c_str());
         }
         log(RETRO_LOG_INFO, "device time: the frontend's thread fired events for %.3f s; the gpu pusher took %.3f s on the CPU thread",
             static_cast<double>(machine->io_event_ns()) / 1e9, static_cast<double>(machine->nv2a().pusher_wall_ns()) / 1e9);

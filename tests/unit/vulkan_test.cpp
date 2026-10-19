@@ -564,3 +564,40 @@ TEST(Vulkan, ThePolygonOffsetMovesACoplanarTriangleInFrontOnlyWhenEnabled) {
     for (const auto& e : renderer.stats().errors) ADD_FAILURE() << "renderer: " << e;
     EXPECT_EQ(pixel_at(ram, 8, 8) & 0x00FFFFFFu, 0xFF0000u) << "pulled in front by 16 depth units";
 }
+
+TEST(Vulkan, ATargetWhoseMemoryAnotherEngineRewroteIsReloadedBeforeItIsDrawnIntoAgain) {
+    // One title resets a glare buffer each frame with a 2D blit and then draws into it additively. The renderer keeps
+    // the target on the GPU between frames, so drawing on over that copy ignored the blit and the buffer saturated.
+    vk::Device device;
+    std::string error;
+    if (!device.init(error)) GTEST_SKIP() << "no Vulkan device: " << error;
+    std::vector<u8> ram(4u << 20, 0);
+    RamResolver handles;
+    handles.size = static_cast<u32>(ram.size());
+    VulkanRenderer renderer(device, handles, ram.data(), static_cast<u32>(ram.size()));
+    ASSERT_TRUE(renderer.init(error)) << error;
+    Kelvin k;
+    k.set_sink(&renderer);
+    setup_target(k);
+    k.method(mthd::kVertexDataArrayFormat + 12, 2u);
+    k.method(mthd::kDiffuse4ub, 0xFF000040);  // a little red, added each draw
+    k.method(mthd::kBlendEnable, 1);
+    k.method(mthd::kBlendSfactor, 1);  // ONE
+    k.method(mthd::kBlendDfactor, 1);  // ONE
+    k.method(mthd::kBlendEquation, 0x8006);
+    draw_full_triangle(k, ram);
+    renderer.end_frame();
+    ASSERT_EQ(pixel_at(ram, 8, 8) & 0x00FFFFFFu, 0x400000u);
+    // Another engine writes the target's memory (the 2D blit's path: the bytes, then the renderer hears of it).
+    for (u32 y = 0; y < 64; ++y)
+        for (u32 x = 0; x < 64; ++x) {
+            const u32 green = 0xFF003000u;
+            std::memcpy(&ram[0x10000 + y * 256 + x * 4], &green, 4);
+        }
+    renderer.invalidate(0x10000, 64 * 256);
+    draw_full_triangle(k, ram);
+    renderer.end_frame();
+    for (const auto& e : renderer.stats().errors) ADD_FAILURE() << "renderer: " << e;
+    EXPECT_EQ(pixel_at(ram, 8, 8) & 0x00FFFFFFu, 0x403000u) << "the draw adds to what RAM held, not to the GPU's earlier copy (0x800000)";
+    EXPECT_EQ(renderer.stats().surface_reloads, 1u);
+}

@@ -160,6 +160,9 @@ VulkanRenderer::VulkanRenderer(vk::Device& device, const HandleResolver& handles
         debug_roundtrip_ = s.find("roundtrip") != std::string::npos;
         // texlog: every texture decode to stderr (address, format, size, levels, faces, whether a target overlaps it).
         debug_tex_log_ = s.find("texlog") != std::string::npos;
+        // nofog: every draw as if fog were off (the pixel side reads the same switch).
+        debug_no_fog_ = s.find("nofog") != std::string::npos;
+        debug_vsh_dump_ = s.find("vshdump") != std::string::npos;
         if (debug_draw_id_) debug_flat_ = true;
     }
 }
@@ -531,27 +534,7 @@ VulkanRenderer::Surface* VulkanRenderer::target_for(const KelvinState& s) {
     end_pass();
     fresh_image(t.color);
     fresh_image(t.depth);
-    {
-        // Upload the current RAM contents as the starting picture.
-        const u32 bpp = t.color_bytes();
-        std::vector<u8> pixels(static_cast<std::size_t>(width) * height * bpp, 0);
-        for (u32 y = 0; y < height; ++y) {
-            for (u32 x = 0; x < width; ++x) {
-                const u32 off = t.swizzled ? swizzled_offset(x, y, 0, t.log_w, t.log_h, 0) * bpp : y * t.pitch + x * bpp;
-                if (static_cast<u64>(phys) + off + bpp <= ram_size_) std::memcpy(&pixels[(static_cast<std::size_t>(y) * width + x) * bpp], ram_ + phys + off, bpp);
-            }
-        }
-        VkDeviceSize offset = 0;
-        if (staging_alloc(pixels.size(), offset)) {
-            std::memcpy(static_cast<u8*>(staging_.buffer.mapped) + offset, pixels.data(), pixels.size());
-            VkBufferImageCopy region{};
-            region.bufferOffset = offset;
-            region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-            region.imageExtent = {width, height, 1};
-            fn_->vkCmdCopyBufferToImage(cb_, staging_.buffer.buffer, t.color.image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
-            upload_barrier();
-        }
-    }
+    upload_color_from_ram(t);  // the guest may draw over an existing picture
     t.pass = render_pass(cf, df);
     VkImageView views[2] = {t.color.view, t.depth.view};
     VkFramebufferCreateInfo fbi{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
@@ -567,9 +550,38 @@ VulkanRenderer::Surface* VulkanRenderer::target_for(const KelvinState& s) {
     return raw;
 }
 
+// The colour image takes what RAM holds: at the target's creation, and again before it is drawn into once another
+// engine has rewritten its memory (one title resets a glare buffer each frame with a 2D blit, then draws into it
+// additively; drawing on over the GPU's stale copy saturated it to white).
+void VulkanRenderer::upload_color_from_ram(Surface& t) {
+    const u32 bpp = t.color_bytes();
+    std::vector<u8> pixels(static_cast<std::size_t>(t.width) * t.height * bpp, 0);
+    for (u32 y = 0; y < t.height; ++y) {
+        for (u32 x = 0; x < t.width; ++x) {
+            const u32 off = t.swizzled ? swizzled_offset(x, y, 0, t.log_w, t.log_h, 0) * bpp : y * t.pitch + x * bpp;
+            if (static_cast<u64>(t.phys) + off + bpp <= ram_size_) std::memcpy(&pixels[(static_cast<std::size_t>(y) * t.width + x) * bpp], ram_ + t.phys + off, bpp);
+        }
+    }
+    VkDeviceSize offset = 0;
+    if (staging_alloc(pixels.size(), offset)) {
+        std::memcpy(static_cast<u8*>(staging_.buffer.mapped) + offset, pixels.data(), pixels.size());
+        VkBufferImageCopy region{};
+        region.bufferOffset = offset;
+        region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        region.imageExtent = {t.width, t.height, 1};
+        fn_->vkCmdCopyBufferToImage(cb_, staging_.buffer.buffer, t.color.image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+        upload_barrier();
+    }
+}
+
 bool VulkanRenderer::ensure_pass(Surface& t) {
     if (pass_open_ && pass_target_ == &t) return true;
     end_pass();
+    if (t.color_ram_newer) {
+        upload_color_from_ram(t);
+        t.color_ram_newer = false;
+        ++stats_.surface_reloads;
+    }
     if (sampled_since_barrier_) surface_barrier();  // draws that sampled a target finish before it is drawn into again
     t.last_rendered_frame = frame_index_;
     t.ram_newer = false;
@@ -810,6 +822,10 @@ void VulkanRenderer::invalidate(u32 phys, u32 len) {
     for (auto& [k, s] : surfaces_) {
         const u64 a0 = s->phys, a1 = a0 + s->bytes(), z0 = s->zeta_phys, z1 = z0 + s->zeta_bytes();
         if ((a0 < b1 && b0 < a1) || (z0 < b1 && b0 < z1)) s->ram_newer = true;
+        if (a0 < b1 && b0 < a1) {
+            s->color_ram_newer = true;
+            if (pass_open_ && pass_target_ == s.get()) end_pass();  // the next draw into it reopens the pass, reloaded
+        }
     }
 }
 
@@ -837,7 +853,7 @@ VkShaderModule VulkanRenderer::vertex_shader(const KelvinState& s, std::string& 
     const bool vp = s.vertex_program_mode();
     const bool smooth = s.reg(mthd::kShadeModel) != 0x1D00;
     if (!vp && !vsh::fixed_function_supported(s, error)) return VK_NULL_HANDLE;
-    const bool fog = (s.reg(0x02A4) & 1u) != 0;
+    const bool fog = !debug_no_fog_ && (s.reg(0x02A4) & 1u) != 0;
     const u32 fog_mode = s.reg(0x029C);
     // The fog mode shapes every shader's ending (the distance-to-factor curve).
     const u32 flags = (vp ? 1u : 0u) | (smooth ? 2u : 0u) | (fog ? 4u : 0u) | (fog ? (fog_mode & 0xFFFFu) << 16 : 0u);
@@ -912,6 +928,21 @@ VkShaderModule VulkanRenderer::vertex_shader(const KelvinState& s, std::string& 
     VkShaderModule m = module(spirv);
     vs_cache_[key] = m;
     remember(m);
+    // Instrument: MV_RENDER_DEBUG=vshdump writes each new vertex shader (its disassembly, then its GLSL) to
+    // scratch/vshdump/vs-N.glsl; drawid lines name the shader each draw used.
+    if (debug_draw_id_ || debug_vsh_dump_) {
+        const u32 n = static_cast<u32>(vs_debug_ids_.size());
+        vs_debug_ids_[m] = n;
+        if (debug_vsh_dump_) {
+            std::error_code ec;
+            std::filesystem::create_directories("scratch/vshdump", ec);
+            if (std::FILE* f = std::fopen(std::format("scratch/vshdump/vs-{}.glsl", n).c_str(), "w")) {
+                for (const auto& line : t.disassembly) std::fprintf(f, "// %s\n", line.c_str());
+                std::fprintf(f, "%s", t.glsl.c_str());
+                std::fclose(f);
+            }
+        }
+    }
     return m;
 }
 
@@ -1170,16 +1201,20 @@ const VulkanRenderer::TextureEntry* VulkanRenderer::texture(const KelvinState& s
         std::fprintf(stderr, "texlog: decode %08x format %02x %ux%u levels %u faces %u filter %08x%s\n", phys, ts.color_format(), d.width, d.height, d.levels, d.faces, ts.filter, target ? " (a render target)" : "");
         // MV_RENDER_DEBUG=texlog,texdump: the first decode of each address, format and size as scratch/texdump/*.png.
         static const bool dump_all = std::getenv("MV_RENDER_DEBUG") && std::string_view(std::getenv("MV_RENDER_DEBUG")).find("texdump") != std::string_view::npos;
-        static std::unordered_map<u64, bool> dumped;
+        // MV_TEXDUMP_EVERY=N: every Nth decode of each texture instead of only the first (named -N in decodes).
+        static const u32 every = std::getenv("MV_TEXDUMP_EVERY") ? static_cast<u32>(std::atoi(std::getenv("MV_TEXDUMP_EVERY"))) : 0u;
+        static std::unordered_map<u64, u32> dumped;
         const u64 dump_key = (static_cast<u64>(phys) << 32) ^ (static_cast<u64>(ts.color_format()) << 24) ^ (static_cast<u64>(d.width) << 12) ^ d.height;
-        if (dump_all && d.pixel == HostPixel::Rgba8 && d.depth == 1 && !dumped[dump_key]) {
-            dumped[dump_key] = true;
+        const u32 nth = dumped[dump_key]++;
+        if (dump_all && d.pixel == HostPixel::Rgba8 && d.depth == 1 && (nth == 0 || (every && nth % every == 0))) {
             std::error_code ec;
             std::filesystem::create_directories("scratch/texdump", ec);
             std::vector<u8> img(d.image(0, 0));
             for (std::size_t i = 3; i < img.size(); i += 4) img[i] = 255;
             std::string e;
-            png::write(std::format("scratch/texdump/{:08x}-{:02x}-{}x{}.png", phys, ts.color_format(), d.width, d.height), d.width, d.height, img.data(), d.width * 4, e);
+            png::write(every ? std::format("scratch/texdump/{:08x}-{:02x}-{}x{}-{:06}.png", phys, ts.color_format(), d.width, d.height, nth)
+                             : std::format("scratch/texdump/{:08x}-{:02x}-{}x{}.png", phys, ts.color_format(), d.width, d.height),
+                       d.width, d.height, img.data(), d.width * 4, e);
         }
         // And every 50th cube map decoded, its six faces side by side, to scratch/texlog-cube-PHYS-N.png.
         static u32 cubes = 0;
@@ -1427,6 +1462,9 @@ void VulkanRenderer::clear(const KelvinState& s, u32 bits) {
     }
     x1 = std::min(x1, t->width - 1);
     y1 = std::min(y1, t->height - 1);
+    if (debug_draw_id_)
+        std::fprintf(stderr, "drawid clear: surface %08x bits %02x colour %08x zstencil %08x rect %u,%u..%u,%u of %ux%u (registers %08x %08x)\n", t->phys, bits, s.clear_color(),
+                     s.clear_zstencil(), x0, y0, x1, y1, t->width, t->height, rect_h, rect_v);
     float color[4];
     clear_color_rgba(t->color_format, s.clear_color(), color);
     // CLEAR_SURFACE bits 4-7 select R, G, B and A. All four is an attachment clear; fewer is a full-screen
@@ -1558,8 +1596,27 @@ void VulkanRenderer::draw(const KelvinState& s, const DrawBatch& batch) {
     ++stats_.draws;
     const u32 draw_id = frame_draws_++;
     if (debug_draw_id_)
-        std::fprintf(stderr, "drawid %u: surface %08x, stages %05x, blend %u, %zu indices, %zu ranges, %zu inline words, %u immediate\n", draw_id, s.surface().color_offset,
-                     s.reg(mthd::kShaderStageProgram), s.blend() ? 1u : 0u, batch.indices.size(), batch.ranges.size(), batch.inline_words.size(), batch.immediate_count);
+        std::fprintf(stderr,
+                     "drawid %u: surface %08x, stages %05x, blend %u, %zu indices, %zu ranges, %zu inline words, %u immediate; program %u, depth test %u func %x write %u, "
+                     "colour mask %08x, stencil %u, clip %g..%g, zeta %08x format %08x control0 %08x\n",
+                     draw_id, s.surface().color_offset, s.reg(mthd::kShaderStageProgram), s.blend() ? 1u : 0u, batch.indices.size(), batch.ranges.size(),
+                     batch.inline_words.size(), batch.immediate_count, s.vertex_program_mode() ? 1u : 0u, s.depth_test() ? 1u : 0u, s.reg(mthd::kDepthFunc),
+                     s.depth_write() ? 1u : 0u, s.reg(mthd::kColorMask), s.stencil_test() ? 1u : 0u, static_cast<double>(std::bit_cast<float>(s.reg(mthd::kClipMin))),
+                     static_cast<double>(std::bit_cast<float>(s.reg(mthd::kClipMax))), s.reg(mthd::kSurfaceZetaOffset), s.reg(mthd::kSurfaceFormat), s.reg(mthd::kControl0));
+    if (debug_draw_id_ && (s.blend() || s.surface().color_offset >= 0x03f00000u))
+        std::fprintf(stderr, "drawid %u: blend sfactor %x dfactor %x equation %x colour %08x; texture 0 at %08x format %08x, alpha test %u, combiner control %08x\n", draw_id,
+                     s.reg(mthd::kBlendSfactor), s.reg(mthd::kBlendDfactor), s.reg(mthd::kBlendEquation), s.reg(mthd::kBlendColor), texture_phys(s, s.texture(0)), s.texture(0).format,
+                     s.alpha_test() ? 1u : 0u, s.reg(mthd::kCombinerControl));
+    if (debug_draw_id_ && (s.surface().color_offset >= 0x03f00000u || s.reg(mthd::kShaderStageProgram) == 0x08421u))
+        for (u32 st = 1; st < (s.reg(mthd::kCombinerControl) & 0xFFu); ++st)
+            std::fprintf(stderr, "drawid %u: combiner stage %u colour in %08x out %08x alpha in %08x out %08x factors %08x %08x\n", draw_id, st, s.reg(mthd::kCombinerColorIcw + 4 * st),
+                         s.reg(mthd::kCombinerColorOcw + 4 * st), s.reg(mthd::kCombinerAlphaIcw + 4 * st), s.reg(mthd::kCombinerAlphaOcw + 4 * st), s.reg(mthd::kCombinerFactor0 + 4 * st),
+                         s.reg(mthd::kCombinerFactor1 + 4 * st));
+    if (debug_draw_id_ && (s.surface().color_offset >= 0x03f00000u || s.reg(mthd::kShaderStageProgram) == 0x08421u))
+        std::fprintf(stderr, "drawid %u: combiner stage 0 colour in %08x out %08x alpha in %08x out %08x factors %08x %08x; final %08x %08x; texture 0 rect %08x control0 %08x control1 %08x filter %08x address %08x\n",
+                     draw_id, s.reg(mthd::kCombinerColorIcw), s.reg(mthd::kCombinerColorOcw), s.reg(mthd::kCombinerAlphaIcw), s.reg(mthd::kCombinerAlphaOcw),
+                     s.reg(mthd::kCombinerFactor0), s.reg(mthd::kCombinerFactor1), s.reg(mthd::kCombinerSpecFogCw0), s.reg(mthd::kCombinerSpecFogCw1),
+                     s.reg(mthd::kTextureBase + 0x18), s.reg(mthd::kTextureBase + 0x0C), s.reg(mthd::kTextureBase + 0x10), s.reg(mthd::kTextureBase + 0x14), s.reg(mthd::kTextureBase + 0x08));
     if (debug_skip_blend_ && s.blend()) return;  // MV_RENDER_DEBUG=skipblend: the opaque passes alone
     std::string error;
     Surface* t = target_for(s);
@@ -1568,6 +1625,14 @@ void VulkanRenderer::draw(const KelvinState& s, const DrawBatch& batch) {
         return;
     }
     if (debug_tex_log_) std::fprintf(stderr, "texlog: draw into %08x %s\n", t->phys, s.surface().swizzled() ? "swizzled" : "linear");
+    if (debug_draw_id_) {
+        // Has anything but this renderer written the target's RAM since the last draw into it?
+        static std::unordered_map<u32, u32> seen;
+        const u32 newest = handles_.newest_write(t->phys, t->bytes());
+        u32& last = seen[t->phys];
+        if (last && newest > last) std::fprintf(stderr, "drawid %u: target %08x RAM written by the CPU or a device since its last draw (generation %u -> %u)\n", draw_id, t->phys, last, newest);
+        last = std::max(newest, handles_.write_generation());
+    }
     FetchedVertices v;
     bool fetched;
     {
@@ -1588,6 +1653,8 @@ void VulkanRenderer::draw(const KelvinState& s, const DrawBatch& batch) {
         ++stats_.skipped;
         return;
     }
+    if (debug_draw_id_)
+        if (auto it = vs_debug_ids_.find(vs); it != vs_debug_ids_.end()) std::fprintf(stderr, "drawid %u: vertex shader vs-%u\n", draw_id, it->second);
     psh::Key pkey = psh::key_from_state(s);
     if (debug_shadow_pass_) pkey.shadow_compare_func = 7;  // every shadow lookup lit
     std::array<psh::SamplerKind, 4> kinds{};

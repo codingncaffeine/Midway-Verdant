@@ -64,7 +64,8 @@ public:
         u64 descriptor_reuses{0};  // draws that kept the previous draw's descriptor set
         u64 surface_samples{0};  // textures bound straight to a render target's image
         u64 shaders_from_disk{0};  // shader compiles the disk cache answered
-        u64 textures_unchanged{0};  // textures whose pages were written but whose bytes hashed the same: kept
+        u64 textures_unchanged{0};
+        u64 surface_reloads{0};  // render targets reloaded from RAM after another engine wrote them  // textures whose pages were written but whose bytes hashed the same: kept
         // Where the time goes, in nanoseconds: the whole draw and its parts (the texture part includes the
         // write-backs a sample forces; the shader parts are the compiles, a lookup costs nothing measurable); the
         // submits and the fence waits; the copies back to RAM, colour and depth (and the wait for the device copy
@@ -113,6 +114,7 @@ private:
         // target drawn this frame or the last, with nothing written over it, still holds what RAM holds.
         u64 last_rendered_frame{0};
         bool ram_newer{false};
+        bool color_ram_newer{false};  // another engine wrote the colour memory: reload it before drawing into it
         // The guest memory each image covers: a pitch is already in bytes.
         u32 bytes() const { return swizzled ? color_bytes() * width * height : pitch * height; }
         u32 color_bytes() const;
@@ -134,6 +136,7 @@ private:
     void end_pass();
     Surface* target_for(const KelvinState& s);
     bool ensure_pass(Surface& t);
+    void upload_color_from_ram(Surface& t);
     // Write-backs come in batches: each queued surface records its copy after the frame's draws, and
     // finish_write_backs() waits once for all of them, then stores each into guest RAM in the order queued.
     void queue_write_back(Surface& s);
@@ -294,6 +297,9 @@ private:
     bool attachments_written_{false}, sampled_since_barrier_{false};  // hazards the next surface_barrier() covers
     bool depth16_sampled_{false}, depth24_sampled_{false};  // the device samples (and filters) these depth formats
     bool debug_tex_log_{false};
+    bool debug_no_fog_{false};
+    bool debug_vsh_dump_{false};
+    std::unordered_map<VkShaderModule, u32> vs_debug_ids_;  // drawid/vshdump: each vertex shader's dump number
     bool debug_roundtrip_{false};  // MV_RENDER_DEBUG=roundtrip: sampled targets go through RAM as before (an A/B control)
     u32 frame_draws_{0};  // draws since the frame began (the index mv-pbcap draws lists)
 };

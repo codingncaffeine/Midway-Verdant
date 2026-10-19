@@ -285,7 +285,9 @@ Key key_from_state(const KelvinState& s) {
     k.alpha_test = s.alpha_test();
     k.alpha_func = s.reg(mthd::kAlphaFunc);
     k.smooth_shading = s.reg(mthd::kShadeModel) != 0x1D00;
-    k.fog_enable = s.reg(kFogEnable) & 1u;
+    // Instrument: MV_RENDER_DEBUG=nofog draws as if fog were off (the vertex side follows in the renderer).
+    static const bool no_fog = std::getenv("MV_RENDER_DEBUG") && std::string_view(std::getenv("MV_RENDER_DEBUG")).find("nofog") != std::string_view::npos;
+    k.fog_enable = !no_fog && (s.reg(kFogEnable) & 1u);
     return k;
 }
 

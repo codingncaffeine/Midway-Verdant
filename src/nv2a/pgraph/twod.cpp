@@ -77,7 +77,12 @@ bool TwoD::blit() {
         error_ = "rectangle outside RAM";
         return false;
     }
-    if (before_read_) before_read_(static_cast<u32>(ps), static_cast<u32>(s1 - s0));
+    // The source must be in RAM, and so must whatever was rendered into the destination: the blit may cover only
+    // part of it, and the rest has to survive into the reloaded picture.
+    if (before_read_) {
+        before_read_(static_cast<u32>(ps), static_cast<u32>(s1 - s0));
+        before_read_(static_cast<u32>(pd), static_cast<u32>(d1 - d0));
+    }
     for (u32 y = 0; y < h; ++y) std::memmove(ram_ + pd + y * dst_pitch, ram_ + ps + y * src_pitch, row);
     if (after_write_) after_write_(static_cast<u32>(pd), static_cast<u32>(d1 - d0));
     ++blits_;
