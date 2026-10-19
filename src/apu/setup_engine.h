@@ -112,8 +112,6 @@ private:
         u32 ssl_index{0}, ssl_segment{0};
         bool starved_reported{false};
         bool off_pending{false};
-        // Played to the end of a one-shot buffer: silent but still on its list, until VOICE_OFF or a restart.
-        bool finished{false};
         // The last ADPCM block decoded: its address and samples (left, right interleaved).
         u64 adpcm_key{~0ull};
         std::array<i16, kAdpcmSamplesPerBlock * 2> adpcm{};

@@ -219,7 +219,7 @@ struct VoiceRig : Rig {
 };
 }  // namespace
 
-TEST(ApuVoices, VoiceOnLinksAtTheTopOfItsListAndAOneShotStaysThereSilentUntilVoiceOffRetiresItWithATrap) {
+TEST(ApuVoices, VoiceOnLinksAtTheTopOfItsListAndAOneShotThatPlaysToItsEndRetiresWithItsNotifierAndATrap) {
     using SE = apu::SetupEngine;
     VoiceRig r;
     r.vp(SE::kMethodSetCurrentVoice, 5);
@@ -239,15 +239,7 @@ TEST(ApuVoices, VoiceOnLinksAtTheTopOfItsListAndAOneShotStaysThereSilentUntilVoi
     EXPECT_EQ(r.rd(Apu::kIsts), 0u);
     r.sched.advance_to(Rig::frame(3));
     EXPECT_EQ(r.cbo(5), 63u) << "stopped at its last sample";
-    EXPECT_EQ(r.rd(SE::kRegListTop[0]), 5u) << "played to its end: silent, still on its list";
-    EXPECT_TRUE(r.field(5, SE::kFieldState) & SE::kStateActive);
-    EXPECT_EQ(r.rd(Apu::kIsts), 0u) << "no idle report for a buffer that ran out";
-    EXPECT_FALSE(r.irq);
-    EXPECT_EQ(r.apu.setup_engine().voices_retired(), 0u);
-
-    r.vp(SE::kMethodVoiceOff, 5);
-    r.sched.advance_to(Rig::frame(4));
-    EXPECT_EQ(r.rd(SE::kRegListTop[0]), SE::kNoVoice) << "turned off: retired and off the list";
+    EXPECT_EQ(r.rd(SE::kRegListTop[0]), SE::kNoVoice) << "played to its end: retired and off the list";
     EXPECT_FALSE(r.field(5, SE::kFieldState) & SE::kStateActive);
     EXPECT_EQ(r.rd(Apu::kFectl) & (Apu::kFectlMethodMode | Apu::kFectlTrapReason), Apu::kFectlTrapped | Apu::kFectlTrapRequested);
     EXPECT_EQ(r.rd(Apu::kFeDecMethod), SE::kSe2FeIdleVoice);
@@ -256,7 +248,7 @@ TEST(ApuVoices, VoiceOnLinksAtTheTopOfItsListAndAOneShotStaysThereSilentUntilVoi
     {
         u8 status = 0;
         r.bus.read_ram(r.rd(SE::kRegNotifierBase) + 16 * (SE::kNotifierBase + 5 * SE::kNotifiersPerVoice) + 15, &status, 1);
-        EXPECT_EQ(status, SE::kNotifierDone) << "turning the voice off reports it done through its first notifier";
+        EXPECT_EQ(status, SE::kNotifierDone) << "a buffer that played out reports it done through its first notifier";
     }
     EXPECT_TRUE(r.irq);
     EXPECT_TRUE(r.apu.front_end_trapped());
@@ -272,7 +264,7 @@ TEST(ApuVoices, VoiceOnLinksAtTheTopOfItsListAndAOneShotStaysThereSilentUntilVoi
     r.vp(0x37C, 4096u << 16);
     r.vp(SE::kMethodVoiceOn, 6);
     EXPECT_EQ(r.rd(SE::kRegListTop[0]), 6u);
-    r.sched.advance_to(Rig::frame(5));
+    r.sched.advance_to(Rig::frame(4));
     EXPECT_EQ(r.cbo(6), 64u);
 }
 
@@ -287,10 +279,10 @@ TEST(ApuVoices, ALoopingVoiceWrapsAndRetiresOnlyWhenTurnedOffAndQueuedTrapsWaitF
     r.vp(SE::kMethodSetAntecedentVoice, 0x1FFFFu);
     r.vp(SE::kMethodVoiceOn, 0x40);
     r.vp(SE::kMethodVoicePause, 0x40);
-    // A second, one-shot voice on the 3D list.
+    // A second, one-shot voice on the 3D list, long enough to be playing still.
     r.vp(SE::kMethodSetCurrentVoice, 7);
     r.vp(0x304, 0x5000E0E6u);
-    r.vp(SE::kMethodBufEbo, 31);
+    r.vp(SE::kMethodBufEbo, 1000);
     r.vp(SE::kMethodSetAntecedentVoice, 0x2FFFFu);
     r.vp(SE::kMethodVoiceOn, 7);
     EXPECT_EQ(r.rd(SE::kRegListTop[1]), 7u);
@@ -299,7 +291,7 @@ TEST(ApuVoices, ALoopingVoiceWrapsAndRetiresOnlyWhenTurnedOffAndQueuedTrapsWaitF
     EXPECT_EQ(r.cbo(0x40), 0u) << "wrapped to the loop start";
     EXPECT_TRUE(r.field(0x40, SE::kFieldState) & SE::kStateActive);
     EXPECT_EQ(r.rd(SE::kRegListTop[0]), 0x40u);
-    EXPECT_EQ(r.rd(SE::kRegListTop[1]), 7u) << "the one-shot ran out and stays listed";
+    EXPECT_EQ(r.rd(SE::kRegListTop[1]), 7u) << "the one-shot plays on";
     EXPECT_FALSE(r.irq);
 
     // Both turned off in the same frame: the 2D list is walked first, so its report comes first.
@@ -437,30 +429,35 @@ TEST(ApuSynthesis, ABufferVoicePlaysItsSamplesIntoItsBinAtItsVolumeAndHeadroom) 
     for (u32 i = 0; i < 32; ++i) EXPECT_NEAR(r.bin(0, i), SynthRig::pcm(32 + i) / 32768.0f * g, 1e-6f) << "sample " << (32 + i);
     r.sched.advance_to(Rig::frame(3));
     for (u32 i = 0; i < 32; ++i) EXPECT_EQ(r.bin(0, i), 0.0f) << "past its end the voice is silent, sample " << i;
-    EXPECT_EQ(r.apu.setup_engine().voices_retired(), 0u) << "and it stays on its list";
+    EXPECT_EQ(r.apu.setup_engine().voices_retired(), 1u) << "and turned off";
 }
 
-TEST(ApuSynthesis, ProgrammingAOneShotsEndStartsItAgainAndAReplayedVoiceIsLinkedOnce) {
+TEST(ApuSynthesis, ProgrammingAPlayingOneShotsEndStartsItAgainAndAReplayedVoiceIsLinkedOnce) {
     using SE = apu::SetupEngine;
     SynthRig r;
     r.fill_pcm(64);
-    r.start(kPcm16Mono, 31, 0, 0, 0);  // one frame of samples, no loop
+    r.start(kPcm16Mono, 63, 0, 0, 0);  // two frames of samples, no loop
     r.sched.advance_to(Rig::frame(1));
     EXPECT_FLOAT_EQ(r.bin(0, 5), SynthRig::pcm(5) / 32768.0f);
-    r.sched.advance_to(Rig::frame(2));
-    EXPECT_EQ(r.bin(0, 5), 0.0f) << "finished: silent";
     // The kernel's replay of a voice it still counts as playing: the buffer's end and loop offsets, no VOICE_ON.
     r.vp(SE::kMethodSetCurrentVoice, SynthRig::kVoice);
-    r.vp(SE::kMethodBufEbo, 31);
+    r.vp(SE::kMethodBufEbo, 63);
     r.vp(SE::kMethodBufLbo, 0);
-    r.sched.advance_to(Rig::frame(3));
+    r.sched.advance_to(Rig::frame(2));
     for (u32 i = 0; i < 32; ++i) EXPECT_FLOAT_EQ(r.bin(0, i), SynthRig::pcm(i) / 32768.0f) << "played again from its start, sample " << i;
     // VOICE_ON for a voice still on its list starts it without linking it a second time.
     r.vp(SE::kMethodSetAntecedentVoice, 0x1FFFFu);
     r.vp(SE::kMethodVoiceOn, SynthRig::kVoice);
     EXPECT_EQ(r.rd(SE::kRegListTop[0]), SynthRig::kVoice);
     EXPECT_EQ(r.field(SynthRig::kVoice, SE::kFieldPitchLink) & 0xFFFFu, SE::kNoVoice) << "not linked to itself";
-    r.sched.advance_to(Rig::frame(4));
+    r.sched.advance_to(Rig::frame(3));
+    EXPECT_FLOAT_EQ(r.bin(0, 3), SynthRig::pcm(3) / 32768.0f);
+    // Played to its end, it is off its list; VOICE_ON links it again and it plays from its start.
+    r.sched.advance_to(Rig::frame(5));
+    EXPECT_EQ(r.rd(SE::kRegListTop[0]), SE::kNoVoice);
+    r.vp(SE::kMethodVoiceOn, SynthRig::kVoice);
+    EXPECT_EQ(r.rd(SE::kRegListTop[0]), SynthRig::kVoice);
+    r.sched.advance_to(Rig::frame(6));
     EXPECT_FLOAT_EQ(r.bin(0, 3), SynthRig::pcm(3) / 32768.0f);
     // A looping voice keeps its place when its end is programmed again.
     SynthRig l;

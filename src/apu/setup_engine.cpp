@@ -106,7 +106,6 @@ bool SetupEngine::method(u32 offset, u32 value) {
             set_field(handle, kFieldOffset, field(handle, kFieldOffset) & ~kOffsetMask);  // CBO = 0 [verify]
             Bookkeeping& b = book_[handle];
             b.off_pending = false;
-            b.finished = false;
             b.fraction = 0;
             b.ssl_index = 0;
             b.ssl_segment = 0;
@@ -200,12 +199,11 @@ bool SetupEngine::method(u32 offset, u32 value) {
             return true;
         case kMethodBufEbo: {
             set_field(current_, kFieldNext, (field(current_, kFieldNext) & ~kOffsetMask) | (value & kOffsetMask));
-            // Programming a one-shot buffer's end starts it again from its beginning, playing or finished. The kernel
-            // replays a sound this way, without VOICE_ON, on a voice it still counts as playing: the boot sound's
-            // closing chime and the echoes of its jingle, both in the recording of a real console. [INFERRED]
+            // Programming a playing one-shot buffer's end starts it again from its beginning. The kernel replays a
+            // sound this way, without VOICE_ON, on a voice it still counts as playing: the boot sound's closing chime
+            // and the echoes of its jingle, both in the recording of a real console. [INFERRED]
             if (!(field(current_, kFieldFmt) & (kFmtLoop | kFmtStream))) {
                 Bookkeeping& b = book_[current_];
-                b.finished = false;
                 b.fraction = 0;
                 set_field(current_, kFieldOffset, field(current_, kFieldOffset) & ~kOffsetMask);
             }
@@ -224,7 +222,7 @@ bool SetupEngine::on_a_list(u32 handle) const {
 }
 
 // Insert the voice where the antecedent says: at the top of a list, or after another voice. A voice still on a list
-// (a finished one-shot the host starts again) stays where it is: linking it twice would loop the list.
+// (one the host starts again while it plays) stays where it is: linking it twice would loop the list.
 void SetupEngine::link_on(u32 handle) {
     if (on_a_list(handle)) return;
     const u32 list = (antecedent_ >> kAntecedentListShift) & 3u;
@@ -303,17 +301,14 @@ void SetupEngine::walk(u32 list) {
                 const double step = std::exp2((pitch + pitch_scale * 32.0 * static_cast<double>(ef)) / 4096.0);
                 const u32 fmt = field(handle, kFieldFmt);
                 Frame samples{};
-                Bookkeeping& b = book_[handle];
-                if (!b.finished) {
-                    const bool more = (fmt & kFmtMultipass) ? read_submix(fmt, samples)
-                                      : (fmt & kFmtStream) ? render_stream(handle, fmt, step, samples) : render_buffer(handle, fmt, step, samples);
-                    filter(handle, fmt, samples);
-                    mix_voice(handle, samples, ea);
-                    // A stream that runs dry ends; a one-shot buffer that reaches its end falls silent and stays on its
-                    // list (no idle report): the host turns it off, or starts it again by programming its end.
-                    if (!more && (fmt & kFmtStream)) retire_now = true;
-                    else if (!more) b.finished = true;
-                }
+                const bool more = (fmt & kFmtMultipass) ? read_submix(fmt, samples)
+                                  : (fmt & kFmtStream) ? render_stream(handle, fmt, step, samples) : render_buffer(handle, fmt, step, samples);
+                filter(handle, fmt, samples);
+                mix_voice(handle, samples, ea);
+                // A stream that runs dry and a one-shot buffer that reaches its end both turn off: the voice leaves its
+                // list with its notifier written and the idle report, which is how DirectSound learns a buffer stopped
+                // (a title waiting for a sound to finish otherwise waits for ever). The reference emulator turns it off too.
+                if (!more) retire_now = true;
                 // The first frame played: the voice is no longer new.
                 state = field(handle, kFieldState) & ~kStateNew;
                 set_field(handle, kFieldState, state);
