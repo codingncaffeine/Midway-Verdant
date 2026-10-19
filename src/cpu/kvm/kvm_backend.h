@@ -2,6 +2,7 @@
 #if defined(__linux__)
 #include <time.h>
 
+#include <array>
 #include <atomic>
 #include <mutex>
 #include <string>
@@ -113,6 +114,15 @@ private:
     u64 backstop_shots_{0};
     bool halted_{false};    // HLT: the guest waits for an interrupt; guest time skips to each next event
     std::string stopped_at_;  // the first HLT with interrupts off: where, and the stack (for the unload report)
+    // The kernel's idle loop (fast mode with the guest clock): it spins with interrupts enabled instead of halting, so
+    // an idle console burns host time. Found in RAM once the kernel is there, a hardware execution breakpoint on it
+    // turns a full turn of the loop with no interrupt since (it has looked for work and found none) into a halt, which
+    // skips guest time to the next event as HLT does. MV_IDLE_SKIP=0 leaves the loop to spin.
+    std::array<u32, 2> idle_eips_{};  // the loops found (0 = none), one hardware breakpoint each
+    u32 idle_eip_{0};                 // the first, 0 until found
+    bool idle_skip_{true};
+    u64 idle_injections_at_hit_{~0ull}, idle_hits_{0}, idle_halts_{0}, idle_scans_{0};
+    void find_idle_loop();
     Cycles tsc_epoch_{0};   // guest time at which the TSC was zero
     u64 vblank_seen_{0};
     bool frame_tsc_due_{false};

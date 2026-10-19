@@ -69,6 +69,7 @@ u64 thread_cpu_ns() { return clock_ns(CLOCK_THREAD_CPUTIME_ID); }
 KvmBackend::KvmBackend() {
     const char* p = std::getenv("MV_PROFILE_EIP");
     profile_eip_ = p && *p && *p != '0';
+    if (const char* s = std::getenv("MV_IDLE_SKIP"); s && *s == '0') idle_skip_ = false;
     if (const char* w = std::getenv("MV_WATCH_AT_BREAK"); w && *w) {
         const std::string s = w;
         const auto plus = s.find('+'), star = s.find('*');
@@ -427,6 +428,8 @@ std::string KvmBackend::report() const {
                                            : std::format(" mmio {:08x} x{}", top[i].first, top[i].second);
     }
     if (!stopped_at_.empty()) r += "\nkvm: the guest stopped: " + stopped_at_;
+    if (idle_eip_) r += std::format("\nkvm: the kernel idle loops at {:08x} {:08x}: {} hits, {} turned into halts", idle_eips_[0], idle_eips_[1], idle_hits_, idle_halts_);
+    else if (idle_skip_ && guest_clock_on_) r += std::format("\nkvm: the kernel idle loop was not found ({} scans): it spins", idle_scans_);
     if (!guest_clock_on_) return r;
     r += std::format("\nguest clock: TSC {} kHz on the host clock{}, {} rewinds ({:.3f} s of guest time), {} guest writes{}{}; TSC lead at frame ends (us): last {:.1f}, mean {:.1f}, min {:.1f}, max {:.1f} over {}",
                      clock_.tsc_khz(), tsc_scaled_ ? "" : " (NOT SCALED: the host has no TSC control)", tsc_rewinds_,
@@ -465,7 +468,7 @@ void KvmBackend::join() {
 }
 
 void KvmBackend::kick() {
-    ++stats_.kicks;
+    std::atomic_ref<u64>(stats_.kicks).fetch_add(1, std::memory_order_relaxed);  // also from the GPU's FIFO thread
     if (run_) set_immediate_exit(run_, 1);
     if (thread_.joinable()) pthread_kill(thread_.native_handle(), kKickSignal);
     machine_->wake_cpu();
@@ -598,6 +601,17 @@ void KvmBackend::thread_main() {
                     if (machine_->pic().pending_vector() >= 0) {
                         halted_ = false;
                     } else if (sched.has_pending()) {
+                        // The GPU's FIFO thread finishes first: an idle CPU sees the GPU finish at once, as when the
+                        // pusher ran inline, instead of skipping guest time past work still in flight.
+                        if (machine_->nv2a().fifo_threaded()) {
+                            machine_->nv2a().wait_fifo_idle();
+                            // What it raised meanwhile reaches the PIC before any time is skipped.
+                            machine_->advance_time();
+                            if (machine_->pic().pending_vector() >= 0) {
+                                halted_ = false;
+                                continue;
+                            }
+                        }
                         if (const Cycles skipped = clock_.warp_to(sched.next_deadline())) tsc_offset_add(static_cast<i64>(skipped));
                         continue;
                     } else {
@@ -608,6 +622,7 @@ void KvmBackend::thread_main() {
                 if (const u64 v = machine_->nv2a().vblanks(); v != vblank_seen_) {
                     vblank_seen_ = v;
                     frame_tsc_due_ = true;
+                    if (idle_skip_ && !idle_eip_ && idle_scans_ < 1200 && break_eips_.empty() && !watch_va_) find_idle_loop();
                 }
                 arm_backstop(false);
             }
@@ -701,6 +716,23 @@ void KvmBackend::thread_main() {
                 break;
             case KVM_EXIT_INTR: break;
             case KVM_EXIT_DEBUG: {
+                if (idle_eip_ && (run_->debug.arch.pc == idle_eips_[0] || run_->debug.arch.pc == idle_eips_[1]) && break_eips_.empty() && !watch_va_) {
+                    // The idle loop. A turn of it with no interrupt injected since the last hit found no work: halt.
+                    ++idle_hits_;
+                    const bool quiet = stats_.irq_injections == idle_injections_at_hit_;
+                    idle_injections_at_hit_ = stats_.irq_injections;
+                    if (quiet && run_->if_flag && guest_clock_on_) {
+                        halted_ = true;
+                        ++idle_halts_;
+                    }
+                    // Step over the breakpoint: the resume flag suppresses it for one instruction.
+                    kvm_regs regs{};
+                    if (ioctl(vcpu_fd_, KVM_GET_REGS, &regs) == 0) {
+                        regs.rflags |= 1u << 16;
+                        ioctl(vcpu_fd_, KVM_SET_REGS, &regs);
+                    }
+                    break;
+                }
                 // A --break-eip address: log where the guest is, then drop that breakpoint and keep the others.
                 Regs r{};
                 lock.unlock();
@@ -764,7 +796,8 @@ void KvmBackend::thread_main() {
 
 // Hardware execution breakpoints (DR0-DR3) on the --break-eip addresses; the debug exit logs and disarms them.
 void KvmBackend::arm_breakpoints() {
-    if (break_eips_.empty() && !watch_va_) return;
+    const bool idle = idle_eip_ && break_eips_.empty() && !watch_va_;
+    if (break_eips_.empty() && !watch_va_ && !idle) return;
     kvm_guest_debug dbg{};
     dbg.control = KVM_GUESTDBG_ENABLE | KVM_GUESTDBG_USE_HW_BP;
     dbg.arch.debugreg[7] = 1u << 10;  // the bit that is always set in DR7
@@ -775,6 +808,13 @@ void KvmBackend::arm_breakpoints() {
     if (watch_va_) {
         dbg.arch.debugreg[3] = watch_va_;
         dbg.arch.debugreg[7] |= (1u << 6) | (1u << 28) | (3u << 30);  // L3; R/W3 01 = data writes; LEN3 11 = 4 bytes
+    }
+    if (idle) {
+        for (std::size_t i = 0; i < idle_eips_.size(); ++i)
+            if (idle_eips_[i]) {
+                dbg.arch.debugreg[i] = idle_eips_[i];
+                dbg.arch.debugreg[7] |= 1u << (i * 2);  // Li, execution, one byte
+            }
     }
     if (ioctl(vcpu_fd_, KVM_SET_GUEST_DEBUG, &dbg) < 0) {
         trace::log(trace::Cat::Boot, "break: KVM_SET_GUEST_DEBUG failed: {}", std::strerror(errno));
@@ -855,3 +895,36 @@ std::unique_ptr<CpuBackend> make_fast_backend(std::string& why_not) {
 }
 }  // namespace mv
 #endif
+
+namespace mv {
+
+// The loops the kernel spins in when it has nothing to run: STI, two NOPs, CLI, then a compare of the DPC list head
+// with itself (the shape of the NT-family idle loop, found by profiling where an idle console spends its time). The
+// kernel image is identity-mapped at 0x80000000; it holds two (the idle thread's, which also looks for a ready thread,
+// and one that only waits for DPCs). Each found arms a breakpoint on its second NOP, where interrupts are enabled and
+// the loop has not yet looked for work; either leaves only through work an interrupt queued.
+void KvmBackend::find_idle_loop() {
+    ++idle_scans_;
+    static constexpr u8 kShape[] = {0xFB, 0x90, 0x90, 0xFA, 0x3B, 0x6D, 0x00, 0x74};
+    constexpr u32 kFrom = 0x10000, kTo = 0x80000;
+    const Bus& bus = machine_->bus();
+    if (bus.ram_size() < kTo) return;
+    const u8* ram = bus.ram();
+    std::array<u32, 2> found{};
+    u32 matches = 0;
+    for (u32 a = kFrom; a + sizeof kShape <= kTo; ++a) {
+        if (ram[a] != 0xFB || std::memcmp(ram + a, kShape, sizeof kShape) != 0) continue;
+        if (matches < found.size()) found[matches] = 0x80000000u + a + 2;
+        ++matches;
+    }
+    if (matches == 0 || matches > found.size()) return;
+    idle_eips_ = found;
+    idle_eip_ = found[0];
+    trace::log(trace::Cat::Cpu, "the kernel idle loops are at {:08x} {:08x}: their idle turns halt", found[0], found[1]);
+    kvm_guest_debug off{};
+    ioctl(vcpu_fd_, KVM_SET_GUEST_DEBUG, &off);
+    breakpoints_armed_ = false;
+    arm_breakpoints();
+}
+
+}  // namespace mv
