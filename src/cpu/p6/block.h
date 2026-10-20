@@ -33,6 +33,7 @@ struct Block {
     u8 n{0};           // instructions
     u16 bytes{0};      // length of the code
     bool rep{false};   // a lone REP string instruction: costed per element
+    u8 countdown{0xFF};  // a two-instruction loop on itself that counts this register down by one (DEC/SUB 1; JNZ), else 0xFF
     BranchKind branch{BranchKind::None};  // what the final instruction is
     u8 exit_counter{1};  // the final conditional branch's two-bit predictor (taken at 2 and 3)
     bool exit_seen{false};
@@ -76,6 +77,8 @@ struct Block {
 
 struct BlockStats {
     u64 built{0}, killed{0}, pages_written{0}, device_page_writes{0};
+    u64 code_page_writes_kept{0};  // CPU writes near code that overlapped no block (every block kept)
+    u64 empty_blocks{0};  // places no block can start (a page-straddling or undecodable first instruction)
     u64 lookups{0}, fast_hits{0};  // find(): calls, and those the direct-mapped cache answered
     u64 relinks{0};  // chains that found their block in the fast cache when the exit's link was missing or elsewhere
     // Every native run's end: [0..15] the chain test that stopped it at a normal block end (0: none was tried, the
@@ -84,11 +87,13 @@ struct BlockStats {
     // Exits that reached the engine's chain instead of the generated code's (the first inline condition that failed):
     // 0 no valid link, 1 budget, 2 limit, 3 pending work, 4 fetch translation, 5 fetch lines not the most recent, 6 an
     // indirect exit or a return (no inline chain), 7 none (the inline chain would have taken it).
-    std::array<u64, 8> slow_chain{};
+    // 8 the spin probe's EIP (the engine compares the state).
+    std::array<u64, 9> slow_chain{};
     u64 whole_runs{0}, fallback_steps{0}, block_insns{0};
     u64 mispredicts{0};
     u64 native_runs{0}, native_insns{0}, native_helpers{0}, native_ineligible{0}, native_handoffs{0}, chains{0}, links_refused{0};
     u64 spin_skips{0}, spin_cycles{0};  // loops whose passes were skipped, and the cycles they covered
+    u64 countdown_skips{0}, countdown_passes{0};  // countdown loops whose passes were skipped, and the passes
     u64 spin_short_runs{0};  // runs from a known spin loop, ended after one pass
     std::array<u64, 16> spin_elsewhere_why{};  // runs ended away from their start: the chain test that stopped them     // of those, runs that measured their pass from their first return to the start
     // Why a long run was not a skippable pass: an interpreted instruction, a cache penalty, a mispredict, ended
@@ -108,7 +113,8 @@ public:
     ~BlockEngine() override;
 
     // The block that starts at the current CS:EIP, built if needed; nullptr when none can be (the code is outside
-    // RAM, crosses the code segment's limit, or its first instruction faults on fetch or decode): the caller steps.
+    // RAM, crosses the code segment's limit, or its first instruction straddles the page's end or faults on fetch or
+    // decode): the caller steps.
     Block* find();
 
     enum class Next : u8 { Continue, Exit };
@@ -165,10 +171,11 @@ public:
         BlockStats* stats;
         u32* rsb;
         unsigned* rsb_top;
+        const u8* code_granules;  // see CodeWatcher
     };
-    NativeView native_view() { return {&link_epoch_, &stats_, rsb_.data(), &rsb_top_}; }
+    NativeView native_view() { return {&link_epoch_, &stats_, rsb_.data(), &rsb_top_, code_granules_.data()}; }
 
-    void code_written(u32 ram_page) override;
+    void code_written(u32 ram_page, unsigned off, unsigned len) override;
     const BlockStats& stats() const { return stats_; }
     std::size_t live_blocks() const { return blocks_.size(); }
     // The blocks that took the most cycles (runs x schedule), for reports.
@@ -177,6 +184,10 @@ public:
 private:
     Block* build(const u8* page, unsigned off, u32 ram_page, u8 mode);
     void kill_page(u32 ram_page);
+    // The blocks of a page whose code overlaps [off, off + len) dropped (a CPU write); the page's granules redone.
+    void kill_range(u32 ram_page, unsigned off, unsigned len);
+    void kill_block(Block* b);
+    void mark_granules(u32 ram_page);
     // A link slot names `to` (null: nothing), kept in to's incoming list.
     void set_link(Block::Link& slot, Block* to);
     // Every link into and out of `b` cleared (its translation or its assumptions changed: links are learned under
@@ -187,16 +198,19 @@ private:
     void take_device_writes();
     u32 exit_cost(Block& b, u32 entry_eip);
     unsigned run_native(Run& r);
-    void spin_skip(const JitCtx& c, u64 start, u64 instructions);
+    void spin_skip(const JitCtx& c, u64 instructions);
+    void countdown_skip(Block& b, u64 limit);
     bool stores_undone(const JitCtx& c) const;
     bool predictors_undone() const;
-    bool back_at_start(const JitCtx& c) const;
-    // Starting points whose runs did not come back to their state: no more chaining past the budget from there.
+    // Arm the spin probe at EIP `eip`, cycle `at`, after `insns` instructions of the run: the state is copied.
+    void arm_probe(JitCtx& c, u32 eip, u64 at, u64 insns);
+    // Probe EIPs whose runs did not come back to their state: no more chaining past the budget from there.
     bool not_a_fixed_point(u32 eip) const { return not_fixed_[(eip ^ (eip >> 9)) & 255] == eip; }
     void remember_not_fixed(u32 eip) { not_fixed_[(eip ^ (eip >> 9)) & 255] = eip; }
     std::array<u32, 256> not_fixed_{};
-    // Loops the spin skip has skipped: a run starting at one stops after its first pass (back where it began) so the
-    // skip is tried at once, instead of after the chain budget — events end such runs thousands of times a second.
+    // Loops the spin skip has skipped: a run starting at one is probed from its start, so it stops after its first
+    // pass and the skip is tried at once, instead of after the chain budget — events end such runs thousands of times
+    // a second.
     bool known_spin(u32 eip) const { return known_spin_[(eip ^ (eip >> 9)) & 255] == eip; }
     void remember_spin(u32 eip) { known_spin_[(eip ^ (eip >> 9)) & 255] = eip; }
     std::array<u32, 256> known_spin_{};
@@ -218,6 +232,7 @@ private:
     u32 epoch_{1};  // a kill makes every fast entry stale at once
     u32 link_epoch_{1};  // a kill or a new translation makes every chain link stale at once
     std::vector<std::vector<Block*>> page_blocks_;
+    std::vector<u8> code_granules_;  // see CodeWatcher
     std::vector<std::unique_ptr<Block>> graveyard_;
     Block* running_{nullptr};
     bool running_dead_{false};
@@ -229,7 +244,7 @@ private:
     std::exception_ptr jit_error_;
     u64 hot_{8};
     u32 chain_budget_{1024};  // the dispatcher's batch and its lock are not kept waiting for long
-    CpuState spin_start_{};
+    CpuState spin_start_{};  // the state where the probe was armed
     u32 probe_eip_{0};  // where the next run probes a spin loop with stores (0: none)
     bool probing_{false};
     struct ProbeByte {

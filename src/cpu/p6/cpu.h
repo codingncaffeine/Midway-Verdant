@@ -59,6 +59,8 @@ public:
     void add_instructions(u64 n) { instructions_ += n; }
     void clear_faulted() { last_faulted_ = false; }
     unsigned rep_iterations() const { return rep_iterations_; }
+    // REP MOVS/STOS over plain RAM a page at a time (on; tests compare it with the element loop).
+    void set_fast_strings(bool on) { fast_strings_ = on; }
     Timing& scheduler() { return sched_; }
     // Take a pending external interrupt if the core accepts one now (IF set, no inhibit): delivers it and
     // returns true. Wakes a halted core.
@@ -187,6 +189,7 @@ private:
     const Insn* cur_insn_{&insn_};
     PhysAddr fetch_phys_{0};
     unsigned rep_iterations_{0};
+    bool fast_strings_{true};
     unsigned top_before_{0};
     std::function<int()> irq_pending_, irq_ack_;
     u32 cpuid_signature_{0x0000068Au};

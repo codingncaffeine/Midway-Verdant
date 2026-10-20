@@ -741,8 +741,70 @@ void Cpu::exec_string(const Insn& in) {
     const bool string_io = in.op == Op::Ins || in.op == Op::Outs;
     const unsigned limit = single_iteration_ && !string_io ? 1 : kRepIterationsPerStep;
     unsigned done = 0;
+    // REP MOVS/STOS between flat segments (base 0, no limit: an element inside a page cannot fault on its offset) over
+    // plain RAM: a run of elements inside the current page of each end at a time, with the element order, the cache
+    // lookups, the dirty mark and the per-step limit of the loop below, without its per-element translations. Anything
+    // else (a page's end, a miss, a device, code nearby, the oracle's log) is the loop's, element by element.
+    auto flat = [&](u8 g, bool write) {
+        const Segment& s = st_.seg[g];
+        return s.base == 0 && s.limit == 0xFFFFFFFFu && !s.unusable() && !s.expand_down() && (write ? s.writable() : s.readable());
+    };
+    const bool fast = fast_strings_ && in.rep && a32 && (in.op == Op::Movs || in.op == Op::Stos) && st_.protected_mode() && !st_.v8086() && flat(kEs, true) &&
+                      (in.op == Op::Stos || flat(src_seg, false));
     for (;;) {
         if (in.rep && cx() == 0) return;
+        if (fast) {
+            const bool movs = in.op == Op::Movs;
+            const u32 dl = di(), sl = si();
+            u8* dh = nullptr;
+            u8* sh = nullptr;
+            PhysAddr dp = 0, sp = 0;
+            // Elements of this run: inside both pages (from the element's offset in its page, by direction), up to ECX
+            // and the step's limit.
+            auto room = [&](u32 lin) -> u32 {
+                const u32 off = lin & 0xFFFu;
+                if (off + size > 4096) return 0;
+                return delta > 0 ? (4096 - off) / size : off / size + 1;
+            };
+            u32 n = std::min(cx(), limit - done);
+            n = std::min(n, room(dl));
+            if (movs) n = std::min(n, room(sl));
+            if (n > 0 && mem_.ram_hit(dl, true, dh, dp) && (!movs || mem_.ram_hit(sl, false, sh, sp))) {
+                const std::size_t span = static_cast<std::size_t>(n) * size;
+                const u8* lo = delta > 0 ? dh : dh - (span - size);
+                if (!mem_.near_code(lo, span)) {
+                    const u32 v = st_.reg(kEax, size);
+                    const PhysAddr page = dp & ~0xFFFu;
+                    for (u32 k = 0; k < n; ++k) {
+                        u32 e = v;
+                        if (movs) {
+                            e = 0;
+                            std::memcpy(&e, sh, size);
+                            mem_.note_load(sp, size);
+                            sh += delta;
+                            sp += static_cast<u32>(delta);
+                        }
+                        std::memcpy(dh, &e, size);
+                        mem_.note_store(dp, size);
+                        dh += delta;
+                        dp += static_cast<u32>(delta);
+                    }
+                    mem_.mark_written(page);
+                    const u32 step = static_cast<u32>(delta) * n;
+                    st_.gpr[kEdi] += step;
+                    if (movs) st_.gpr[kEsi] += step;
+                    st_.gpr[kEcx] -= n;
+                    rep_iterations_ += n;
+                    done += n;
+                    if (done >= limit && cx() != 0) {
+                        st_.eip = insn_eip_;
+                        last_rep_step_ = true;
+                        return;
+                    }
+                    continue;
+                }
+            }
+        }
         switch (in.op) {
             case Op::Movs: {
                 const u32 dl = linear(kEs, di(), size, Access::Write);

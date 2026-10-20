@@ -30,12 +30,14 @@ struct IoRecord {
     u32 value;
 };
 
-// Told when the CPU writes into a RAM page that holds translated code (D26), before the write returns.
+// Told when the CPU writes near translated code (D26), before the write returns: `granules` holds a byte per 64
+// bytes of RAM, non-zero where a write of up to 16 bytes starting there may overlap a block's code.
 class CodeWatcher {
 public:
     virtual ~CodeWatcher() = default;
-    virtual void code_written(u32 ram_page) = 0;
+    virtual void code_written(u32 ram_page, unsigned off, unsigned len) = 0;
 };
+inline constexpr unsigned kCodeGranuleBits = 6;
 
 class Memory {
 public:
@@ -45,7 +47,10 @@ public:
     void set_device_hook(std::function<void()> hook) { device_hook_ = std::move(hook); }
     // Instrument: called after every device access (kind r/w = memory-mapped, i/o = port; the value read or written).
     void set_device_trace(std::function<void(char kind, u32 addr, unsigned size, u32 value)> trace) { device_trace_ = std::move(trace); }
-    void set_code_watcher(CodeWatcher* w) { code_watch_ = w; }
+    void set_code_watcher(CodeWatcher* w, const u8* granules) {
+        code_watch_ = w;
+        code_granules_ = granules;
+    }
 
     // Linear-address accesses (after segmentation). Sizes 1, 2, 4; `read_bytes`/`write_bytes` for the wide
     // x87/SSE operands. They throw #PF.
@@ -55,6 +60,31 @@ public:
     void write_bytes(u32 lin, const void* in, unsigned n);
     // Check that a write to [lin, lin+n) would not fault (translation with write intent) without writing.
     void probe_write(u32 lin, unsigned n);
+
+    // The string fast path's pieces (Cpu::exec_string): the host byte and physical address of `lin` when it is a TLB
+    // hit on RAM (writable for a write) with paging on and no oracle log, else false (nothing looked up past the entry);
+    // whether a write to [p, p + n) may touch translated code; an access noted in the cache model as read() and write()
+    // note it; a page written, as write() marks it.
+    bool ram_hit(u32 lin, bool write, u8*& host, PhysAddr& phys) const {
+        if (!st_.paging() || logging_) return false;
+        const TlbEntry& e = tlb_[(lin >> 12) & (kTlbSize - 1)];
+        if (e.tag != (lin >> 12) || !e.host || (write && !e.writable)) return false;
+        host = e.host + (lin & 0xFFFu);
+        phys = e.phys_page | (lin & 0xFFFu);
+        return true;
+    }
+    bool near_code(const u8* p, std::size_t n) const {
+        if (!code_watch_) return false;
+        const std::size_t at = static_cast<std::size_t>(p - bus_.ram());
+        for (std::size_t g = at >> kCodeGranuleBits; g <= (at + n - 1) >> kCodeGranuleBits; ++g)
+            if (code_granules_[g]) return true;
+        return false;
+    }
+    void note_load(PhysAddr phys, unsigned size) { note(phys, size, 0); }
+    void note_store(PhysAddr phys, unsigned size) { note(phys, size, 1); }
+    void mark_written(PhysAddr page) {
+        if (dirty_tracking_) mark_dirty(page, 1);
+    }
 
     // Translate a linear address; throws #PF. `user` = the access is made at CPL 3.
     PhysAddr translate(u32 lin, Access access);
@@ -168,10 +198,12 @@ private:
     std::function<void()> device_hook_;
     std::function<void(char, u32, unsigned, u32)> device_trace_;
     CodeWatcher* code_watch_{nullptr};
-    void check_code(const u8* p) {
+    const u8* code_granules_{nullptr};
+    // `n` bytes written at RAM byte `p` (n <= 16).
+    void check_code(const u8* p, unsigned n) {
         if (code_watch_) {
-            const u32 page = bus_.ram_page(p);
-            if (bus_.code_page(page)) code_watch_->code_written(page);
+            const std::size_t at = static_cast<std::size_t>(p - bus_.ram());
+            if (code_granules_[at >> kCodeGranuleBits]) code_watch_->code_written(static_cast<u32>(at >> 12), static_cast<unsigned>(at & 0xFFFu), n);
         }
     }
     bool logging_{false};

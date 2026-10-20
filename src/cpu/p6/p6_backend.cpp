@@ -402,16 +402,16 @@ std::string P6Backend::report() const {
                          b.fast_hits, b.relinks);
         for (unsigned w = 0; w < b.run_end.size(); ++w)
             if (b.run_end[w]) r += std::format(" {}:{}", w == 16 ? std::string("mid-block") : w == 17 ? std::string("fault") : std::to_string(w), b.run_end[w]);
-        r += "; exits through the engine's chain (link, budget, limit, pending, fetch translation, fetch lines, indirect, none):";
+        r += "; exits through the engine's chain (link, budget, limit, pending, fetch translation, fetch lines, indirect, none, spin probe):";
         for (u64 n : b.slow_chain) r += std::format(" {}", n);
-        r += std::format("\ncpu p6 blocks: {} built, {} live, {} killed ({} page writes, {} by devices); runs {} whole; {} fallback steps; {} instructions in blocks; {} exit mispredicts; cycles: schedules {}, penalties {}, exits {}, REP {}",
-                         b.built, blocks_->live_blocks(), b.killed, b.pages_written, b.device_page_writes, b.whole_runs, b.fallback_steps,
+        r += std::format("\ncpu p6 blocks: {} built, {} live, {} killed ({} writes into code, {} by devices; {} writes near code kept every block); {} places no block starts; runs {} whole; {} fallback steps; {} instructions in blocks; {} exit mispredicts; cycles: schedules {}, penalties {}, exits {}, REP {}",
+                         b.built, blocks_->live_blocks(), b.killed, b.pages_written, b.device_page_writes, b.code_page_writes_kept, b.empty_blocks, b.whole_runs, b.fallback_steps,
                          b.block_insns, b.mispredicts, b.schedule_cycles, b.penalty_cycles, b.exit_cycles, b.rep_cycles);
         if (p6::Jit* j = blocks_->jit()) {
-            r += std::format("\ncpu p6 recompiler: {} blocks translated ({} KiB, {} flushes); {} native runs, {} native instructions, {} by the interpreter inside them; {} hand-offs, {} runs refused (assumptions changed); {} blocks entered by a chain; {} spin skips covering {} cycles ({} one-pass runs of known loops; refused: interpreted {}, penalty {}, mispredict {}, elsewhere {}, state {}, log full {}, stores {})",
+            r += std::format("\ncpu p6 recompiler: {} blocks translated ({} KiB, {} flushes); {} native runs, {} native instructions, {} by the interpreter inside them; {} hand-offs, {} runs refused (assumptions changed); {} blocks entered by a chain; {} spin skips covering {} cycles ({} one-pass runs of known loops; refused: interpreted {}, penalty {}, mispredict {}, elsewhere {}, state {}, log full {}, stores {}); {} countdown loops skipped {} passes",
                              j->compiled(), j->code_bytes() / 1024, j->flushes(), b.native_runs, b.native_insns, b.native_helpers, b.native_handoffs, b.native_ineligible, b.chains,
                              b.spin_skips, b.spin_cycles, b.spin_short_runs, b.spin_refused[0], b.spin_refused[1], b.spin_refused[2], b.spin_refused[3], b.spin_refused[4], b.spin_refused[5],
-                             b.spin_refused[6]);
+                             b.spin_refused[6], b.countdown_skips, b.countdown_passes);
             r += "; elsewhere by chain test:";
             for (unsigned w = 0; w < 16; ++w)
                 if (b.spin_elsewhere_why[w]) r += std::format(" {}:{}", w, b.spin_elsewhere_why[w]);

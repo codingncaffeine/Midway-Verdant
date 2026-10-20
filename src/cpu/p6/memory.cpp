@@ -168,7 +168,7 @@ void Memory::write_phys(PhysAddr phys, unsigned size, u32 value) {
         }
         std::memcpy(p, &value, size);
         if (dirty_tracking_) mark_dirty(phys, size);
-        check_code(p);
+        check_code(p, size);
         return;
     }
     if (device_hook_) device_hook_();
@@ -227,7 +227,7 @@ void Memory::write(u32 lin, unsigned size, u32 value) {
     if (e.host && !logging_) {
         std::memcpy(e.host + (lin & kPageMask), &value, size);
         if (dirty_tracking_) mark_dirty(e.phys_page, 1);
-        check_code(e.host);
+        check_code(e.host + (lin & kPageMask), size);
         note(e.phys_page | (lin & kPageMask), size, 1);
         return;
     }

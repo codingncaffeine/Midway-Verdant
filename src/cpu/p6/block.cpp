@@ -69,9 +69,10 @@ BranchKind branch_kind(Op op) {
 
 }  // namespace
 
-BlockEngine::BlockEngine(Cpu& cpu, Bus& bus) : cpu_(cpu), bus_(bus), fast_(kFastSize), page_blocks_(bus.ram_size() / 4096) {
+BlockEngine::BlockEngine(Cpu& cpu, Bus& bus)
+    : cpu_(cpu), bus_(bus), fast_(kFastSize), page_blocks_(bus.ram_size() / 4096), code_granules_(bus.ram_size() >> kCodeGranuleBits) {
     bus_.set_code_tracking(true);
-    cpu_.memory().set_code_watcher(this);
+    cpu_.memory().set_code_watcher(this, code_granules_.data());
     if (const char* l = std::getenv("MV_P6_BLOCK_LOG"); l && *l) {
         std::string spec(l);
         const auto c2 = spec.rfind(':'), c1 = spec.rfind(':', c2 - 1);
@@ -89,7 +90,7 @@ BlockEngine::BlockEngine(Cpu& cpu, Bus& bus) : cpu_(cpu), bus_(bus), fast_(kFast
 }
 
 BlockEngine::~BlockEngine() {
-    cpu_.memory().set_code_watcher(nullptr);
+    cpu_.memory().set_code_watcher(nullptr, nullptr);
     bus_.set_code_tracking(false);
 }
 
@@ -122,12 +123,12 @@ Block* BlockEngine::find() {
     } else {
         const auto it = blocks_.find(key(page, off, mode));
         b = it != blocks_.end() ? it->second.get() : build(host - off, off, page, mode);
-        if (!b) return nullptr;
         if (!b->lin) b->lin = lin;
         f = FastEntry{lin, mode, epoch_, b};
         const u32 idx = fast_index(lin, mode);
         if (std::find(b->fast_slots.begin(), b->fast_slots.end(), idx) == b->fast_slots.end()) b->fast_slots.push_back(idx);
     }
+    if (b->n == 0) return nullptr;  // no block can start here: the step runs it
     // The whole block inside the code segment (the step faults at the instruction that leaves it).
     const u32 last = s.eip + b->bytes - 1u;
     if (last < s.eip || last > s.seg[kCs].limit) return nullptr;
@@ -165,13 +166,25 @@ Block* BlockEngine::build(const u8* page, unsigned off, u32 ram_page, u8 mode) {
         at += in.len;
         if (ends_block(in)) break;
     }
-    if (b->insns.empty()) return nullptr;
+    if (b->insns.empty()) {
+        // The first instruction straddles the page's end, or does not decode: an empty block remembers it, so the
+        // next visit steps at once (no build, no exception); it holds the page's bytes from here to the end (all the
+        // decode read), and a write over them drops it as it would a block.
+        b->bytes = static_cast<u16>(4096 - off);
+        ++stats_.empty_blocks;
+    }
     b->n = static_cast<u8>(b->insns.size());
-    b->bytes = static_cast<u16>(at - off);
-    b->branch = branch_kind(b->insns.back().op);
+    if (b->n) b->bytes = static_cast<u16>(at - off);
+    b->branch = b->n ? branch_kind(b->insns.back().op) : BranchKind::None;
+    if (b->n == 2 && b->insns[1].op == Op::Jcc && b->insns[1].cc == 5 && b->insns[1].imm == static_cast<u32>(-static_cast<i32>(b->bytes))) {
+        const Insn& d = b->insns[0];
+        const bool by_one = d.dst.kind == OpndKind::Reg && d.size == 4 && !d.lock &&
+                            (d.op == Op::Dec || (d.src.kind == OpndKind::Imm && ((d.op == Op::Sub && d.imm == 1) || (d.op == Op::Add && d.imm == 0xFFFFFFFFu))));
+        if (by_one) b->countdown = d.dst.reg;
+    }
     std::array<const Insn*, kMaxBlockInsns> list{};
     for (unsigned i = 0; i < b->n; ++i) list[i] = &b->insns[i];
-    b->cycles = schedule_block(cpu_.scheduler(), list.data(), b->n, b->after.data());
+    b->cycles = b->n ? schedule_block(cpu_.scheduler(), list.data(), b->n, b->after.data()) : 0;
     b->entry.cycles = b->cycles;
     b->entry.n = b->n;
     b->entry.host_page = bus_.ram() + static_cast<std::size_t>(ram_page) * 4096u;
@@ -183,8 +196,15 @@ Block* BlockEngine::build(const u8* page, unsigned off, u32 ram_page, u8 mode) {
     Block* raw = b.get();
     page_blocks_[ram_page].push_back(raw);
     bus_.set_code_page(ram_page, true);
+    {
+        // A write of up to 16 bytes that overlaps the code starts at most 15 bytes before it (writes never cross a
+        // page here: the interpreter splits them, the generated code refuses them).
+        const unsigned from = off >= 15 ? off - 15 : 0, to = off + b->bytes;
+        u8* g = code_granules_.data() + (static_cast<std::size_t>(ram_page) << (12 - kCodeGranuleBits));
+        for (unsigned k = from >> kCodeGranuleBits; k <= (to - 1) >> kCodeGranuleBits; ++k) g[k] = 1;
+    }
     blocks_.emplace(key(ram_page, off, mode), std::move(b));
-    ++stats_.built;
+    if (raw->n) ++stats_.built;
     return raw;
 }
 
@@ -198,23 +218,60 @@ std::string BlockEngine::hottest(unsigned count) const {
     return s;
 }
 
+void BlockEngine::kill_block(Block* b) {
+    if (b == running_ || (current_ && current_->block == b)) running_dead_ = true;
+    forget(*b);
+    const auto it = blocks_.find(key(b->ram_page, b->page_off, b->mode));
+    if (it != blocks_.end()) {
+        graveyard_.push_back(std::move(it->second));
+        blocks_.erase(it);
+    }
+    ++stats_.killed;
+}
+
 void BlockEngine::kill_page(u32 ram_page) {
     if (ram_page >= page_blocks_.size()) return;
     auto& list = page_blocks_[ram_page];
-    for (Block* b : list) {
-        if (b == running_ || (current_ && current_->block == b)) running_dead_ = true;
-        forget(*b);
-        const auto it = blocks_.find(key(b->ram_page, b->page_off, b->mode));
-        if (it != blocks_.end()) {
-            graveyard_.push_back(std::move(it->second));
-            blocks_.erase(it);
-        }
-        ++stats_.killed;
-    }
+    for (Block* b : list) kill_block(b);
     list.clear();
+    mark_granules(ram_page);
     bus_.set_code_page(ram_page, false);
     pending_slot_ = nullptr;
     ++stats_.pages_written;
+}
+
+void BlockEngine::kill_range(u32 ram_page, unsigned off, unsigned len) {
+    if (ram_page >= page_blocks_.size()) return;
+    if (off + len > 4096) kill_range(ram_page + 1, 0, off + len - 4096);
+    auto& list = page_blocks_[ram_page];
+    std::size_t kept = 0;
+    bool any = false;
+    for (Block* b : list) {
+        if (off < b->page_off + b->bytes && off + len > b->page_off) {
+            kill_block(b);
+            any = true;
+        } else {
+            list[kept++] = b;  // its code and its predictor stay (a store elsewhere in the page changes neither: D30)
+        }
+    }
+    list.resize(kept);
+    mark_granules(ram_page);
+    if (list.empty()) bus_.set_code_page(ram_page, false);
+    if (any) {
+        pending_slot_ = nullptr;
+        ++stats_.pages_written;
+    } else {
+        ++stats_.code_page_writes_kept;
+    }
+}
+
+void BlockEngine::mark_granules(u32 ram_page) {
+    u8* g = code_granules_.data() + (static_cast<std::size_t>(ram_page) << (12 - kCodeGranuleBits));
+    std::memset(g, 0, std::size_t{1} << (12 - kCodeGranuleBits));
+    for (const Block* b : page_blocks_[ram_page]) {
+        const unsigned off = b->page_off, from = off >= 15 ? off - 15 : 0, to = off + b->bytes;
+        for (unsigned k = from >> kCodeGranuleBits; k <= (to - 1) >> kCodeGranuleBits; ++k) g[k] = 1;
+    }
 }
 
 void BlockEngine::set_link(Block::Link& slot, Block* to) {
@@ -243,7 +300,7 @@ void BlockEngine::forget(Block& b) {
     b.fast_slots.clear();
 }
 
-void BlockEngine::code_written(u32 ram_page) { kill_page(ram_page); }
+void BlockEngine::code_written(u32 ram_page, unsigned off, unsigned len) { kill_range(ram_page, off, len); }
 
 void BlockEngine::take_device_writes() {
     written_.clear();
@@ -349,6 +406,7 @@ BlockEngine::Next BlockEngine::exec(Run& r, unsigned i) {
 }
 
 unsigned BlockEngine::run(Block& b, u64 limit) {
+    if (jit_ && b.countdown != 0xFF) countdown_skip(b, limit);
     Run r = begin(b, limit);
     cpu_.cache_timing().trace_ = nullptr;
     if (block_log_ && r.start >= log_from_ && r.start <= log_to_) {
@@ -428,26 +486,24 @@ unsigned BlockEngine::run_native(Run& r) {
     c.chain_budget = chain_budget_;
     c.chain_extra = 4096;
     c.start_eip = r.entry_eip;
-    // A spin probe: about one pass (a short budget: the run goes on to where it began) with the stores logged.
-    if (probe_eip_ && probe_eip_ == r.entry_eip && chain_budget_ >= 64) {
-        // Every transition through the engine (a budget of 0: the generated code never commits a chain), one pass:
-        // the chain goes on until it is back where it began. The predictors and the return stack are recorded.
+    // A spin probe with stores or mispredicts, armed by an earlier pass at this EIP: one pass with the stores logged
+    // and every transition through the engine (a budget of 0: the generated code never commits a chain), so the
+    // predictors and the return stack are recorded as exit_cost changes them. The run starts at the probe's EIP.
+    if (probe_eip_ && probe_eip_ == r.entry_eip && chain_budget_ >= 64 && r.extra == 0) {
         c.logging = 1;
         c.chain_budget = 0;
         probing_ = true;
         probed_exits_.clear();
         rsb_at_probe_ = rsb_;
         rsb_top_at_probe_ = rsb_top_;
-    }
-    // A known spin loop: every transition through the engine, so the run ends when it is back where it began.
-    if (!c.logging && chain_budget_ >= 64 && known_spin(r.entry_eip)) {
-        c.chain_budget = 0;
-        c.chain_extra = 256;
+        arm_probe(c, r.entry_eip, r.start, 0);
+    } else if (chain_budget_ >= 64 && r.extra == 0 && known_spin(r.entry_eip)) {
+        // A known spin loop: probed from its start, so the run ends when it is back where it began.
+        c.chain_budget = 256;
+        c.chain_extra = 0;
+        arm_probe(c, r.entry_eip, r.start, 0);
         ++stats_.spin_short_runs;
     }
-    // The state the run began from, for the spin skip (a copy of the registers; the run is long when it matters).
-    const bool spin_watch = chain_budget_ >= 64;
-    if (spin_watch) std::memcpy(&spin_start_, &cpu_.state(), sizeof spin_start_);  // bytes, padding too: compared as bytes
     cpu_.clear_faulted();
     running_ = r.b;
     running_dead_ = false;
@@ -481,13 +537,14 @@ unsigned BlockEngine::run_native(Run& r) {
     c.base += left;
     stats_.penalty_cycles += c.penalties + left;
     ++stats_.run_end[kind == kJitEnd ? (c.stop_why & 15u) : kind == kJitFault ? 17u : 16u];
+    if (c.logging) probe_eip_ = 0;  // one logging probe a candidate; a later pass that qualifies arms another
     if (kind == kJitEnd) {
         if (c.ended) {
             cpu_.set_cycles_only(c.end_cycles);  // the exit was costed where the chain stopped
             pending_slot_ = c.last_slot;
             pending_target_ = c.last_target;
             pending_from_ = &b;
-            if ((spin_watch || c.logging) && r.extra == 0) spin_skip(c, r.start, total - c.helpers);
+            if (c.probe == 2) spin_skip(c, total - c.probe_insns);
         } else {
             const u32 exit = exit_cost(b, c.entry_eip);
             stats_.schedule_cycles += b.cycles;
@@ -525,6 +582,7 @@ void* BlockEngine::chain(JitCtx& c, Block::Link* slot) {
         const Memory::TlbEntry& e = cpu_.memory().tlb()[(lin >> 12) & (Memory::kTlbSize - 1)];
         unsigned why = 7;
         if (a.branch != BranchKind::None && a.branch != BranchKind::Conditional && a.branch != BranchKind::Direct && a.branch != BranchKind::Call) why = 6;
+        else if (c.probe == 1 && s.eip == c.probe_eip) why = 8;
         else if (!t || slot->epoch != link_epoch_ || !t->entry.body || t->entry.jit_eip != s.eip) why = 0;
         else if (c.chain_budget == 0) why = 1;
         else if (c.base + a.cycles + tp::kBlockMispredict + t->entry.cycles + tp::kL2Latency + tp::kDramLatency >= c.limit) why = 2;
@@ -534,7 +592,8 @@ void* BlockEngine::chain(JitCtx& c, Block::Link* slot) {
             const u32* mru = cpu_.cache_timing().l1i_mru();
             const unsigned sets = cpu_.cache_timing().l1i_sets();
             const u32 l = t->entry.fetch_line;
-            if (t->entry.fetch_lines > 2 || mru[(l - 1) & (sets - 1)] != l || (t->entry.fetch_lines == 2 && mru[l & (sets - 1)] != l + 1)) why = 5;
+            for (unsigned k = 0; k < t->entry.fetch_lines; ++k)
+                if (mru[(l - 1 + k) & (sets - 1)] != l + k) why = 5;
         }
         ++stats_.slow_chain[why];
     }
@@ -549,6 +608,19 @@ void* BlockEngine::chain(JitCtx& c, Block::Link* slot) {
     Block* b = slot->to;
     if (exit) ++c.mispredicts;
     const CpuState& s = cpu_.state();
+    // Back at the probe's EIP: a pass of a loop when the whole state is as it was there (the spin skip then checks the
+    // rest); a nested loop's inner block recurs before the outer period ends, so a few other states are let by.
+    if (c.probe == 1 && s.eip == c.probe_eip) {
+        if (std::memcmp(&s, &spin_start_, sizeof s) == 0) {
+            c.probe = 2;
+            return c.stop_why = 7, nullptr;
+        }
+        if (++c.probe_misses >= 16) {
+            ++stats_.spin_refused[4];
+            remember_not_fixed(c.probe_eip);
+            return c.stop_why = 8, nullptr;
+        }
+    }
     if (!b || slot->epoch != link_epoch_ || !b->native || b->jit_eip != s.eip) {
         // No link, a stale one, or one to where the exit went last time (a return, a jump table): the block the
         // dispatcher would run next, from the fast cache, under the conditions a link to it is learned (run()), and
@@ -568,9 +640,19 @@ void* BlockEngine::chain(JitCtx& c, Block::Link* slot) {
         }
         if (!b) return c.stop_why = 1, nullptr;
     }
-    // Past the budget a run goes on (a little) until it is back where it began: the spin skip compares the two.
-    // (only while the run could still be a skippable pass, and not from where that already failed)
-    if (c.chain_budget == 0 && (back_at_start(c) || c.chain_extra == 0 || c.helpers || c.penalties || not_a_fixed_point(c.start_eip))) return c.stop_why = 2, nullptr;
+    // Past the budget a run goes on (a little) to see whether it comes back to the state it was in there: the probe is
+    // armed at this boundary (not where a probe already failed), and the generated code chains on, leaving only to
+    // come here at the probe's EIP. A logging probe takes every transition here.
+    if (c.chain_budget == 0) {
+        if (c.probe) {
+            if (!c.logging || c.chain_extra == 0) return c.stop_why = 2, nullptr;
+        } else {
+            if (c.chain_extra == 0 || not_a_fixed_point(s.eip)) return c.stop_why = 2, nullptr;
+            arm_probe(c, s.eip, end, c.insns_done + a.n);
+            c.chain_budget = c.chain_extra;
+            c.chain_extra = 0;
+        }
+    }
     if (b->jit_eip != s.eip || s.eip == idle_[0] || s.eip == idle_[1]) return c.stop_why = 3, nullptr;
     constexpr u64 kSlowestFetch = tp::kL2Latency + tp::kDramLatency;
     if (end + b->cycles + kSlowestFetch >= c.limit) return c.stop_why = 4, nullptr;
@@ -617,51 +699,37 @@ namespace mv::p6 {
 // something outside the CPU changes memory or raises an interrupt — which only events do (and the devices' own
 // threads, whose timing is the host's either way). So the clock and the instruction count move on by whole passes,
 // stopping a pass short of the limit; the run after that reaches the limit's instruction boundary as it would have.
-void BlockEngine::spin_skip(const JitCtx& c, u64 start, u64 instructions) {
+void BlockEngine::spin_skip(const JitCtx& c, u64 instructions) {
     const bool probe = c.logging != 0;
-    if (probe) probe_eip_ = 0;  // one probe a candidate; a later run that qualifies arms another
-    const u32 chained = probe ? 1u : chain_budget_ - c.chain_budget;
-    if (!probe && chained < 64) return;
-    if (c.helpers) { ++stats_.spin_refused[0]; return; }
-    if (c.penalties) { ++stats_.spin_refused[1]; return; }
-    if (c.mispredicts && !probe) {
+    if (c.helpers != c.probe_helpers) { ++stats_.spin_refused[0]; return; }
+    if (c.penalties != c.probe_penalties) { ++stats_.spin_refused[1]; return; }
+    if (c.mispredicts != c.probe_mispredicts && !probe) {
         // Mispredicts: a periodic pattern leaves each predictor as it found it after a pass; a probe checks that.
         ++stats_.spin_refused[2];
-        if (std::memcmp(&cpu_.state(), &spin_start_, sizeof(CpuState)) == 0 && cpu_.state().eip == c.start_eip) probe_eip_ = c.start_eip;
+        probe_eip_ = c.probe_eip;
         return;
     }
     if (probe && !predictors_undone()) { ++stats_.spin_refused[2]; return; }
     if (instructions == 0) return;
-    const CpuState& s = cpu_.state();
-    if (s.eip != c.start_eip) {
-        ++stats_.spin_refused[3];
-        ++stats_.spin_elsewhere_why[c.stop_why & 15];
-        return;
-    }
-    if (std::memcmp(&s, &spin_start_, sizeof s) != 0) {
-        ++stats_.spin_refused[4];
-        remember_not_fixed(c.start_eip);
-        return;
-    }
     if (c.stores) {
-        // Stores: a pass that leaves memory as it found it is still a fixed point. A long run arms a probe; the
-        // probe checks every location its stores touched holds its first replaced bytes again.
+        // Stores: a pass that leaves memory as it found it is still a fixed point. The next run (it starts here) is a
+        // logging probe, which checks every location its stores touched holds its first replaced bytes again.
         if (!probe) {
-            probe_eip_ = c.start_eip;
+            probe_eip_ = c.probe_eip;
             return;
         }
         if (c.log_count > 256) { ++stats_.spin_refused[5]; return; }
         if (!stores_undone(c)) { ++stats_.spin_refused[6]; return; }
     }
     const u64 now = cpu_.cycles();
-    const u64 period = now - start;
+    const u64 period = now - c.probe_cycle;
     if (period == 0 || now >= c.limit) return;
     const u64 passes = (c.limit - now) / period;
     if (passes < 2) return;
     const u64 k = passes - 1;
     cpu_.set_cycles_only(now + k * period);
     cpu_.add_instructions(k * instructions);
-    remember_spin(c.start_eip);
+    remember_spin(c.probe_eip);
     ++stats_.spin_skips;
     stats_.spin_cycles += k * period;
 }
@@ -702,10 +770,49 @@ bool BlockEngine::predictors_undone() const {
 
 namespace mv::p6 {
 
-// Back where the run began: the same EIP and registers (a nested loop's inner block recurs before its period ends).
-bool BlockEngine::back_at_start(const JitCtx& c) const {
-    const CpuState& s = cpu_.state();
-    return s.eip == c.start_eip && s.gpr == spin_start_.gpr && s.eflags() == spin_start_.eflags();
+// A countdown loop (`dec ecx; jnz self`: the kernel's stall loop) skipped arithmetically. While its exit stays taken
+// and predicted (the two-bit counter saturated), its code line the most recent of its set and nothing is pending, each
+// pass costs the schedule and nothing else and changes only the register and the lazy flags; the next pass the run
+// executes rewrites the flags as they would be (a DEC's CF is carried unchanged through every pass). So whole passes
+// move the clock, the instruction count and the register on, leaving the register at least one and a pass before
+// the limit, so the run then executes as it would have to the limit's boundary. (Called before the run begins.)
+void BlockEngine::countdown_skip(Block& b, u64 limit) {
+    CpuState& s = cpu_.state();
+    const u32 r = s.gpr[b.countdown];
+    if (r < 3 || b.exit_counter != 3 || !b.exit_seen || b.cycles == 0 || !(b.mode & 1) || (s.flags & fl::TF)) return;
+    if (cpu_.memory().penalty_pending() || bus_.code_writes_pending() || s.inhibit_interrupts) return;
+    const Timing& t = cpu_.cache_timing();
+    const u32* mru = t.l1i_mru();
+    const unsigned sets = t.l1i_sets();
+    const u32 l = b.entry.fetch_line;
+    for (unsigned k = 0; k < b.entry.fetch_lines; ++k)
+        if (mru[(l - 1 + k) & (sets - 1)] != l + k) return;
+    const u64 now = cpu_.cycles();
+    if (now >= limit) return;
+    const u64 passes = (limit - now) / b.cycles;
+    if (passes < 3) return;
+    const u64 k = std::min<u64>(r - 2, passes - 2);
+    s.gpr[b.countdown] = r - static_cast<u32>(k);
+    cpu_.set_cycles_only(now + k * b.cycles);
+    cpu_.add_instructions(2 * k);
+    b.entry.runs += k;
+    stats_.schedule_cycles += k * b.cycles;
+    stats_.block_insns += 2 * k;
+    ++stats_.countdown_skips;
+    stats_.countdown_passes += k;
+}
+
+void BlockEngine::arm_probe(JitCtx& c, u32 eip, u64 at, u64 insns) {
+    std::memcpy(&spin_start_, &cpu_.state(), sizeof spin_start_);  // bytes, padding too: compared as bytes
+    c.probe = 1;
+    c.probe_misses = 0;
+    c.probe_eip = eip;
+    c.probe_cycle = at;
+    c.probe_insns = insns;
+    c.probe_helpers = c.helpers;
+    c.probe_penalties = c.penalties;
+    c.probe_mispredicts = c.mispredicts;
+    c.stores = 0;
 }
 
 }  // namespace mv::p6

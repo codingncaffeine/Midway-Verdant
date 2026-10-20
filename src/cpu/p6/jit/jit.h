@@ -44,12 +44,20 @@ struct JitCtx {
     Block::Link* last_slot{};
     u32 last_target{};
     u64 penalties{};
-    // The spin skip's evidence (see BlockEngine::run_native): whether the native code made a store (1), mispredicts, where the
-    // run began, the blocks a run may chain past its budget to end where it began.
+    // The spin skip's evidence (see BlockEngine::chain): whether the native code made a store since the probe was armed
+    // (1), mispredicts, where the run began, the blocks a run may chain past its budget to come back to the probe.
     u32 stores{};
     u32 mispredicts{};
     u32 start_eip{};
     u32 chain_extra{};
+    // The spin probe: armed where the run first went past its chain budget (or at its start, for a known loop or a
+    // logging probe) at EIP `probe_eip`, with the cycle, the instruction count and the counters there; the generated
+    // code's chain leaves to the engine when its target is `probe_eip` (~0: none armed).
+    u32 probe_eip{0xFFFFFFFFu};
+    u8 probe{};         // 0 none, 1 armed, 2 back at the armed state
+    u8 probe_misses{};  // arrivals at probe_eip with another state
+    u64 probe_cycle{}, probe_insns{}, probe_penalties{};
+    u32 probe_helpers{}, probe_mispredicts{};
     // Statistics of the chains the generated code took (folded into the engine's after the run).
     u32 inline_chains{};
     u32 inline_mispredicts{};

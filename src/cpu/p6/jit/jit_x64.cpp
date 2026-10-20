@@ -97,7 +97,7 @@ constexpr i32 kCtxScratch = static_cast<i32>(offsetof(JitCtx, scratch));
 constexpr i32 kCtxBase = static_cast<i32>(offsetof(JitCtx, base)), kCtxLimit = static_cast<i32>(offsetof(JitCtx, limit));
 constexpr i32 kCtxBlock = static_cast<i32>(offsetof(JitCtx, block)), kCtxBudget = static_cast<i32>(offsetof(JitCtx, chain_budget));
 constexpr i32 kCtxInsnsDone = static_cast<i32>(offsetof(JitCtx, insns_done)), kCtxEntryEip = static_cast<i32>(offsetof(JitCtx, entry_eip));
-constexpr i32 kCtxEnded = static_cast<i32>(offsetof(JitCtx, ended));
+constexpr i32 kCtxEnded = static_cast<i32>(offsetof(JitCtx, ended)), kCtxProbeEip = static_cast<i32>(offsetof(JitCtx, probe_eip));
 constexpr i32 kCtxStores = static_cast<i32>(offsetof(JitCtx, stores)), kCtxMispredicts = static_cast<i32>(offsetof(JitCtx, mispredicts));
 constexpr i32 kCtxInlineChains = static_cast<i32>(offsetof(JitCtx, inline_chains)), kCtxInlineMispredicts = static_cast<i32>(offsetof(JitCtx, inline_mispredicts));
 constexpr i32 kCtxInlineSched = static_cast<i32>(offsetof(JitCtx, inline_sched)), kCtxInlineInsns = static_cast<i32>(offsetof(JitCtx, inline_insns));
@@ -322,7 +322,7 @@ private:
         a.mov64(kTlb, reinterpret_cast<u64>(m.tlb()));
         a.mov64(kRam, reinterpret_cast<u64>(m.bus().ram()));
         a.mov64(kMru, reinterpret_cast<u64>(cpu_.cache_timing().l1d_mru()));
-        a.mov64(kCodeMap, reinterpret_cast<u64>(m.bus().code_map()));
+        a.mov64(kCodeMap, reinterpret_cast<u64>(ev_.code_granules));
     }
     void epilogue() {
         a.x87_mem(0xD9, 5, ctx_at(kCtxDefCw));  // fldcw: back to it
@@ -430,6 +430,8 @@ private:
         a.jcc(NE, slow);
         a.alu_imm(4, 7, ctx_at(kCtxBudget), 0);
         a.jcc(E, slow);
+        a.alu_imm(4, 7, ctx_at(kCtxProbeEip), target);  // the spin probe's EIP: the engine compares the state
+        a.jcc(E, slow);
         // R8D = 1 on a mispredict; R9D = the conditional predictor's new state.
         if (kind == BranchKind::Conditional) {
             a.movzx(r9, 1, mem_abs(r10, &b_.exit_counter));
@@ -484,21 +486,23 @@ private:
         a.mov(8, rax, mem(kTlb, tlb + 8));
         a.alu(8, 7, rax, mem(rcx, eHost));
         a.jcc(NE, slow);
-        // The fetch: one or two lines, each looked up in L1I as Timing::code_fetch does — its set's most recent line
+        // The fetch: each line looked up in L1I in order, as Timing::code_fetch does — its set's most recent line
         // changes nothing; a hit on another way takes the clock's next value as its age and becomes the most recent
-        // (the model's own update, here); a miss is the engine's (L2, the penalty). A second line that misses after
-        // the first was updated is still exact: the engine then finds the first its set's most recent.
-        a.movzx(rdi, 1, mem(rcx, eLines));
-        a.alu_imm(4, 7, rdi, 2);
-        a.jcc(A, slow);
+        // (the model's own update, here); a miss is the engine's (L2, the penalty). A line that misses after earlier
+        // ones were updated is still exact: the engine then finds those their sets' most recent.
         a.mov(4, rsi, mem(rcx, eLine));
         fetch_line(slow);
-        Label one = a.label();
+        Label one = a.label(), more = a.label();
         a.alu_imm(1, 7, mem(rcx, eLines), 1);
         a.jcc(E, one);
-        a.mov(4, rsi, mem(rcx, eLine));
+        a.bind(more);
         a.lea(4, rsi, mem(rsi, 1));
         fetch_line(slow);
+        a.movzx(rax, 1, mem(rcx, eLines));
+        a.alu(4, 0, rax, mem(rcx, eLine));  // one past the last line (lines are kept plus one)
+        a.lea(4, rdi, mem(rsi, 1));
+        a.alu(4, 7, rdi, rax);
+        a.jcc(B, more);
         a.bind(one);
         // ---- committed from here ----
         if (kind == BranchKind::Conditional) a.mov(1, mem_abs(rax, &b_.exit_counter), r9);
@@ -645,17 +649,23 @@ private:
         a.mov(8, rsi, mem(kTlb, rcx, 0, 8));  // host page
         a.test(8, rsi, rsi);
         a.jcc(E, fail);
+        a.mov(4, rdi, mem(kTlb, rcx, 0, 4));  // physical page
+        a.mov(4, rdx, rax);
+        a.alu_imm(4, 4, rdx, 0xFFF);
+        a.alu(4, 1, rdi, rdx);  // or: the physical address
+        a.alu(8, 0, rsi, rdx);  // the host byte
         if (write) {
-            // Never into a page holding translated code (the interpreter drops its blocks).
+            // Never near translated code's bytes (the interpreter drops the blocks the write overlaps).
             a.mov(8, rdx, rsi);
             a.alu(8, 5, rdx, kRam);
-            a.shift_imm(8, 5, rdx, 12);
-            a.bt(8, mem(kCodeMap), rdx);
-            a.jcc(B, fail);
+            a.shift_imm(8, 5, rdx, kCodeGranuleBits);
+            a.alu_imm(1, 7, mem(kCodeMap, rdx, 0, 0), 0);
+            a.jcc(NE, fail);
             a.mov_imm(4, ctx_at(kCtxStores), 1);  // the spin skip's evidence (whether any store ran: a plain store, no read)
             // Write tracking: a watched page's first write is the interpreter's (it reports and unwatches the page);
             // with every page logged, the page is marked here (twice is the same if a later check fails).
             Memory& m = cpu_.memory();
+            if (m.dirty_tracking()) a.shift_imm(8, 5, rdx, 12 - kCodeGranuleBits);  // the RAM page
             if (m.dirty_tracking() && m.selective()) {
                 a.mov64(r11, reinterpret_cast<u64>(m.watched_map()));
                 a.bt(8, mem(r11), rdx);
@@ -664,13 +674,8 @@ private:
                 a.mov64(r11, reinterpret_cast<u64>(m.dirty_map()));
                 a.op_rm(8, {0x0F, 0xAB}, rdx, mem(r11));  // bts
             }
+            log_store(size);
         }
-        a.mov(4, rdi, mem(kTlb, rcx, 0, 4));  // physical page
-        a.mov(4, rdx, rax);
-        a.alu_imm(4, 4, rdx, 0xFFF);
-        a.alu(4, 1, rdi, rdx);  // or: the physical address
-        a.alu(8, 0, rsi, rdx);  // the host byte
-        if (write) log_store(size);
         mark("body:", true);
     }
     // The spin probe's store log (only when the context asks: two instructions otherwise). RSI = the host bytes.
@@ -1035,9 +1040,58 @@ private:
     enum class X87Form { None, LoadM32, StoreM32, LoadM64, StoreM64, ArithM32, CompareM32, ArithD8, ArithDcDe, LoadReg, StoreReg, Exchange, Sign, LoadConst, StoreSw,
                          CompareReg, CompareFlags, LoadInt, StoreInt, Sqrt };
 
+    // FLDCW and FNSTCW m16. FLDCW waits (a pending exception is the interpreter's) and keeps its pointers; a word that
+    // unmasks an exception is the interpreter's too (it may arm one). FNSTCW is a control instruction (no pointers).
+    bool control_word(unsigned i, const Insn& in, Label after) {
+        const bool load = in.reg == 5;
+        if (!segment_ok(in.mem_seg, 2, !load)) return false;
+        const bool cw = cw_active_;
+        const Label f = fallback(i, after, cw, cw);
+        x87_preamble(f, !load);
+        effective_address(in);
+        a.mov(4, ctx_at(kCtxEa), rax);
+        access_checks(in.mem_seg, 2, !load, f);
+        if (load) {
+            a.movzx(rcx, 2, mem(rsi));
+            a.alu_imm(4, 4, rcx, 0x3F);
+            a.alu_imm(4, 7, rcx, 0x3F);
+            a.jcc(NE, f);
+            cache(i, false);
+            a.movzx(rcx, 2, mem(rsi));
+            a.alu_imm(4, 4, rcx, 0x1F7F);
+            a.alu_imm(4, 1, rcx, 0x40);
+            a.mov(2, st_at(kFcw), rcx);
+            a.alu_imm(2, 4, st_at(kFsw), 0x7F7F);  // ES and B clear: no pending exception is unmasked
+            x87_pointers(i, in);
+            if (cw_active_) guest_cw();  // the host runs under the new word
+        } else {
+            cache(i, true);
+            a.movzx(rax, 2, st_at(kFcw));
+            a.mov(2, mem(rsi), rax);
+        }
+        host_flags_ = host_cf_ = false;
+        finish(i, true);
+        return true;
+    }
+    // FWAIT: #NM with CR0.MP and TS, #MF for a pending exception with CR0.NE: both the interpreter's (as any pending
+    // exception); otherwise nothing.
+    bool fwait(unsigned i, Label after) {
+        const Label f = fallback(i, after);
+        a.test_imm(2, st_at(kFsw), 0x80);
+        a.jcc(NE, f);
+        a.mov(4, rax, st_at(kCr0Off));
+        a.alu_imm(4, 4, rax, cr0::MP | cr0::TS);
+        a.alu_imm(4, 7, rax, cr0::MP | cr0::TS);
+        a.jcc(E, f);
+        host_flags_ = host_cf_ = false;
+        finish(i, false);
+        return true;
+    }
+
     bool x87(unsigned i, const Insn& in, Label after) {
         if (!kNativeX87) return false;
         const u8 esc = in.opcode;
+        if (in.mem && esc == 0xD9 && (in.reg == 5 || in.reg == 7)) return control_word(i, in, after);
         X87Form k = X87Form::None;
         if (in.mem) {
             if (esc == 0xD9 && in.reg == 0) k = X87Form::LoadM32;
@@ -1052,13 +1106,14 @@ private:
             else if (esc == 0xDF && in.reg == 7) k = X87Form::StoreInt;                    // FISTP m64
         } else {
             if (esc == 0xD8 && (in.reg == 2 || in.reg == 3)) k = X87Form::CompareReg;      // FCOM(P) ST(i)
+            else if (esc == 0xDA && in.modrm == 0xE9) k = X87Form::CompareReg;            // FUCOMPP (ST(1), popped twice)
             else if ((esc == 0xDB || esc == 0xDF) && (in.reg == 5 || in.reg == 6)) k = X87Form::CompareFlags;  // F(U)COMI(P) ST(i)
             else if (esc == 0xD8) k = X87Form::ArithD8;
             else if ((esc == 0xDC || esc == 0xDE) && in.reg != 2 && in.reg != 3) k = X87Form::ArithDcDe;
             else if (esc == 0xD9 && in.modrm >= 0xC0 && in.modrm <= 0xC7) k = X87Form::LoadReg;
             else if (esc == 0xD9 && in.modrm >= 0xC8 && in.modrm <= 0xCF) k = X87Form::Exchange;
             else if (esc == 0xD9 && (in.modrm == 0xE0 || in.modrm == 0xE1)) k = X87Form::Sign;
-            else if (esc == 0xD9 && in.modrm == 0xFA) k = X87Form::Sqrt;
+            else if (esc == 0xD9 && (in.modrm == 0xFA || in.modrm == 0xFC)) k = X87Form::Sqrt;  // FSQRT, FRNDINT
             else if (esc == 0xD9 && (in.modrm == 0xE8 || in.modrm == 0xEE)) k = X87Form::LoadConst;
             else if (esc == 0xDD && (in.reg == 2 || in.reg == 3)) k = X87Form::StoreReg;
             else if (esc == 0xDF && in.modrm == 0xE0) k = X87Form::StoreSw;
@@ -1104,7 +1159,7 @@ private:
                 x87_tag_test(r8, false, f);
                 x87_addr(r10, r8);
                 x87_operand_ok(r10, f);
-                if (k == X87Form::Sqrt) {
+                if (k == X87Form::Sqrt && in.modrm == 0xFA) {
                     a.test_imm(1, mem(r10, 9), 0x80);  // a negative operand (or -0) is the interpreter's
                     a.jcc(NE, f);
                 }
@@ -1253,9 +1308,10 @@ private:
                 break;
             }
             case X87Form::Sqrt: {
-                // The host's square root under the guest's precision and rounding, as the interpreter's (which leaves C1).
+                // The host's square root (or rounding to an integer) under the guest's precision and rounding, as the
+                // interpreter's (which leaves C1).
                 a.x87_mem(0xDB, 5, mem(r10));
-                a.x87_raw(0xD9, 0xFA);  // fsqrt
+                a.x87_raw(0xD9, in.modrm);  // fsqrt / frndint
                 x87_status(false);
                 a.x87_mem(0xDB, 7, mem(r10));
                 x87_tag_of(r10);
@@ -1293,7 +1349,14 @@ private:
                 a.alu_imm(4, 4, rax, 0x4500);
                 a.alu_imm(2, 4, st_at(kFsw), 0xB8FF);
                 a.alu(2, 1, st_at(kFsw), rax);
-                if (in.reg == 3) x87_pop();
+                if (esc == 0xDA) {
+                    // FUCOMPP: the same for ordered operands (the checks), then two pops.
+                    x87_pop();
+                    x87_top();
+                    x87_pop();
+                } else if (in.reg == 3) {
+                    x87_pop();
+                }
                 break;
             }
             case X87Form::CompareFlags: {
@@ -2235,6 +2298,8 @@ private:
             case Op::CallRm: case Op::JmpRm: return indirect(i, in, after);
             case Op::Leave: return leave_frame(i, in, after);
             case Op::Lahf: return lahf(i);
+            case Op::Wait: return fwait(i, after);
+            case Op::Movs: case Op::Stos: return string_once(i, in, after);
             default: return false;
         }
     }
@@ -2541,6 +2606,44 @@ private:
         a.lea(4, rcx, mem(rcx, static_cast<i32>(4 + in.imm)));
         a.mov(4, greg(kEsp, 4), rcx);
         end(i, kNoEip, 0);
+        return true;
+    }
+    // MOVS and STOS without a REP prefix (32-bit addressing): the destination's translation first, then the source's
+    // read and the destination's write in the interpreter's order; ESI/EDI step by the size, down with DF.
+    bool string_once(unsigned i, const Insn& in, Label after) {
+        if (in.rep || in.adsize != 4) return false;
+        const unsigned size = in.size;
+        const bool movs = in.op == Op::Movs;
+        const u8 src_seg = in.seg != kSegNone ? in.seg : static_cast<u8>(kDs);
+        if (!segment_ok(kEs, size, true) || (movs && !segment_ok(src_seg, size, false))) return false;
+        const Label f = fallback(i, after);
+        a.mov(4, rax, greg(kEdi, 4));
+        access_checks(kEs, size, true, f);
+        if (movs) {
+            a.mov(8, ctx_at(kTmp2), rsi);
+            a.mov(8, ctx_at(kTmp3), rdi);
+            a.mov(4, rax, greg(kEsi, 4));
+            access_checks(src_seg, size, false, f);
+            cache(i, false);
+            load_host(rax, size);
+            a.mov(4, ctx_at(kCtxEa), rax);
+            a.mov(8, rsi, ctx_at(kTmp2));
+            a.mov(8, rdi, ctx_at(kTmp3));
+            cache(i, true);
+            a.mov(4, rax, ctx_at(kCtxEa));
+        } else {
+            cache(i, true);
+            load_greg(rax, kEax, size);
+        }
+        a.mov(size, mem(rsi), rax);
+        a.mov32(rcx, size);
+        a.mov32(rdx, static_cast<u32>(-static_cast<i32>(size)));
+        a.test_imm(4, st_at(kFlagsOff), fl::DF);
+        a.cmov(4, NE, rcx, rdx);
+        a.alu(4, 0, greg(kEdi, 4), rcx);
+        if (movs) a.alu(4, 0, greg(kEsi, 4), rcx);
+        host_flags_ = host_cf_ = false;
+        finish(i, true);
         return true;
     }
     // LAHF: AH = the flags' low byte, computed as the interpreter computes it (no materialising).

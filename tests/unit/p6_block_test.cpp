@@ -646,6 +646,73 @@ TEST(P6Block, CodeWrittenByItsOwnBlockRuns) {
     EXPECT_GE(e.stats().killed, 1u);
 }
 
+// A loop whose code page also holds the data it writes: the writes overlap no block, so its blocks stay and run
+// natively; a write over a block's bytes still drops that block and the new code runs. Against the block interpreter.
+TEST(P6Block, WritesNearCodeKillOnlyWhatTheyOverlap) {
+    // 0x1000: mov ecx, 200 | 0x1005: mov [0x1800], ecx; mov [0x17fd], ecx; dec ecx; jnz 0x1005
+    // 0x1014: mov dword [0x1020], 0x90909040; jmp 0x1020 | 0x1020: dec eax; hlt (becomes inc eax; nop x3); 0x1024: hlt
+    const std::vector<u8> code = {0xB9, 0xC8, 0x00, 0x00, 0x00, 0x89, 0x0D, 0x00, 0x18, 0x00, 0x00, 0x89, 0x0D, 0xFD, 0x17, 0x00, 0x00, 0x49, 0x75, 0xF1,
+                                  0xC7, 0x05, 0x20, 0x10, 0x00, 0x00, 0x40, 0x90, 0x90, 0x90, 0xEB, 0x00, 0x48, 0xF4, 0x00, 0x00, 0xF4};
+    auto prepare = [&](Rig& r, BlockEngine& e) {
+        r.load(code);
+        r.cpu.state().eip = 0x1020;  // the original bytes at 0x1020 run once, so a block holds them
+        run_blocks(r, e);
+        r.cpu.state().halted = false;
+        r.cpu.state().eip = kCode;
+        r.cpu.state().gpr[kEax] = 0;
+    };
+    Rig b(true), c(true);
+    b.cpu.set_block_timing(true);
+    BlockEngine eb(b.cpu, b.bus);
+    eb.disable_jit();
+    prepare(b, eb);
+    run_blocks(b, eb);
+    c.cpu.set_block_timing(true);
+    BlockEngine ec(c.cpu, c.bus);
+    ec.set_jit_threshold(0);
+    prepare(c, ec);
+    run_blocks(c, ec);
+    EXPECT_EQ(b.cpu.state().gpr[kEax], 1u);
+    expect_same(b, c, "writes near code", true);
+    EXPECT_EQ(0, std::memcmp(b.bus.ram() + 0x17FD, c.bus.ram() + 0x17FD, 8));
+    EXPECT_EQ(0, std::memcmp(b.bus.ram() + 0x1020, c.bus.ram() + 0x1020, 5));
+    // Only the block at 0x1020 overlapped a write; the loop's blocks stayed and ran natively (no store reached the
+    // interpreter: they are not near the code).
+    EXPECT_EQ(ec.stats().killed, 1u);
+    EXPECT_EQ(eb.stats().killed, 1u);
+    EXPECT_LT(ec.stats().native_helpers, 10u);
+}
+
+// An instruction straddling a page's end in a loop: no block starts there (it is stepped, each visit without a
+// build), and a write over its first bytes is seen the next time round. Against the step, natively.
+TEST(P6Block, PageStraddlingInstructionsAreStepped) {
+    std::vector<u8> code(0x1020, 0x90);
+    auto put = [&](u32 at, std::initializer_list<u8> bytes) { std::copy(bytes.begin(), bytes.end(), code.begin() + (at - kCode)); };
+    put(0x1000, {0xB9, 0x64, 0x00, 0x00, 0x00, 0xE9, 0xE6, 0x0F, 0x00, 0x00});  // mov ecx, 100; jmp 0x1ff0
+    put(0x1FF0, {0x83, 0xC2, 0x01});                                          // add edx, 1; nop x10
+    put(0x1FFD, {0xB8, 0x78, 0x56, 0x34, 0x12});                              // mov eax, 0x12345678 (to 0x2002)
+    put(0x2002, {0x49, 0x0F, 0x85, 0xE7, 0xFF, 0xFF, 0xFF});                  // dec ecx; jnz 0x1ff0
+    put(0x2009, {0x85, 0xF6, 0x75, 0x12});                                    // test esi, esi; jnz 0x201f
+    put(0x200D, {0xC6, 0x05, 0xFD, 0x1F, 0x00, 0x00, 0xBB});                  // mov byte [0x1ffd], 0xbb (mov ebx)
+    put(0x2014, {0x46, 0xB9, 0x64, 0x00, 0x00, 0x00, 0xE9, 0xD1, 0xFF, 0xFF, 0xFF});  // inc esi; mov ecx, 100; jmp 0x1ff0
+    put(0x201F, {0xF4});                                                      // hlt
+    Rig a(true), c(true);
+    a.load(code);
+    c.load(code);
+    run_steps(a);
+    c.cpu.set_block_timing(true);
+    BlockEngine e(c.cpu, c.bus);
+    e.set_jit_threshold(0);
+    run_blocks(c, e);
+    EXPECT_TRUE(c.cpu.state().halted);
+    EXPECT_EQ(a.cpu.state().gpr[kEdx], 0x68Au + 200u);  // EDX starts as the reset signature
+    EXPECT_EQ(a.cpu.state().gpr[kEbx], 0x12345678u);
+    for (unsigned g = 0; g < 8; ++g) EXPECT_EQ(a.cpu.state().gpr[g], c.cpu.state().gpr[g]) << "gpr " << g;
+    EXPECT_EQ(a.cpu.instructions(), c.cpu.instructions());
+    EXPECT_GE(e.stats().empty_blocks, 1u);
+    EXPECT_LE(e.stats().empty_blocks, 3u) << "remembered, not rebuilt each visit";
+}
+
 // A device writes over code the engine holds (DMA through the bus): the next run sees the new code.
 TEST(P6Block, CodeWrittenByADeviceRuns) {
     Rig r;
@@ -721,7 +788,13 @@ TEST(P6Block, X87FormsMatchTheInterpreter) {
         {0xD9, 0x43, 0x18, 0xD8, 0x4B, 0x18, 0xD9, 0x5B, 0x40, 0xDF, 0xE0, 0xF4},  // 1e38 * 1e38 -> fstp single: overflow
         {0xDD, 0xD8, 0xF4},                                                        // fstp st0 on an empty stack
         {0xD9, 0xE8, 0xD8, 0x73, 0x00, 0xD9, 0xEE, 0xDE, 0xF9, 0xDF, 0xE0, 0xF4},  // 1 / (1/3); fldz; fdivp: zero divide
+        // fnstcw [x]; fldcw [chop, single]; fld 1/3; fld1; faddp; frndint; fldcw [x]; fnstsw ax
+        {0xD9, 0x7B, 0x40, 0xD9, 0x6B, 0x20, 0xD9, 0x03, 0xD9, 0xE8, 0xDE, 0xC1, 0xD9, 0xFC, 0xD9, 0x6B, 0x40, 0xDF, 0xE0, 0xF4},
+        {0xD9, 0xE8, 0xD9, 0x03, 0xD9, 0xFC, 0xDA, 0xE9, 0x9B, 0xDF, 0xE0, 0xF4},  // fld1; fld 1/3; frndint; fucompp; fwait; fnstsw
+        // fnstcw [x]; fldcw [IM unmasked] (the interpreter's); fwait; fldcw [x]; fld 3.0; frndint; fld1; fucompp; fnstsw
+        {0xD9, 0x7B, 0x40, 0xD9, 0x6B, 0x24, 0x9B, 0xD9, 0x6B, 0x40, 0xD9, 0x43, 0x04, 0xD9, 0xFC, 0xD9, 0xE8, 0xDA, 0xE9, 0xDF, 0xE0, 0xF4},
     };
+    const u16 words[] = {0x0C7F, 0x0000, 0x037E};  // at +0x20: round toward zero, single precision; at +0x24: #I unmasked
     const u32 singles[] = {0x3EAAAAABu, 0x40400000u, 0x3F800000u, 0x00000001u, 0x7FC00000u, 0x7F800001u, 0x7E967699u};
     for (const u16 cw : std::initializer_list<u16>{0x037F, 0x027F, 0x007F, 0x0F7F, 0x077F}) {
         for (std::size_t s = 0; s < snippets.size(); ++s) {
@@ -729,6 +802,7 @@ TEST(P6Block, X87FormsMatchTheInterpreter) {
             for (Rig* r : {&a, &c}) {
                 r->load(snippets[s]);
                 std::memcpy(r->bus.ram() + kData, singles, sizeof singles);
+                std::memcpy(r->bus.ram() + kData + 0x20, words, sizeof words);
                 r->cpu.state().gpr[kEbx] = kData;
                 r->cpu.state().fpu.fcw = cw;
             }
@@ -738,9 +812,104 @@ TEST(P6Block, X87FormsMatchTheInterpreter) {
             e.set_jit_threshold(0);
             run_blocks(c, e);
             expect_same(a, c, "x87 snippet");
+            EXPECT_EQ(0, std::memcmp(a.bus.ram() + kData + 0x40, c.bus.ram() + kData + 0x40, 16)) << "stores";
+            // The control-word, rounding and compare forms ran natively: only HLT, the first access to the data page
+            // (a TLB miss) and the two FLDCW under an unmasked word are the interpreter's.
+            if (s >= 12) {
+                EXPECT_EQ(e.stats().native_helpers, s == 14 ? 4u : 2u) << "snippet " << s;
+            }
             ASSERT_FALSE(::testing::Test::HasFailure()) << "snippet " << s << " control word " << cw;
         }
     }
+}
+
+// MOVS and STOS without REP, natively: every size, both directions, a destination across a page (the interpreter's).
+TEST(P6Block, StringMovesMatchTheStep) {
+    // mov esi, 0x20000; mov edi, 0x21000; mov eax, 0x11223344; movsd; movsd; movsw; movsb; stosd; stosb; stosw;
+    // std; movsd; stosd; movsb; cld; mov edi, 0x21ffe; movsd; stosd; hlt
+    const std::vector<u8> code = {0xBE, 0x00, 0x00, 0x02, 0x00, 0xBF, 0x00, 0x10, 0x02, 0x00, 0xB8, 0x44, 0x33, 0x22, 0x11, 0xA5, 0xA5, 0x66, 0xA5, 0xA4,
+                                  0xAB, 0xAA, 0x66, 0xAB, 0xFD, 0xA5, 0xAB, 0xA4, 0xFC, 0xBF, 0xFE, 0x1F, 0x02, 0x00, 0xA5, 0xAB, 0xF4};
+    Rig a(true), c(true);
+    for (Rig* r : {&a, &c}) {
+        r->load(code);
+        for (u32 k = 0; k < 64; ++k) r->bus.ram()[0x20000 + k] = static_cast<u8>(0x80 + 3 * k);
+    }
+    run_steps(a);
+    c.cpu.set_block_timing(true);
+    BlockEngine e(c.cpu, c.bus);
+    e.set_jit_threshold(0);
+    run_blocks(c, e);
+    EXPECT_TRUE(c.cpu.state().halted);
+    for (unsigned g = 0; g < 8; ++g) EXPECT_EQ(a.cpu.state().gpr[g], c.cpu.state().gpr[g]) << "gpr " << g;
+    EXPECT_EQ(a.cpu.state().eflags(), c.cpu.state().eflags());
+    EXPECT_EQ(a.cpu.instructions(), c.cpu.instructions());
+    EXPECT_EQ(0, std::memcmp(a.bus.ram() + 0x20000, c.bus.ram() + 0x20000, 0x3000));
+    EXPECT_EQ(c.cpu.state().gpr[kEdi], 0x22006u);
+    EXPECT_GE(e.stats().native_insns, 12u) << "the string forms ran natively (STD, CLD, HLT, the crossing and first touches of a page are the interpreter's)";
+}
+
+// REP MOVS and STOS a page at a time against the element loop: every size, both directions, overlapping ends (an
+// element-wise copy repeats a pattern), page ends, more elements than a step takes (the run resumes), a destination
+// near translated code (the blocks there are dropped), under the cache model. Same state, memory, clock and caches.
+TEST(P6Block, RepStringsMatchTheElementLoop) {
+    // 0x1000: mov esi, 0x20010; mov edi, 0x20014; mov ecx, 3000; rep movsd (overlap: a pattern) |
+    //         mov esi, 0x23ffe; mov edi, 0x28001; mov ecx, 9001; rep movsb (pages, the step's limit) |
+    //         std; mov edi, 0x2c7fe; mov eax, 0x5a5a1234; mov ecx, 700; rep stosw; cld |
+    //         mov edi, 0x2ff00; mov ecx, 100; rep stosd (into the code page at 0x30000: the block there drops) |
+    //         std; mov esi, 0x26003; mov edi, 0x2e001; mov ecx, 1500; rep movsd; cld | jmp 0x30000
+    // 0x30000: nop x 4; hlt (rewritten: the stores fill it with 0x5a5a1234, then 0x30190.. stays) -> the block was there
+    std::vector<u8> code = {0xBE, 0x10, 0x00, 0x02, 0x00, 0xBF, 0x14, 0x00, 0x02, 0x00, 0xB9, 0xB8, 0x0B, 0x00, 0x00, 0xF3, 0xA5,
+                            0xBE, 0xFE, 0x3F, 0x02, 0x00, 0xBF, 0x01, 0x80, 0x02, 0x00, 0xB9, 0x29, 0x23, 0x00, 0x00, 0xF3, 0xA4,
+                            0xFD, 0xBF, 0xFE, 0xC7, 0x02, 0x00, 0xB8, 0x34, 0x12, 0x5A, 0x5A, 0xB9, 0xBC, 0x02, 0x00, 0x00, 0x66, 0xF3, 0xAB, 0xFC,
+                            0xBF, 0x00, 0xFF, 0x02, 0x00, 0xB9, 0x64, 0x00, 0x00, 0x00, 0xF3, 0xAB,
+                            0xFD, 0xBE, 0x03, 0x60, 0x02, 0x00, 0xBF, 0x01, 0xE0, 0x02, 0x00, 0xB9, 0xDC, 0x05, 0x00, 0x00, 0xF3, 0xA5, 0xFC};
+    const u32 jmp_at = kCode + static_cast<u32>(code.size());
+    const u32 rel = 0x30190u - (jmp_at + 5);
+    code.insert(code.end(), {0xE9, static_cast<u8>(rel), static_cast<u8>(rel >> 8), static_cast<u8>(rel >> 16), static_cast<u8>(rel >> 24)});
+    Rig a(true), c(true);
+    for (Rig* r : {&a, &c}) {
+        r->load(code);
+        for (u32 k = 0; k < 0x10000; ++k) r->bus.ram()[0x20000 + k] = static_cast<u8>(k * 7 + (k >> 8));
+        r->load({0x90, 0x90, 0x90, 0x90, 0xF4}, 0x30000);
+        r->load({0x41, 0xF4}, 0x30190);  // inc ecx; hlt
+        r->cpu.set_block_timing(true);
+        r->cpu.memory().set_dirty_tracking(true);
+    }
+    a.cpu.set_fast_strings(false);
+    BlockEngine ea(a.cpu, a.bus), ec(c.cpu, c.bus);
+    for (auto* r : {&a, &c}) {  // the block at 0x30000 exists before the stores reach it
+        BlockEngine& e = r == &a ? ea : ec;
+        r->cpu.state().eip = 0x30000;
+        run_blocks(*r, e);
+        r->cpu.state().halted = false;
+        r->cpu.state().eip = kCode;
+    }
+    run_blocks(a, ea);
+    run_blocks(c, ec);
+    EXPECT_TRUE(c.cpu.state().halted);
+    expect_same(a, c, "REP strings", true);
+    EXPECT_EQ(a.cpu.cache_timing().cache_hash(), c.cpu.cache_timing().cache_hash()) << "the caches' contents and order";
+    EXPECT_EQ(0, std::memcmp(a.bus.ram() + 0x20000, c.bus.ram() + 0x20000, 0x11000));
+    EXPECT_EQ(ea.stats().killed, ec.stats().killed);
+    EXPECT_GE(ec.stats().killed, 1u) << "the stores dropped the block at 0x30000";
+    // The pattern: an element-wise copy one element ahead repeats the first.
+    u32 first = 0, later = 0;
+    std::memcpy(&first, c.bus.ram() + 0x20010, 4);
+    std::memcpy(&later, c.bus.ram() + 0x20010 + 4 * 2999, 4);
+    EXPECT_EQ(first, later);
+    // Again with the translations warm (no walk marks a page): the pages written are the string's own marks.
+    std::vector<u32> pa, pc;
+    for (Rig* r : {&a, &c}) {
+        std::vector<u32> dropped;
+        r->cpu.memory().take_dirty_pages(dropped);
+        r->cpu.state().halted = false;
+        r->cpu.state().eip = kCode;
+        run_blocks(*r, r == &a ? ea : ec);
+    }
+    a.cpu.memory().take_dirty_pages(pa);
+    c.cpu.memory().take_dirty_pages(pc);
+    EXPECT_EQ(pa, pc) << "the pages written";
+    EXPECT_GE(pc.size(), 8u);
 }
 
 // Write tracking under the recompiler: a watched page reports its first write once, then is not watched; every
@@ -905,6 +1074,45 @@ TEST(P6Block, SpinSkipIsExact) {
     EXPECT_GT(ec.stats().spin_skips, 10u);
     std::printf("spin skip: %llu skips over %llu cycles of %llu\n", static_cast<unsigned long long>(ec.stats().spin_skips),
                 static_cast<unsigned long long>(ec.stats().spin_cycles), static_cast<unsigned long long>(c.cpu.cycles()));
+}
+
+// Countdown loops (DEC; JNZ self and SUB 1; JNZ self) skipped arithmetically between the dispatcher's deadlines, against
+// the block interpreter that runs every pass: same state, clock, instruction count and caches at every deadline.
+TEST(P6Block, CountdownSkipIsExact) {
+    auto setup = [](Rig& r) {
+        // 0x1000: mov ecx, 300000 | 0x1005: dec ecx; jnz 0x1005 | mov eax, 123457 | 0x100e: sub eax, 1; jnz 0x100e | hlt
+        r.load({0xB9, 0xE0, 0x93, 0x04, 0x00, 0x49, 0x75, 0xFD, 0xB8, 0x41, 0xE2, 0x01, 0x00, 0x83, 0xE8, 0x01, 0x75, 0xFB, 0xF4});
+    };
+    std::vector<std::string> marks[2];
+    auto run = [&marks](Rig& r, BlockEngine& e, int which) {
+        u64 next_event = 20011;
+        for (unsigned n = 0; n < 3000000 && !r.cpu.state().halted; ++n) {
+            if (r.cpu.cycles() >= next_event) {
+                next_event += 20011;
+                const CpuState& st = r.cpu.state();
+                marks[which].push_back(std::format("{} {} {:x} {:x} {:x} {:x}", r.cpu.cycles(), r.cpu.instructions(), st.eip, st.gpr[kEcx], st.gpr[kEax], st.eflags()));
+            }
+            if (Block* b = e.find()) e.run(*b, next_event);
+            else r.cpu.step();
+        }
+    };
+    Rig b(true), c(true);
+    setup(b);
+    setup(c);
+    b.cpu.set_block_timing(true);
+    BlockEngine eb(b.cpu, b.bus);
+    eb.disable_jit();
+    run(b, eb, 0);
+    c.cpu.set_block_timing(true);
+    BlockEngine ec(c.cpu, c.bus);
+    run(c, ec, 1);
+    EXPECT_TRUE(c.cpu.state().halted);
+    expect_same(b, c, "skipped countdowns", true);
+    EXPECT_EQ(b.cpu.cache_timing().cache_hash(), c.cpu.cache_timing().cache_hash());
+    EXPECT_EQ(marks[0], marks[1]) << "the state at every deadline";
+    EXPECT_GT(marks[0].size(), 10u);
+    EXPECT_GT(ec.stats().countdown_passes, 300000u) << "both loops were skipped";
+    EXPECT_EQ(eb.stats().countdown_skips, 0u);
 }
 
 // The spin probe: a polling loop that calls a function each pass (a return address and a saved register on the
@@ -1253,6 +1461,36 @@ TEST(P6Block, CacheSetPressureMatchesTheInterpreter) {
     EXPECT_TRUE(c.cpu.state().halted);
     EXPECT_GT(c.cpu.cache_timing().stats().l1d_misses, 3000u) << "the set was under pressure";
     EXPECT_GT(ec.stats().native_insns, 30000u) << "the loop ran natively";
+}
+
+// A block over four code lines chained to itself: the generated code's chain looks each line up (no trip through
+// the engine for the fetch), and the caches end as the model leaves them. Against the block interpreter.
+TEST(P6Block, LongBlocksChainInline) {
+    // 0x1000: mov ecx, 2000; jmp 0x101c | 0x101c: add eax, 1 (x30); dec ecx; jnz 0x101c (32 instructions, 97 bytes:
+    // lines 0x1000-0x1060) | hlt
+    std::vector<u8> code(0x1C, 0x90);
+    const u8 head[] = {0xB9, 0xD0, 0x07, 0x00, 0x00, 0xE9, 0x12, 0x00, 0x00, 0x00};
+    std::memcpy(code.data(), head, sizeof head);
+    for (unsigned k = 0; k < 30; ++k) code.insert(code.end(), {0x83, 0xC0, 0x01});
+    const u32 rel = 0x101Cu - (0x101Cu + 90 + 1 + 6);
+    code.insert(code.end(), {0x49, 0x0F, 0x85, static_cast<u8>(rel), static_cast<u8>(rel >> 8), static_cast<u8>(rel >> 16), static_cast<u8>(rel >> 24), 0xF4});
+    Rig b(true), c(true);
+    for (Rig* r : {&b, &c}) {
+        r->load(code);
+        r->cpu.set_block_timing(true);
+    }
+    BlockEngine eb(b.cpu, b.bus);
+    eb.disable_jit();
+    BlockEngine ec(c.cpu, c.bus);
+    ec.set_jit_threshold(0);
+    run_lockstep(b, eb, c, ec, "a block over four lines");
+    expect_same(b, c, "a block over four lines", true);
+    EXPECT_EQ(b.cpu.cache_timing().cache_hash(), c.cpu.cache_timing().cache_hash()) << "the caches' contents and order";
+    EXPECT_EQ(c.cpu.state().gpr[kEax], 2000u * 30u);
+    EXPECT_GT(ec.stats().chains, 1900u) << "the block chained";
+    u64 slow = 0;
+    for (u64 n : ec.stats().slow_chain) slow += n;
+    EXPECT_LT(slow, 40u) << "the chains were the generated code's own (the fetch looked up inline; the budget and the spin probe aside)";
 }
 
 // Code lines through one L1 instruction set: six blocks 4 KiB apart (one set), chained by direct jumps, two of them
