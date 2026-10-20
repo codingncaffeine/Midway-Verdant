@@ -6,7 +6,11 @@
 # (every 600 frames) are identical. Extra arguments go to mv-retro-host (presses that drive the title into play).
 # Needs the user's console files (local-notes/user-files.env, as av-smoke.sh); work in scratch/p6-oracle/LABEL.
 #   tests/boot/p6-oracle.sh BUILD_DIR DISC LABEL FRAMES [mv-retro-host args...]
-#   env: DISK=raw hard-disk image to start from (default the system folder's), TMO=seconds per run (default 7200)
+#   env: DISK=raw hard-disk image to start from (default the system folder's), TMO=seconds per run (default 7200),
+#        GOLDEN=DIR: with no golden in DIR yet, the full comparison runs and, when it passes, its reference (the block
+#        interpreter's deliveries, final hashes and pictures) is kept there; with one, only the recompiler runs and is
+#        compared with it (a speed change must leave the guest's run unchanged: minutes instead of the interpreter's
+#        hour). Delete the golden when the guest's behaviour is meant to change.
 set -uo pipefail
 cd "$(dirname "$0")/../.."
 [[ $# -ge 4 ]] || { sed -n '2,9p' "$0"; exit 2; }
@@ -35,9 +39,21 @@ run() {  # run JIT [mv-retro-host args]
     echo $? > "$d/exit"
     rm -f "$d/sys/midway-verdant/xbox_hdd.raw"
 }
-run 0 "$@" &
-run 1 "$@" &
-wait
+golden="${GOLDEN:-}"
+if [[ -n "$golden" && -f "$golden/deliveries.txt" ]]; then
+    # Against the kept reference: the recompiler alone; the reference stands in for the interpreter's run.
+    run 1 "$@"
+    mkdir -p "$out/j0"
+    cp "$golden/deliveries.txt" "$out/j0/deliveries.txt"
+    cp "$golden/log" "$out/j0/log"
+    cp -r "$golden/png" "$out/j0/png"
+    echo 0 > "$out/j0/exit"
+    echo "against the golden in $golden"
+else
+    run 0 "$@" &
+    run 1 "$@" &
+    wait
+fi
 fail=0
 for j in 0 1; do
     [[ "$(cat "$out/j$j/exit")" == 0 ]] || { echo "FAIL: the run with MV_P6_JIT=$j exited $(cat "$out/j$j/exit") (see $out/j$j/log)"; fail=1; }
@@ -58,5 +74,11 @@ for p in "$out"/j0/png/*.png; do
     cmp -s "$p" "$out/j1/png/$(basename "$p")" || bad=$((bad + 1))
 done
 if [[ $bad -eq 0 ]]; then echo "pictures: $n identical"; else echo "FAIL: $bad of $n pictures differ"; fail=1; fi
+if [[ $fail -eq 0 && -n "$golden" && ! -f "$golden/deliveries.txt" ]]; then
+    mkdir -p "$golden"
+    cp "$out/j0/deliveries.txt" "$out/j0/log" "$golden/"
+    cp -r "$out/j0/png" "$golden/png"
+    echo "golden kept in $golden"
+fi
 [[ $fail -eq 0 ]] && echo "P6 ORACLE PASSED: $label" || echo "P6 ORACLE FAILED: $label"
 exit $fail
