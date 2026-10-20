@@ -56,12 +56,14 @@ TEST(GpuTiming, SevenGpuClocksAreTwentyTwoCpuCycles) {
     EXPECT_EQ(gpu_timing::gpu_from_cycles(21), 6u) << "rounded down: an idle GPU never starts in the future";
 }
 
-// Stage C: a pixel costs the longer of its pipeline time (four pipelines) and its memory time (192/7 bytes a clock).
+// Stage C: a pixel costs the longer of its pipeline time (four pipelines) and its memory time (192/7 bytes a clock),
+// at the GeForce 3 family's measured fill efficiency.
 TEST(GpuTiming, APixelCostsItsPipelineOrItsMemoryTime) {
-    EXPECT_EQ(gpu_timing::pixel_clocks(400, 1, 0), 100u) << "no traffic: four a clock";
-    EXPECT_EQ(gpu_timing::pixel_clocks(400, 2, 0), 200u) << "two passes";
-    // 16 bytes a pixel: 400 x 16 x 7 / 192 = 233.3 -> 234 clocks, longer than the pipeline's 100.
-    EXPECT_EQ(gpu_timing::pixel_clocks(400, 1, 16), 234u);
+    // At the measured 0.85 efficiency (x 20/17, rounded up).
+    EXPECT_EQ(gpu_timing::pixel_clocks(400, 1, 0), 118u) << "no traffic: four a clock, 100 -> 118";
+    EXPECT_EQ(gpu_timing::pixel_clocks(400, 2, 0), 236u) << "two passes, 200 -> 236";
+    // 16 bytes a pixel: 400 x 16 x 7 / 192 = 233.3 -> 234 clocks (longer than the pipeline's 100) -> 276.
+    EXPECT_EQ(gpu_timing::pixel_clocks(400, 1, 16), 276u);
     KelvinState s;
     s.r[(mthd::kSurfaceFormat >> 2) & 0x7FF] = 0x5 | (0x2 << 4);  // A8R8G8B8 colour, Z24S8 depth
     s.r[(mthd::kColorMask >> 2) & 0x7FF] = 0x01010101;

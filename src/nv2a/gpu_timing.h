@@ -38,10 +38,16 @@ u64 pixel_passes(const pgraph::KelvinState& state);
 inline constexpr u64 kBusBytesNum = 192, kBusBytesDen = 7;  // bytes per GPU clock
 inline constexpr u64 kTexelBytes = 1;                        // [estimate]
 u64 pixel_bytes(const pgraph::KelvinState& state);
+// Calibration (measured, not the NV2A itself but its sibling): the GeForce 3 family (same 4x2 pipelines, 128-bit DDR;
+// the Ti 200 has the Xbox's 6.4 GB/s) reached 0.83-0.89 of min(pipeline, memory) limits in 3DMark 2001's fill tests
+// (AnandTech's GeForce3 Titanium review, Ti 200 1165.6 Mtexels/s multitextured; users' GeForce 3 and overclocked
+// Ti 200 runs 715/1430 and 755/1556 Mtexels/s): a pixel takes 20/17 of its limit (0.85 efficiency).
+inline constexpr u64 kFillEfficiencyNum = 20, kFillEfficiencyDen = 17;
 inline u64 pixel_clocks(u64 pixels, u64 passes, u64 bytes = 0) {
     const u64 pipeline = (pixels * passes + kPixelsPerClock - 1) / kPixelsPerClock;
     const u64 memory = (pixels * bytes * kBusBytesDen + kBusBytesNum - 1) / kBusBytesNum;
-    return pipeline > memory ? pipeline : memory;
+    const u64 limit = pipeline > memory ? pipeline : memory;
+    return (limit * kFillEfficiencyNum + kFillEfficiencyDen - 1) / kFillEfficiencyDen;
 }
 
 // GPU clocks and CPU cycles: exactly 7 GPU clocks per 22 CPU cycles (233.33 and 733.33 MHz).
