@@ -1,5 +1,6 @@
 #include "cpu/p6/timing.h"
 
+#include <bit>
 #include <algorithm>
 
 namespace mv::p6 {
@@ -247,20 +248,27 @@ Cost cost_of(const Insn& in) {
 
 Timing::Cache::Cache(unsigned sets, unsigned ways) : sets_(sets), ways_(ways) {}
 
-bool Timing::Cache::access(PhysAddr phys, u64 now) {
+// A hit is looked for in every way at once (the compare has no branches); only a miss looks for the victim: the last
+// empty way, else the first least recently used.
+template <unsigned W>
+bool Timing::Cache::access_ways(PhysAddr phys, u64 now) {
     const u32 line = phys >> 5;
     const unsigned set = line & (sets_ - 1);
-    const unsigned base = set * ways_;
-    mru_[set] = line + 1;
+    const unsigned base = set * W;
+    const u32 want = line + 1;
+    mru_[set] = want;
+    const u32* t = &tags_[base];
+    unsigned hits = 0;
+    for (unsigned w = 0; w < W; ++w) hits |= (t[w] == want ? 1u : 0u) << w;
+    if (hits) {
+        last_use_[base + static_cast<unsigned>(std::countr_zero(hits))] = now;
+        return true;
+    }
     unsigned victim = base;
     u64 oldest = ~u64{0};
-    for (unsigned w = 0; w < ways_; ++w) {
+    for (unsigned w = 0; w < W; ++w) {
         const unsigned i = base + w;
-        if (valid_[i] && tags_[i] == line) {
-            last_use_[i] = now;
-            return true;
-        }
-        if (!valid_[i]) {
+        if (!t[w]) {
             victim = i;
             oldest = 0;
         } else if (last_use_[i] < oldest) {
@@ -268,11 +276,12 @@ bool Timing::Cache::access(PhysAddr phys, u64 now) {
             victim = i;
         }
     }
-    valid_[victim] = 1;
-    tags_[victim] = line;
+    tags_[victim] = want;
     last_use_[victim] = now;
     return false;
 }
+template bool Timing::Cache::access_ways<4>(PhysAddr, u64);
+template bool Timing::Cache::access_ways<8>(PhysAddr, u64);
 
 Timing::Timing() { reset(); }
 
@@ -614,12 +623,12 @@ u64 Timing::cache_hash() const {
             const unsigned base = set * c->ways_;
             for (unsigned w = 0; w < c->ways_; ++w) {
                 const unsigned i = base + w;
-                if (!c->valid_[i]) continue;
+                if (!c->tags_[i]) continue;
                 // The way's rank by age in its set: the order, not the clock values, decides the victims.
                 unsigned rank = 0;
                 for (unsigned o = 0; o < c->ways_; ++o)
-                    if (c->valid_[base + o] && c->last_use_[base + o] < c->last_use_[i]) ++rank;
-                mix((static_cast<u64>(c->tags_[i]) << 8) | rank);
+                    if (c->tags_[base + o] && c->last_use_[base + o] < c->last_use_[i]) ++rank;
+                mix((static_cast<u64>(c->tags_[i] - 1) << 8) | rank);
             }
         }
     }

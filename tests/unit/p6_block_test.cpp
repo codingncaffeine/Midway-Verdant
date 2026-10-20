@@ -373,7 +373,7 @@ struct Gen {
     void fpu_wide(std::vector<u8>& c) {
         const u8 d8 = static_cast<u8>(next() & 0xF8);
         const u8 i = static_cast<u8>(next() % static_cast<u32>(depth > 1 ? depth : 2));
-        switch (next() % 16) {
+        switch (next() % 19) {
             case 0: if (depth >= 8) return; c.insert(c.end(), {0xDF, static_cast<u8>(next() & 1 ? 0x43 : 0x6B), d8}); ++depth; return;  // fild m16 / m64
             case 1: if (depth <= 0) return; c.insert(c.end(), {0xDF, static_cast<u8>(next() & 1 ? 0x5B : 0x7B), d8}); --depth; return;  // fistp m16 / m64
             case 2: if (depth <= 0) return; c.insert(c.end(), {0xDB, 0x53, d8}); return;                                     // fist m32
@@ -382,7 +382,7 @@ struct Gen {
             case 5: if (depth < 2) return; c.insert(c.end(), {0xDF, static_cast<u8>((next() & 1 ? 0xF0 : 0xE8) | i)}); --depth; return;  // fcomip / fucomip
             case 6: if (depth < 2) return; c.insert(c.end(), {static_cast<u8>(next() & 1 ? 0xDA : 0xDB), static_cast<u8>(0xC0 | (next() % 4) << 3 | i)}); return;  // fcmovcc
             case 7: if (depth <= 0) return; { static constexpr u8 u[] = {0xFA, 0xFC, 0xE4, 0xE5, 0xFD, 0xF8}; c.insert(c.end(), {0xD9, u[next() % 6]}); } return;  // fsqrt frndint ftst fxam fscale fprem
-            case 8: if (depth <= 0) return; c.insert(c.end(), {0xDC, static_cast<u8>(0x43 | (next() % 8) << 3), d8}); if (((c[c.size() - 2] >> 3) & 7) == 3) --depth; return;  // arith m64 (fcomp pops)
+            case 8: if (depth <= 0) return; c.insert(c.end(), {0xDC, static_cast<u8>(0x43 | (next() % 8) << 3), static_cast<u8>(next() & 0xFC)}); if (((c[c.size() - 2] >> 3) & 7) == 3) --depth; return;  // arith m64 (fcomp pops)
             case 9: if (depth <= 0) return; c.insert(c.end(), {0xDA, static_cast<u8>(0x43 | (next() % 8) << 3), d8}); if (((c[c.size() - 2] >> 3) & 7) == 3) --depth; return;  // fiadd.. m32
             case 10: if (depth <= 0) return; c.insert(c.end(), {0xDB, 0x7B, static_cast<u8>(next() % 0xF0)}); --depth; return;  // fstp m80
             case 11: if (depth >= 8) return; c.insert(c.end(), {0xDB, 0x6B, static_cast<u8>(next() % 0xF0)}); ++depth; return;  // fld m80
@@ -390,6 +390,9 @@ struct Gen {
             case 13: if (depth >= 8) return; { static constexpr u8 k[] = {0xE9, 0xEA, 0xEB, 0xEC, 0xED}; c.insert(c.end(), {0xD9, k[next() % 5]}); } ++depth; return;  // constants
             case 14: c.insert(c.end(), {0xD9, 0x7B, d8}); return;                                                             // fnstcw
             case 15: c.insert(c.end(), {0xDB, 0xE2}); return;                                                                 // fnclex
+            case 16: if (depth >= 8) return; c.insert(c.end(), {0xDB, 0x43, static_cast<u8>(next() % 0xF0)}); ++depth; return;  // fild m32 (any byte)
+            case 17: if (depth <= 0) return; c.insert(c.end(), {0xDB, 0x5B, static_cast<u8>(next() % 0xF0)}); --depth; return;  // fistp m32 (any byte)
+            case 18: if (depth < 2) return; c.insert(c.end(), {0xD8, static_cast<u8>((next() & 1 ? 0xD8 : 0xD0) | i)}); if ((c.back() & 0xF8) == 0xD8) --depth; return;  // fcom(p) st(i)
         }
     }
     // More SSE and MMX forms for the wide test.
@@ -403,11 +406,14 @@ struct Gen {
         // Scalar forms on words that are 4- but not 8-aligned, and the compares into EFLAGS (then a SETcc reads them).
         if (next() % 3 == 0) {
             const u8 d4 = static_cast<u8>((next() & 0xF8) | 4);
-            switch (next() % 4) {
+            const u8 dany = static_cast<u8>(next() % 0xF0);  // any byte: elements across cache lines
+            switch (next() % (kHostX87 ? 6u : 5u)) {
                 case 0: { static constexpr u8 ops[] = {0x58, 0x59, 0x5C, 0x5E, 0x5D, 0x5F, 0x51}; c.insert(c.end(), {0xF3, 0x0F, ops[next() % 7], static_cast<u8>(0x43 | x << 3), d4}); break; }
-                case 1: c.insert(c.end(), {0xF3, 0x0F, static_cast<u8>(next() & 1 ? 0x10 : 0x11), static_cast<u8>(0x43 | x << 3), d4}); break;
+                case 1: c.insert(c.end(), {0xF3, 0x0F, static_cast<u8>(next() & 1 ? 0x10 : 0x11), static_cast<u8>(0x43 | x << 3), next() & 1 ? d4 : dany}); break;
                 case 2: c.insert(c.end(), {0x0F, static_cast<u8>(next() & 1 ? 0x2E : 0x2F), static_cast<u8>(0x43 | x << 3), d4}); break;
                 case 3: c.insert(c.end(), {0x0F, static_cast<u8>(next() & 1 ? 0x2E : 0x2F), static_cast<u8>(0xC0 | x << 3 | y)}); break;
+                case 4: { static constexpr u8 ops[] = {0x12, 0x13, 0x16, 0x17, 0x10, 0x11}; c.insert(c.end(), {0x0F, ops[next() % 6], static_cast<u8>(0x43 | x << 3), dany}); break; }  // 64-bit moves, movups
+                case 5: c.insert(c.end(), {0x0F, static_cast<u8>(next() & 1 ? 0x6F : 0x7F), static_cast<u8>(0x43 | x << 3), dany}); break;  // movq mm
             }
             if (c[c.size() - 2] == 0x2E || c[c.size() - 2] == 0x2F || c[c.size() - 3] == 0x2E || c[c.size() - 3] == 0x2F)
                 c.insert(c.end(), {0x0F, static_cast<u8>(0x90 + (next() & 15)), static_cast<u8>(0xC0 | reg8())});  // setcc: the flags are used
@@ -415,7 +421,7 @@ struct Gen {
         }
         switch (next() % (kHostX87 ? 14u : 9u)) {
             case 0: c.insert(c.end(), {0xF3, 0x0F, 0x2A}); if (m) c.insert(c.end(), {static_cast<u8>(0x43 | x << 3), d8}); else c.push_back(static_cast<u8>(0xC0 | x << 3 | src())); break;  // cvtsi2ss
-            case 1: c.insert(c.end(), {0xF3, 0x0F, static_cast<u8>(next() & 1 ? 0x2C : 0x2D), static_cast<u8>(0xC0 | reg() << 3 | y)}); break;  // cvt(t)ss2si
+            case 1: c.insert(c.end(), {0xF3, 0x0F, static_cast<u8>(next() & 1 ? 0x2C : 0x2D)}); if (m) c.insert(c.end(), {static_cast<u8>(0x43 | reg() << 3), static_cast<u8>(next() % 0xF0)}); else c.push_back(static_cast<u8>(0xC0 | reg() << 3 | y)); break;  // cvt(t)ss2si
             case 2: c.insert(c.end(), {0x0F, static_cast<u8>(next() & 1 ? 0x53 : 0x52)}); modrm(d8); break;             // rcpps/rsqrtps
             case 3: c.insert(c.end(), {0xF3, 0x0F, static_cast<u8>(next() & 1 ? 0x53 : 0x52)}); modrm(d8); break;       // rcpss/rsqrtss
             case 4: c.insert(c.end(), {0x0F, static_cast<u8>(next() & 1 ? 0x2E : 0x2F)}); modrm(d8); break;             // ucomiss/comiss
@@ -1217,4 +1223,72 @@ TEST(P6Block, ChainsRelinkAReturnToItsOtherCaller) {
     expect_same(b, c, "a return to alternating callers", true);
     EXPECT_EQ(c.cpu.state().gpr[kEax], 6000u);
     EXPECT_GT(ec.stats().relinks, 1000u) << "the returns relinked";
+}
+
+// More lines through one L1 data set than it has ways, with hits on lines that are not the set's most recent: the
+// model's LRU order decides every victim, so the generated code's own hit handling (ages, the clock) must be the
+// model's to the cycle. (The generated programs touch too few lines for any eviction.)
+TEST(P6Block, CacheSetPressureMatchesTheInterpreter) {
+    // 0x1000: mov ecx, 3000
+    // 0x1005: mov eax, [ebx]; mov eax, [ebx+0x1000]; mov eax, [ebx]; mov eax, [ebx+0x2000]; mov eax, [ebx+0x3000];
+    //         mov eax, [ebx+0x1000]; mov edx, ecx; and edx, 7; shl edx, 12; mov eax, [edx+ebx]; mov [ebx+0x5000], eax;
+    //         dec ecx; jnz 0x1005 | hlt
+    const std::vector<u8> code = {0xB9, 0xB8, 0x0B, 0x00, 0x00,
+                                  0x8B, 0x03, 0x8B, 0x83, 0x00, 0x10, 0x00, 0x00, 0x8B, 0x03, 0x8B, 0x83, 0x00, 0x20, 0x00, 0x00,
+                                  0x8B, 0x83, 0x00, 0x30, 0x00, 0x00, 0x8B, 0x83, 0x00, 0x10, 0x00, 0x00, 0x89, 0xCA, 0x83, 0xE2, 0x07,
+                                  0xC1, 0xE2, 0x0C, 0x8B, 0x04, 0x1A, 0x89, 0x83, 0x00, 0x50, 0x00, 0x00, 0x49, 0x0F, 0x85, 0xCC, 0xFF, 0xFF, 0xFF, 0xF4};
+    Rig b(true), c(true);
+    for (Rig* r : {&b, &c}) {
+        r->load(code);
+        r->cpu.state().gpr[kEbx] = kData;
+        r->cpu.set_block_timing(true);
+    }
+    BlockEngine eb(b.cpu, b.bus);
+    eb.disable_jit();
+    BlockEngine ec(c.cpu, c.bus);
+    ec.set_jit_threshold(0);
+    run_lockstep(b, eb, c, ec, "lines through one set");
+    expect_same(b, c, "lines through one set", true);
+    EXPECT_EQ(b.cpu.cache_timing().cache_hash(), c.cpu.cache_timing().cache_hash()) << "the caches' contents and order";
+    EXPECT_TRUE(c.cpu.state().halted);
+    EXPECT_GT(c.cpu.cache_timing().stats().l1d_misses, 3000u) << "the set was under pressure";
+    EXPECT_GT(ec.stats().native_insns, 30000u) << "the loop ran natively";
+}
+
+// Code lines through one L1 instruction set: six blocks 4 KiB apart (one set), chained by direct jumps, two of them
+// entered again from the line of an earlier one (a hit on a way that is not the set's most recent). The chain's own
+// fetch lookup must age and evict exactly as the model.
+TEST(P6Block, CodeSetPressureMatchesTheInterpreter) {
+    auto jmp = [](u32 at, u32 to) {
+        const u32 rel = to - (at + 5);
+        return std::vector<u8>{0xE9, static_cast<u8>(rel), static_cast<u8>(rel >> 8), static_cast<u8>(rel >> 16), static_cast<u8>(rel >> 24)};
+    };
+    // add eax, k; jmp next — A 0x1000 -> B 0x2000 -> A2 0x1010 -> C 0x3000 -> D 0x4000 -> B2 0x2010 -> E 0x5000 -> F 0x6000
+    const u32 at[] = {0x1000, 0x2000, 0x1010, 0x3000, 0x4000, 0x2010, 0x5000};
+    const u32 to[] = {0x2000, 0x1010, 0x3000, 0x4000, 0x2010, 0x5000, 0x6000};
+    Rig b(true), c(true);
+    for (Rig* r : {&b, &c}) {
+        for (unsigned k = 0; k < 7; ++k) {
+            std::vector<u8> code = {0x83, 0xC0, static_cast<u8>(k + 1)};
+            const auto j = jmp(at[k] + 3, to[k]);
+            code.insert(code.end(), j.begin(), j.end());
+            r->load(code, at[k]);
+        }
+        // F 0x6000: dec ecx; jnz 0x1000; hlt
+        const u32 rel = 0x1000u - 0x6007u;
+        r->load({0x49, 0x0F, 0x85, static_cast<u8>(rel), static_cast<u8>(rel >> 8), static_cast<u8>(rel >> 16), static_cast<u8>(rel >> 24), 0xF4}, 0x6000);
+        r->cpu.state().gpr[kEcx] = 2000;
+        r->cpu.set_block_timing(true);
+    }
+    BlockEngine eb(b.cpu, b.bus);
+    eb.disable_jit();
+    BlockEngine ec(c.cpu, c.bus);
+    ec.set_jit_threshold(0);
+    run_lockstep(b, eb, c, ec, "code lines through one set");
+    expect_same(b, c, "code lines through one set", true);
+    EXPECT_EQ(b.cpu.cache_timing().cache_hash(), c.cpu.cache_timing().cache_hash()) << "the caches' contents and order";
+    EXPECT_TRUE(c.cpu.state().halted);
+    EXPECT_EQ(c.cpu.state().gpr[kEax], 2000u * 28u);
+    EXPECT_GT(c.cpu.cache_timing().stats().l1i_misses, 2000u) << "the set was under pressure";
+    EXPECT_GT(ec.stats().chains, 10000u) << "the blocks chained";
 }

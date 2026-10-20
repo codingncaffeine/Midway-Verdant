@@ -75,6 +75,20 @@ public:
     const u32* l1i_mru() const { return l1i_.mru_.data(); }
     unsigned l1i_sets() const { return l1i_.sets_; }
     unsigned l1d_sets() const { return l1d_.sets_; }
+    // The L1 data cache's tags (line plus one, ways of a set together) and ages, and the clock that ages them: the
+    // recompiler's generated code settles a hit on any way itself (the model's own update: the way's age from the
+    // clock, the set's most recent line).
+    const u32* l1d_tags() const { return l1d_.tags_.data(); }
+    u64* l1d_last_use() { return l1d_.last_use_.data(); }
+    unsigned l1d_ways() const { return l1d_.ways_; }
+    u64* lru_clock_word() { return &lru_clock_; }
+    // The same for the L1 instruction cache (the chain's code fetch).
+    const u32* l1i_tags() const { return l1i_.tags_.data(); }
+    u64* l1i_last_use() { return l1i_.last_use_.data(); }
+    unsigned l1i_ways() const { return l1i_.ways_; }
+    u32* l1i_mru_mutable() { return l1i_.mru_.data(); }
+    u32* l1d_mru_mutable() { return l1d_.mru_.data(); }
+    bool ideal() const { return ideal_; }
     const TimingStats& stats() const { return stats_; }
     // Block timing (D26): an ideal pipeline (code and data hit L1, branches are predicted) that schedules a translated
     // block once; its caches and predictor are never touched.
@@ -98,14 +112,15 @@ public:
 private:
     struct Cache {
         Cache(unsigned sets, unsigned ways);
-        bool access(PhysAddr phys, u64 now);  // true on a hit; allocates on a miss
+        bool access(PhysAddr phys, u64 now) { return ways_ == 4 ? access_ways<4>(phys, now) : access_ways<8>(phys, now); }  // true on a hit; allocates on a miss
+        template <unsigned W>
+        bool access_ways(PhysAddr phys, u64 now);
         // The most recently used line of each set, plus one (0: none): a hit on it changes no LRU order, so the
         // recompiler's generated code checks it inline and skips the model.
         std::array<u32, 512> mru_{};
         unsigned sets_, ways_;
-        std::array<u32, 4096> tags_{};
+        std::array<u32, 4096> tags_{};  // the line plus one (0: the way is empty)
         std::array<u64, 4096> last_use_{};
-        std::array<u8, 4096> valid_{};
     };
     struct Btb {
         u32 tag{0};

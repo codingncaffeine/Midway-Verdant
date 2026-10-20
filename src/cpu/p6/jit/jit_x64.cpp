@@ -208,6 +208,7 @@ void h_cache(JitCtx* c, u32 phys, u32 arg) {
 void* h_chain(JitCtx* c, Block::Link* slot) { return c->engine->chain(*c, slot); }
 
 void h_materialise(CpuState* s) { s->materialise(); }
+u32 h_eflags(const CpuState* s) { return s->eflags(); }  // computed, the lazy record left as it is (LAHF)
 u32 h_cf(const CpuState* s) { return s->cf() ? 1u : 0u; }
 u32 h_cond(const Cpu* cpu, u32 cc) { return cpu->condition(static_cast<u8>(cc)) ? 1u : 0u; }
 
@@ -225,18 +226,37 @@ public:
     Asm a;
     std::size_t body{0};  // where the block's own code starts, past the prologue (chains enter there)
 
+    // MV_JIT_MAP's profile marks: where each part of the code starts (offset, kind), kept only with the map on.
+    static bool marking() {
+        static const bool on = [] {
+            const char* p = std::getenv("MV_JIT_MAP");
+            return p && *p;
+        }();
+        return on;
+    }
+    std::vector<std::pair<u32, std::string>> marks;
+    std::string op_;
+    void mark(const char* kind, bool with_op = false) {
+        if (marking()) marks.emplace_back(static_cast<u32>(a.size()), with_op ? std::string(kind) + op_ : std::string(kind));
+    }
+
     void run() {
         epilogue_ = a.label();
+        mark("prologue");
         prologue();
         body = a.size();
         for (unsigned i = 0; i < b_.n; ++i) {
             Label after = a.label();
+            if (marking()) op_ = op_name(b_.insns[i].op);
+            mark("insn:", true);
             if (!native(i, after)) inline_helper(i);
             a.bind(after);
         }
         // The last instruction always leaves (native or helper); nothing falls through to here.
         a.bind(epilogue_);
+        mark("epilogue");
         epilogue();
+        mark("stubs");
         for (const Stub& s : stubs_) {
             a.bind(s.entry);
             if (s.cw_before) default_cw();
@@ -329,6 +349,7 @@ private:
         a.call_abs(reinterpret_cast<const void*>(&h_exec));
     }
     void inline_helper(unsigned i) {
+        mark("helper:", true);
         x87_leave();
         sse_leave();
         call_helper(i);
@@ -352,6 +373,7 @@ private:
     // and may chain into the next block's native code.
     static constexpr u64 kNoEip = ~u64{0};
     void end(unsigned i, u64 eip, unsigned slot) {
+        mark("chain");
         x87_leave();
         sse_leave();
         if (eip != kNoEip) a.mov_imm(4, st_at(kEipOff), static_cast<u32>(eip));
@@ -362,6 +384,7 @@ private:
         // Taken as the engine counts it: a jump to the next instruction is not taken.
         if (inline_chain) chain_inline(static_cast<u32>(eip), slot, static_cast<u32>(eip) != next_eip(b_.n - 1u), slow);
         a.bind(slow);
+        mark("chain-slow");
         a.mov(8, kArg0, kCtx);
         a.mov64(kArg1, reinterpret_cast<u64>(&b_.links[slot]));
         a.call_abs(reinterpret_cast<const void*>(&h_chain));
@@ -443,7 +466,7 @@ private:
         a.alu_imm(8, 0, rax, tp::kL2Latency + tp::kDramLatency);
         a.alu(8, 7, rax, ctx_at(kCtxLimit));
         a.jcc(AE, slow);
-        // Nothing pending: a device\x27s write into code, a penalty not yet charged.
+        // Nothing pending: a device's write into code, a penalty not yet charged.
         a.mov64(rax, reinterpret_cast<u64>(cpu_.memory().bus().code_pending_byte()));
         a.alu_imm(1, 7, mem(rax), 0);
         a.jcc(NE, slow);
@@ -453,7 +476,7 @@ private:
         a.mov64(rax, reinterpret_cast<u64>(cpu_.memory().device_cycles_word()));
         a.alu_imm(8, 7, mem(rax), 0);
         a.jcc(NE, slow);
-        // The fetch translation: a TLB hit on the next block\x27s page (the linear address is the target: flat CS).
+        // The fetch translation: a TLB hit on the next block's page (the linear address is the target: flat CS).
         const u32 lin = st_.seg[kCs].base + target;
         const i32 tlb = static_cast<i32>(((lin >> 12) & (Memory::kTlbSize - 1)) * 32);
         a.alu_imm(4, 7, mem(kTlb, tlb), lin >> 12);
@@ -461,25 +484,21 @@ private:
         a.mov(8, rax, mem(kTlb, tlb + 8));
         a.alu(8, 7, rax, mem(rcx, eHost));
         a.jcc(NE, slow);
-        // The fetch: one or two lines, each its set\x27s most recent in L1I (else the model has work: the engine\x27s).
-        const unsigned isets = cpu_.cache_timing().l1i_sets();
-        a.mov64(rax, reinterpret_cast<u64>(cpu_.cache_timing().l1i_mru()));
+        // The fetch: one or two lines, each looked up in L1I as Timing::code_fetch does — its set's most recent line
+        // changes nothing; a hit on another way takes the clock's next value as its age and becomes the most recent
+        // (the model's own update, here); a miss is the engine's (L2, the penalty). A second line that misses after
+        // the first was updated is still exact: the engine then finds the first its set's most recent.
         a.movzx(rdi, 1, mem(rcx, eLines));
         a.alu_imm(4, 7, rdi, 2);
         a.jcc(A, slow);
         a.mov(4, rsi, mem(rcx, eLine));
-        a.lea(4, rdi, mem(rsi, -1));
-        a.alu_imm(4, 4, rdi, isets - 1);
-        a.alu(4, 7, rsi, mem(rax, rdi, 2, 0));
-        a.jcc(NE, slow);
+        fetch_line(slow);
         Label one = a.label();
         a.alu_imm(1, 7, mem(rcx, eLines), 1);
         a.jcc(E, one);
-        a.lea(4, rdi, mem(rsi, 0));
-        a.alu_imm(4, 4, rdi, isets - 1);
+        a.mov(4, rsi, mem(rcx, eLine));
         a.lea(4, rsi, mem(rsi, 1));
-        a.alu(4, 7, rsi, mem(rax, rdi, 2, 0));
-        a.jcc(NE, slow);
+        fetch_line(slow);
         a.bind(one);
         // ---- committed from here ----
         if (kind == BranchKind::Conditional) a.mov(1, mem_abs(rax, &b_.exit_counter), r9);
@@ -510,6 +529,50 @@ private:
         a.mov_imm(1, ctx_at(kCtxEnded), 0);
         a.alu_imm(8, 0, mem(rcx, eRuns), 1);
         a.jmp(rdx);
+    }
+    // One code line of the next block (ESI = the line plus one) in L1I, for chain_inline: the most recent of its set,
+    // or found in a way of it and made so (the age from the clock); else `slow`. Clobbers RAX RDI R11; keeps RCX RDX
+    // R8-R10.
+    void fetch_line(Label slow) {
+        Timing& t = cpu_.cache_timing();
+        const unsigned isets = t.l1i_sets();
+        Label ok = a.label();
+        a.lea(4, rdi, mem(rsi, -1));
+        a.alu_imm(4, 4, rdi, isets - 1);
+        a.mov64(rax, reinterpret_cast<u64>(t.l1i_mru()));
+        a.alu(4, 7, rsi, mem(rax, rdi, 2, 0));
+        a.jcc(E, ok);
+        if (t.l1i_ways() != 4 || t.ideal()) {
+            a.jmp(slow);
+            a.bind(ok);
+            return;
+        }
+        Label found = a.label();
+        a.mov64(r11, reinterpret_cast<u64>(t.l1i_tags()));
+        a.shift_imm(4, 4, rdi, 2);  // the set's first way
+        Label w[4] = {a.label(), a.label(), a.label(), a.label()};
+        for (unsigned k = 0; k < 4; ++k) {
+            a.alu(4, 7, rsi, mem(r11, rdi, 2, static_cast<i32>(4 * k)));
+            a.jcc(E, w[k]);
+        }
+        a.jmp(slow);
+        for (unsigned k = 3; k >= 1; --k) {
+            a.bind(w[k]);
+            a.lea(4, rdi, mem(rdi, static_cast<i32>(k)));
+            a.jmp(found);
+        }
+        a.bind(w[0]);
+        a.bind(found);
+        a.mov64(r11, reinterpret_cast<u64>(t.lru_clock_word()));
+        a.mov(8, rax, mem(r11));
+        a.lea(8, rax, mem(rax, 1));
+        a.mov(8, mem(r11), rax);
+        a.mov64(r11, reinterpret_cast<u64>(t.l1i_last_use()));
+        a.mov(8, mem(r11, rdi, 3, 0), rax);
+        a.shift_imm(4, 5, rdi, 2);  // the set again
+        a.mov64(rax, reinterpret_cast<u64>(t.l1i_mru_mutable()));
+        a.mov(4, mem(rax, rdi, 2, 0), rsi);
+        a.bind(ok);
     }
     // A memory operand at an absolute host address (through `scratch`, loaded first).
     Mem mem_abs(Reg scratch, const void* p) {
@@ -557,6 +620,7 @@ private:
     // EAX holds the offset in `seg`: limit check, linear address, page and TLB checks. Leaves RSI = the host byte,
     // EDI = the physical address. Jumps to `fail` for anything the interpreter must do.
     void access_checks(u8 seg, unsigned size, bool write, Label fail) {
+        mark("access");
         const Segment& s = st_.seg[seg];
         if (s.limit != 0xFFFFFFFFu) {
             a.alu_imm(4, 7, rax, s.limit - (size - 1));
@@ -588,7 +652,7 @@ private:
             a.shift_imm(8, 5, rdx, 12);
             a.bt(8, mem(kCodeMap), rdx);
             a.jcc(B, fail);
-            a.alu_imm(4, 0, ctx_at(kCtxStores), 1);  // the spin skip's evidence
+            a.mov_imm(4, ctx_at(kCtxStores), 1);  // the spin skip's evidence (whether any store ran: a plain store, no read)
             // Write tracking: a watched page's first write is the interpreter's (it reports and unwatches the page);
             // with every page logged, the page is marked here (twice is the same if a later check fails).
             Memory& m = cpu_.memory();
@@ -607,6 +671,7 @@ private:
         a.alu(4, 1, rdi, rdx);  // or: the physical address
         a.alu(8, 0, rsi, rdx);  // the host byte
         if (write) log_store(size);
+        mark("body:", true);
     }
     // The spin probe's store log (only when the context asks: two instructions otherwise). RSI = the host bytes.
     void log_store(unsigned size) {
@@ -636,8 +701,13 @@ private:
         a.bind(done);
     }
     // The cache model for an access at EDI (RSI, RAX and RDI are kept).
+    // An SSE form holds its operands in xmm0/xmm1 across its lookup (its checks come before any effect): the call to
+    // the model keeps them (C++ may use any vector register).
+    bool keep_xmm_{false};
     void cache(unsigned i, bool store) {
-        const unsigned sets = cpu_.cache_timing().l1d_sets();
+        mark("cache");
+        Timing& t = cpu_.cache_timing();
+        const unsigned sets = t.l1d_sets();
         Label hit = a.label();
         a.mov(4, rcx, rdi);
         a.shift_imm(4, 5, rcx, 5);  // the line
@@ -648,6 +718,38 @@ private:
         // MV_JIT_NO_MRU=1 sends every access through the full model (a control for the inline check).
         static const bool every_access = std::getenv("MV_JIT_NO_MRU") != nullptr;
         if (!every_access) a.jcc(E, hit);
+        if (!every_access && t.l1d_ways() == 4 && !t.ideal()) {
+            // A hit on another way of the set: the model's own update (Cache::access_ways) — the way's age from the
+            // clock (which data_access advances first), the set's most recent line. No penalty, so nothing about the
+            // limit changes either. ECX = the line plus one, EDX = the set.
+            Label miss = a.label(), found = a.label();
+            a.mov64(r8, reinterpret_cast<u64>(t.l1d_tags()));
+            a.mov(4, r9, rdx);
+            a.shift_imm(4, 4, r9, 2);  // the set's first way
+            for (unsigned w = 0; w < 4; ++w) {
+                Label next = a.label();
+                a.alu(4, 7, rcx, mem(r8, r9, 2, static_cast<i32>(4 * w)));
+                a.jcc(NE, next);
+                if (w) a.lea(4, r9, mem(r9, static_cast<i32>(w)));
+                a.jmp(found);
+                a.bind(next);
+            }
+            a.jmp(miss);
+            a.bind(found);
+            a.mov64(r8, reinterpret_cast<u64>(t.lru_clock_word()));
+            a.mov(8, r10, mem(r8));
+            a.lea(8, r10, mem(r10, 1));
+            a.mov(8, mem(r8), r10);
+            a.mov64(r8, reinterpret_cast<u64>(t.l1d_last_use()));
+            a.mov(8, mem(r8, r9, 3, 0), r10);
+            a.mov(4, mem(kMru, rdx, 2, 0), rcx);
+            a.jmp(hit);
+            a.bind(miss);
+        }
+        if (keep_xmm_) {
+            a.sse(0, 0x11, 0, ctx_at(kTmp0));  // movups [ctx+tmp0], xmm0 (tmp0-tmp3: 32 bytes)
+            a.sse(0, 0x11, 1, ctx_at(kTmp2));
+        }
         a.mov(8, ctx_at(kSaveRsi), rsi);
         a.mov(8, ctx_at(kSaveRax), rax);
         a.mov(8, ctx_at(kSaveRdi), rdi);
@@ -658,7 +760,22 @@ private:
         a.mov(8, rsi, ctx_at(kSaveRsi));
         a.mov(8, rax, ctx_at(kSaveRax));
         a.mov(8, rdi, ctx_at(kSaveRdi));
+        if (keep_xmm_) {
+            a.sse(0, 0x10, 0, ctx_at(kTmp0));
+            a.sse(0, 0x10, 1, ctx_at(kTmp2));
+        }
         a.bind(hit);
+        mark("body:", true);
+    }
+    // The interpreter's element accesses (4 bytes each, in address order) each looked up at its first byte, as
+    // Memory::note does: any alignment is exact (a second look at a set's most recent line changes nothing). EDI kept.
+    void cache_elems(unsigned i, bool store, unsigned elems) {
+        cache(i, store);
+        for (unsigned e = 1; e < elems; ++e) {
+            a.lea(4, rdi, mem(rdi, 4));
+            cache(i, store);
+        }
+        if (elems > 1) a.lea(4, rdi, mem(rdi, -4 * static_cast<i32>(elems - 1)));
     }
     void load_host(Reg dst, unsigned size) {
         if (size == 4) a.mov(4, dst, mem(rsi));
@@ -915,7 +1032,8 @@ private:
         a.mov(2, mem(to, 8), rax);
     }
 
-    enum class X87Form { None, LoadM32, StoreM32, LoadM64, StoreM64, ArithM32, CompareM32, ArithD8, ArithDcDe, LoadReg, StoreReg, Exchange, Sign, LoadConst, StoreSw };
+    enum class X87Form { None, LoadM32, StoreM32, LoadM64, StoreM64, ArithM32, CompareM32, ArithD8, ArithDcDe, LoadReg, StoreReg, Exchange, Sign, LoadConst, StoreSw,
+                         CompareReg, CompareFlags, LoadInt, StoreInt, Sqrt };
 
     bool x87(unsigned i, const Insn& in, Label after) {
         if (!kNativeX87) return false;
@@ -926,25 +1044,34 @@ private:
             else if (esc == 0xDD && in.reg == 0) k = X87Form::LoadM64;
             else if (esc == 0xDD && (in.reg == 2 || in.reg == 3)) k = X87Form::StoreM64;
             else if (esc == 0xD9 && (in.reg == 2 || in.reg == 3)) k = X87Form::StoreM32;
-            else if (esc == 0xD8 && (in.reg == 2 || in.reg == 3)) k = X87Form::CompareM32;
-            else if (esc == 0xD8) k = X87Form::ArithM32;
+            else if ((esc == 0xD8 || esc == 0xDC) && (in.reg == 2 || in.reg == 3)) k = X87Form::CompareM32;  // m32fp / m64fp
+            else if (esc == 0xD8 || esc == 0xDC) k = X87Form::ArithM32;
+            else if ((esc == 0xDB || esc == 0xDF) && in.reg == 0) k = X87Form::LoadInt;    // FILD m32 / m16
+            else if (esc == 0xDF && in.reg == 5) k = X87Form::LoadInt;                     // FILD m64
+            else if ((esc == 0xDB || esc == 0xDF) && (in.reg == 2 || in.reg == 3)) k = X87Form::StoreInt;  // FIST(P) m32 / m16
+            else if (esc == 0xDF && in.reg == 7) k = X87Form::StoreInt;                    // FISTP m64
         } else {
-            if (esc == 0xD8 && in.reg != 2 && in.reg != 3) k = X87Form::ArithD8;
+            if (esc == 0xD8 && (in.reg == 2 || in.reg == 3)) k = X87Form::CompareReg;      // FCOM(P) ST(i)
+            else if ((esc == 0xDB || esc == 0xDF) && (in.reg == 5 || in.reg == 6)) k = X87Form::CompareFlags;  // F(U)COMI(P) ST(i)
+            else if (esc == 0xD8) k = X87Form::ArithD8;
             else if ((esc == 0xDC || esc == 0xDE) && in.reg != 2 && in.reg != 3) k = X87Form::ArithDcDe;
             else if (esc == 0xD9 && in.modrm >= 0xC0 && in.modrm <= 0xC7) k = X87Form::LoadReg;
             else if (esc == 0xD9 && in.modrm >= 0xC8 && in.modrm <= 0xCF) k = X87Form::Exchange;
             else if (esc == 0xD9 && (in.modrm == 0xE0 || in.modrm == 0xE1)) k = X87Form::Sign;
+            else if (esc == 0xD9 && in.modrm == 0xFA) k = X87Form::Sqrt;
             else if (esc == 0xD9 && (in.modrm == 0xE8 || in.modrm == 0xEE)) k = X87Form::LoadConst;
             else if (esc == 0xDD && (in.reg == 2 || in.reg == 3)) k = X87Form::StoreReg;
             else if (esc == 0xDF && in.modrm == 0xE0) k = X87Form::StoreSw;
         }
         if (k == X87Form::None) return false;
-        const bool write = k == X87Form::StoreM32 || k == X87Form::StoreM64;
-        const bool m64 = k == X87Form::LoadM64 || k == X87Form::StoreM64;
-        const unsigned msize = m64 ? 8 : 4;
+        const bool write = k == X87Form::StoreM32 || k == X87Form::StoreM64 || k == X87Form::StoreInt;
+        const bool m64 = k == X87Form::LoadM64 || k == X87Form::StoreM64 || ((k == X87Form::ArithM32 || k == X87Form::CompareM32) && esc == 0xDC);
+        const bool integer = k == X87Form::LoadInt || k == X87Form::StoreInt;
+        // An integer's size: m16 under DF /0 /2 /3, m64 under DF /5 /7, m32 under DB.
+        const unsigned msize = integer ? (esc == 0xDB ? 4u : (in.reg == 5 || in.reg == 7) ? 8u : 2u) : m64 ? 8 : 4;
         if (in.mem && !segment_ok(in.mem_seg, msize, write)) return false;
         const bool host = k == X87Form::StoreM32 || k == X87Form::LoadM64 || k == X87Form::StoreM64 || k == X87Form::ArithM32 || k == X87Form::CompareM32 || k == X87Form::ArithD8 || k == X87Form::ArithDcDe ||
-                          k == X87Form::LoadM32;
+                          k == X87Form::LoadM32 || k == X87Form::StoreInt || k == X87Form::Sqrt;
         const bool cw_before = cw_active_;
         const Label f = fallback(i, after, cw_before, host || cw_before);
         x87_preamble(f, k == X87Form::StoreSw);
@@ -959,33 +1086,30 @@ private:
             effective_address(in);
             a.mov(4, ctx_at(kCtxEa), rax);
             access_checks(in.mem_seg, msize, write, f);
-            if (m64) {
-                // The interpreter reads or writes the two halves: native when they share a cache line.
-                a.mov(4, rax, rsi);
-                a.alu_imm(4, 4, rax, 31);
-                a.alu_imm(4, 7, rax, 24);
-                a.jcc(A, f);
-            }
-            if (k == X87Form::LoadM64) x87_m64_ok(f);
-            else if (!write) x87_m32_ok(f);
+            if (m64 && !write) x87_m64_ok(f);
+            else if (!write && !integer) x87_m32_ok(f);
         }
         // Every check before any effect: the stack, the operands' classes.
         x87_top();
         const unsigned ri = in.rm;
         switch (k) {
-            case X87Form::LoadM32: case X87Form::LoadM64: case X87Form::LoadConst:
+            case X87Form::LoadM32: case X87Form::LoadM64: case X87Form::LoadConst: case X87Form::LoadInt:
                 x87_phys(r9, 7);
                 x87_tag_test(r9, true, f);
                 break;
             case X87Form::StoreM32: case X87Form::StoreM64:
                 x87_tag_test(r8, false, f);
                 break;
-            case X87Form::ArithM32: case X87Form::CompareM32: case X87Form::Sign: case X87Form::StoreReg:
+            case X87Form::ArithM32: case X87Form::CompareM32: case X87Form::Sign: case X87Form::StoreReg: case X87Form::StoreInt: case X87Form::Sqrt:
                 x87_tag_test(r8, false, f);
                 x87_addr(r10, r8);
                 x87_operand_ok(r10, f);
+                if (k == X87Form::Sqrt) {
+                    a.test_imm(1, mem(r10, 9), 0x80);  // a negative operand (or -0) is the interpreter's
+                    a.jcc(NE, f);
+                }
                 break;
-            case X87Form::ArithD8: case X87Form::ArithDcDe: case X87Form::Exchange:
+            case X87Form::ArithD8: case X87Form::ArithDcDe: case X87Form::Exchange: case X87Form::CompareReg: case X87Form::CompareFlags:
                 x87_phys(r9, ri);
                 x87_tag_test(r8, false, f);
                 x87_tag_test(r9, false, f);
@@ -1005,10 +1129,20 @@ private:
             default: break;
         }
         if (in.mem) {
-            cache(i, write);  // the interpreter's one access (clobbers R8-R11)
+            cache_elems(i, write, msize > 4 ? 2 : 1);  // the interpreter's accesses: one, or the two halves (clobbers R8-R11)
             x87_top();
         }
         x87_pointers(i, in);
+        if (k == X87Form::CompareFlags) {
+            // The interpreter materialises the lazy flags (OF SF AF stay theirs) before it sets ZF PF CF. A call: the
+            // host x87 stack is empty here, as the ABI wants; the registers the checks left are computed again.
+            a.mov(8, kArg0, kSt);
+            a.call_abs(reinterpret_cast<const void*>(&h_materialise));
+            x87_top();
+            x87_phys(r9, ri);
+            x87_addr(r10, r8);
+            x87_addr(r11, r9);
+        }
         if (host) x87_enter();
         switch (k) {
             case X87Form::LoadM32: case X87Form::LoadM64: {
@@ -1046,7 +1180,7 @@ private:
             case X87Form::ArithM32: {
                 x87_addr(r10, r8);
                 a.x87_mem(0xDB, 5, mem(r10));
-                a.x87_mem(0xD8, in.reg, mem(rsi));  // the operation with the single, as the interpreter's on its conversion
+                a.x87_mem(esc, in.reg, mem(rsi));  // the operation with the single or double, as the interpreter's on its conversion
                 x87_status(true);
                 a.x87_mem(0xDB, 7, mem(r10));
                 x87_tag_of(r10);
@@ -1056,7 +1190,7 @@ private:
             case X87Form::CompareM32: {
                 x87_addr(r10, r8);
                 a.x87_mem(0xDB, 5, mem(r10));
-                a.x87_mem(0xD8, 3, mem(rsi));  // fcomp dword: the host's C3 C2 C0 are the guest's for ordered operands
+                a.x87_mem(esc, 3, mem(rsi));  // fcomp dword / qword: the host's C3 C2 C0 are the guest's for ordered operands
                 a.fnstsw_ax();
                 a.alu_imm(4, 4, rax, 0x4500);
                 a.alu_imm(2, 4, st_at(kFsw), 0xB8FF);  // C0 C1 C2 C3 cleared
@@ -1116,6 +1250,68 @@ private:
                 x87_tag_of(r11);
                 x87_set_tag(r9);
                 x87_clear_c1();
+                break;
+            }
+            case X87Form::Sqrt: {
+                // The host's square root under the guest's precision and rounding, as the interpreter's (which leaves C1).
+                a.x87_mem(0xDB, 5, mem(r10));
+                a.x87_raw(0xD9, 0xFA);  // fsqrt
+                x87_status(false);
+                a.x87_mem(0xDB, 7, mem(r10));
+                x87_tag_of(r10);
+                x87_set_tag(r8);
+                break;
+            }
+            case X87Form::LoadInt: {
+                // FILD: every integer is exact in 80 bits (no control word matters).
+                x87_phys(r9, 7);
+                x87_addr(r10, r9);
+                a.x87_mem(msize == 4 ? 0xDB : 0xDF, msize == 8 ? 5 : 0, mem(rsi));  // fild word / dword / qword
+                a.x87_mem(0xDB, 7, mem(r10));  // fstp tbyte
+                x87_clear_c1();
+                x87_set_top(r9);
+                x87_tag_of(r10);
+                x87_set_tag(r9);
+                break;
+            }
+            case X87Form::StoreInt: {
+                // FIST(P) under the guest's rounding, as the interpreter's host conversion: out of range gives the
+                // integer indefinite with IE (masked: the preamble), C1 from the rounding.
+                x87_addr(r10, r8);
+                a.x87_mem(0xDB, 5, mem(r10));  // fld tbyte
+                a.x87_mem(msize == 4 ? 0xDB : 0xDF, msize == 8 ? 7 : 3, mem(rsi));  // fistp word / dword / qword
+                x87_status(true);
+                if (in.reg != 2) x87_pop();  // FIST /2 keeps it
+                break;
+            }
+            case X87Form::CompareReg: {
+                // FCOM(P) ST(i): C3 C2 C0 from the host's compare of the two (ordered: the checks), C1 cleared.
+                a.x87_mem(0xDB, 5, mem(r11));  // ST(i), then ST(0) on top
+                a.x87_mem(0xDB, 5, mem(r10));
+                a.x87_raw(0xDE, 0xD9);  // fcompp
+                a.fnstsw_ax();
+                a.alu_imm(4, 4, rax, 0x4500);
+                a.alu_imm(2, 4, st_at(kFsw), 0xB8FF);
+                a.alu(2, 1, st_at(kFsw), rax);
+                if (in.reg == 3) x87_pop();
+                break;
+            }
+            case X87Form::CompareFlags: {
+                // F(U)COMI(P): ZF PF CF from the host's compare; the other flags as materialised; C1 cleared.
+                a.x87_mem(0xDB, 5, mem(r11));
+                a.x87_mem(0xDB, 5, mem(r10));
+                a.x87_raw(0xDF, 0xF1);  // fcomip st, st(1)
+                a.x87_raw(0xDD, 0xD8);  // fstp st(0)
+                a.byte(0x9C);  // pushfq
+                a.pop(rax);
+                a.alu_imm(4, 4, rax, fl::ZF | fl::PF | fl::CF);
+                a.mov(4, rcx, st_at(kFlagsOff));
+                a.alu_imm(4, 4, rcx, ~(fl::ZF | fl::PF | fl::CF));
+                a.alu(4, 1, rcx, rax);
+                a.mov(4, st_at(kFlagsOff), rcx);
+                x87_clear_c1();
+                if (esc == 0xDF) x87_pop();
+                known_ = Known::Unknown;
                 break;
             }
             case X87Form::Sign: {
@@ -1560,7 +1756,7 @@ private:
         const bool scalar = in.rep == 1;
         const u8 op = in.opcode;
         const unsigned d = in.reg;
-        enum class K { None, Load, Store, Arith, Logic, Shuf, Unpack, Cmp, MovMsk, LoadLow64, StoreLow64, LoadHigh64, StoreHigh64, Comi } k = K::None;
+        enum class K { None, Load, Store, Arith, Logic, Shuf, Unpack, Cmp, MovMsk, LoadLow64, StoreLow64, LoadHigh64, StoreHigh64, Comi, CvtSi2Ss, CvtSs2Si } k = K::None;
         switch (op) {
             case 0x10: case 0x28: k = K::Load; break;
             case 0x11: case 0x29: k = K::Store; break;
@@ -1576,24 +1772,27 @@ private:
             case 0x16: if (!scalar) k = K::LoadHigh64; break;  // MOVHPS xmm, m64 | MOVLHPS
             case 0x17: if (!scalar && in.mem) k = K::StoreHigh64; break;
             case 0x2E: case 0x2F: if (!scalar) k = K::Comi; break;  // UCOMISS / COMISS: a scalar compare into EFLAGS
+            case 0x2A: if (scalar) k = K::CvtSi2Ss; break;            // CVTSI2SS xmm, r/m32
+            case 0x2C: case 0x2D: if (scalar) k = K::CvtSs2Si; break; // CVT(T)SS2SI r32, xmm/m32
             default: break;
         }
         if (k == K::None) return false;
         const bool store = k == K::Store || k == K::StoreLow64 || k == K::StoreHigh64;
         const unsigned size = (k == K::LoadLow64 || k == K::StoreLow64 || k == K::LoadHigh64 || k == K::StoreHigh64) ? 8 : (scalar || k == K::Comi) ? 4 : 16;
         if (in.mem && !segment_ok(in.mem_seg, size, store)) return false;
-        const bool host_math = k == K::Arith || k == K::Cmp || k == K::Comi;
+        const bool host_math = k == K::Arith || k == K::Cmp || k == K::Comi || k == K::CvtSi2Ss || k == K::CvtSs2Si;
         const bool sse_before = sse_active_;
         const Label f = fallback(i, after, cw_active_, cw_active_, sse_before, host_math || sse_before);
         sse_preamble(f);
         // The second operand into xmm1 (memory: checked here, read after the cache lookup below).
+        // The interpreter's 4-byte element accesses this form's one lookup stands for (see cache_elems).
+        unsigned elems = size / 4;
         if (in.mem) {
-            // Packed forms the interpreter checks for alignment (MOVAPS, arithmetic, logic, ...) fault there; MOVUPS
-            // and the 64-bit moves are only native when their elements stay in one line.
+            // Packed forms the interpreter checks for alignment (MOVAPS, arithmetic, logic, ...) fault there; an
+            // aligned offset in a segment based on a multiple of 16 keeps the four elements in one line (one lookup).
             const bool checked = !scalar && size == 16 && op != 0x10 && op != 0x11;
-            // A 4-byte element aligned to 4 stays in one cache line (it was held to 8 like the 64-bit moves: every
-            // scalar on an odd word went to the interpreter).
-            sse_memory(in, size, store, size == 16 ? 16 : size, checked, f);
+            if (checked && (st_.seg[in.mem_seg].base & 15) == 0) elems = 1;
+            sse_memory(in, size, store, checked ? 16 : 1, checked, f);
         }
         a.sse(0, 0x10, 0, xmm_at(d));  // xmm0 = the destination register (movups)
         if (k == K::Arith || k == K::Cmp || k == K::Comi) {
@@ -1604,8 +1803,20 @@ private:
             if (op != 0x51) sse_lanes_ok(0, lanes, f);  // SQRT reads only its source
             sse_lanes_ok(1, lanes, f);
         }
+        if (k == K::CvtSs2Si) {
+            // The source into xmm1; a NaN, an infinity or anything of magnitude 2^31 or more is the interpreter's (it
+            // gives the integer indefinite with IE itself, without the host).
+            if (in.mem) a.sse(0xF3, 0x10, 1, mem(rsi));
+            else a.sse(0, 0x10, 1, xmm_at(in.rm));
+            a.sse_rr(0x66, 0x7E, 1, 0);  // movd eax, xmm1
+            a.alu_imm(4, 4, rax, 0x7F800000);
+            a.alu_imm(4, 7, rax, 158u << 23);
+            a.jcc(AE, f);
+        }
         if (in.mem) {
-            cache(i, store);  // keeps RSI and RDI
+            keep_xmm_ = true;
+            cache_elems(i, store, elems);  // keeps RSI and RDI (and xmm0/xmm1)
+            keep_xmm_ = false;
         }
         if (host_math) sse_enter();
         switch (k) {
@@ -1682,6 +1893,19 @@ private:
             case K::StoreLow64: case K::StoreHigh64:
                 a.sse(0, op, 0, mem(rsi));
                 break;
+            case K::CvtSi2Ss:
+                // The host's conversion under the guest's rounding, as the interpreter's (inexact: PE).
+                if (in.mem) a.sse(0xF3, 0x2A, 0, mem(rsi));
+                else {
+                    a.mov(4, rax, greg(in.rm, 4));
+                    a.sse_rr(0xF3, 0x2A, 0, 0);  // cvtsi2ss xmm0, eax
+                }
+                a.sse(0, 0x11, 0, xmm_at(d));
+                break;
+            case K::CvtSs2Si:
+                a.sse_rr(0xF3, op, 0, 1);  // cvt(t)ss2si eax, xmm1: truncating, or under the guest's rounding
+                a.mov(4, greg(static_cast<u8>(d), 4), rax);
+                break;
             default: break;
         }
         host_flags_ = host_cf_ = false;
@@ -1711,7 +1935,7 @@ private:
                              (op >= 0xD1 && op <= 0xFE && op != 0xD4 && op != 0xD6 && op != 0xE6 && op != 0xF4 && op != 0xFB);
         if (!mmx_map || in.prefix_66 || in.rep == 2 || in.lock) return false;
         const unsigned d = in.reg;
-        enum class K { None, Emms, MovdIn, MovdOut, MovqIn, MovqOut, Shift, Shuffle, Binary } k = K::None;
+        enum class K { None, Emms, MovdIn, MovdOut, MovqIn, MovqOut, Shift, Shuffle, Binary, Pextrw } k = K::None;
         bool high_unpack = false, pack = false;
         switch (op) {
             case 0x77: k = K::Emms; break;
@@ -1724,6 +1948,7 @@ private:
                 if (!in.mem && (in.reg == 2 || in.reg == 6 || (in.reg == 4 && op != 0x73))) k = K::Shift;
                 break;
             case 0x70: k = K::Shuffle; break;
+            case 0xC5: if (!in.mem) k = K::Pextrw; break;  // PEXTRW r32, mm, imm8
             case 0x68: case 0x69: case 0x6A: high_unpack = true; k = K::Binary; break;
             case 0x63: case 0x67: case 0x6B: pack = true; k = K::Binary; break;
             case 0x60: case 0x61: case 0x62: case 0x64: case 0x65: case 0x66: case 0x74: case 0x75: case 0x76:
@@ -1747,16 +1972,14 @@ private:
         if (in.mem) {
             effective_address(in);
             access_checks(in.mem_seg, size, store, f);
-            if (size == 8) {
-                // The interpreter reads or writes the two halves: native when they share a cache line.
-                a.mov(4, rax, rsi);
-                a.alu_imm(4, 4, rax, 31);
-                a.alu_imm(4, 7, rax, 24);
-                a.jcc(A, f);
-            }
-            cache(i, store);
+            cache_elems(i, store, size / 4);  // the interpreter reads or writes 64 bits as two halves
         }
         switch (k) {
+            case K::Pextrw:
+                mm_touch();
+                a.movzx(rax, 2, mem(kSt, kSt0 + static_cast<i32>(16 * (in.rm & 7)) + static_cast<i32>(2 * (in.imm & 3))));
+                a.mov(4, greg(static_cast<u8>(d), 4), rax);
+                break;
             case K::Emms:
                 a.mov_imm(2, st_at(kFtw), 0xFFFF);
                 break;
@@ -2011,6 +2234,7 @@ private:
             case Op::Div: case Op::Idiv: return divide(i, in, after);
             case Op::CallRm: case Op::JmpRm: return indirect(i, in, after);
             case Op::Leave: return leave_frame(i, in, after);
+            case Op::Lahf: return lahf(i);
             default: return false;
         }
     }
@@ -2319,6 +2543,15 @@ private:
         end(i, kNoEip, 0);
         return true;
     }
+    // LAHF: AH = the flags' low byte, computed as the interpreter computes it (no materialising).
+    bool lahf(unsigned i) {
+        a.mov(8, kArg0, kSt);
+        a.call_abs(reinterpret_cast<const void*>(&h_eflags));
+        a.mov(1, greg(4, 1), rax);  // AH
+        host_flags_ = host_cf_ = false;
+        finish(i, false);
+        return true;
+    }
     bool setcc(unsigned i, const Insn& in) {
         if (in.dst.kind != OpndKind::Reg) return false;
         condition_to_edx(in.cc);
@@ -2375,8 +2608,10 @@ bool Jit::compile(Block& b, Cpu& cpu, BlockEngine& engine) {
         return p && *p ? std::fopen(p, "w") : nullptr;
     }();
     if (map) {
-        std::fprintf(map, "%llx %llx %08x %u\n", static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(b.native)),
+        std::fprintf(map, "%llx %llx %08x %u", static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(b.native)),
                      static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(b.native) + n), b.jit_eip, b.n);
+        for (const auto& [off, kind] : t.marks) std::fprintf(map, " %x:%s", off, kind.c_str());
+        std::fputc('\n', map);
         std::fflush(map);
     }
     used_ += (n + 15) & ~std::size_t{15};
