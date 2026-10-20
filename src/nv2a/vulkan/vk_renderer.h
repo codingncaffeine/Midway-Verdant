@@ -297,7 +297,7 @@ private:
         bool harvested{true};
     };
     static constexpr u32 kQueriesPerFrame = 4096;
-    static constexpr u32 kSubmitDraws = 256;  // counted draws a submission carries at most (<= kQueriesPerFrame)
+    static constexpr u32 kSubmitDraws = 32;  // counted draws a submission carries at most (<= kQueriesPerFrame)
     bool count_draws_{false};
     u64 next_ticket_{1}, last_ticket_{0};
     std::unordered_map<u64, DrawCounts> counts_;
