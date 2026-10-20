@@ -50,8 +50,11 @@ inline u64 pixel_clocks(u64 pixels, u64 passes, u64 bytes = 0) {
     return (limit * kFillEfficiencyNum + kFillEfficiencyDen - 1) / kFillEfficiencyDen;
 }
 
-// GPU clocks and CPU cycles: exactly 7 GPU clocks per 22 CPU cycles (233.33 and 733.33 MHz).
-inline Cycles cycles_from_gpu(u64 gpu_clocks) { return muldiv64_ceil(gpu_clocks, clk::kCpuHzNum, clk::kGpuHzNum); }
-inline u64 gpu_from_cycles(Cycles cycles) { return muldiv64(cycles, clk::kGpuHzNum, clk::kCpuHzNum); }
+// GPU clocks and CPU cycles: exactly 7 GPU clocks per 22 CPU cycles (233.33 and 733.33 MHz). In 64 bits (a 128-bit
+// division per method was 1.5 % of a title's CPU thread): exact while a count stays below 2^59 (25 years of either clock).
+inline constexpr u64 kGpuToCpuNum = 22, kGpuToCpuDen = 7;
+static_assert(clk::kCpuHzNum * kGpuToCpuDen == clk::kGpuHzNum * kGpuToCpuNum, "22 CPU cycles per 7 GPU clocks");
+inline Cycles cycles_from_gpu(u64 gpu_clocks) { return (gpu_clocks * kGpuToCpuNum + kGpuToCpuDen - 1) / kGpuToCpuDen; }
+inline u64 gpu_from_cycles(Cycles cycles) { return cycles / kGpuToCpuNum * kGpuToCpuDen + cycles % kGpuToCpuNum * kGpuToCpuDen / kGpuToCpuNum; }
 
 }  // namespace mv::gpu_timing

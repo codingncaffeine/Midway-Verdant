@@ -2261,8 +2261,10 @@ VkPipeline VulkanRenderer::clear_pipeline(VkRenderPass pass, VkColorComponentFla
 
 void VulkanRenderer::draw(const KelvinState& s, const DrawBatch& batch) {
     last_ticket_ = 0;
-    // A frame whose queries are used up goes to the GPU before this draw (its pass reopens below).
-    if (count_draws_ && frames_[slot_].queries >= kQueriesPerFrame) submit();
+    // A frame whose queries are used up goes to the GPU before this draw (its pass reopens below); and with counting
+    // on, every few hundred draws: the GPU works on them while the CPU goes on, so a count asked for later is usually
+    // in already instead of a submit and a wait for the whole batch (5.6 % of a title's CPU thread waited there).
+    if (count_draws_ && frames_[slot_].queries >= kSubmitDraws) submit();
     Timed timed(stats_.ns_draw);
     ++stats_.draws;
     ++frame_draws_;

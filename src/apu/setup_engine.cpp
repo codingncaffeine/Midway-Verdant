@@ -487,6 +487,17 @@ bool SetupEngine::sge_byte(u32 sge_offset, PhysAddr& phys) const {
 
 u32 SetupEngine::read_bytes(const Source& src, u32 byte_offset, u32 bytes) const {
     u32 v = 0;
+    // The common case: all the bytes in one 4 KiB page of the buffer (one scatter-gather lookup, one read; a sample
+    // was a table lookup and a bus read per byte). Anything else, byte by byte below, with the same results.
+    if (src.stream) {
+        if (bus_.read_ram(src.segment + byte_offset, &v, bytes)) return v;
+        v = 0;
+    } else if (((src.base + byte_offset) & 0xFFFu) + bytes <= 0x1000u) {
+        PhysAddr at = 0;
+        if (!sge_byte(src.base + byte_offset, at)) return 0;
+        if (bus_.read_ram(at, &v, bytes)) return v;
+        v = 0;
+    }
     for (u32 i = 0; i < bytes; ++i) {
         PhysAddr at = 0;
         if (src.stream) at = src.segment + byte_offset + i;
