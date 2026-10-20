@@ -50,6 +50,19 @@ public:
         return 0;
 #endif
     }
+    // The guest's condition codes into the host's status word, for an instruction whose codes are read back from the
+    // host (FPREM, FPTAN, FSIN...): one that leaves some unchanged (an invalid operand) then leaves the guest's, not
+    // whatever the host's last x87 instruction left (native code's compares: the result depended on what ran before).
+    void conditions(u16 guest_sw) {
+#if MV_HOST_X87
+        u16 env[14];
+        asm volatile("fnstenv %0" : "=m"(env));
+        env[2] = static_cast<u16>((env[2] & ~kSwCond) | (guest_sw & kSwCond));
+        asm volatile("fldenv %0" : : "m"(env) : "memory");
+#else
+        (void)guest_sw;
+#endif
+    }
     // The host's condition codes (for FPREM, FXAM-like instructions run on the host).
     u16 status() {
 #if MV_HOST_X87
@@ -741,6 +754,7 @@ void X87::run_d9() {
             bool in_range = true;
             if (!nan_result(x, 0, false, r)) {
                 HostFpu host(f.fcw);
+                host.conditions(f.fsw);
 #if MV_HOST_X87
                 long double one;
                 asm volatile("fptan" : "=t"(one), "=u"(r) : "0"(x));
@@ -820,6 +834,7 @@ void X87::run_d9() {
             u16 cc = 0;
             if (!nan_result(a, b, true, r)) {
                 HostFpu host(f.fcw);
+                host.conditions(f.fsw);
 #if MV_HOST_X87
                 if (in.modrm == 0xF5) asm volatile("fprem1" : "+t"(a) : "u"(b));
                 else asm volatile("fprem" : "+t"(a) : "u"(b));
@@ -874,6 +889,7 @@ void X87::run_d9() {
                 c = s;
             } else {
                 HostFpu host(f.fcw);
+                host.conditions(f.fsw);
 #if MV_HOST_X87
                 asm volatile("fsincos" : "=t"(c), "=u"(s) : "0"(x));
                 in_range = (host.status() & kSwC2) == 0;
@@ -948,6 +964,7 @@ void X87::run_d9() {
             bool in_range = true;
             if (!nan_result(x, 0, false, r)) {
                 HostFpu host(f.fcw);
+                host.conditions(f.fsw);
 #if MV_HOST_X87
                 if (in.modrm == 0xFE) asm volatile("fsin" : "+t"(x));
                 else asm volatile("fcos" : "+t"(x));
