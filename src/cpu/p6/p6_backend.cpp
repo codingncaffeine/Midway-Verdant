@@ -402,6 +402,8 @@ std::string P6Backend::report() const {
                          b.fast_hits, b.relinks);
         for (unsigned w = 0; w < b.run_end.size(); ++w)
             if (b.run_end[w]) r += std::format(" {}:{}", w == 16 ? std::string("mid-block") : w == 17 ? std::string("fault") : std::to_string(w), b.run_end[w]);
+        r += "; exits through the engine's chain (link, budget, limit, pending, fetch translation, fetch lines, indirect, none):";
+        for (u64 n : b.slow_chain) r += std::format(" {}", n);
         r += std::format("\ncpu p6 blocks: {} built, {} live, {} killed ({} page writes, {} by devices); runs {} whole; {} fallback steps; {} instructions in blocks; {} exit mispredicts; cycles: schedules {}, penalties {}, exits {}, REP {}",
                          b.built, blocks_->live_blocks(), b.killed, b.pages_written, b.device_page_writes, b.whole_runs, b.fallback_steps,
                          b.block_insns, b.mispredicts, b.schedule_cycles, b.penalty_cycles, b.exit_cycles, b.rep_cycles);

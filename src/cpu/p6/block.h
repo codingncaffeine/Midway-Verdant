@@ -63,6 +63,10 @@ struct Block {
         u32 epoch{0};
     };
     std::array<Link, 2> links{};
+    // The link slots (of other blocks or its own) that name this block, and the fast-cache entries that held it: a
+    // kill clears exactly these (BlockEngine::forget), so a write into one code page leaves every other link and entry.
+    std::vector<Link*> incoming;
+    std::vector<u32> fast_slots;
     bool jit_dirty{false};
     bool jit_failed{false};
     u8 jit_compiles{0};
@@ -77,6 +81,10 @@ struct BlockStats {
     // Every native run's end: [0..15] the chain test that stopped it at a normal block end (0: none was tried, the
     // exit went to the dispatcher), [16] an exit mid-block (a device access, a fault, the limit), [17] a fault.
     std::array<u64, 18> run_end{};
+    // Exits that reached the engine's chain instead of the generated code's (the first inline condition that failed):
+    // 0 no valid link, 1 budget, 2 limit, 3 pending work, 4 fetch translation, 5 fetch lines not the most recent, 6 an
+    // indirect exit or a return (no inline chain), 7 none (the inline chain would have taken it).
+    std::array<u64, 8> slow_chain{};
     u64 whole_runs{0}, fallback_steps{0}, block_insns{0};
     u64 mispredicts{0};
     u64 native_runs{0}, native_insns{0}, native_helpers{0}, native_ineligible{0}, native_handoffs{0}, chains{0}, links_refused{0};
@@ -169,6 +177,13 @@ public:
 private:
     Block* build(const u8* page, unsigned off, u32 ram_page, u8 mode);
     void kill_page(u32 ram_page);
+    // A link slot names `to` (null: nothing), kept in to's incoming list.
+    void set_link(Block::Link& slot, Block* to);
+    // Every link into and out of `b` cleared (its translation or its assumptions changed: links are learned under
+    // equal snapshots, and the generated code's chain does not compare them again).
+    void drop_links(Block& b);
+    // `b` is going away: links into and out of it, and its fast-cache entries, cleared.
+    void forget(Block& b);
     void take_device_writes();
     u32 exit_cost(Block& b, u32 entry_eip);
     unsigned run_native(Run& r);

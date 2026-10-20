@@ -125,6 +125,8 @@ Block* BlockEngine::find() {
         if (!b) return nullptr;
         if (!b->lin) b->lin = lin;
         f = FastEntry{lin, mode, epoch_, b};
+        const u32 idx = fast_index(lin, mode);
+        if (std::find(b->fast_slots.begin(), b->fast_slots.end(), idx) == b->fast_slots.end()) b->fast_slots.push_back(idx);
     }
     // The whole block inside the code segment (the step faults at the instruction that leaves it).
     const u32 last = s.eip + b->bytes - 1u;
@@ -201,6 +203,7 @@ void BlockEngine::kill_page(u32 ram_page) {
     auto& list = page_blocks_[ram_page];
     for (Block* b : list) {
         if (b == running_ || (current_ && current_->block == b)) running_dead_ = true;
+        forget(*b);
         const auto it = blocks_.find(key(b->ram_page, b->page_off, b->mode));
         if (it != blocks_.end()) {
             graveyard_.push_back(std::move(it->second));
@@ -210,10 +213,34 @@ void BlockEngine::kill_page(u32 ram_page) {
     }
     list.clear();
     bus_.set_code_page(ram_page, false);
-    ++epoch_;
-    ++link_epoch_;
     pending_slot_ = nullptr;
     ++stats_.pages_written;
+}
+
+void BlockEngine::set_link(Block::Link& slot, Block* to) {
+    if (slot.to == to) return;
+    if (Block* old = slot.to) {
+        auto& in = old->incoming;
+        if (const auto it = std::find(in.begin(), in.end(), &slot); it != in.end()) {
+            *it = in.back();
+            in.pop_back();
+        }
+    }
+    slot.to = to;
+    if (to) to->incoming.push_back(&slot);
+}
+
+void BlockEngine::drop_links(Block& b) {
+    for (Block::Link* s : b.incoming) s->to = nullptr;
+    b.incoming.clear();
+    for (Block::Link& s : b.links) set_link(s, nullptr);
+}
+
+void BlockEngine::forget(Block& b) {
+    drop_links(b);
+    for (u32 i : b.fast_slots)
+        if (fast_[i].block == &b) fast_[i] = FastEntry{};
+    b.fast_slots.clear();
 }
 
 void BlockEngine::code_written(u32 ram_page) { kill_page(ram_page); }
@@ -348,14 +375,14 @@ unsigned BlockEngine::run(Block& b, u64 limit) {
             }
             // Links are only ever learned to blocks with native code, so a first translation leaves every existing link
             // as valid as it was; a translation again (the block's assumptions changed) may not (a flush bumped it).
-            if (++b.jit_compiles > 1) ++link_epoch_;
+            if (++b.jit_compiles > 1) drop_links(b);
         }
         // The last native exit's slot learns where it led, when a chain there could be valid (same snapshot).
         if (pending_slot_) {
             // Only the block the exit itself led to: an interrupt, a fault or a fallback step in between runs another.
             if (b.native && b.jit_eip == r.entry_eip && r.entry_eip == pending_target_ && b.jit_dirty == pending_from_->jit_dirty &&
                 same_segments(b, *pending_from_) && b.jit_eip != idle_[0] && b.jit_eip != idle_[1]) {
-                pending_slot_->to = &b;
+                set_link(*pending_slot_, &b);
                 pending_slot_->epoch = link_epoch_;
             }
             else if (b.native && r.entry_eip != pending_target_) {
@@ -370,7 +397,7 @@ unsigned BlockEngine::run(Block& b, u64 limit) {
             ++stats_.native_ineligible;
             if (b.jit_compiles < 4) b.native = b.entry.body = nullptr;
             else b.jit_failed = true;
-            ++link_epoch_;
+            drop_links(b);
         }
     }
     unsigned i = 0;
@@ -490,6 +517,27 @@ unsigned BlockEngine::run_native(Run& r) {
 // the link names that block's current translation with the same segments. Then its run begins as `begin` would.
 void* BlockEngine::chain(JitCtx& c, Block::Link* slot) {
     Block& a = *c.block;
+    {
+        // Statistics: why the generated code's own chain did not take this exit.
+        const CpuState& s = cpu_.state();
+        const Block* t = slot->to;
+        const u32 lin = s.seg[kCs].base + s.eip;
+        const Memory::TlbEntry& e = cpu_.memory().tlb()[(lin >> 12) & (Memory::kTlbSize - 1)];
+        unsigned why = 7;
+        if (a.branch != BranchKind::None && a.branch != BranchKind::Conditional && a.branch != BranchKind::Direct && a.branch != BranchKind::Call) why = 6;
+        else if (!t || slot->epoch != link_epoch_ || !t->entry.body || t->entry.jit_eip != s.eip) why = 0;
+        else if (c.chain_budget == 0) why = 1;
+        else if (c.base + a.cycles + tp::kBlockMispredict + t->entry.cycles + tp::kL2Latency + tp::kDramLatency >= c.limit) why = 2;
+        else if (bus_.code_writes_pending() || cpu_.memory().penalty_pending()) why = 3;
+        else if (e.tag != (lin >> 12) || e.host != t->entry.host_page) why = 4;
+        else {
+            const u32* mru = cpu_.cache_timing().l1i_mru();
+            const unsigned sets = cpu_.cache_timing().l1i_sets();
+            const u32 l = t->entry.fetch_line;
+            if (t->entry.fetch_lines > 2 || mru[(l - 1) & (sets - 1)] != l || (t->entry.fetch_lines == 2 && mru[l & (sets - 1)] != l + 1)) why = 5;
+        }
+        ++stats_.slow_chain[why];
+    }
     const u32 exit = exit_cost(a, c.entry_eip);
     stats_.schedule_cycles += a.cycles;
     stats_.exit_cycles += exit;
@@ -513,7 +561,7 @@ void* BlockEngine::chain(JitCtx& c, Block::Link* slot) {
             if (n->native && n->jit_eip == s.eip && n->jit_dirty == a.jit_dirty && same_segments(*n, a) && s.eip != idle_[0] && s.eip != idle_[1] &&
                 s.eip + n->bytes - 1u >= s.eip && s.eip + n->bytes - 1u <= s.seg[kCs].limit) {
                 b = n;
-                slot->to = n;
+                set_link(*slot, n);
                 slot->epoch = link_epoch_;
                 ++stats_.relinks;
             }
