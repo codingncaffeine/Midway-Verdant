@@ -258,6 +258,8 @@ bool Machine::init(std::string& error) {
         // The accurate core's runs are deterministic (the oracle compares two of them): the audio processors, whose DMA
         // reads and writes guest RAM, run on the CPU's thread at their frame.
         apu_.run_processors_inline();
+        // The GPU takes console time in the accurate core (PLAN D28); MV_GPU_TIMING=0 is the measurement control.
+        if (const char* g = std::getenv("MV_GPU_TIMING"); !(g && *g == '0') && !nv2a_.fifo_threaded()) nv2a_.set_timed(true);
         // The interpreter: milestones on its own timeline, so their times are deterministic.
         milestone_poll_.name = "milestones";
         milestone_poll_.fire = [this](Cycles now) {

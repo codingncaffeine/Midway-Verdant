@@ -16,6 +16,7 @@ bool PushbufferWalker::deliver(const DmaObject& dma, u32& get) {
             return false;
         }
         get += 4;
+        position_ = get;
         ++methods_;
         --pending_.remaining;
         const u32 method = pending_.method;

@@ -1,5 +1,7 @@
 #include "nv2a/nv2a_stub.h"
 
+#include "nv2a/gpu_timing.h"
+
 #include "nv2a/vulkan/vk_renderer.h"
 
 #include <chrono>
@@ -73,6 +75,20 @@ Nv2aStub::Nv2aStub(Bus& bus, Scheduler& sched, std::function<void(bool)> irq)
         update_irq();
         schedule_vblank();
     };
+    pusher_event_.name = "nv2a.pusher";
+    pusher_event_.fire = [this](Cycles) {
+        auto gpu = lock_gpu();
+        // The GPU clock has reached the observable method the walk stopped at: it runs now, then the walk goes on.
+        if (held_) {
+            const PushbufferMethod m = *held_;
+            held_.reset();
+            charge(m);
+            execute_method(m);
+            walker_.clear_stop();
+            get_marks_.push_back({gpu_clock_, walker_.position()});
+        }
+        run_pusher_inline();
+    };
     alarm_.name = "nv2a.ptimer-alarm";
     alarm_.fire = [this](Cycles) {
         auto gpu = lock_gpu();
@@ -110,6 +126,12 @@ void Nv2aStub::reset() {
     ptimer_offset_ = 0;
     ctx_switch_subchannel_ = 8;
     sched_.cancel(alarm_);
+    sched_.cancel(pusher_event_);
+    held_.reset();
+    get_marks_.clear();
+    get_visible_ = 0;
+    gpu_clock_ = 0;
+    methods_since_mark_ = 0;
     kelvin_ = pgraph::Kelvin();
     kelvin_.set_sink(renderer_);
     kelvin_.set_vertex_memory(this, {bus_.ram(), static_cast<u32>(bus_.ram_size())});
@@ -282,7 +304,69 @@ void Nv2aStub::set_renderer(pgraph::VulkanRenderer* renderer) {
     kelvin_.set_sink(renderer);
 }
 
+// Methods whose effect the CPU can see: they wait for the GPU clock in the timed pusher.
+bool Nv2aStub::observable(const PushbufferMethod& m) const {
+    if (m.method == 0x0050 || m.method == 0x0104 || m.method == kMethodNoOperation) return m.method != kMethodNoOperation || m.value != 0;
+    const u32 cls = bound_[m.subchannel];
+    if (cls == kClassPattern && m.method == kMethodPatternColor0) return true;
+    if (cls == 0x97) {
+        switch (m.method) {
+            case 0x012C: case 0x0130: case 0x0120: case 0x0124: case 0x17D0: case 0x1D70: return true;  // flips, reports, semaphore
+            default: return false;
+        }
+    }
+    return false;
+}
+
+// What a method costs the GPU (gpu_timing.h): the front end, and for Kelvin's draws and clears their work.
+u64 Nv2aStub::method_clocks(const PushbufferMethod& m) const {
+    u64 c = gpu_timing::kMethodClocks;
+    if (renderer_ && bound_[m.subchannel] == 0x97) {
+        if (m.method == pgraph::mthd::kBeginEnd && m.value == 0 && kelvin_.in_begin()) c += gpu_timing::draw_clocks(kelvin_.state(), kelvin_.batch());
+        else if (m.method == pgraph::mthd::kClearSurface) c += gpu_timing::clear_clocks(kelvin_.state());
+    }
+    return c;
+}
+
+void Nv2aStub::charge(const PushbufferMethod& m) {
+    gpu_clock_ += method_clocks(m);
+    if (++methods_since_mark_ >= 32) {
+        methods_since_mark_ = 0;
+        get_marks_.push_back({gpu_clock_, walker_.position()});
+    }
+}
+
+bool Nv2aStub::gpu_busy() const { return held_ || gpu_timing::cycles_from_gpu(gpu_clock_) > sched_.now(); }
+
+// GET as the guest sees it in the timed pusher: the position the GPU had reached at the guest's present.
+u32 Nv2aStub::visible_get() {
+    const Cycles now = sched_.now();
+    while (!get_marks_.empty() && gpu_timing::cycles_from_gpu(get_marks_.front().clock) <= now) {
+        get_visible_ = get_marks_.front().get;
+        get_marks_.pop_front();
+    }
+    if (get_marks_.empty() && !held_) get_visible_ = reg(kCache1DmaGet);
+    return get_visible_;
+}
+
 void Nv2aStub::on_method(const PushbufferMethod& m) {
+    if (timed_) {
+        // An observable method the GPU clock has not reached: the walk stops here and an event runs it at its time.
+        const Cycles start = gpu_timing::cycles_from_gpu(gpu_clock_);
+        if (observable(m) && start > sched_.now()) {
+            held_ = m;
+            walker_.request_stop();
+            get_marks_.push_back({gpu_clock_, walker_.position() - 4});  // GET stands at this method until it runs
+            sched_.cancel(pusher_event_);
+            sched_.schedule(pusher_event_, start);
+            return;
+        }
+        charge(m);
+    }
+    execute_method(m);
+}
+
+void Nv2aStub::execute_method(const PushbufferMethod& m) {
     // On the FIFO thread the walk stops every few methods to let a waiting register access in (the rest of the header
     // follows on the next chunk).
     if (fifo_threaded_ && ++chunk_methods_ >= kChunkMethods) walker_.request_stop();
@@ -512,6 +596,8 @@ void Nv2aStub::run_pusher() {
 }
 
 void Nv2aStub::run_pusher_inline() {
+    // Timed: an observable method waits for the GPU clock; its event goes on with the walk (a kick meanwhile only moved PUT).
+    if (timed_ && held_) return;
     chunk_methods_ = 0;
     const u32 get_before = reg(kCache1DmaGet);
     const u64 methods_before = walker_.methods_seen();
@@ -532,8 +618,10 @@ void Nv2aStub::run_pusher_inline() {
     collect_writes();
     if (capture_) capture_->run(sched_.now(), get, put);
     sync_point(kSyncNextRun);  // a run still open: the next one would queue behind it
+    if (timed_) gpu_clock_ = std::max(gpu_clock_, gpu_timing::gpu_from_cycles(sched_.now()));  // an idle GPU starts now
     const auto t0 = std::chrono::steady_clock::now();
     get = walker_.run(dma, get, put);
+    if (timed_) get_marks_.push_back({gpu_clock_, get});
     const auto t1 = std::chrono::steady_clock::now();
     last_run_ns_ = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
     pusher_wall_ns_ += last_run_ns_;
@@ -591,7 +679,9 @@ u32 Nv2aStub::mmio_read(PhysAddr addr, unsigned size) {
         case kPcrtcRaster: word = raster_line(); break;
         case kPfbCstatus: word = static_cast<u32>(bus_.ram_size()); break;  // the RAM size in bytes
         case kUser + 0x40: word = reg(kCache1DmaPut); break;
-        case kUser + 0x44: word = reg(kCache1DmaGet); break;
+        case kUser + 0x44: word = timed_ ? visible_get() : reg(kCache1DmaGet); break;
+        case kCache1DmaGet: word = timed_ ? visible_get() : reg(kCache1DmaGet); break;
+        case kPgraphStatus: word = (timed_ && gpu_busy()) ? (reg(key) | 1u) : reg(key); break;  // bit 0: the engine is busy
         case kUser + 0x48: word = reg(kCache1Ref); break;
         case kCache1DmaCtl: word = reg(key) | (1u << 31); break;  // the pushbuffer translation is always valid
         case kPramdacPllTestCounter: word = reg(key) | kPllLocked; break;  // the PLLs lock at once

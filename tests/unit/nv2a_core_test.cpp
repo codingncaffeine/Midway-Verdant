@@ -6,6 +6,7 @@
 #include "core/bus.h"
 #include "core/clock.h"
 #include "core/scheduler.h"
+#include "nv2a/gpu_timing.h"
 #include "nv2a/nv2a_stub.h"
 #include "nv2a/scanout.h"
 
@@ -227,4 +228,53 @@ TEST(Nv2aFence, ThePatternColourMethodIsReadBackFromPgraph) {
     c.method(Nv2aStub::kMethodPatternColor0, 0x12345678);
     c.kick();
     EXPECT_EQ(c.gpu.mmio_read(Nv2aStub::kPgraphPattColor0, 4), 0x5EED0001u);
+}
+
+// The timed pusher (PLAN D28): 1000 methods nobody can observe, then SET_REFERENCE and a semaphore release. Timed, the
+// kick changes nothing the CPU can see; the engine reads busy and GET trails; the reference lands exactly when the GPU
+// clock reaches it (not a cycle before), the semaphore one method later, then the engine is idle with GET at PUT.
+// Untimed (the fast mode), both land at the kick.
+TEST(Nv2aTiming, ObservableMethodsLandWhenTheGpuClockReachesThem) {
+    for (const bool timed : {false, true}) {
+        SCOPED_TRACE(timed ? "timed" : "untimed");
+        Channel c;
+        c.gpu.set_timed(timed);
+        const u64 clocks_before = c.gpu.gpu_clocks();
+        for (int i = 0; i < 1000; ++i) c.method(Nv2aStub::kMethodNoOperation, 0);
+        c.method(0x0050, 0x77);              // SET_REFERENCE
+        c.method(0x1D70, 0xCAFE0001);        // BACK_END_WRITE_SEMAPHORE_RELEASE
+        c.kick();
+        const u32 put = c.gpu.reg(Nv2aStub::kCache1DmaPut);
+        auto semaphore = [&] {
+            u32 v = 0;
+            c.bus.read_ram(Channel::kSemaphore, &v, 4);
+            return v;
+        };
+        if (!timed) {
+            EXPECT_EQ(c.gpu.mmio_read(Nv2aStub::kUser + 0x48, 4), 0x77u);
+            EXPECT_EQ(semaphore(), 0xCAFE0001u);
+            EXPECT_EQ(c.gpu.mmio_read(Nv2aStub::kPgraphStatus, 4) & 1u, 0u);
+            continue;
+        }
+        EXPECT_NE(c.gpu.mmio_read(Nv2aStub::kUser + 0x48, 4), 0x77u) << "the reference waits for the GPU";
+        EXPECT_NE(semaphore(), 0xCAFE0001u);
+        EXPECT_EQ(c.gpu.mmio_read(Nv2aStub::kPgraphStatus, 4) & 1u, 1u) << "busy";
+        EXPECT_LT(c.gpu.mmio_read(Nv2aStub::kUser + 0x44, 4), put) << "GET trails";
+        // The reference's time: the GPU clock after the 1000 methods (each one clock), from the clock at the kick.
+        const Cycles at = gpu_timing::cycles_from_gpu(clocks_before + 1000);
+        c.sched.advance_to(at - 1);
+        EXPECT_NE(c.gpu.mmio_read(Nv2aStub::kUser + 0x48, 4), 0x77u) << "not a cycle early";
+        const u32 get_mid = c.gpu.mmio_read(Nv2aStub::kUser + 0x44, 4);
+        EXPECT_GT(get_mid, Channel::kPushbuffer) << "GET has moved with the GPU clock";
+        EXPECT_LT(get_mid, put);
+        c.sched.advance_to(at);
+        EXPECT_EQ(c.gpu.mmio_read(Nv2aStub::kUser + 0x48, 4), 0x77u) << "on time";
+        EXPECT_NE(semaphore(), 0xCAFE0001u) << "the semaphore is one method later";
+        const Cycles sem_at = gpu_timing::cycles_from_gpu(clocks_before + 1001);
+        c.sched.advance_to(sem_at);
+        EXPECT_EQ(semaphore(), 0xCAFE0001u);
+        c.sched.advance_to(gpu_timing::cycles_from_gpu(clocks_before + 1002));
+        EXPECT_EQ(c.gpu.mmio_read(Nv2aStub::kPgraphStatus, 4) & 1u, 0u) << "idle";
+        EXPECT_EQ(c.gpu.mmio_read(Nv2aStub::kUser + 0x44, 4), put);
+    }
 }

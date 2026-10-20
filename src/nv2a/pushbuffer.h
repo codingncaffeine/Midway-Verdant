@@ -41,7 +41,11 @@ public:
     // A sink may ask the walk to stop right after the method it was handed (the engine trapped on it); the
     // rest of that header's methods are delivered when the walk resumes.
     void request_stop() { stop_requested_ = true; }
+    // A method executed outside a walk (the timed pusher's held method) may ask for a stop the next walk must not see.
+    void clear_stop() { stop_requested_ = false; }
     bool mid_header() const { return pending_.remaining != 0; }
+    // While a sink runs: the offset just past the data word it was handed (where GET stands once that method is done).
+    u32 position() const { return position_; }
 
     u64 methods_seen() const { return methods_; }
     u64 words_fetched() const { return words_; }
@@ -59,6 +63,7 @@ private:
     bool error_{false};
     std::string last_error_;
     bool stop_requested_{false};
+    u32 position_{0};
     struct PendingHeader {
         u32 remaining{0}, method{0}, subchannel{0}, header_at{0};
         bool increasing{false};

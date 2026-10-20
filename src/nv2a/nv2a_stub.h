@@ -4,6 +4,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <deque>
 #include <mutex>
 #include <thread>
 #include <memory>
@@ -107,6 +108,15 @@ public:
     void start_fifo_thread(std::function<void()> request);
     void stop_fifo_thread();
     bool fifo_threaded() const { return fifo_threaded_; }
+    // The accurate core's timed pusher (PLAN D28): GPU work takes console time. Methods the guest cannot observe are
+    // walked ahead (their drawing recorded at once) while the GPU clock is charged for them; a method it can observe
+    // (a semaphore, a notify, a report, the flip indices and stall, a software method, SET_REFERENCE, the pattern
+    // fence) waits until the GPU clock reaches it and runs from an event at that time; GET reports the position the GPU
+    // has reached in the guest's present, PGRAPH_STATUS reads busy while the GPU clock is ahead. Deterministic: the
+    // costs come from the method stream (gpu_timing.h). Off: the pusher takes no time (the fast mode, MV_GPU_TIMING=0).
+    void set_timed(bool on) { timed_ = on; }
+    bool timed() const { return timed_; }
+    u64 gpu_clocks() const { return gpu_clock_; }  // instrument: GPU clocks charged so far
     bool fifo_busy_now() const { return fifo_busy_.load(std::memory_order_relaxed); }  // instrument: the FIFO thread has work in hand
     void service();
     // Until the pusher has nothing left it can run (a halted CPU calls it before it skips guest time).
@@ -198,6 +208,12 @@ private:
     // Guest time as the GPU sees it: the scheduler's on the machine's threads, the last register access's on the FIFO thread.
     Cycles gpu_now() const;
     void on_method(const PushbufferMethod& m);
+    void execute_method(const PushbufferMethod& m);
+    bool observable(const PushbufferMethod& m) const;
+    u64 method_clocks(const PushbufferMethod& m) const;
+    void charge(const PushbufferMethod& m);
+    u32 visible_get();
+    bool gpu_busy() const;
 
     void capture_object(u32 handle);
 
@@ -222,6 +238,19 @@ private:
     bool irq_level_{false};
     TimerEvent vblank_;
     TimerEvent alarm_;  // PTIMER ALARM_0: the next time TIME_0 reaches the alarm's bits 31:5
+    // The timed pusher: the GPU clock (NVPLL clocks), the observable method waiting for it and the event that runs it,
+    // and GET as it stood at points of the GPU clock (every few methods and at each stop) for reads in the present.
+    bool timed_{false};
+    u64 gpu_clock_{0};
+    std::optional<PushbufferMethod> held_;
+    TimerEvent pusher_event_;
+    struct GetMark {
+        u64 clock;
+        u32 get;
+    };
+    std::deque<GetMark> get_marks_;
+    u32 get_visible_{0};
+    u32 methods_since_mark_{0};
     u64 ptimer_offset_{0};  // what software's TIME_0/TIME_1 writes added to the counter, in ticks
     u32 ctx_switch_subchannel_{8};
     std::function<void(Cycles)> vblank_hook_;
