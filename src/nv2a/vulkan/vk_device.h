@@ -42,6 +42,8 @@ public:
     // the MV_VK_VALIDATE environment variable.
     bool init(std::string& error, bool software = false);
     bool ready() const { return device_ != VK_NULL_HANDLE; }
+    // Exact occlusion counts, enabled when the device has them.
+    bool occlusion_precise() const { return occlusion_precise_; }
 
     const Functions& fn() const { return fn_; }
     VkDevice device() const { return device_; }
@@ -71,6 +73,7 @@ private:
     VkInstance instance_{VK_NULL_HANDLE};
     VkPhysicalDevice physical_{VK_NULL_HANDLE};
     VkDevice device_{VK_NULL_HANDLE};
+    bool occlusion_precise_{false};
     VkQueue queue_{VK_NULL_HANDLE};
     u32 queue_family_{0};
     VkCommandPool pool_{VK_NULL_HANDLE};

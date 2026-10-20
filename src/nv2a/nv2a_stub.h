@@ -73,6 +73,8 @@ public:
     // The pattern class's SET_MONOCHROME_COLOR0 lands in PGRAPH PATT_COLOR0, which software reads back: Direct3D pushes
     // a value through it and polls the register to know the engine has reached that point.
     static constexpr u32 kClassPattern = 0x44, kMethodPatternColor0 = 0x0310, kPgraphPattColor0 = 0x400B10;
+    static constexpr u32 kMethodClearReport = 0x17C8, kMethodZpassEnable = 0x17CC;  // Kelvin: CLEAR_REPORT_VALUE, SET_ZPASS_PIXEL_COUNT_ENABLE
+    static constexpr u32 kMethodZminMaxControl = 0x1D78;  // Kelvin: SET_ZMIN_MAX_CONTROL
     // Two 3D-class methods whose values software reads back from the engine's register file: the kernel passes a
     // software method's arguments through them (a register offset or a flip address, and a value) [verify the
     // register names against the public listing].
@@ -117,6 +119,10 @@ public:
     void set_timed(bool on) { timed_ = on; }
     bool timed() const { return timed_; }
     u64 gpu_clocks() const { return gpu_clock_; }  // instrument: GPU clocks charged so far
+    // Stage B instruments: pixels counted, the clocks they cost, and how often the GPU's counts had to be waited for.
+    u64 timed_pixels() const { return timed_pixels_; }
+    u64 pixel_clocks() const { return pixel_clocks_; }
+    u64 pixel_resolves() const { return pixel_resolves_; }
     bool fifo_busy_now() const { return fifo_busy_.load(std::memory_order_relaxed); }  // instrument: the FIFO thread has work in hand
     void service();
     // Until the pusher has nothing left it can run (a halted CPU calls it before it skips guest time).
@@ -213,7 +219,10 @@ private:
     u64 method_clocks(const PushbufferMethod& m) const;
     void charge(const PushbufferMethod& m);
     u32 visible_get();
-    bool gpu_busy() const;
+    bool gpu_busy();
+    void push_mark(u64 clock, u32 get);
+    void resolve_pixels();
+    static bool debug_zpass();
 
     void capture_object(u32 handle);
 
@@ -247,8 +256,21 @@ private:
     struct GetMark {
         u64 clock;
         u32 get;
+        u64 index;  // marks_pushed_ when it was pushed
     };
     std::deque<GetMark> get_marks_;
+    u64 marks_pushed_{0};
+    // Draws whose pixels the host GPU has not reported yet (stage B): their clocks join the GPU clock, and move every
+    // mark pushed after them, when something the CPU can see needs the exact time.
+    struct PendingDraw {
+        u64 ticket;      // 0: CLEAR_REPORT_VALUE (the z-pass count restarts here, in stream order)
+        u64 passes;
+        u64 mark_index;
+        bool zpass;      // SET_ZPASS_PIXEL_COUNT_ENABLE was on: its passed samples count
+    };
+    u64 zpass_count_{0};  // samples passed since CLEAR_REPORT_VALUE, for GET_REPORT (timed, with a renderer)
+    std::deque<PendingDraw> pending_draws_;
+    u64 timed_pixels_{0}, pixel_clocks_{0}, pixel_resolves_{0};
     u32 get_visible_{0};
     u32 methods_since_mark_{0};
     u64 ptimer_offset_{0};  // what software's TIME_0/TIME_1 writes added to the counter, in ticks

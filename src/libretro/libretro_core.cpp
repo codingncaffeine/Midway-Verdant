@@ -359,6 +359,12 @@ RETRO_API void retro_unload_game(void) {
         log(RETRO_LOG_INFO, "retro_run: the CPU held at each vblank for the picture: noticed after %.3f ms (max %.1f), grabbed in %.3f ms (means)",
             frames_run ? hold_wake_ms_sum / static_cast<double>(frames_run) : 0.0, hold_wake_ms_max, frames_run ? hold_grab_ms_sum / static_cast<double>(frames_run) : 0.0);
         log(RETRO_LOG_INFO, "gpu: busiest register reads:%s", machine->nv2a().busiest_reads(6).c_str());
+        if (machine->nv2a().timed())
+            log(RETRO_LOG_INFO, "gpu timing: %.3f s of GPU time for %.3f s of console time; %llu pixels drawn costing %.3f s; their counts waited for %llu times; %llu z-pass reports",
+                static_cast<double>(machine->nv2a().gpu_clocks()) / (static_cast<double>(mv::clk::kGpuHzNum) / mv::clk::kGpuHzDen),
+                static_cast<double>(mv::ns_from_cycles(machine->scheduler().now())) / 1e9, static_cast<unsigned long long>(machine->nv2a().timed_pixels()),
+                static_cast<double>(machine->nv2a().pixel_clocks()) / (static_cast<double>(mv::clk::kGpuHzNum) / mv::clk::kGpuHzDen),
+                static_cast<unsigned long long>(machine->nv2a().pixel_resolves()), static_cast<unsigned long long>(machine->nv2a().reports()));
         log(RETRO_LOG_INFO, "gpu: %s; %s", machine->nv2a().harvest_report().c_str(), machine->cpu()->selective_tracking() ? "only the pages under textures watched" : "every page logged");
         if (machine->nv2a().fifo_threaded()) log(RETRO_LOG_INFO, "gpu: register reads while the FIFO thread had work:%s", machine->nv2a().busiest_reads(10, true).c_str());
         log(RETRO_LOG_INFO, "gpu: a FIFO thread could have run %.3f s of the pusher's %.3f s alongside the guest (%llu points where the guest needed its result)",

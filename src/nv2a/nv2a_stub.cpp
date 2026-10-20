@@ -80,12 +80,18 @@ Nv2aStub::Nv2aStub(Bus& bus, Scheduler& sched, std::function<void(bool)> irq)
         auto gpu = lock_gpu();
         // The GPU clock has reached the observable method the walk stopped at: it runs now, then the walk goes on.
         if (held_) {
+            // The draws before it may have pixels not yet counted: with them, its time may lie further on.
+            if (!pending_draws_.empty()) resolve_pixels();
+            if (const Cycles start = gpu_timing::cycles_from_gpu(gpu_clock_); start > sched_.now()) {
+                sched_.schedule(pusher_event_, start);
+                return;
+            }
             const PushbufferMethod m = *held_;
             held_.reset();
             charge(m);
             execute_method(m);
             walker_.clear_stop();
-            get_marks_.push_back({gpu_clock_, walker_.position()});
+            push_mark(gpu_clock_, walker_.position());
         }
         run_pusher_inline();
     };
@@ -132,6 +138,9 @@ void Nv2aStub::reset() {
     get_visible_ = 0;
     gpu_clock_ = 0;
     methods_since_mark_ = 0;
+    marks_pushed_ = 0;
+    pending_draws_.clear();
+    zpass_count_ = 0;
     kelvin_ = pgraph::Kelvin();
     kelvin_.set_sink(renderer_);
     kelvin_.set_vertex_memory(this, {bus_.ram(), static_cast<u32>(bus_.ram_size())});
@@ -168,9 +177,12 @@ void Nv2aStub::advance_flip_field(unsigned shift) {
 }
 
 // GET_REPORT: a 16-byte report at the report DMA object + the offset in bits 23:0 — the PTIMER time, the count, and a
-// status word of zero (done). The count is the z-pass pixel count since CLEAR_REPORT_VALUE; the renderer has no
-// occlusion queries yet, so a report says every pixel of the screen passed (a visibility test finds its object
-// visible) instead of leaving the report unwritten, which a title polling for it waits on forever.
+// status word of zero (done). The count is the z-pass sample count since CLEAR_REPORT_VALUE. A report says every pixel
+// of the screen passed, so a visibility test finds its object visible instead of a title polling for an unwritten
+// report for ever. MV_ZPASS_REPORTS=1 (accurate core with a renderer) writes the renderer's occlusion counts instead
+// (every draw before the report is counted by then: it waits for the GPU clock); not the default yet: Halo's flare
+// tests (a 4-vertex fan, depth LEQUAL, writes off, z cull mode) pass no sample in our renderer even with the depth
+// test and culling off, so every flare vanished (session 18; the transformed vertices are the next thing to look at).
 void Nv2aStub::write_report(u32 parameter) {
     const auto dma = dma_object(lookup_handle(report_handle_) & 0xFFFFu);
     const u32 offset = parameter & 0x00FFFFFFu;
@@ -181,8 +193,14 @@ void Nv2aStub::write_report(u32 parameter) {
     u8 report[16]{};
     const u64 t = ptimer_ticks();
     for (int i = 0; i < 8; ++i) report[i] = static_cast<u8>(t >> (8 * i));
-    const u32 count = (scanout_programmed() ? scanout_width() * scanout_height() : 640u * 480u);
+    static const bool real_counts = [] {
+        const char* z = std::getenv("MV_ZPASS_REPORTS");
+        return z && *z == '1';
+    }();
+    const u32 count = (real_counts && timed_ && renderer_) ? static_cast<u32>(std::min<u64>(zpass_count_, 0xFFFFFFFFu))
+                                            : (scanout_programmed() ? scanout_width() * scanout_height() : 640u * 480u);
     for (int i = 0; i < 4; ++i) report[8 + i] = static_cast<u8>(count >> (8 * i));
+    if (debug_zpass()) std::fprintf(stderr, "zpass: GET_REPORT %08x -> %u\n", parameter, count);
     bus_.write_ram(dma.base + offset, report, 16);
     ++reports_;
 }
@@ -304,6 +322,15 @@ void Nv2aStub::set_renderer(pgraph::VulkanRenderer* renderer) {
     kelvin_.set_sink(renderer);
 }
 
+// Instrument: MV_DEBUG_ZPASS=1 prints the z-pass methods, each counted draw's samples and every report to stderr.
+bool Nv2aStub::debug_zpass() {
+    static const bool on = [] {
+        const char* z = std::getenv("MV_DEBUG_ZPASS");
+        return z && *z == '1';
+    }();
+    return on;
+}
+
 // Methods whose effect the CPU can see: they wait for the GPU clock in the timed pusher.
 bool Nv2aStub::observable(const PushbufferMethod& m) const {
     if (m.method == 0x0050 || m.method == 0x0104 || m.method == kMethodNoOperation) return m.method != kMethodNoOperation || m.value != 0;
@@ -332,15 +359,57 @@ void Nv2aStub::charge(const PushbufferMethod& m) {
     gpu_clock_ += method_clocks(m);
     if (++methods_since_mark_ >= 32) {
         methods_since_mark_ = 0;
-        get_marks_.push_back({gpu_clock_, walker_.position()});
+        push_mark(gpu_clock_, walker_.position());
     }
 }
 
-bool Nv2aStub::gpu_busy() const { return held_ || gpu_timing::cycles_from_gpu(gpu_clock_) > sched_.now(); }
+bool Nv2aStub::gpu_busy() {
+    if (held_ || gpu_timing::cycles_from_gpu(gpu_clock_) > sched_.now()) return true;
+    if (pending_draws_.empty()) return false;
+    resolve_pixels();  // idle without the pixels: they decide
+    return gpu_timing::cycles_from_gpu(gpu_clock_) > sched_.now();
+}
+
+void Nv2aStub::push_mark(u64 clock, u32 get) { get_marks_.push_back({clock, get, marks_pushed_++}); }
+
+// The pending draws' pixels from the renderer (it waits for the GPU only for counts not yet in): the GPU clock and
+// every mark pushed after each draw move on by what that draw's pixels took.
+void Nv2aStub::resolve_pixels() {
+    ++pixel_resolves_;
+    u64 delta = 0;
+    auto mk = get_marks_.begin();
+    for (const PendingDraw& d : pending_draws_) {
+        for (; mk != get_marks_.end() && mk->index < d.mark_index; ++mk) mk->clock += delta;
+        if (d.ticket == 0) {
+            zpass_count_ = 0;
+            continue;
+        }
+        const auto counts = renderer_ ? renderer_->draw_counts(d.ticket) : pgraph::VulkanRenderer::DrawCounts{};
+        if (d.zpass) zpass_count_ += counts.samples;
+        if (debug_zpass()) std::fprintf(stderr, "zpass: draw %llu samples %llu pixels %llu%s\n", static_cast<unsigned long long>(d.ticket),
+                                        static_cast<unsigned long long>(counts.samples), static_cast<unsigned long long>(counts.fragments), d.zpass ? " counted" : "");
+        const u64 c = gpu_timing::pixel_clocks(counts.fragments, d.passes);
+        delta += c;
+        timed_pixels_ += counts.fragments;
+        pixel_clocks_ += c;
+    }
+    for (; mk != get_marks_.end(); ++mk) mk->clock += delta;
+    gpu_clock_ += delta;
+    pending_draws_.clear();
+}
 
 // GET as the guest sees it in the timed pusher: the position the GPU had reached at the guest's present.
 u32 Nv2aStub::visible_get() {
     const Cycles now = sched_.now();
+    // A mark after a draw whose pixels are not counted may move on: count them before trusting one in the present.
+    if (!pending_draws_.empty()) {
+        const u64 first = pending_draws_.front().mark_index;
+        for (const GetMark& mk : get_marks_)
+            if (mk.index >= first) {
+                if (gpu_timing::cycles_from_gpu(mk.clock) <= now) resolve_pixels();
+                break;
+            }
+    }
     while (!get_marks_.empty() && gpu_timing::cycles_from_gpu(get_marks_.front().clock) <= now) {
         get_visible_ = get_marks_.front().get;
         get_marks_.pop_front();
@@ -352,11 +421,16 @@ u32 Nv2aStub::visible_get() {
 void Nv2aStub::on_method(const PushbufferMethod& m) {
     if (timed_) {
         // An observable method the GPU clock has not reached: the walk stops here and an event runs it at its time.
-        const Cycles start = gpu_timing::cycles_from_gpu(gpu_clock_);
+        Cycles start = gpu_timing::cycles_from_gpu(gpu_clock_);
+        // Observable and reached without the pending draws' pixels: with them it may not be reached yet.
+        if (observable(m) && start <= sched_.now() && !pending_draws_.empty()) {
+            resolve_pixels();
+            start = gpu_timing::cycles_from_gpu(gpu_clock_);
+        }
         if (observable(m) && start > sched_.now()) {
             held_ = m;
             walker_.request_stop();
-            get_marks_.push_back({gpu_clock_, walker_.position() - 4});  // GET stands at this method until it runs
+            push_mark(gpu_clock_, walker_.position() - 4);  // GET stands at this method until it runs
             sched_.cancel(pusher_event_);
             sched_.schedule(pusher_event_, start);
             return;
@@ -448,7 +522,31 @@ void Nv2aStub::execute_method(const PushbufferMethod& m) {
     // The live GPU: every Kelvin method goes through the state machine to the renderer; the semaphore release is
     // the frame marker, so the frame is rendered and written back to RAM before the CPU can see the semaphore.
     if (renderer_ && bound_[m.subchannel] == 0x97) {
+        const bool draw_end = timed_ && m.method == pgraph::mthd::kBeginEnd && m.value == 0 && kelvin_.in_begin();
+        const u64 passes = draw_end ? gpu_timing::pixel_passes(kelvin_.state()) : 0;
+        const u64 ticket_before = renderer_->last_draw_ticket();
+        const unsigned debug_primitive = draw_end ? static_cast<unsigned>(kelvin_.batch().primitive) : 0u;
+        const u64 debug_vertices = draw_end && debug_zpass() ? gpu_timing::vertex_count(kelvin_.state(), kelvin_.batch()) : 0;
         kelvin_.method(m.method, m.value);
+        // A draw the renderer counted: its pixels join the GPU clock when they are needed (stage B).
+        if (draw_end) {
+            const u64 ticket = renderer_->last_draw_ticket();
+            if (ticket && ticket != ticket_before)
+                pending_draws_.push_back({ticket, passes, marks_pushed_, (kelvin_.state().reg(kMethodZpassEnable) & 1u) != 0});
+            if (debug_zpass() && (kelvin_.state().reg(kMethodZpassEnable) & 1u)) {
+                const auto& st = kelvin_.state();
+                std::fprintf(stderr, "zpass: counted draw ticket %llu (before %llu): primitive %u, %llu vertices, depth test %u func %04x write %u, stencil %u, colour mask %08x, cull %u face %04x, program mode %u, clip %08x %08x, zmin/max control %08x\n",
+                             static_cast<unsigned long long>(ticket), static_cast<unsigned long long>(ticket_before), debug_primitive,
+                             static_cast<unsigned long long>(debug_vertices), st.depth_test() ? 1u : 0u, st.reg(pgraph::mthd::kDepthFunc), st.depth_write() ? 1u : 0u,
+                             st.stencil_test() ? 1u : 0u, st.color_mask(), st.cull_face() ? 1u : 0u, st.reg(pgraph::mthd::kCullFace), st.transform_mode(),
+                             st.reg(pgraph::mthd::kSurfaceClipH), st.reg(pgraph::mthd::kSurfaceClipV), st.reg(kMethodZminMaxControl));
+            }
+        }
+        if (debug_zpass() && (m.method == kMethodClearReport || m.method == kMethodZpassEnable)) std::fprintf(stderr, "zpass: method %04x <- %08x\n", m.method, m.value);
+        if (timed_ && m.method == kMethodClearReport && m.value == 1) {
+            if (pending_draws_.empty()) zpass_count_ = 0;
+            else pending_draws_.push_back({0, 0, marks_pushed_, false});
+        }
         if (m.method == 0x1D70) {
             renderer_->flush_frame();
             ++rendered_frames_;
@@ -621,7 +719,7 @@ void Nv2aStub::run_pusher_inline() {
     if (timed_) gpu_clock_ = std::max(gpu_clock_, gpu_timing::gpu_from_cycles(sched_.now()));  // an idle GPU starts now
     const auto t0 = std::chrono::steady_clock::now();
     get = walker_.run(dma, get, put);
-    if (timed_) get_marks_.push_back({gpu_clock_, get});
+    if (timed_) push_mark(gpu_clock_, get);
     const auto t1 = std::chrono::steady_clock::now();
     last_run_ns_ = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
     pusher_wall_ns_ += last_run_ns_;

@@ -36,6 +36,17 @@ public:
     // The live machine's frame boundary: submit the work without waiting for it, and leave the surfaces on the
     // device — they reach RAM when a texture samples them, and the scanout one at vblank (write_back_at).
     void flush_frame();
+    // Draw counting (the timed pusher's pixels, PLAN D28 stage B): every draw is wrapped in an occlusion query (the
+    // samples that passed, exact by the Vulkan definition: the core stays deterministic); the last
+    // draw's ticket (0: it drew nothing) is read after the draw, and draw_counts gives its counts in the target's
+    // logical pixels (divided by its anti-aliasing scale), submitting and waiting for the GPU only if they are not in.
+    void set_count_draws(bool on) { count_draws_ = on; }
+    u64 last_draw_ticket() const { return last_ticket_; }
+    struct DrawCounts {
+        u64 fragments{0};  // pixels written: the passed samples in the target's logical pixels
+        u64 samples{0};    // samples that passed the depth and stencil tests, at the stored (anti-aliased) size
+    };
+    DrawCounts draw_counts(u64 ticket);
     bool write_back_at(u32 phys);
     // Every render target overlapping [phys, phys + len) reaches RAM (colour and depth): the 2D engine reads there.
     void write_back_range(u32 phys, u32 len);
@@ -277,7 +288,19 @@ private:
         std::vector<vk::Image> dead_images;
         std::vector<VkImageView> dead_views;
         std::vector<VkFramebuffer> dead_framebuffers;
+        // Draw counting: the queries this frame used, the ticket of its first, each draw's anti-aliasing scale, and
+        // whether its results have been read (they are, before the pools are reset for the frame's next use).
+        VkQueryPool occlusion{VK_NULL_HANDLE};
+        u32 queries{0};
+        u64 first_ticket{1};
+        std::vector<u32> aa_scale;
+        bool harvested{true};
     };
+    static constexpr u32 kQueriesPerFrame = 4096;
+    bool count_draws_{false};
+    u64 next_ticket_{1}, last_ticket_{0};
+    std::unordered_map<u64, DrawCounts> counts_;
+    void harvest(Frame& fr);
     std::array<Frame, kFramesInFlight> frames_{};
     u32 slot_{0};                       // the recording frame
     u64 submitted_{0}, completed_{0};  // submissions made, and the last one known to have finished

@@ -95,6 +95,12 @@ namespace mv::vk {
     X(vkCmdBindIndexBuffer)         \
     X(vkCmdDraw)                    \
     X(vkCmdDrawIndexed)             \
+    X(vkCreateQueryPool)            \
+    X(vkDestroyQueryPool)           \
+    X(vkCmdResetQueryPool)          \
+    X(vkCmdBeginQuery)              \
+    X(vkCmdEndQuery)                \
+    X(vkGetQueryPoolResults)        \
     X(vkCmdSetViewport)             \
     X(vkCmdSetScissor)              \
     X(vkCmdClearAttachments)        \

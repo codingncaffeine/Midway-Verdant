@@ -94,6 +94,8 @@ bool Device::init(std::string& error, bool software) {
     features.samplerAnisotropy = available.samplerAnisotropy;
     features.independentBlend = available.independentBlend;
     features.largePoints = available.largePoints;
+    features.occlusionQueryPrecise = available.occlusionQueryPrecise;
+    occlusion_precise_ = available.occlusionQueryPrecise;
     VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
     dci.queueCreateInfoCount = 1;
     dci.pQueueCreateInfos = &qci;

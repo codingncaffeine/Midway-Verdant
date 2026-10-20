@@ -27,6 +27,11 @@ u64 program_length(const pgraph::KelvinState& state);
 u64 draw_clocks(const pgraph::KelvinState& state, const pgraph::DrawBatch& batch);
 // CLEAR_SURFACE: the clip rectangle's pixels at four a clock.
 u64 clear_clocks(const pgraph::KelvinState& state);
+// Stage B, the pixels of a draw: the passes a pixel takes through its pipeline (two texture units a pass; two
+// combiner stages a pass [estimate]), and the clocks for `pixels` of them at four pipelines.
+inline constexpr u64 kTexturesPerPass = 2, kCombinerStagesPerPass = 2;
+u64 pixel_passes(const pgraph::KelvinState& state);
+inline u64 pixel_clocks(u64 pixels, u64 passes) { return (pixels * passes + kPixelsPerClock - 1) / kPixelsPerClock; }
 
 // GPU clocks and CPU cycles: exactly 7 GPU clocks per 22 CPU cycles (233.33 and 733.33 MHz).
 inline Cycles cycles_from_gpu(u64 gpu_clocks) { return muldiv64_ceil(gpu_clocks, clk::kCpuHzNum, clk::kGpuHzNum); }

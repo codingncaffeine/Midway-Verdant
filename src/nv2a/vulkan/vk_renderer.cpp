@@ -224,6 +224,7 @@ VulkanRenderer::~VulkanRenderer() {
     for (Frame& fr : frames_) {
         if (fr.pool) f.vkDestroyDescriptorPool(dev_.device(), fr.pool, nullptr);
         if (fr.fence) f.vkDestroyFence(dev_.device(), fr.fence, nullptr);
+        if (fr.occlusion) f.vkDestroyQueryPool(dev_.device(), fr.occlusion, nullptr);
         if (fr.cb) f.vkFreeCommandBuffers(dev_.device(), dev_.pool(), 1, &fr.cb);
     }
 }
@@ -286,6 +287,14 @@ bool VulkanRenderer::init(std::string& error) {
             error = "frame in flight: descriptor pool, command buffer or fence creation failed";
             return false;
         }
+        VkQueryPoolCreateInfo qpi{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+        qpi.queryType = VK_QUERY_TYPE_OCCLUSION;
+        qpi.queryCount = kQueriesPerFrame;
+        if (f.vkCreateQueryPool(dev_.device(), &qpi, nullptr, &fr.occlusion) != VK_SUCCESS) {
+            error = "frame in flight: occlusion query pool creation failed";
+            return false;
+        }
+        fr.aa_scale.assign(kQueriesPerFrame, 1);
     }
 
     // Placeholder textures for the stages a shader does not sample: 1x1 white.
@@ -349,6 +358,49 @@ void VulkanRenderer::begin_frame(u32 slot) {
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     f.vkBeginCommandBuffer(cb_, &bi);
     recording_ = true;
+    // The frame's queries: what its last use counted is read first (its fence has signalled), then the pools reset.
+    harvest(fr);
+    f.vkCmdResetQueryPool(cb_, fr.occlusion, 0, kQueriesPerFrame);  // always: counting may be switched on mid-frame
+    fr.queries = 0;
+    fr.first_ticket = next_ticket_;
+    fr.harvested = false;
+}
+
+// A finished frame's query results into counts_, by ticket (once).
+void VulkanRenderer::harvest(Frame& fr) {
+    if (fr.harvested) return;
+    fr.harvested = true;
+    if (!fr.queries) return;
+    std::vector<u64> occlusion(fr.queries);
+    fn_->vkGetQueryPoolResults(dev_.device(), fr.occlusion, 0, fr.queries, occlusion.size() * 8, occlusion.data(), 8, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+    for (u32 q = 0; q < fr.queries; ++q) {
+        // Pixels: the samples that passed, in the target's logical pixels (the GeForce 3's Z occlusion culling makes a
+        // failed pixel cheap; a shaded-fragment count from the pipeline statistics query is not exact on every driver
+        // and broke the core's determinism). Samples as stored, anti-aliasing included, for the z-pass reports (an
+        // occlusion count is in samples on NVIDIA hardware [verify on a console]).
+        counts_[fr.first_ticket + q] = {occlusion[q] / std::max<u32>(fr.aa_scale[q], 1), occlusion[q]};
+    }
+}
+
+VulkanRenderer::DrawCounts VulkanRenderer::draw_counts(u64 ticket) {
+    if (auto it = counts_.find(ticket); it != counts_.end()) {
+        const DrawCounts c = it->second;
+        counts_.erase(it);
+        return c;
+    }
+    for (u32 i = 0; i < kFramesInFlight; ++i) {
+        Frame& fr = frames_[i];
+        if (fr.harvested || ticket < fr.first_ticket || ticket >= fr.first_ticket + fr.queries) continue;
+        if (i == slot_ && recording_) submit();  // still being recorded: it goes to the GPU now
+        if (fr.serial > completed_) {
+            fn_->vkWaitForFences(dev_.device(), 1, &fr.fence, VK_TRUE, ~0ull);
+            completed_ = std::max(completed_, fr.serial);
+            ++stats_.waits;
+        }
+        harvest(fr);
+        return draw_counts(ticket);
+    }
+    return {};  // a ticket no frame holds (already read)
 }
 
 void VulkanRenderer::retire(vk::Image& image) {
@@ -2208,6 +2260,9 @@ VkPipeline VulkanRenderer::clear_pipeline(VkRenderPass pass, VkColorComponentFla
 }
 
 void VulkanRenderer::draw(const KelvinState& s, const DrawBatch& batch) {
+    last_ticket_ = 0;
+    // A frame whose queries are used up goes to the GPU before this draw (its pass reopens below).
+    if (count_draws_ && frames_[slot_].queries >= kQueriesPerFrame) submit();
     Timed timed(stats_.ns_draw);
     ++stats_.draws;
     ++frame_draws_;
@@ -2513,11 +2568,23 @@ void VulkanRenderer::draw(const KelvinState& s, const DrawBatch& batch) {
     const VkDeviceSize vb_offsets[2] = {voffset, voffset + vertex_bytes};
     const VkBuffer vbs[2] = {vertex_ring_.buffer.buffer, vertex_ring_.buffer.buffer};
     fn_->vkCmdBindVertexBuffers(cb_, 0, 2, vbs, vb_offsets);
+    Frame& qf = frames_[slot_];
+    const u32 query = qf.queries;
+    if (count_draws_) {
+        fn_->vkCmdBeginQuery(cb_, qf.occlusion, query, dev_.occlusion_precise() ? VK_QUERY_CONTROL_PRECISE_BIT : 0);
+    }
     if (!indices.empty()) {
         fn_->vkCmdBindIndexBuffer(cb_, index_ring_.buffer.buffer, ioffset, VK_INDEX_TYPE_UINT32);
         fn_->vkCmdDrawIndexed(cb_, static_cast<u32>(indices.size()), 1, 0, 0, 0);
     } else {
         fn_->vkCmdDraw(cb_, v.count, 1, 0, 0);
+    }
+    if (count_draws_) {
+        fn_->vkCmdEndQuery(cb_, qf.occlusion, query);
+        qf.aa_scale[query] = t->aa_x * t->aa_y;
+        ++qf.queries;
+        last_ticket_ = qf.first_ticket + query;
+        next_ticket_ = last_ticket_ + 1;
     }
     stats_.ns_record += ns_since(t_part);
 }

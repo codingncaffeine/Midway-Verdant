@@ -52,6 +52,14 @@ u64 draw_clocks(const pgraph::KelvinState& state, const pgraph::DrawBatch& batch
     return vertices * per_vertex + primitive_count(batch.primitive, vertices) * kTriangleSetupClocks;
 }
 
+u64 pixel_passes(const pgraph::KelvinState& state) {
+    u64 textures = 0;
+    for (u32 stage = 0; stage < 4; ++stage)
+        if (state.shader_stage_program(stage) != 0) ++textures;
+    const u64 stages = state.combiner_stages();
+    return std::max<u64>({1, (textures + kTexturesPerPass - 1) / kTexturesPerPass, (stages + kCombinerStagesPerPass - 1) / kCombinerStagesPerPass});
+}
+
 u64 clear_clocks(const pgraph::KelvinState& state) {
     const auto s = state.surface();
     const u64 pixels = static_cast<u64>(s.clip_width()) * s.clip_height();
