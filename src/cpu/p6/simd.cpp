@@ -479,12 +479,15 @@ void Simd::run_mmx() {
         case 0xF3: shift_by(64, true, false); break;
         case 0xD5: lanes16([](i32 x, i32 y) { return (x * y) & 0xFFFF; }); break;                           // PMULLW
         case 0xE5: lanes16([](i32 x, i32 y) { return (x * y) >> 16; }); break;                              // PMULHW
-        case 0xE4: lanes16u([](i32 x, i32 y) { return (x * y) >> 16; }); break;                             // PMULHUW
+        case 0xE4:  // PMULHUW: the product in 32 unsigned bits (0xFFFF * 0xFFFF overflows an int: undefined in C++)
+            lanes16u([](i32 x, i32 y) { return static_cast<i32>((static_cast<u32>(x) * static_cast<u32>(y)) >> 16); });
+            break;
         case 0xF5:                                                                                           // PMADDWD
             for (unsigned i = 0; i < 2; ++i) {
                 const i32 x0 = static_cast<i16>((a >> (32 * i)) & 0xFFFF), x1 = static_cast<i16>((a >> (32 * i + 16)) & 0xFFFF);
                 const i32 y0 = static_cast<i16>((b >> (32 * i)) & 0xFFFF), y1 = static_cast<i16>((b >> (32 * i + 16)) & 0xFFFF);
-                r |= static_cast<u64>(static_cast<u32>(x0 * y0 + x1 * y1)) << (32 * i);
+                // In 64 bits: 0x8000 * 0x8000 twice is 2^31, past an int (the hardware wraps it to 0x80000000).
+                r |= static_cast<u64>(static_cast<u32>(static_cast<i64>(x0) * y0 + static_cast<i64>(x1) * y1)) << (32 * i);
             }
             break;
         case 0xF6: {  // PSADBW

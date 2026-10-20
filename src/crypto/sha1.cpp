@@ -46,6 +46,7 @@ void Sha1::process_block(const u8* block) {
 }
 
 void Sha1::update(std::span<const u8> data) {
+    if (data.empty()) return;  // an empty span may hold a null pointer, which memcpy must never see
     total_bytes_ += data.size();
     std::size_t off = 0;
     if (buffered_) {

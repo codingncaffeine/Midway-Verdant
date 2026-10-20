@@ -1111,6 +1111,22 @@ TEST(P6Block, WideProgramsMatchTheInterpreter) {
         wide_setup(a, code, program);
         a.cpu.set_block_timing(false);
         wide_setup(b, code, program);
+        if (const char* t = std::getenv("P6DBG_TRACE"); t && std::strtoul(t, nullptr, 10) == program) {
+            // Instrument: the step's x87 state after every instruction of this program (raw registers, TOP, tags, status).
+            for (unsigned k = 0; k < 100000 && !a.cpu.state().halted; ++k) {
+                const u32 at = a.cpu.state().eip;
+                a.cpu.step();
+                const FpuState& f = a.cpu.state().fpu;
+                std::string line = std::format("{:x} sw {:04x} tw {:04x} cw {:04x} mx {:04x}", at, f.fsw, f.ftw, f.fcw, f.mxcsr);
+                for (unsigned r = 0; r < 8; ++r) {
+                    u8 raw[10];
+                    std::memcpy(raw, &f.st[r], 10);
+                    line += " ";
+                    for (int byte = 9; byte >= 0; --byte) line += std::format("{:02x}", raw[byte]);
+                }
+                std::printf("%s\n", line.c_str());
+            }
+        }
         run_steps(a);
         BlockEngine eb(b.cpu, b.bus);
         eb.disable_jit();
