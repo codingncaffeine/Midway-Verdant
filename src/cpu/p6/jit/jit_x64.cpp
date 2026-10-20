@@ -95,12 +95,10 @@ constexpr i32 kCtxSt = static_cast<i32>(offsetof(JitCtx, st));
 constexpr i32 kCtxExit = static_cast<i32>(offsetof(JitCtx, exit));
 constexpr i32 kCtxScratch = static_cast<i32>(offsetof(JitCtx, scratch));
 constexpr i32 kCtxBase = static_cast<i32>(offsetof(JitCtx, base)), kCtxLimit = static_cast<i32>(offsetof(JitCtx, limit));
-constexpr i32 kCtxBlock = static_cast<i32>(offsetof(JitCtx, block)), kCtxBudget = static_cast<i32>(offsetof(JitCtx, chain_budget));
-constexpr i32 kCtxInsnsDone = static_cast<i32>(offsetof(JitCtx, insns_done)), kCtxEntryEip = static_cast<i32>(offsetof(JitCtx, entry_eip));
-constexpr i32 kCtxEnded = static_cast<i32>(offsetof(JitCtx, ended)), kCtxProbeEip = static_cast<i32>(offsetof(JitCtx, probe_eip));
+constexpr i32 kCtxBlock = static_cast<i32>(offsetof(JitCtx, block)), kCtxChainLimit = static_cast<i32>(offsetof(JitCtx, chain_limit));
+constexpr i32 kCtxInsnsDone = static_cast<i32>(offsetof(JitCtx, insns_done)), kCtxProbeEip = static_cast<i32>(offsetof(JitCtx, probe_eip));
 constexpr i32 kCtxStores = static_cast<i32>(offsetof(JitCtx, stores)), kCtxMispredicts = static_cast<i32>(offsetof(JitCtx, mispredicts));
 constexpr i32 kCtxInlineChains = static_cast<i32>(offsetof(JitCtx, inline_chains)), kCtxInlineMispredicts = static_cast<i32>(offsetof(JitCtx, inline_mispredicts));
-constexpr i32 kCtxInlineSched = static_cast<i32>(offsetof(JitCtx, inline_sched)), kCtxInlineInsns = static_cast<i32>(offsetof(JitCtx, inline_insns));
 constexpr i32 kCtxLogging = static_cast<i32>(offsetof(JitCtx, logging)), kCtxLogCount = static_cast<i32>(offsetof(JitCtx, log_count));
 constexpr i32 kCtxLog = static_cast<i32>(offsetof(JitCtx, log));
 // The scratch slots, one owner each: the cache call's saved RSI RAX RDI; INC/DEC's CF; a new ESP; a computed
@@ -135,10 +133,24 @@ static_assert(offsetof(Memory::TlbEntry, tag) == 0 && offsetof(Memory::TlbEntry,
 // pages holding translated code. All callee-saved; RAX RCX RDX RSI RDI R8-R11 are scratch.
 constexpr Reg kCtx = rbx, kSt = r12, kTlb = r13, kRam = r14, kMru = r15, kCodeMap = rbp;
 #if defined(_WIN32)
-constexpr Reg kArg0 = rcx, kArg1 = rdx, kArg2 = r8;
+constexpr Reg kArg0 = rcx, kArg1 = rdx, kArg2 = r8, kArg3 = r9;
 #else
-constexpr Reg kArg0 = rdi, kArg1 = rsi, kArg2 = rdx;
+constexpr Reg kArg0 = rdi, kArg1 = rsi, kArg2 = rdx, kArg3 = rcx;
 #endif
+
+// A chain cell's copy (see Translator::join): fixed bytes, so a link is patched at fixed offsets from its start.
+//   0 lea rax, [r10 + cycles]      (imm 3: the next block's cycles; 0x7FFFFFFF unlinked: the limit check always fails)
+//   7 cmp rax, [rbx + chain_limit]; 14 jae slow
+//  20 cmp dword [rbx + probe_eip], target; 30 je slow
+//  36 skip (2 bytes: nop, or a short jump over the translation check, or over it and every line check)
+//  38 cmp dword [r13 + tlb], tag (disp 41, imm 45); 49 jne slow; 55 cmp dword [r13 + tlb + 4], page (disp 58, imm 62); 66 jne slow
+//  72 skip (2 bytes: over the line checks not used)
+//  74 four line checks of 17 bytes: cmp dword [r15 + l1i - l1d + set * 4], line + 1 (disp +3, imm +7); jne slow
+// 142 the commit
+constexpr unsigned kCellLeaImm = 3, kCellSkipT = 36, kCellTagDisp = 41, kCellTagImm = 45, kCellPageDisp = 58, kCellPageImm = 62, kCellSkipL = 72,
+                   kCellLines = 74, kCellLine = 17, kCellEnd = 142;
+constexpr u32 kCellUnlinked = 0x7FFFFFFFu;
+constexpr i32 kCtxTargets = static_cast<i32>(offsetof(JitCtx, targets));
 
 Mem greg(u8 r, unsigned size) {
     if (size == 1) return r < 4 ? mem(kSt, kGpr + 4 * r) : mem(kSt, kGpr + 4 * (r - 4) + 1);
@@ -151,10 +163,12 @@ Mem ctx_at(i32 off) { return mem(kCtx, off); }
 
 // Execute instruction `i` with the interpreter, as the block interpreter does: the clock at its start, its
 // penalties added, the run left when it faulted, reached a device, rewrote its own page or passed the limit.
-u32 h_exec(JitCtx* c, u32 i) {
-    Block& b = *c->block;
+u32 h_exec(JitCtx* c, u32 i, Block* blk) {
+    Block& b = *blk;
+    c->block = blk;  // the block running (a kill of it is seen: BlockEngine::kill_block)
     Cpu& cpu = *c->cpu;
     Memory& mem = cpu.memory();
+    const u64 walks = mem.page_walks();
     cpu.state().eip = b.jit_eip + b.off[i];
     cpu.set_cycles_only(c->base + (i ? b.after[i - 1] : 0));
     ++c->helpers;
@@ -181,6 +195,9 @@ u32 h_exec(JitCtx* c, u32 i) {
     const u64 penalty = mem.take_penalty();
     c->base += penalty;
     c->penalties += penalty;
+    // A walk may have replaced a translation a chain cell relies on without checking (its own page's): the engine's
+    // chain checks the next exit.
+    if (mem.page_walks() != walks) std::atomic_ref<u64>(c->chain_limit).store(0, std::memory_order_relaxed);
     if (!ok) return (i << 2) | kJitFault;
     if (i + 1 == b.n) return (i << 2) | kJitEnd;
     if (mem.device_events() != c->devices || c->engine->running_dead() || c->base + b.after[i] >= c->limit) return (i << 2) | kJitExit;
@@ -192,15 +209,15 @@ u32 h_exec(JitCtx* c, u32 i) {
 }
 
 // A data access the inline check could not settle (not the set's most recent line): the full cache model.
-void h_cache(JitCtx* c, u32 phys, u32 arg) {
+void h_cache(JitCtx* c, u32 phys, u32 arg, const Block* b) {
     const unsigned i = arg >> 8;
     const u64 p = c->cpu->cache_timing().data_access(phys, (arg & 1) != 0);
     c->base += p;
     c->penalties += p;
     // The limit at the next boundary: leave there. Past the block's end only: a later boundary may reach it, which
     // the interpreter finds instruction by instruction — hand the rest of the block over to it.
-    if (c->base + c->block->after[i] >= c->limit) c->exit = 1;
-    else if (c->base + c->block->cycles >= c->limit) c->exit = 2;
+    if (c->base + b->after[i] >= c->limit) c->exit = 1;
+    else if (c->base + b->cycles >= c->limit) c->exit = 2;
 }
 
 // The end of a block whose last instruction left normally: the engine costs the exit and returns where the run goes
@@ -235,6 +252,8 @@ public:
         return on;
     }
     std::vector<std::pair<u32, std::string>> marks;
+    // Each exit slot's chain cell copies (offsets of their starts and final jumps; 0: none).
+    std::array<std::array<u32, 2>, 2> cell{}, cell_jump{};
     std::string op_;
     void mark(const char* kind, bool with_op = false) {
         if (marking()) marks.emplace_back(static_cast<u32>(a.size()), with_op ? std::string(kind) + op_ : std::string(kind));
@@ -244,7 +263,14 @@ public:
         epilogue_ = a.label();
         mark("prologue");
         prologue();
+        // Inside a run the host's x87 control word and MXCSR are the guest's (loaded here once, kept across chains):
+        // every block's body starts that way, and only the paths into C++ (helpers, the engine's chain, the epilogue)
+        // put C++'s back, flushing the guest's sticky flags first.
+        if (kNativeX87) guest_cw();
+        sse_load();
         body = a.size();
+        cw_active_ = kNativeX87;
+        sse_active_ = true;
         for (unsigned i = 0; i < b_.n; ++i) {
             Label after = a.label();
             if (marking()) op_ = op_name(b_.insns[i].op);
@@ -290,6 +316,8 @@ private:
     Known known_{Known::Unknown};
     unsigned known_size_{4};
     bool host_flags_{false};   // the host flags hold the last flag writer's result
+    Label ways_;               // the current exit's way search (see end)
+    bool ways_used_{false};
     bool host_cf_{false};      // ... including CF (not after INC/DEC)
     bool cw_active_{false};    // the host x87 runs under the guest's control word (see x87_enter)
     bool sse_active_{false};   // the host SSE runs under the guest's MXCSR (see sse_enter)
@@ -325,6 +353,9 @@ private:
         a.mov64(kCodeMap, reinterpret_cast<u64>(ev_.code_granules));
     }
     void epilogue() {
+        // The block the run ended in (chain cells do not keep the context's block current).
+        a.mov64(rcx, reinterpret_cast<u64>(&b_));
+        a.mov(8, ctx_at(kCtxBlock), rcx);
         a.x87_mem(0xD9, 5, ctx_at(kCtxDefCw));  // fldcw: back to it
         a.ldmxcsr(ctx_at(kCtxSseDef));
 #if defined(_WIN32)
@@ -346,6 +377,7 @@ private:
     void call_helper(unsigned i) {
         a.mov(8, kArg0, kCtx);
         a.mov32(kArg1, i);
+        a.mov64(kArg2, reinterpret_cast<u64>(&b_));
         a.call_abs(reinterpret_cast<const void*>(&h_exec));
     }
     void inline_helper(unsigned i) {
@@ -369,174 +401,136 @@ private:
         stubs_.push_back(s);
         return s.entry;
     }
-    // The block's normal end at EIP `eip` (kNoEip: already stored): the engine costs the exit through link slot `slot`
-    // and may chain into the next block's native code.
+    // The block's normal end at EIP `eip` (kNoEip: already stored, a return): a chain cell for the exit (see join),
+    // and where it does not take the exit, the engine, which costs it through link slot `slot` and may chain into the
+    // next block's native code.
     static constexpr u64 kNoEip = ~u64{0};
     void end(unsigned i, u64 eip, unsigned slot) {
         mark("chain");
-        x87_leave();
-        sse_leave();
-        if (eip != kNoEip) a.mov_imm(4, st_at(kEipOff), static_cast<u32>(eip));
+        if (kNativeX87) x87_enter();  // the next block's body starts with the guest's words (after a helper: again)
+        sse_enter();
         Label slow = a.label();
+        ways_ = a.label();
+        ways_used_ = false;
         const BranchKind kind = b_.branch;
-        const bool inline_chain = eip != kNoEip && (kind == BranchKind::None || kind == BranchKind::Conditional || kind == BranchKind::Direct ||
-                                                     kind == BranchKind::Call);
+        const bool has_cell = eip != kNoEip && (kind == BranchKind::None || kind == BranchKind::Conditional || kind == BranchKind::Direct ||
+                                                kind == BranchKind::Call);
         // Taken as the engine counts it: a jump to the next instruction is not taken.
-        if (inline_chain) chain_inline(static_cast<u32>(eip), slot, static_cast<u32>(eip) != next_eip(b_.n - 1u), slow);
+        if (has_cell) chain_cell(static_cast<u32>(eip), slot, static_cast<u32>(eip) != next_eip(b_.n - 1u), slow);
+        else if (eip == kNoEip && b_.jit_key && (kind == BranchKind::Return || kind == BranchKind::Indirect || kind == BranchKind::CallIndirect))
+            chain_target(slow);
+        if (ways_used_) {
+            // A code line that is in its set but not the set's most recent (ESI = the line plus one, RDX = where to go
+            // on): the model's own update, then back; a miss is the engine's.
+            a.bind(ways_);
+            mark("chain-ways");
+            fetch_line(slow);
+            a.jmp(rdx);
+        }
         a.bind(slow);
         mark("chain-slow");
+        if (eip != kNoEip) a.mov_imm(4, st_at(kEipOff), static_cast<u32>(eip));
+        // The engine reads the whole state (the spin probe compares it): the guest's flags in, C++'s words back.
+        sse_flush();
+        if (kNativeX87) default_cw();
         a.mov(8, kArg0, kCtx);
         a.mov64(kArg1, reinterpret_cast<u64>(&b_.links[slot]));
         a.call_abs(reinterpret_cast<const void*>(&h_chain));
         Label back = a.label();
         a.test(8, rax, rax);
         a.jcc(E, back);
-        a.jmp(rax);
+        a.mov(8, r11, rax);
+        if (kNativeX87) guest_cw();
+        sse_load();
+        a.jmp(r11);
         a.bind(back);
         a.mov32(rax, (i << 2) | kJitEnd);
         a.jmp(epilogue_);
+        cw_active_ = false;  // (the epilogue's state; the caller restores what a second exit starts from)
+        sse_active_ = false;
     }
-    // BlockEngine::chain's common case in the block's own code: the exit's prediction worked out without committing,
-    // every condition of a chain checked (the link, the next block's translation, the budget, the limit with the
-    // slowest fetch, no device write into code, no penalty pending, the fetch translation, the fetch's lines being
-    // the most recent of their sets: no cache state to change); then the predictor, the statistics and the run
-    // move on and the next block's code is entered. Anything else goes to `slow`, where the engine does it all.
-    void chain_inline(u32 target, unsigned slot, bool taken, Label slow) {
-        static const i32 kEntry = [] {
-            static const Block probe;
-            return static_cast<i32>(reinterpret_cast<const u8*>(&probe.entry) - reinterpret_cast<const u8*>(&probe));
-        }();
-        const i32 eBody = kEntry + static_cast<i32>(offsetof(Block::Entry, body));
-        const i32 eHost = kEntry + static_cast<i32>(offsetof(Block::Entry, host_page));
-        const i32 eRuns = kEntry + static_cast<i32>(offsetof(Block::Entry, runs));
-        const i32 eCycles = kEntry + static_cast<i32>(offsetof(Block::Entry, cycles));
-        const i32 eLine = kEntry + static_cast<i32>(offsetof(Block::Entry, fetch_line));
-        const i32 eLines = kEntry + static_cast<i32>(offsetof(Block::Entry, fetch_lines));
-        const i32 eEip = kEntry + static_cast<i32>(offsetof(Block::Entry, jit_eip));
+    // A return's or an indirect jump's chain (the target in the state's EIP), when the exit was predicted (a return:
+    // the return stack's top is the target; an indirect jump: its last target) so its cost is the schedule alone: the
+    // target cache's entry for the EIP, made for this block's assumptions, with the checks of a chain cell (the limit,
+    // the spin probe, the page's translation, the code lines), then the commit (the return stack popped, or pushed for
+    // an indirect call). Anything else is the engine's.
+    void chain_target(Label slow) {
+        mark("chain-target");
         const BranchKind kind = b_.branch;
-        // R11 = the link, RCX = the next block, RDX = its entry.
-        a.mov64(r11, reinterpret_cast<u64>(&b_.links[slot]));
-        a.mov(8, rcx, mem(r11, static_cast<i32>(offsetof(Block::Link, to))));
-        a.test(8, rcx, rcx);
-        a.jcc(E, slow);
-        a.mov64(rax, reinterpret_cast<u64>(ev_.link_epoch));
-        a.mov(4, rax, mem(rax));
-        a.alu(4, 7, rax, mem(r11, static_cast<i32>(offsetof(Block::Link, epoch))));
-        a.jcc(NE, slow);
-        a.mov(8, rdx, mem(rcx, eBody));
-        a.test(8, rdx, rdx);
-        a.jcc(E, slow);
-        a.alu_imm(4, 7, mem(rcx, eEip), target);  // the next block is the target's (a link is only a hint)
-        a.jcc(NE, slow);
-        a.alu_imm(4, 7, ctx_at(kCtxBudget), 0);
-        a.jcc(E, slow);
-        a.alu_imm(4, 7, ctx_at(kCtxProbeEip), target);  // the spin probe's EIP: the engine compares the state
-        a.jcc(E, slow);
-        // R8D = 1 on a mispredict; R9D = the conditional predictor's new state.
-        if (kind == BranchKind::Conditional) {
-            a.movzx(r9, 1, mem_abs(r10, &b_.exit_counter));
-            a.mov32(r8, 0);
-            a.alu_imm(4, 7, r9, 2);
-            a.setcc(taken ? B : AE, r8);  // taken: predicted not taken below 2; not taken: predicted taken from 2
-            if (taken) {
-                a.lea(4, rax, mem(r9, 1));
-                a.mov32(rsi, 3);
-                a.alu(4, 7, rax, rsi);
-                a.cmov(4, A, rax, rsi);
-                a.mov(4, r9, rax);
-            } else {
-                a.lea(4, rax, mem(r9, -1));
-                a.test(4, r9, r9);
-                a.cmov(4, NE, r9, rax);
-            }
-        } else if (kind == BranchKind::Direct || kind == BranchKind::Call) {
-            a.movzx(r8, 1, mem_abs(r10, &b_.exit_seen));
-            a.alu_imm(4, 6, r8, 1);
+        a.mov(4, rax, st_at(kEipOff));
+        if (kind == BranchKind::Return) {
+            a.mov64(rdx, reinterpret_cast<u64>(ev_.rsb_top));
+            a.mov(4, rcx, mem(rdx));
+            a.lea(4, rcx, mem(rcx, 15));
+            a.alu_imm(4, 4, rcx, 15);
+            a.mov64(rsi, reinterpret_cast<u64>(ev_.rsb));
+            a.alu(4, 7, rax, mem(rsi, rcx, 2, 0));
+            a.jcc(NE, slow);
         } else {
-            a.mov32(r8, 0);
+            a.mov64(rdx, reinterpret_cast<u64>(&b_.exit_target));
+            a.alu(4, 7, rax, mem(rdx));
+            a.jcc(NE, slow);
+            a.mov64(rdx, reinterpret_cast<u64>(&b_.exit_seen));
+            a.alu_imm(1, 7, mem(rdx), 0);
+            a.jcc(E, slow);
         }
-        // R10 = the cycle the block ends at.
-        a.lea(4, rax, mem(r8, r8, 1, 0));
-        a.shift_imm(4, 4, rax, 2);  // x12
-        static_assert(tp::kBlockMispredict == 12);
+        a.mov(4, r8, rax);
+        a.shift_imm(4, 5, r8, 12);
+        a.alu(4, 6, r8, rax);
+        a.alu_imm(4, 4, r8, JitCtx::kTargets - 1);
+        a.shift_imm(4, 4, r8, 6);
+        a.lea(8, r9, mem(kCtx, r8, 0, kCtxTargets));
+        a.alu(4, 7, rax, mem(r9, 0));
+        a.jcc(NE, slow);
+        a.alu_imm(4, 7, mem(r9, 4), b_.jit_key);
+        a.jcc(NE, slow);
         a.mov(8, r10, ctx_at(kCtxBase));
-        a.alu(8, 0, r10, rax);
         a.alu_imm(8, 0, r10, b_.cycles);
-        // The limit with the slowest fetch.
-        a.mov(4, rax, mem(rcx, eCycles));
-        a.alu(8, 0, rax, r10);
-        a.alu_imm(8, 0, rax, tp::kL2Latency + tp::kDramLatency);
-        a.alu(8, 7, rax, ctx_at(kCtxLimit));
+        a.mov(4, r11, mem(r9, 8));
+        a.alu(8, 0, r11, r10);
+        a.alu(8, 7, r11, ctx_at(kCtxChainLimit));
         a.jcc(AE, slow);
-        // Nothing pending: a device's write into code, a penalty not yet charged.
-        a.mov64(rax, reinterpret_cast<u64>(cpu_.memory().bus().code_pending_byte()));
-        a.alu_imm(1, 7, mem(rax), 0);
+        a.alu(4, 7, rax, ctx_at(kCtxProbeEip));
+        a.jcc(E, slow);
+        a.mov(4, r11, mem(r9, 12));
+        a.mov(4, rdi, mem(r9, 16));
+        a.alu(4, 7, rdi, mem(kTlb, r11, 0, 0));
         a.jcc(NE, slow);
-        a.mov64(rax, reinterpret_cast<u64>(cpu_.memory().penalty_word()));
-        a.alu_imm(8, 7, mem(rax), 0);
+        a.mov(4, rdi, mem(r9, 20));
+        a.alu(4, 7, rdi, mem(kTlb, r11, 0, 4));
         a.jcc(NE, slow);
-        a.mov64(rax, reinterpret_cast<u64>(cpu_.memory().device_cycles_word()));
-        a.alu_imm(8, 7, mem(rax), 0);
+        Label one = a.label();
+        a.mov(8, r11, mem(r9, 32));
+        a.mov(4, rdi, mem(r9, 24));
+        a.alu(4, 7, rdi, mem(kMru, r11, 0, 0));
         a.jcc(NE, slow);
-        // The fetch translation: a TLB hit on the next block's page (the linear address is the target: flat CS).
-        const u32 lin = st_.seg[kCs].base + target;
-        const i32 tlb = static_cast<i32>(((lin >> 12) & (Memory::kTlbSize - 1)) * 32);
-        a.alu_imm(4, 7, mem(kTlb, tlb), lin >> 12);
-        a.jcc(NE, slow);
-        a.mov(8, rax, mem(kTlb, tlb + 8));
-        a.alu(8, 7, rax, mem(rcx, eHost));
-        a.jcc(NE, slow);
-        // The fetch: each line looked up in L1I in order, as Timing::code_fetch does — its set's most recent line
-        // changes nothing; a hit on another way takes the clock's next value as its age and becomes the most recent
-        // (the model's own update, here); a miss is the engine's (L2, the penalty). A line that misses after earlier
-        // ones were updated is still exact: the engine then finds those their sets' most recent.
-        a.mov(4, rsi, mem(rcx, eLine));
-        fetch_line(slow);
-        Label one = a.label(), more = a.label();
-        a.alu_imm(1, 7, mem(rcx, eLines), 1);
+        a.mov(4, rdi, mem(r9, 28));
+        a.test(4, rdi, rdi);
         a.jcc(E, one);
-        a.bind(more);
-        a.lea(4, rsi, mem(rsi, 1));
-        fetch_line(slow);
-        a.movzx(rax, 1, mem(rcx, eLines));
-        a.alu(4, 0, rax, mem(rcx, eLine));  // one past the last line (lines are kept plus one)
-        a.lea(4, rdi, mem(rsi, 1));
-        a.alu(4, 7, rdi, rax);
-        a.jcc(B, more);
+        a.mov(8, r11, mem(r9, 40));
+        a.alu(4, 7, rdi, mem(kMru, r11, 0, 0));
+        a.jcc(NE, slow);
         a.bind(one);
         // ---- committed from here ----
-        if (kind == BranchKind::Conditional) a.mov(1, mem_abs(rax, &b_.exit_counter), r9);
-        if (kind != BranchKind::None) {
-            a.mov_imm(1, mem_abs(rax, &b_.exit_seen), 1);
-            a.mov_imm(4, mem_abs(rax, &b_.exit_target), target);
+        if (kind == BranchKind::Return) {
+            a.mov(4, mem(rdx), rcx);
+        } else if (kind == BranchKind::CallIndirect) {
+            a.mov64(rdx, reinterpret_cast<u64>(ev_.rsb_top));
+            a.mov(4, rcx, mem(rdx));
+            a.mov64(rsi, reinterpret_cast<u64>(ev_.rsb));
+            a.mov_imm(4, mem(rsi, rcx, 2, 0), next_eip(b_.n - 1u));
+            a.lea(4, rcx, mem(rcx, 1));
+            a.alu_imm(4, 4, rcx, 15);
+            a.mov(4, mem(rdx), rcx);
         }
-        if (kind == BranchKind::Call) {
-            a.mov64(rax, reinterpret_cast<u64>(ev_.rsb_top));
-            a.mov(4, rsi, mem(rax));
-            a.mov64(rdi, reinterpret_cast<u64>(ev_.rsb));
-            a.mov_imm(4, mem(rdi, rsi, 2, 0), next_eip(b_.n - 1u));
-            a.lea(4, rsi, mem(rsi, 1));
-            a.alu_imm(4, 4, rsi, 15);
-            a.mov(4, mem(rax), rsi);
-        }
-        // Statistics in the run's own context (the engine folds them in once the run is over).
-        a.alu(4, 0, ctx_at(kCtxMispredicts), r8);
-        a.alu(4, 0, ctx_at(kCtxInlineMispredicts), r8);
-        a.alu_imm(4, 0, ctx_at(kCtxInlineChains), 1);
-        a.alu_imm(8, 0, ctx_at(kCtxInlineSched), b_.cycles);
-        a.alu_imm(8, 0, ctx_at(kCtxInlineInsns), b_.n);
-        a.alu_imm(4, 5, ctx_at(kCtxBudget), 1);
-        a.alu_imm(8, 0, ctx_at(kCtxInsnsDone), b_.n);
         a.mov(8, ctx_at(kCtxBase), r10);
-        a.mov(8, ctx_at(kCtxBlock), rcx);
-        a.mov_imm(4, ctx_at(kCtxEntryEip), target);
-        a.mov_imm(1, ctx_at(kCtxEnded), 0);
-        a.alu_imm(8, 0, mem(rcx, eRuns), 1);
-        a.jmp(rdx);
+        a.alu_imm(8, 0, ctx_at(kCtxInsnsDone), b_.n);
+        a.alu_imm(4, 0, ctx_at(kCtxInlineChains), 1);
+        a.mov(8, rax, mem(r9, 48));
+        a.jmp(rax);
     }
-    // One code line of the next block (ESI = the line plus one) in L1I, for chain_inline: the most recent of its set,
-    // or found in a way of it and made so (the age from the clock); else `slow`. Clobbers RAX RDI R11; keeps RCX RDX
-    // R8-R10.
+    // One code line (ESI = the line plus one) in L1I: the most recent of its set, or found in a way of it and made so
+    // (the age from the clock, as Timing::code_fetch does); else `slow`. Clobbers RAX RDI R11; keeps RCX RDX R8-R10.
     void fetch_line(Label slow) {
         Timing& t = cpu_.cache_timing();
         const unsigned isets = t.l1i_sets();
@@ -577,6 +571,127 @@ private:
         a.mov64(rax, reinterpret_cast<u64>(t.l1i_mru_mutable()));
         a.mov(4, mem(rax, rdi, 2, 0), rsi);
         a.bind(ok);
+    }
+    // An exit's chain cell: the exit's prediction worked out (a conditional exit: the fast copy when its two-bit
+    // predictor is saturated the way it went, which changes nothing; else the copy that steps it), R10 = the cycle the
+    // block ends at, then a copy of the checks and the commit (join), patched for the block the exit leads to.
+    void chain_cell(u32 target, unsigned slot, bool taken, Label slow) {
+        const BranchKind kind = b_.branch;
+        if (kind == BranchKind::Conditional) {
+            Label step = a.label();
+            a.mov64(rax, reinterpret_cast<u64>(&b_.exit_counter));
+            a.alu_imm(1, 7, mem(rax), taken ? 3 : 0);
+            a.jcc(NE, step);
+            a.mov(8, r10, ctx_at(kCtxBase));
+            a.alu_imm(8, 0, r10, b_.cycles);
+            join(target, slot, 0, slow);
+            a.bind(step);
+            mark("chain-step");
+            // R9 = the predictor's new state, R8 = 1 on a mispredict (RAX = its address).
+            a.movzx(r9, 1, mem(rax));
+            a.mov32(r8, 0);
+            a.alu_imm(4, 7, r9, 2);
+            a.setcc(taken ? B : AE, r8);  // taken: predicted not taken below 2; not taken: predicted taken from 2
+            if (taken) {
+                a.lea(4, rcx, mem(r9, 1));
+                a.mov32(rsi, 3);
+                a.alu(4, 7, rcx, rsi);
+                a.cmov(4, A, rcx, rsi);
+                a.mov(4, r9, rcx);
+            } else {
+                a.lea(4, rcx, mem(r9, -1));
+                a.test(4, r9, r9);
+                a.cmov(4, NE, r9, rcx);
+            }
+            static_assert(tp::kBlockMispredict == 12);
+            a.mov(8, r10, ctx_at(kCtxBase));
+            a.lea(8, rcx, mem(r8, r8, 1, 0));
+            a.lea(8, r10, mem(r10, rcx, 2, static_cast<i32>(b_.cycles)));  // + 12 on a mispredict
+            join(target, slot, 1, slow);
+        } else {
+            a.mov(8, r10, ctx_at(kCtxBase));
+            a.alu_imm(8, 0, r10, b_.cycles);
+            join(target, slot, 0, slow);
+        }
+    }
+    // One copy of a chain cell's checks and commit (R10 = the cycle this block ends at), in the fixed layout patch_link
+    // fills (kCell*): the next block must end before the chain limit (which also holds the budget, a device's write
+    // into code, a helper's page walk), not be the spin probe's EIP, have its page's translation in the TLB (unless it
+    // is this block's page: nothing replaced that translation since this block's own was checked — native code never
+    // walks) and its code lines the most recent of their sets in L1I (unless they are this block's: this block's fetch
+    // made them so and only fetches touch L1I), so its fetch changes no cache state. Then the run moves on and the next
+    // block's code is entered. Unlinked, the first check always fails: `slow`, where the engine does it all.
+    void join(u32 target, unsigned slot, unsigned copy, Label slow) {
+        mark(copy ? "chain-cell-step" : "chain-cell");
+        const std::size_t at = a.size();
+        cell[slot][copy] = static_cast<u32>(at);
+        const u8 lea[] = {0x49, 0x8D, 0x82};  // lea rax, [r10 + imm32]
+        for (u8 v : lea) a.byte(v);
+        a.dword(kCellUnlinked);
+        const u8 cmp_limit[] = {0x48, 0x3B, 0x83};  // cmp rax, [rbx + disp32]
+        for (u8 v : cmp_limit) a.byte(v);
+        a.dword(static_cast<u32>(kCtxChainLimit));
+        a.jcc(AE, slow);
+        a.byte(0x81);  // cmp dword [rbx + disp32], imm32
+        a.byte(0xBB);
+        a.dword(static_cast<u32>(kCtxProbeEip));
+        a.dword(target);
+        a.jcc(E, slow);
+        a.byte(0x66);  // skip (patched)
+        a.byte(0x90);
+        for (int k = 0; k < 2; ++k) {
+            a.byte(0x41);  // cmp dword [r13 + disp32], imm32
+            a.byte(0x81);
+            a.byte(0xBD);
+            a.dword(0);
+            a.dword(0);
+            a.jcc(NE, slow);
+        }
+        a.byte(0x66);  // skip (patched)
+        a.byte(0x90);
+        std::array<Label, 4> line_miss{}, line_back{};
+        for (unsigned k = 0; k < 4; ++k) {
+            line_miss[k] = a.label();
+            line_back[k] = a.label();
+            a.byte(0x41);  // cmp dword [r15 + disp32], imm32
+            a.byte(0x81);
+            a.byte(0xBF);
+            a.dword(0);
+            a.dword(0);
+            a.jcc(NE, line_miss[k]);
+            a.bind(line_back[k]);
+        }
+        if (a.size() - at != kCellEnd) std::abort();  // the layout patch_link relies on
+        // ---- committed from here ----
+        a.mov(8, ctx_at(kCtxBase), r10);
+        a.alu_imm(8, 0, ctx_at(kCtxInsnsDone), b_.n);
+        a.alu_imm(4, 0, ctx_at(kCtxInlineChains), 1);
+        if (copy) {
+            a.mov64(rax, reinterpret_cast<u64>(&b_.exit_counter));
+            a.mov(1, mem(rax), r9);
+            a.alu(4, 0, ctx_at(kCtxMispredicts), r8);
+            a.alu(4, 0, ctx_at(kCtxInlineMispredicts), r8);
+        }
+        if (b_.branch == BranchKind::Call) {
+            a.mov64(rax, reinterpret_cast<u64>(ev_.rsb_top));
+            a.mov(4, rsi, mem(rax));
+            a.mov64(rdi, reinterpret_cast<u64>(ev_.rsb));
+            a.mov_imm(4, mem(rdi, rsi, 2, 0), next_eip(b_.n - 1u));
+            a.lea(4, rsi, mem(rsi, 1));
+            a.alu_imm(4, 4, rsi, 15);
+            a.mov(4, mem(rax), rsi);
+        }
+        cell_jump[slot][copy] = static_cast<u32>(a.size());
+        a.jmp(slow);  // patched: the next block's body
+        // Each line check's way search (out of the way): ESI = the check's own immediate (10 bytes before where it goes
+        // on), RDX = where it goes on.
+        for (unsigned k = 0; k < 4; ++k) {
+            a.bind(line_miss[k]);
+            a.lea_rip(rdx, line_back[k]);
+            a.mov(4, rsi, mem(rdx, -10));
+            a.jmp(ways_);
+        }
+        ways_used_ = true;
     }
     // A memory operand at an absolute host address (through `scratch`, loaded first).
     Mem mem_abs(Reg scratch, const void* p) {
@@ -761,6 +876,7 @@ private:
         a.mov(4, kArg1, rdi);
         a.mov(8, kArg0, kCtx);
         a.mov32(kArg2, (i << 8) | (store ? 1u : 0u));
+        a.mov64(kArg3, reinterpret_cast<u64>(&b_));
         a.call_abs(reinterpret_cast<const void*>(&h_cache));
         a.mov(8, rsi, ctx_at(kSaveRsi));
         a.mov(8, rax, ctx_at(kSaveRax));
@@ -2696,6 +2812,7 @@ bool Jit::compile(Block& b, Cpu& cpu, BlockEngine& engine) {
     b.jit_eip = cpu.state().eip;
     for (unsigned g = 0; g < kSegCount; ++g) b.jit_seg[g] = cpu.state().seg[g];
     b.jit_dirty = cpu.memory().dirty_tracking();
+    b.jit_key = engine.snapshot_key(b);
     Translator t(b, cpu, engine.native_view());
     t.run();
     if (!t.a.finish()) return false;
@@ -2705,6 +2822,11 @@ bool Jit::compile(Block& b, Cpu& cpu, BlockEngine& engine) {
     b.native = buffer_ + used_;
     b.entry.body = buffer_ + used_ + t.body;
     b.entry.jit_eip = b.jit_eip;
+    for (unsigned k = 0; k < 2; ++k) {
+        b.links[k].cell = t.cell[k];
+        b.links[k].jump = t.cell_jump[k];
+        b.links[k].patched = false;
+    }
     // MV_JIT_MAP=FILE: the generated code's ranges and their guest blocks, for a sampling profiler.
     static std::FILE* map = [] {
         const char* p = std::getenv("MV_JIT_MAP");
@@ -2722,9 +2844,74 @@ bool Jit::compile(Block& b, Cpu& cpu, BlockEngine& engine) {
     return true;
 }
 
+namespace {
+void put32(u8* p, u32 v) { std::memcpy(p, &v, 4); }
+}  // namespace
+
+bool Jit::patch_link(Block& from, unsigned slot, const Block& to, Cpu& cpu) {
+    Block::Link& l = from.links[slot];
+    if (!from.native || !l.cell[0] || !to.entry.body) return false;
+    const u32 cs = from.jit_seg[kCs].base;
+    const u32 la = cs + from.jit_eip, lb = cs + to.jit_eip;
+    const bool same_page = (la >> 12) == (lb >> 12) && to.ram_page == from.ram_page;
+    const unsigned idx = (lb >> 12) & (Memory::kTlbSize - 1);
+    const Memory::TlbEntry& e = cpu.memory().tlb()[idx];
+    if (!same_page && (e.tag != (lb >> 12) || e.host != to.entry.host_page)) return false;
+    const bool own = to.entry.fetch_line >= from.entry.fetch_line &&
+                     to.entry.fetch_line + to.entry.fetch_lines <= from.entry.fetch_line + from.entry.fetch_lines;
+    const unsigned lines = own ? 0u : to.entry.fetch_lines;
+    if (lines > 4) return false;
+    const Timing& t = cpu.cache_timing();
+    const i64 l1i = reinterpret_cast<const u8*>(t.l1i_mru()) - reinterpret_cast<const u8*>(t.l1d_mru());
+    u8* code = static_cast<u8*>(from.native);
+    for (unsigned c = 0; c < 2; ++c) {
+        if (!l.cell[c]) continue;
+        u8* p = code + l.cell[c];
+        put32(p + kCellLeaImm, to.cycles);
+        if (same_page) {
+            p[kCellSkipT] = 0xEB;
+            p[kCellSkipT + 1] = static_cast<u8>(lines ? kCellSkipL - (kCellSkipT + 2) : kCellEnd - (kCellSkipT + 2));
+        } else {
+            p[kCellSkipT] = 0x66;
+            p[kCellSkipT + 1] = 0x90;
+            put32(p + kCellTagDisp, idx * 32);
+            put32(p + kCellTagImm, lb >> 12);
+            put32(p + kCellPageDisp, idx * 32 + 4);
+            put32(p + kCellPageImm, e.phys_page);
+        }
+        if (lines == 4) {
+            p[kCellSkipL] = 0x66;
+            p[kCellSkipL + 1] = 0x90;
+        } else {
+            p[kCellSkipL] = 0xEB;
+            p[kCellSkipL + 1] = static_cast<u8>((4 - lines) * kCellLine);
+        }
+        for (unsigned j = 0; j < lines; ++j) {
+            u8* q = p + kCellLines + (4 - lines + j) * kCellLine;
+            const u32 line = to.entry.fetch_line + j;  // plus one, as the MRU keeps it
+            put32(q + 3, static_cast<u32>(static_cast<i32>(l1i + ((line - 1) & (t.l1i_sets() - 1)) * 4)));
+            put32(q + 7, line);
+        }
+        u8* j = code + l.jump[c];
+        put32(j + 1, static_cast<u32>(static_cast<u8*>(to.entry.body) - (j + 5)));
+    }
+    l.patched = true;
+    return true;
+}
+
+void Jit::unpatch_link(Block& from, unsigned slot) {
+    Block::Link& l = from.links[slot];
+    if (from.native && l.patched)
+        for (unsigned c = 0; c < 2; ++c)
+            if (l.cell[c]) put32(static_cast<u8*>(from.native) + l.cell[c] + kCellLeaImm, kCellUnlinked);
+    l.patched = false;
+}
+
 #else  // no x86-64 host: blocks stay interpreted
 
 bool Jit::compile(Block&, Cpu&, BlockEngine&) { return false; }
+bool Jit::patch_link(Block&, unsigned, const Block&, Cpu&) { return false; }
+void Jit::unpatch_link(Block& from, unsigned slot) { from.links[slot].patched = false; }
 
 #endif
 

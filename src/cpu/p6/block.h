@@ -58,10 +58,16 @@ struct Block {
         u8 n{0};
         u32 jit_eip{0};                // the EIP the native code was made for (a copy)
     } entry;
-    // Where each exit of the final instruction went last (a hint: every condition is checked when a chain is taken).
+    // Where each exit of the final instruction went last. A link to a translated block is patched into the exit's
+    // chain cell (see Jit::patch_link), which then checks only what can change while it holds (the limit, the spin
+    // probe, the page's translation, the code lines); anything else unpatches it (a kill, a translation again).
     struct Link {
         Block* to{nullptr};
         u32 epoch{0};
+        Block* from{nullptr};  // the block whose exit this is
+        std::array<u32, 2> cell{};  // the chain cell's copies in from's native code (offsets; 0: none): fast, predictor step
+        std::array<u32, 2> jump{};  // each copy's final jump
+        bool patched{false};
     };
     std::array<Link, 2> links{};
     // The link slots (of other blocks or its own) that name this block, and the fast-cache entries that held it: a
@@ -73,6 +79,8 @@ struct Block {
     u8 jit_compiles{0};
     std::array<Segment, kSegCount> jit_seg{};
     u32 lin{0};  // the linear address it was first built at (reports)
+    u32 jit_key{0};  // its translation's snapshot (BlockEngine::snapshot_key): equal keys, equal assumptions
+    std::vector<u32> target_slots;  // the JitCtx::targets entries that hold it
 };
 
 struct BlockStats {
@@ -160,11 +168,12 @@ public:
     // The end of a native block (the generated code calls it): its exit costed, then the next block's native entry if
     // the run may go on there without the dispatcher, else null. See block.cpp.
     void* chain(JitCtx& c, Block::Link* slot);
+    // Cycles of chain budget a block counts for (the budget is a cycle bound: the generated code compares one limit).
+    static constexpr u64 kBudgetCycles = 16;
     // The kernel idle loop's check addresses: never chained into (the dispatcher halts there).
-    void set_idle_eips(u32 a, u32 b) {
-        idle_ = {a, b};
-        ++link_epoch_;  // links made before are not checked against them inline
-    }
+    void set_idle_eips(u32 a, u32 b);
+    // A small number naming a block's translation assumptions (segments, write tracking); 0 is never one.
+    u32 snapshot_key(const Block& b);
     // What the generated code reads and updates in the engine (stable addresses for the engine's life).
     struct NativeView {
         u32* link_epoch;
@@ -198,6 +207,7 @@ private:
     void take_device_writes();
     u32 exit_cost(Block& b, u32 entry_eip);
     unsigned run_native(Run& r);
+    void open_chain_limit(JitCtx& c);
     void spin_skip(const JitCtx& c, u64 instructions);
     void countdown_skip(Block& b, u64 limit);
     bool stores_undone(const JitCtx& c) const;
@@ -263,6 +273,8 @@ private:
     std::array<u32, 16> rsb_at_probe_{};
     unsigned rsb_top_at_probe_{0};
     std::array<u32, 2> idle_{};
+    std::vector<std::pair<std::array<Segment, kSegCount>, bool>> snapshots_;
+    std::unique_ptr<JitCtx> ctx_;  // the native runs' context (one: its address is the generated code's and the bus's)
     JitCtx* current_{nullptr};  // the native run in progress
     Block::Link* pending_slot_{nullptr};  // the last native exit's link slot, filled by the next block run
     u32 pending_target_{0};  // where that exit went (the next block run must start there to be linked)

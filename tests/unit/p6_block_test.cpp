@@ -1407,9 +1407,9 @@ TEST(P6Block, WideProgramsMatchTheInterpreter) {
                 static_cast<unsigned long long>(deliveries));
 }
 
-// A function called from two places in turn: its RET's link always remembers the other caller, so the chain looks the
-// real return block up (the fast cache) and relinks instead of going back to the dispatcher. Against the block
-// interpreter in lock step; the relinks happened.
+// A function called from two places in turn: its RET's target changes every time, so it chains through the target
+// cache in the generated code (each caller's return block filled once by the engine's chain) instead of going back to
+// the dispatcher. Against the block interpreter in lock step; the returns chained without the engine.
 TEST(P6Block, ChainsRelinkAReturnToItsOtherCaller) {
     // 0x1000: mov ecx, 2000
     // 0x1005: call 0x1100 | 0x100A: add eax, 3 | 0x100D: call 0x1100 | 0x1012: add edx, 5 | 0x1015: dec ecx; jnz 0x1005 | hlt
@@ -1430,7 +1430,10 @@ TEST(P6Block, ChainsRelinkAReturnToItsOtherCaller) {
     run_lockstep(b, eb, c, ec, "a return to alternating callers");
     expect_same(b, c, "a return to alternating callers", true);
     EXPECT_EQ(c.cpu.state().gpr[kEax], 6000u);
-    EXPECT_GT(ec.stats().relinks, 1000u) << "the returns relinked";
+    u64 slow = 0;
+    for (u64 n : ec.stats().slow_chain) slow += n;
+    EXPECT_GT(ec.stats().chains, 7000u) << "the blocks chained";
+    EXPECT_LT(slow, 100u) << "the returns chained in the generated code (the budget and the spin probe aside)";
 }
 
 // More lines through one L1 data set than it has ways, with hits on lines that are not the set's most recent: the
@@ -1491,6 +1494,32 @@ TEST(P6Block, LongBlocksChainInline) {
     u64 slow = 0;
     for (u64 n : ec.stats().slow_chain) slow += n;
     EXPECT_LT(slow, 40u) << "the chains were the generated code's own (the fetch looked up inline; the budget and the spin probe aside)";
+}
+
+// A loop whose data access and code share a TLB entry (the data 4 MiB above, an alias of the same RAM): every pass the
+// interpreter's walk for the data replaces the code's translation, so the next block's fetch walks again. A chain cell
+// to the loop's own page must not skip that (the helper's walk sends the exit through the engine). Against the block
+// interpreter, in lock step, with every walk's cache traffic.
+TEST(P6Block, ChainsSeeAWalkThatReplacesTheirTranslation) {
+    // 0x1000: mov ecx, 0 | 0x1005: mov eax, [0x401000]; inc ecx; cmp ecx, 300; jne 0x1005 | hlt
+    const std::vector<u8> code = {0xB9, 0x00, 0x00, 0x00, 0x00, 0xA1, 0x00, 0x10, 0x40, 0x00, 0x41, 0x81, 0xF9, 0x2C, 0x01, 0x00, 0x00, 0x75, 0xF2, 0xF4};
+    Rig b(true), c(true);
+    for (Rig* r : {&b, &c}) {
+        r->load(code);
+        const u32 alias = 0x83;  // the second 4 MiB: the same RAM again
+        std::memcpy(r->bus.ram() + 0x100000 + 4, &alias, 4);
+        r->cpu.set_block_timing(true);
+    }
+    BlockEngine eb(b.cpu, b.bus);
+    eb.disable_jit();
+    BlockEngine ec(c.cpu, c.bus);
+    ec.set_jit_threshold(0);
+    run_lockstep(b, eb, c, ec, "a walk replacing the code's translation");
+    expect_same(b, c, "a walk replacing the code's translation", true);
+    EXPECT_EQ(b.cpu.cache_timing().cache_hash(), c.cpu.cache_timing().cache_hash()) << "the caches' contents and order";
+    EXPECT_EQ(b.cpu.memory().page_walks(), c.cpu.memory().page_walks());
+    EXPECT_GT(c.cpu.memory().page_walks(), 500u) << "the code and the data took turns in the entry";
+    EXPECT_EQ(c.cpu.state().gpr[kEcx], 300u);
 }
 
 // Code lines through one L1 instruction set: six blocks 4 KiB apart (one set), chained by direct jumps, two of them

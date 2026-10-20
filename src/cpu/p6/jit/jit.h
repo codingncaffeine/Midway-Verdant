@@ -17,30 +17,34 @@
 
 namespace mv::p6 {
 
-// What the generated code and its helpers share (offsets fixed: the code addresses it from RBX).
+// What the generated code and its helpers share (offsets fixed: the code addresses it from RBX). One per engine, for
+// its life (a device thread may zero `chain_limit` at any time: see Bus::set_code_write_kill).
 struct JitCtx {
     CpuState* st{};          // 0
     Cpu* cpu{};              // 8
     BlockEngine* engine{};   // 16
     Block* block{};          // 24
     u64 base{};              // 32: the run's start plus the penalties so far (cycles)
-    u64 limit{};             // 40: the cycle the run must not pass
+    u64 limit{};             // 40: the cycle the run must not pass (the next event, the stop cycle)
     u64 devices{};           // 48: the memory unit's device-access count at the run's start
     u32 helpers{};           // 56: instructions the interpreter executed for the native code
     u8 exit{};               // 60: leave after the current instruction (1), or hand the rest of the block to the
                            //     interpreter after it (2: a penalty may make a later boundary reach the limit)
     u8 pad[3]{};             // 61
     u64 scratch[12]{};       // 64: slots for the generated code (see jit_x64.cpp)
+    // The generated code's chain goes on into the next block only while that block ends before this cycle: the limit,
+    // or sooner the end of the chain budget; 0 sends every exit through the engine (a device wrote into code, a helper
+    // walked the page tables, a logging probe). The engine restores it where it chains.
+    u64 chain_limit{};
+    u64 budget_end{};
     std::exception_ptr* error{};  // where a helper leaves what the interpreter threw (an unimplemented form)
     u64* helper_ops{};  // statistics: the interpreter's instructions by operation
-    // Chains (used by C++ only): the current block's entry EIP; whether its exit was already costed and the cycle it
-    // ended at; the instructions of the blocks before it in this run; how many more blocks may chain; the link slot
-    // the last exit tried; the penalties added (statistics).
-    u32 entry_eip{};
+    // Chains: whether the run's last exit was already costed (by the engine) and the cycle it ended at; the
+    // instructions of the blocks before the current one in this run; the link slot the last exit tried; the penalties
+    // added (statistics).
     u8 ended{};
     u64 end_cycles{};
     u64 insns_done{};
-    u32 chain_budget{};
     Block::Link* last_slot{};
     u32 last_target{};
     u64 penalties{};
@@ -61,8 +65,6 @@ struct JitCtx {
     // Statistics of the chains the generated code took (folded into the engine's after the run).
     u32 inline_chains{};
     u32 inline_mispredicts{};
-    u64 inline_sched{};
-    u64 inline_insns{};
     // The spin probe: with `logging` set, each native store logs its host address, size and the bytes it replaces
     // (16-byte stores as two entries); past 256 entries only the count grows.
     u8 logging{};
@@ -72,7 +74,26 @@ struct JitCtx {
         u64 old;
     } log[256];  // not initialised: read only up to log_count (zeroing 4 KiB a run was a measurable cost)
     u8 stop_why{};  // instrument: which test in BlockEngine::chain ended the run (0: none)
+    // Where returns and indirect jumps chain inside the generated code: by target EIP (direct-mapped), each block the
+    // engine chained such an exit into, with what its checks need (filled by BlockEngine::chain, cleared when the block
+    // goes or is translated again). 64 bytes an entry, offsets fixed.
+    struct Target {
+        u32 eip;
+        u32 key;     // the block's snapshot (segments, write tracking): it must be the exit's own
+        u32 cycles;
+        u32 tlb;     // the TLB entry's offset, its tag and physical page for the block's page
+        u32 tag;
+        u32 page;
+        u32 line[2];  // the block's code lines plus one (the second 0: one line)
+        i64 mru[2];   // each line's set in L1I, as an offset from the L1D MRU array (R15)
+        void* body;
+        Block* block;
+    };
+    static constexpr unsigned kTargets = 4096;
+    static unsigned target_index(u32 eip) { return (eip ^ (eip >> 12)) & (kTargets - 1); }
+    Target targets[kTargets]{};
 };
+static_assert(sizeof(JitCtx::Target) == 64);
 
 // The native function's result: (instruction index << 2) | kind.
 enum JitResult : u32 { kJitEnd = 0, kJitExit = 1, kJitFault = 3 };
@@ -99,6 +120,13 @@ public:
     u64 flushes() const { return flushes_; }
     // Drop every block's native code (the buffer is full, or the machine reset).
     void flush(BlockEngine& engine);
+    // Exit `slot` of `from`'s last instruction patched to chain into `to`'s native code inside the generated code (its
+    // chain cell gets `to`'s cycles, its page's translation unless it is `from`'s page, its code lines unless they are
+    // among `from`'s, and the jump). False when the cell cannot hold the link (none for this exit, `to`'s page not in
+    // the TLB as `to` was made for, more than four lines). The link's conditions (same segments, write tracking, not
+    // the idle loop) are the caller's.
+    static bool patch_link(Block& from, unsigned slot, const Block& to, Cpu& cpu);
+    static void unpatch_link(Block& from, unsigned slot);
 
 private:
     u8* buffer_{nullptr};

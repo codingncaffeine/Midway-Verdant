@@ -266,6 +266,13 @@ public:
         byte(static_cast<u8>(0x80 + c));
         fixup(l);
     }
+    // lea r64, [rip + label]
+    void lea_rip(Reg dst, Label l) {
+        rex(true, dst, 0, 0);
+        byte(0x8D);
+        byte(static_cast<u8>(0x05 | (dst & 7) << 3));
+        fixup(l);
+    }
 
 private:
     struct Fixup {

@@ -102,6 +102,10 @@ public:
     // The pending flag's byte, for generated code (read with a plain load: x86 orders it as acquire).
     const void* code_pending_byte() const { return &code_pending_; }
     void take_code_writes(std::vector<u32>& pages);
+    // A word a write into code zeroes, after it records the write (the CPU's run limit for chaining: D29 S1). The CPU
+    // thread, after it writes the word, looks at code_writes_pending() again (a full fence between), so a write is
+    // never missed: either it sees the write pending, or the write's zero lands after its own store.
+    void set_code_write_kill(u64* word) { code_write_kill_.store(word, std::memory_order_seq_cst); }
 
     // Unknown-access bookkeeping: (page, is_write) -> count; printed by the runner at the end.
     struct Unknown {
@@ -130,6 +134,7 @@ private:
     std::unique_ptr<std::atomic<u64>[]> code_, code_written_;
     std::size_t code_words_{0};
     std::atomic<bool> code_pending_{false};
+    std::atomic<u64*> code_write_kill_{nullptr};
 };
 
 }  // namespace mv

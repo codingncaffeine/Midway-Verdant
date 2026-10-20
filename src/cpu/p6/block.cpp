@@ -70,9 +70,16 @@ BranchKind branch_kind(Op op) {
 }  // namespace
 
 BlockEngine::BlockEngine(Cpu& cpu, Bus& bus)
-    : cpu_(cpu), bus_(bus), fast_(kFastSize), page_blocks_(bus.ram_size() / 4096), code_granules_(bus.ram_size() >> kCodeGranuleBits) {
+    : cpu_(cpu), bus_(bus), fast_(kFastSize), page_blocks_(bus.ram_size() / 4096), code_granules_(bus.ram_size() >> kCodeGranuleBits),
+      ctx_(std::make_unique<JitCtx>()) {
     bus_.set_code_tracking(true);
     cpu_.memory().set_code_watcher(this, code_granules_.data());
+    ctx_->st = &cpu_.state();
+    ctx_->cpu = &cpu_;
+    ctx_->engine = this;
+    ctx_->error = &jit_error_;
+    ctx_->helper_ops = stats_.helper_ops.data();
+    bus_.set_code_write_kill(&ctx_->chain_limit);
     if (const char* l = std::getenv("MV_P6_BLOCK_LOG"); l && *l) {
         std::string spec(l);
         const auto c2 = spec.rfind(':'), c1 = spec.rfind(':', c2 - 1);
@@ -90,6 +97,7 @@ BlockEngine::BlockEngine(Cpu& cpu, Bus& bus)
 }
 
 BlockEngine::~BlockEngine() {
+    bus_.set_code_write_kill(nullptr);
     cpu_.memory().set_code_watcher(nullptr, nullptr);
     bus_.set_code_tracking(false);
 }
@@ -194,6 +202,7 @@ Block* BlockEngine::build(const u8* page, unsigned off, u32 ram_page, u8 mode) {
         b->entry.fetch_lines = static_cast<u8>(((code + b->bytes - 1) >> 5) - (code >> 5) + 1);
     }
     Block* raw = b.get();
+    for (Block::Link& l : raw->links) l.from = raw;
     page_blocks_[ram_page].push_back(raw);
     bus_.set_code_page(ram_page, true);
     {
@@ -275,7 +284,11 @@ void BlockEngine::mark_granules(u32 ram_page) {
 }
 
 void BlockEngine::set_link(Block::Link& slot, Block* to) {
-    if (slot.to == to) return;
+    if (slot.to == to) {
+        if (to && !slot.patched) Jit::patch_link(*slot.from, static_cast<unsigned>(&slot - slot.from->links.data()), *to, cpu_);
+        return;
+    }
+    if (slot.patched) Jit::unpatch_link(*slot.from, static_cast<unsigned>(&slot - slot.from->links.data()));
     if (Block* old = slot.to) {
         auto& in = old->incoming;
         if (const auto it = std::find(in.begin(), in.end(), &slot); it != in.end()) {
@@ -284,13 +297,42 @@ void BlockEngine::set_link(Block::Link& slot, Block* to) {
         }
     }
     slot.to = to;
-    if (to) to->incoming.push_back(&slot);
+    if (to) {
+        to->incoming.push_back(&slot);
+        Jit::patch_link(*slot.from, static_cast<unsigned>(&slot - slot.from->links.data()), *to, cpu_);
+    }
 }
 
 void BlockEngine::drop_links(Block& b) {
-    for (Block::Link* s : b.incoming) s->to = nullptr;
+    for (u32 i : b.target_slots) {
+        JitCtx::Target& t = ctx_->targets[i];
+        if (t.block == &b) t = JitCtx::Target{};
+    }
+    b.target_slots.clear();
+    for (Block::Link* s : b.incoming) {
+        if (s->patched) Jit::unpatch_link(*s->from, static_cast<unsigned>(s - s->from->links.data()));
+        s->to = nullptr;
+    }
     b.incoming.clear();
     for (Block::Link& s : b.links) set_link(s, nullptr);
+}
+
+u32 BlockEngine::snapshot_key(const Block& b) {
+    for (std::size_t k = 0; k < snapshots_.size(); ++k) {
+        const auto& [seg, dirty] = snapshots_[k];
+        bool same = dirty == b.jit_dirty;
+        for (unsigned g = 0; same && g < kSegCount; ++g) same = seg[g].base == b.jit_seg[g].base && seg[g].limit == b.jit_seg[g].limit && seg[g].ar == b.jit_seg[g].ar;
+        if (same) return static_cast<u32>(k + 1);
+    }
+    snapshots_.emplace_back(b.jit_seg, b.jit_dirty);
+    return static_cast<u32>(snapshots_.size());
+}
+
+void BlockEngine::set_idle_eips(u32 a, u32 b) {
+    idle_ = {a, b};
+    ++link_epoch_;  // links made before are not taken by the engine's chain
+    for (auto& [k, blk] : blocks_)
+        if (blk->jit_eip == a || blk->jit_eip == b) drop_links(*blk);  // nor by a chain cell
 }
 
 void BlockEngine::forget(Block& b) {
@@ -472,26 +514,37 @@ namespace mv::p6 {
 // as `exec` would have set it.
 unsigned BlockEngine::run_native(Run& r) {
     Memory& mem = cpu_.memory();
-    JitCtx c;  // default member initialisers: everything but the store log
-    c.st = &cpu_.state();
-    c.cpu = &cpu_;
-    c.engine = this;
+    JitCtx& c = *ctx_;
     c.block = r.b;
     c.base = r.start + r.extra;
     c.limit = r.limit;
     c.devices = mem.device_events();
-    c.error = &jit_error_;
-    c.entry_eip = r.entry_eip;
-    c.helper_ops = stats_.helper_ops.data();
-    c.chain_budget = chain_budget_;
-    c.chain_extra = 4096;
+    c.helpers = 0;
+    c.exit = 0;
+    c.ended = 0;
+    c.end_cycles = 0;
+    c.insns_done = 0;
+    c.last_slot = nullptr;
+    c.last_target = 0;
+    c.penalties = 0;
+    c.stores = 0;
+    c.mispredicts = 0;
     c.start_eip = r.entry_eip;
+    c.chain_extra = 4096;
+    c.inline_chains = 0;
+    c.inline_mispredicts = 0;
+    c.logging = 0;
+    c.log_count = 0;
+    c.stop_why = 0;
+    c.probe = 0;
+    c.probe_eip = 0xFFFFFFFFu;
+    c.probe_misses = 0;
+    c.budget_end = c.base + static_cast<u64>(chain_budget_) * kBudgetCycles;
     // A spin probe with stores or mispredicts, armed by an earlier pass at this EIP: one pass with the stores logged
-    // and every transition through the engine (a budget of 0: the generated code never commits a chain), so the
+    // and every transition through the engine (a chain limit of 0: the generated code never commits a chain), so the
     // predictors and the return stack are recorded as exit_cost changes them. The run starts at the probe's EIP.
     if (probe_eip_ && probe_eip_ == r.entry_eip && chain_budget_ >= 64 && r.extra == 0) {
         c.logging = 1;
-        c.chain_budget = 0;
         probing_ = true;
         probed_exits_.clear();
         rsb_at_probe_ = rsb_;
@@ -499,11 +552,12 @@ unsigned BlockEngine::run_native(Run& r) {
         arm_probe(c, r.entry_eip, r.start, 0);
     } else if (chain_budget_ >= 64 && r.extra == 0 && known_spin(r.entry_eip)) {
         // A known spin loop: probed from its start, so the run ends when it is back where it began.
-        c.chain_budget = 256;
+        c.budget_end = c.base + 256 * kBudgetCycles;
         c.chain_extra = 0;
         arm_probe(c, r.entry_eip, r.start, 0);
         ++stats_.spin_short_runs;
     }
+    open_chain_limit(c);
     cpu_.clear_faulted();
     running_ = r.b;
     running_dead_ = false;
@@ -522,7 +576,7 @@ unsigned BlockEngine::run_native(Run& r) {
     const unsigned kind = result & 3;
     const u64 total = c.insns_done + i + 1;
     cpu_.add_instructions(total - c.helpers);
-    stats_.block_insns += i + 1;
+    stats_.block_insns += total;
     ++stats_.native_runs;
     if ((stats_.native_runs & 0xFFFF) == 0) not_fixed_.fill(0);  // a loop that warmed up gets another chance
     stats_.native_insns += total - c.helpers;
@@ -531,8 +585,6 @@ unsigned BlockEngine::run_native(Run& r) {
     stats_.whole_runs += c.inline_chains;
     stats_.mispredicts += c.inline_mispredicts;
     stats_.exit_cycles += static_cast<u64>(c.inline_mispredicts) * tp::kBlockMispredict;
-    stats_.schedule_cycles += c.inline_sched;
-    stats_.block_insns += c.inline_insns;
     const u64 left = mem.take_penalty();
     c.base += left;
     stats_.penalty_cycles += c.penalties + left;
@@ -546,47 +598,61 @@ unsigned BlockEngine::run_native(Run& r) {
             pending_from_ = &b;
             if (c.probe == 2) spin_skip(c, total - c.probe_insns);
         } else {
-            const u32 exit = exit_cost(b, c.entry_eip);
-            stats_.schedule_cycles += b.cycles;
+            const u32 exit = exit_cost(b, b.jit_eip);
             stats_.exit_cycles += exit;
             cpu_.set_cycles_only(c.base + b.cycles + exit);
         }
     } else if (kind == kJitExit && c.exit == 2) {
         // The interpreter finishes the block from the next instruction, with the penalties so far.
         cpu_.set_cycles_only(c.base + b.after[i]);
-        Run rest{&b, c.base, c.entry_eip, 0, c.limit};
+        Run rest{&b, c.base, b.jit_eip, 0, c.limit};
         ++stats_.native_handoffs;
         unsigned j = i + 1;
         while (exec(rest, j) == Next::Continue) ++j;
         return static_cast<unsigned>(c.insns_done) + j + 1;
     } else {
-        stats_.schedule_cycles += b.after[i];
         cpu_.set_cycles_only(c.base + b.after[i] + (kind == kJitFault ? tp::kInterruptDelivery : 0));
     }
+    // The schedules' share of the run (statistics): what the clock moved less the penalties and mispredicts.
+    stats_.schedule_cycles += cpu_.cycles() - r.start - (c.penalties + r.extra + left) - c.mispredicts * tp::kBlockMispredict -
+                              (kind == kJitFault ? tp::kInterruptDelivery : 0);
     return static_cast<unsigned>(total);
 }
 
-// The end of a native block whose last instruction left normally. Its exit is costed as `exec` costs it. Then the run
-// goes on in the next block's native code only where the dispatcher would have done nothing in between: the next
-// deadline and the stop cycle lie past the next block even with the slowest code fetch (so no event fires and no
-// interrupt becomes deliverable — native code changes neither IF nor the PIC), no device wrote into code, the fetch
-// translation hits the TLB on the page the block came from (find() would walk nothing), it is not the idle loop, and
-// the link names that block's current translation with the same segments. Then its run begins as `begin` would.
+// The generated code's chain limit for the run from here: the limit or the budget's end, whichever comes first (0 for
+// a logging probe, whose every transition is the engine's); then 0 if a device wrote into code meanwhile.
+void BlockEngine::open_chain_limit(JitCtx& c) {
+    const u64 v = c.logging ? 0 : std::min(c.limit, c.budget_end);
+    std::atomic_ref<u64>(c.chain_limit).store(v, std::memory_order_seq_cst);
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    if (bus_.code_writes_pending()) std::atomic_ref<u64>(c.chain_limit).store(0, std::memory_order_seq_cst);
+}
+
+// The end of a native block whose last instruction left normally, when its chain cell did not take the exit. Its exit is
+// costed as `exec` costs it. Then the run goes on in the next block's native code only where the dispatcher would have
+// done nothing in between: the next deadline and the stop cycle lie past the next block even with the slowest code
+// fetch (so no event fires and no interrupt becomes deliverable — native code changes neither IF nor the PIC), no
+// device wrote into code, the fetch translation hits the TLB on the page the block came from (find() would walk
+// nothing), it is not the idle loop, and the link names that block's current translation with the same segments. Then
+// its run begins as `begin` would. Past the chain budget the run goes on (a little) only to see whether it comes back
+// to the state it was in there (the spin probe).
 void* BlockEngine::chain(JitCtx& c, Block::Link* slot) {
-    Block& a = *c.block;
+    Block& a = *slot->from;
+    c.block = &a;
+    const CpuState& s = cpu_.state();
     {
         // Statistics: why the generated code's own chain did not take this exit.
-        const CpuState& s = cpu_.state();
         const Block* t = slot->to;
         const u32 lin = s.seg[kCs].base + s.eip;
         const Memory::TlbEntry& e = cpu_.memory().tlb()[(lin >> 12) & (Memory::kTlbSize - 1)];
+        const u64 end_max = c.base + a.cycles + tp::kBlockMispredict;
         unsigned why = 7;
         if (a.branch != BranchKind::None && a.branch != BranchKind::Conditional && a.branch != BranchKind::Direct && a.branch != BranchKind::Call) why = 6;
         else if (c.probe == 1 && s.eip == c.probe_eip) why = 8;
-        else if (!t || slot->epoch != link_epoch_ || !t->entry.body || t->entry.jit_eip != s.eip) why = 0;
-        else if (c.chain_budget == 0) why = 1;
-        else if (c.base + a.cycles + tp::kBlockMispredict + t->entry.cycles + tp::kL2Latency + tp::kDramLatency >= c.limit) why = 2;
-        else if (bus_.code_writes_pending() || cpu_.memory().penalty_pending()) why = 3;
+        else if (!t || !slot->patched || slot->epoch != link_epoch_ || !t->entry.body || t->entry.jit_eip != s.eip) why = 0;
+        else if (end_max + t->entry.cycles >= c.limit) why = 2;
+        else if (end_max + t->entry.cycles >= c.budget_end) why = 1;
+        else if (c.chain_limit == 0) why = 3;
         else if (e.tag != (lin >> 12) || e.host != t->entry.host_page) why = 4;
         else {
             const u32* mru = cpu_.cache_timing().l1i_mru();
@@ -597,17 +663,15 @@ void* BlockEngine::chain(JitCtx& c, Block::Link* slot) {
         }
         ++stats_.slow_chain[why];
     }
-    const u32 exit = exit_cost(a, c.entry_eip);
+    const u32 exit = exit_cost(a, a.jit_eip);
     stats_.schedule_cycles += a.cycles;
     stats_.exit_cycles += exit;
     const u64 end = c.base + a.cycles + exit;
     c.end_cycles = end;
     c.ended = 1;
     c.last_slot = slot;
-    c.last_target = cpu_.state().eip;
-    Block* b = slot->to;
+    c.last_target = s.eip;
     if (exit) ++c.mispredicts;
-    const CpuState& s = cpu_.state();
     // Back at the probe's EIP: a pass of a loop when the whole state is as it was there (the spin skip then checks the
     // rest); a nested loop's inner block recurs before the outer period ends, so a few other states are let by.
     if (c.probe == 1 && s.eip == c.probe_eip) {
@@ -621,6 +685,7 @@ void* BlockEngine::chain(JitCtx& c, Block::Link* slot) {
             return c.stop_why = 8, nullptr;
         }
     }
+    Block* b = slot->to;
     if (!b || slot->epoch != link_epoch_ || !b->native || b->jit_eip != s.eip) {
         // No link, a stale one, or one to where the exit went last time (a return, a jump table): the block the
         // dispatcher would run next, from the fast cache, under the conditions a link to it is learned (run()), and
@@ -640,18 +705,16 @@ void* BlockEngine::chain(JitCtx& c, Block::Link* slot) {
         }
         if (!b) return c.stop_why = 1, nullptr;
     }
-    // Past the budget a run goes on (a little) to see whether it comes back to the state it was in there: the probe is
-    // armed at this boundary (not where a probe already failed), and the generated code chains on, leaving only to
-    // come here at the probe's EIP. A logging probe takes every transition here.
-    if (c.chain_budget == 0) {
-        if (c.probe) {
-            if (!c.logging || c.chain_extra == 0) return c.stop_why = 2, nullptr;
-        } else {
-            if (c.chain_extra == 0 || not_a_fixed_point(s.eip)) return c.stop_why = 2, nullptr;
-            arm_probe(c, s.eip, end, c.insns_done + a.n);
-            c.chain_budget = c.chain_extra;
-            c.chain_extra = 0;
-        }
+    // The budget: a logging probe counts its transitions; otherwise the first block past the budget's end arms the
+    // probe here (not where one already failed) and the run goes on a little, else it stops.
+    if (c.logging) {
+        if (c.chain_extra == 0) return c.stop_why = 2, nullptr;
+        --c.chain_extra;
+    } else if (end + b->cycles >= c.budget_end) {
+        if (c.probe || chain_budget_ == 0 || not_a_fixed_point(s.eip)) return c.stop_why = 2, nullptr;
+        arm_probe(c, s.eip, end, c.insns_done + a.n);
+        c.budget_end = end + c.chain_extra * kBudgetCycles;
+        c.chain_extra = 0;
     }
     if (b->jit_eip != s.eip || s.eip == idle_[0] || s.eip == idle_[1]) return c.stop_why = 3, nullptr;
     constexpr u64 kSlowestFetch = tp::kL2Latency + tp::kDramLatency;
@@ -660,21 +723,37 @@ void* BlockEngine::chain(JitCtx& c, Block::Link* slot) {
     const u32 lin = s.seg[kCs].base + s.eip;
     const Memory::TlbEntry& e = cpu_.memory().tlb()[(lin >> 12) & (Memory::kTlbSize - 1)];
     if (e.tag != (lin >> 12) || !e.host || bus_.ram_page(e.host) != b->ram_page || (lin & 0xFFFu) != b->page_off) return c.stop_why = 6, nullptr;
-    if (c.chain_budget) --c.chain_budget;
-    else --c.chain_extra;
+    // A link the cell could not hold when it was learned (its page not in the TLB then) is patched now it is.
+    if (!slot->patched && slot->to == b) Jit::patch_link(a, static_cast<unsigned>(slot - a.links.data()), *b, cpu_);
+    // A return or an indirect jump: the generated code chains there itself next time (the target cache).
+    if ((a.branch == BranchKind::Return || a.branch == BranchKind::Indirect || a.branch == BranchKind::CallIndirect) && b->entry.fetch_lines <= 2 && b->jit_key) {
+        const unsigned i = JitCtx::target_index(s.eip);
+        JitCtx::Target& t = c.targets[i];
+        if (t.block && t.block != b) {
+            auto& v = t.block->target_slots;
+            v.erase(std::remove(v.begin(), v.end(), i), v.end());
+        }
+        const Timing& tm = cpu_.cache_timing();
+        const i64 l1i = reinterpret_cast<const u8*>(tm.l1i_mru()) - reinterpret_cast<const u8*>(tm.l1d_mru());
+        const u32 l = b->entry.fetch_line;
+        t = JitCtx::Target{s.eip, b->jit_key, b->cycles, ((lin >> 12) & (Memory::kTlbSize - 1)) * 32, lin >> 12, e.phys_page,
+                           {l, b->entry.fetch_lines == 2 ? l + 1 : 0u},
+                           {l1i + static_cast<i64>(((l - 1) & (tm.l1i_sets() - 1)) * 4), l1i + static_cast<i64>((l & (tm.l1i_sets() - 1)) * 4)},
+                           b->entry.body, b};
+        if (std::find(b->target_slots.begin(), b->target_slots.end(), i) == b->target_slots.end()) b->target_slots.push_back(i);
+    }
     ++b->entry.runs;
     ++stats_.whole_runs;
     ++stats_.chains;
-    stats_.block_insns += a.n;
     c.insns_done += a.n;
     const PhysAddr code = static_cast<PhysAddr>(b->ram_page) * 4096u + b->page_off;
     const u64 fetch = cpu_.cache_timing().code_fetch(code, b->bytes);
     c.penalties += fetch;
     c.base = end + fetch;
     c.block = b;
-    c.entry_eip = s.eip;
     c.ended = 0;
     running_ = b;
+    open_chain_limit(c);
     cpu_.set_cycles_only(c.base);
     return b->entry.body;
 }
@@ -684,8 +763,16 @@ void BlockEngine::disable_jit() { jit_.reset(); }
 void BlockEngine::drop_native() {
     ++link_epoch_;
     pending_slot_ = nullptr;
-    for (auto& [k, b] : blocks_) b->native = b->entry.body = nullptr;
-    for (auto& b : graveyard_) b->native = b->entry.body = nullptr;
+    // The code (and its chain cells) is gone with the buffer: every link with it, no unpatching.
+    auto reset = [](Block& b) {
+        b.native = b.entry.body = nullptr;
+        for (Block::Link& l : b.links) l = Block::Link{nullptr, 0, &b, {}, {}, false};
+        b.incoming.clear();
+        b.target_slots.clear();
+    };
+    for (JitCtx::Target& t : ctx_->targets) t = JitCtx::Target{};
+    for (auto& [k, b] : blocks_) reset(*b);
+    for (auto& b : graveyard_) reset(*b);
 }
 
 }  // namespace mv::p6
@@ -761,8 +848,11 @@ namespace mv::p6 {
 
 // Whether the probe's pass left every predictor it touched, and the return stack, as it found them.
 bool BlockEngine::predictors_undone() const {
-    for (const ProbedExit& p : probed_exits_)
-        if (p.block->exit_counter != p.counter || p.block->exit_seen != p.seen || p.block->exit_target != p.target) return false;
+    // (The last target matters only to an indirect exit's prediction; a direct one's chain cells leave it.)
+    for (const ProbedExit& p : probed_exits_) {
+        const bool indirect = p.block->branch == BranchKind::Indirect || p.block->branch == BranchKind::CallIndirect;
+        if (p.block->exit_counter != p.counter || p.block->exit_seen != p.seen || (indirect && p.block->exit_target != p.target)) return false;
+    }
     return rsb_ == rsb_at_probe_ && rsb_top_ == rsb_top_at_probe_;
 }
 

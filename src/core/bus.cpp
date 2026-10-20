@@ -83,7 +83,10 @@ void Bus::note_code_write(const u8* p, std::size_t len) {
         code_written_[page / 64].fetch_or(bit, std::memory_order_relaxed);
         any = true;
     }
-    if (any) code_pending_.store(true, std::memory_order_release);
+    if (any) {
+        code_pending_.store(true, std::memory_order_seq_cst);
+        if (u64* k = code_write_kill_.load(std::memory_order_seq_cst)) std::atomic_ref<u64>(*k).store(0, std::memory_order_seq_cst);
+    }
 }
 
 void Bus::take_code_writes(std::vector<u32>& pages) {
