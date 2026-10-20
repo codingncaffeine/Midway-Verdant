@@ -265,6 +265,7 @@ private:
     struct PendingDraw {
         u64 ticket;      // 0: CLEAR_REPORT_VALUE (the z-pass count restarts here, in stream order)
         u64 passes;
+        u64 bytes;       // memory traffic per pixel (stage C)
         u64 mark_index;
         bool zpass;      // SET_ZPASS_PIXEL_COUNT_ENABLE was on: its passed samples count
     };

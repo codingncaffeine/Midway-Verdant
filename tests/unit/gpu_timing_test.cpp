@@ -55,3 +55,19 @@ TEST(GpuTiming, SevenGpuClocksAreTwentyTwoCpuCycles) {
     EXPECT_EQ(gpu_timing::gpu_from_cycles(22), 7u);
     EXPECT_EQ(gpu_timing::gpu_from_cycles(21), 6u) << "rounded down: an idle GPU never starts in the future";
 }
+
+// Stage C: a pixel costs the longer of its pipeline time (four pipelines) and its memory time (192/7 bytes a clock).
+TEST(GpuTiming, APixelCostsItsPipelineOrItsMemoryTime) {
+    EXPECT_EQ(gpu_timing::pixel_clocks(400, 1, 0), 100u) << "no traffic: four a clock";
+    EXPECT_EQ(gpu_timing::pixel_clocks(400, 2, 0), 200u) << "two passes";
+    // 16 bytes a pixel: 400 x 16 x 7 / 192 = 233.3 -> 234 clocks, longer than the pipeline's 100.
+    EXPECT_EQ(gpu_timing::pixel_clocks(400, 1, 16), 234u);
+    KelvinState s;
+    s.r[(mthd::kSurfaceFormat >> 2) & 0x7FF] = 0x5 | (0x2 << 4);  // A8R8G8B8 colour, Z24S8 depth
+    s.r[(mthd::kColorMask >> 2) & 0x7FF] = 0x01010101;
+    s.r[(mthd::kDepthTestEnable >> 2) & 0x7FF] = 1;
+    s.r[(mthd::kDepthMask >> 2) & 0x7FF] = 1;
+    EXPECT_EQ(gpu_timing::pixel_bytes(s), 4u + 4u + 4u) << "colour written, depth read and written";
+    s.r[(mthd::kBlendEnable >> 2) & 0x7FF] = 1;
+    EXPECT_EQ(gpu_timing::pixel_bytes(s), 8u + 4u + 4u) << "blending reads the colour too";
+}

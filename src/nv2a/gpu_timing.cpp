@@ -60,10 +60,22 @@ u64 pixel_passes(const pgraph::KelvinState& state) {
     return std::max<u64>({1, (textures + kTexturesPerPass - 1) / kTexturesPerPass, (stages + kCombinerStagesPerPass - 1) / kCombinerStagesPerPass});
 }
 
+u64 pixel_bytes(const pgraph::KelvinState& state) {
+    const auto surface = state.surface();
+    u64 b = 0;
+    if (state.color_mask() != 0) b += surface.color_bytes() * (state.blend() ? 2u : 1u);
+    if (state.depth_test() || state.stencil_test()) b += surface.zeta_bytes();
+    if (state.depth_write()) b += surface.zeta_bytes();
+    for (u32 stage = 0; stage < 4; ++stage)
+        if (state.shader_stage_program(stage) != 0) b += kTexelBytes;
+    return b;
+}
+
 u64 clear_clocks(const pgraph::KelvinState& state) {
     const auto s = state.surface();
     const u64 pixels = static_cast<u64>(s.clip_width()) * s.clip_height();
-    return (pixels + kPixelsPerClock - 1) / kPixelsPerClock;
+    // Colour and depth written ([estimate]: the clear bits are not consulted; a fast Z clear is not modelled).
+    return pixel_clocks(pixels, 1, s.color_bytes() + s.zeta_bytes());
 }
 
 }  // namespace mv::gpu_timing

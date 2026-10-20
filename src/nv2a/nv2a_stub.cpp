@@ -388,7 +388,7 @@ void Nv2aStub::resolve_pixels() {
         if (d.zpass) zpass_count_ += counts.samples;
         if (debug_zpass()) std::fprintf(stderr, "zpass: draw %llu samples %llu pixels %llu%s\n", static_cast<unsigned long long>(d.ticket),
                                         static_cast<unsigned long long>(counts.samples), static_cast<unsigned long long>(counts.fragments), d.zpass ? " counted" : "");
-        const u64 c = gpu_timing::pixel_clocks(counts.fragments, d.passes);
+        const u64 c = gpu_timing::pixel_clocks(counts.fragments, d.passes, d.bytes);
         delta += c;
         timed_pixels_ += counts.fragments;
         pixel_clocks_ += c;
@@ -524,6 +524,7 @@ void Nv2aStub::execute_method(const PushbufferMethod& m) {
     if (renderer_ && bound_[m.subchannel] == 0x97) {
         const bool draw_end = timed_ && m.method == pgraph::mthd::kBeginEnd && m.value == 0 && kelvin_.in_begin();
         const u64 passes = draw_end ? gpu_timing::pixel_passes(kelvin_.state()) : 0;
+        const u64 bytes = draw_end ? gpu_timing::pixel_bytes(kelvin_.state()) : 0;
         const u64 ticket_before = renderer_->last_draw_ticket();
         const unsigned debug_primitive = draw_end ? static_cast<unsigned>(kelvin_.batch().primitive) : 0u;
         const u64 debug_vertices = draw_end && debug_zpass() ? gpu_timing::vertex_count(kelvin_.state(), kelvin_.batch()) : 0;
@@ -532,7 +533,7 @@ void Nv2aStub::execute_method(const PushbufferMethod& m) {
         if (draw_end) {
             const u64 ticket = renderer_->last_draw_ticket();
             if (ticket && ticket != ticket_before)
-                pending_draws_.push_back({ticket, passes, marks_pushed_, (kelvin_.state().reg(kMethodZpassEnable) & 1u) != 0});
+                pending_draws_.push_back({ticket, passes, bytes, marks_pushed_, (kelvin_.state().reg(kMethodZpassEnable) & 1u) != 0});
             if (debug_zpass() && (kelvin_.state().reg(kMethodZpassEnable) & 1u)) {
                 const auto& st = kelvin_.state();
                 std::fprintf(stderr, "zpass: counted draw ticket %llu (before %llu): primitive %u, %llu vertices, depth test %u func %04x write %u, stencil %u, colour mask %08x, cull %u face %04x, program mode %u, clip %08x %08x, zmin/max control %08x\n",
@@ -545,7 +546,7 @@ void Nv2aStub::execute_method(const PushbufferMethod& m) {
         if (debug_zpass() && (m.method == kMethodClearReport || m.method == kMethodZpassEnable)) std::fprintf(stderr, "zpass: method %04x <- %08x\n", m.method, m.value);
         if (timed_ && m.method == kMethodClearReport && m.value == 1) {
             if (pending_draws_.empty()) zpass_count_ = 0;
-            else pending_draws_.push_back({0, 0, marks_pushed_, false});
+            else pending_draws_.push_back({0, 0, 0, marks_pushed_, false});
         }
         if (m.method == 0x1D70) {
             renderer_->flush_frame();
