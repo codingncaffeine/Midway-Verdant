@@ -400,6 +400,19 @@ struct Gen {
             if (m) c.insert(c.end(), {static_cast<u8>(0x43 | x << 3), disp});
             else c.push_back(static_cast<u8>(0xC0 | x << 3 | y));
         };
+        // Scalar forms on words that are 4- but not 8-aligned, and the compares into EFLAGS (then a SETcc reads them).
+        if (next() % 3 == 0) {
+            const u8 d4 = static_cast<u8>((next() & 0xF8) | 4);
+            switch (next() % 4) {
+                case 0: { static constexpr u8 ops[] = {0x58, 0x59, 0x5C, 0x5E, 0x5D, 0x5F, 0x51}; c.insert(c.end(), {0xF3, 0x0F, ops[next() % 7], static_cast<u8>(0x43 | x << 3), d4}); break; }
+                case 1: c.insert(c.end(), {0xF3, 0x0F, static_cast<u8>(next() & 1 ? 0x10 : 0x11), static_cast<u8>(0x43 | x << 3), d4}); break;
+                case 2: c.insert(c.end(), {0x0F, static_cast<u8>(next() & 1 ? 0x2E : 0x2F), static_cast<u8>(0x43 | x << 3), d4}); break;
+                case 3: c.insert(c.end(), {0x0F, static_cast<u8>(next() & 1 ? 0x2E : 0x2F), static_cast<u8>(0xC0 | x << 3 | y)}); break;
+            }
+            if (c[c.size() - 2] == 0x2E || c[c.size() - 2] == 0x2F || c[c.size() - 3] == 0x2E || c[c.size() - 3] == 0x2F)
+                c.insert(c.end(), {0x0F, static_cast<u8>(0x90 + (next() & 15)), static_cast<u8>(0xC0 | reg8())});  // setcc: the flags are used
+            return;
+        }
         switch (next() % (kHostX87 ? 14u : 9u)) {
             case 0: c.insert(c.end(), {0xF3, 0x0F, 0x2A}); if (m) c.insert(c.end(), {static_cast<u8>(0x43 | x << 3), d8}); else c.push_back(static_cast<u8>(0xC0 | x << 3 | src())); break;  // cvtsi2ss
             case 1: c.insert(c.end(), {0xF3, 0x0F, static_cast<u8>(next() & 1 ? 0x2C : 0x2D), static_cast<u8>(0xC0 | reg() << 3 | y)}); break;  // cvt(t)ss2si
@@ -1178,4 +1191,30 @@ TEST(P6Block, WideProgramsMatchTheInterpreter) {
                 static_cast<unsigned long long>(native), static_cast<unsigned long long>(insns), static_cast<unsigned long long>(faults[0]),
                 static_cast<unsigned long long>(faults[1]), static_cast<unsigned long long>(faults[2]), static_cast<unsigned long long>(faults[3]),
                 static_cast<unsigned long long>(deliveries));
+}
+
+// A function called from two places in turn: its RET's link always remembers the other caller, so the chain looks the
+// real return block up (the fast cache) and relinks instead of going back to the dispatcher. Against the block
+// interpreter in lock step; the relinks happened.
+TEST(P6Block, ChainsRelinkAReturnToItsOtherCaller) {
+    // 0x1000: mov ecx, 2000
+    // 0x1005: call 0x1100 | 0x100A: add eax, 3 | 0x100D: call 0x1100 | 0x1012: add edx, 5 | 0x1015: dec ecx; jnz 0x1005 | hlt
+    // 0x1100: add esi, eax; xor esi, edx; ret
+    const std::vector<u8> main = {0xB9, 0xD0, 0x07, 0x00, 0x00, 0xE8, 0xF6, 0x00, 0x00, 0x00, 0x83, 0xC0, 0x03, 0xE8, 0xEE, 0x00, 0x00, 0x00,
+                                  0x83, 0xC2, 0x05, 0x49, 0x0F, 0x85, 0xE9, 0xFF, 0xFF, 0xFF, 0xF4};
+    const std::vector<u8> fn = {0x01, 0xC6, 0x31, 0xD6, 0xC3};
+    Rig b(true), c(true);
+    for (Rig* r : {&b, &c}) {
+        r->load(main);
+        r->load(fn, 0x1100);
+        r->cpu.set_block_timing(true);
+    }
+    BlockEngine eb(b.cpu, b.bus);
+    eb.disable_jit();
+    BlockEngine ec(c.cpu, c.bus);
+    ec.set_jit_threshold(0);
+    run_lockstep(b, eb, c, ec, "a return to alternating callers");
+    expect_same(b, c, "a return to alternating callers", true);
+    EXPECT_EQ(c.cpu.state().gpr[kEax], 6000u);
+    EXPECT_GT(ec.stats().relinks, 1000u) << "the returns relinked";
 }

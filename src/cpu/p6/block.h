@@ -72,6 +72,11 @@ struct Block {
 
 struct BlockStats {
     u64 built{0}, killed{0}, pages_written{0}, device_page_writes{0};
+    u64 lookups{0}, fast_hits{0};  // find(): calls, and those the direct-mapped cache answered
+    u64 relinks{0};  // chains that found their block in the fast cache when the exit's link was missing or elsewhere
+    // Every native run's end: [0..15] the chain test that stopped it at a normal block end (0: none was tried, the
+    // exit went to the dispatcher), [16] an exit mid-block (a device access, a fault, the limit), [17] a fault.
+    std::array<u64, 18> run_end{};
     u64 whole_runs{0}, fallback_steps{0}, block_insns{0};
     u64 mispredicts{0};
     u64 native_runs{0}, native_insns{0}, native_helpers{0}, native_ineligible{0}, native_handoffs{0}, chains{0}, links_refused{0};

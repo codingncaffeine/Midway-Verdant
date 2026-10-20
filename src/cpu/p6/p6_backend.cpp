@@ -398,6 +398,10 @@ std::string P6Backend::report() const {
     }
     if (blocks_) {
         const p6::BlockStats& b = blocks_->stats();
+        r += std::format("\ncpu p6 block lookups: {}, {} from the fast cache; {} chains relinked through it; native runs ended by (chain test: runs):", b.lookups,
+                         b.fast_hits, b.relinks);
+        for (unsigned w = 0; w < b.run_end.size(); ++w)
+            if (b.run_end[w]) r += std::format(" {}:{}", w == 16 ? std::string("mid-block") : w == 17 ? std::string("fault") : std::to_string(w), b.run_end[w]);
         r += std::format("\ncpu p6 blocks: {} built, {} live, {} killed ({} page writes, {} by devices); runs {} whole; {} fallback steps; {} instructions in blocks; {} exit mispredicts; cycles: schedules {}, penalties {}, exits {}, REP {}",
                          b.built, blocks_->live_blocks(), b.killed, b.pages_written, b.device_page_writes, b.whole_runs, b.fallback_steps,
                          b.block_insns, b.mispredicts, b.schedule_cycles, b.penalty_cycles, b.exit_cycles, b.rep_cycles);

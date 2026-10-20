@@ -19,51 +19,51 @@ namespace mv::p6 {
 
 // What the generated code and its helpers share (offsets fixed: the code addresses it from RBX).
 struct JitCtx {
-    CpuState* st;          // 0
-    Cpu* cpu;              // 8
-    BlockEngine* engine;   // 16
-    Block* block;          // 24
-    u64 base;              // 32: the run's start plus the penalties so far (cycles)
-    u64 limit;             // 40: the cycle the run must not pass
-    u64 devices;           // 48: the memory unit's device-access count at the run's start
-    u32 helpers;           // 56: instructions the interpreter executed for the native code
-    u8 exit;               // 60: leave after the current instruction (1), or hand the rest of the block to the
+    CpuState* st{};          // 0
+    Cpu* cpu{};              // 8
+    BlockEngine* engine{};   // 16
+    Block* block{};          // 24
+    u64 base{};              // 32: the run's start plus the penalties so far (cycles)
+    u64 limit{};             // 40: the cycle the run must not pass
+    u64 devices{};           // 48: the memory unit's device-access count at the run's start
+    u32 helpers{};           // 56: instructions the interpreter executed for the native code
+    u8 exit{};               // 60: leave after the current instruction (1), or hand the rest of the block to the
                            //     interpreter after it (2: a penalty may make a later boundary reach the limit)
-    u8 pad[3];             // 61
-    u64 scratch[12];       // 64: slots for the generated code (see jit_x64.cpp)
-    std::exception_ptr* error;  // where a helper leaves what the interpreter threw (an unimplemented form)
-    u64* helper_ops;  // statistics: the interpreter's instructions by operation
+    u8 pad[3]{};             // 61
+    u64 scratch[12]{};       // 64: slots for the generated code (see jit_x64.cpp)
+    std::exception_ptr* error{};  // where a helper leaves what the interpreter threw (an unimplemented form)
+    u64* helper_ops{};  // statistics: the interpreter's instructions by operation
     // Chains (used by C++ only): the current block's entry EIP; whether its exit was already costed and the cycle it
     // ended at; the instructions of the blocks before it in this run; how many more blocks may chain; the link slot
     // the last exit tried; the penalties added (statistics).
-    u32 entry_eip;
-    u8 ended;
-    u64 end_cycles;
-    u64 insns_done;
-    u32 chain_budget;
-    Block::Link* last_slot;
-    u32 last_target;
-    u64 penalties;
+    u32 entry_eip{};
+    u8 ended{};
+    u64 end_cycles{};
+    u64 insns_done{};
+    u32 chain_budget{};
+    Block::Link* last_slot{};
+    u32 last_target{};
+    u64 penalties{};
     // The spin skip's evidence (see BlockEngine::run_native): stores the native code made, mispredicts, where the
     // run began, the blocks a run may chain past its budget to end where it began.
-    u32 stores;
-    u32 mispredicts;
-    u32 start_eip;
-    u32 chain_extra;
+    u32 stores{};
+    u32 mispredicts{};
+    u32 start_eip{};
+    u32 chain_extra{};
     // Statistics of the chains the generated code took (folded into the engine's after the run).
-    u32 inline_chains;
-    u32 inline_mispredicts;
-    u64 inline_sched;
-    u64 inline_insns;
+    u32 inline_chains{};
+    u32 inline_mispredicts{};
+    u64 inline_sched{};
+    u64 inline_insns{};
     // The spin probe: with `logging` set, each native store logs its host address, size and the bytes it replaces
     // (16-byte stores as two entries); past 256 entries only the count grows.
-    u8 logging;
-    u32 log_count;
+    u8 logging{};
+    u32 log_count{};
     struct LogEntry {
         u64 where;  // the host address, the size in the top byte
         u64 old;
-    } log[256];
-    u8 stop_why;  // instrument: which test in BlockEngine::chain ended the run (0: none)
+    } log[256];  // not initialised: read only up to log_count (zeroing 4 KiB a run was a measurable cost)
+    u8 stop_why{};  // instrument: which test in BlockEngine::chain ended the run (0: none)
 };
 
 // The native function's result: (instruction index << 2) | kind.

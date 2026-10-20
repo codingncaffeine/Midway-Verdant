@@ -115,8 +115,10 @@ Block* BlockEngine::find() {
     const unsigned off = lin & 0xFFFu;
     FastEntry& f = fast_[fast_index(lin, mode)];
     Block* b = nullptr;
+    ++stats_.lookups;
     if (f.epoch == epoch_ && f.lin == lin && f.mode == mode && f.block->ram_page == page && f.block->page_off == off) {
         b = f.block;
+        ++stats_.fast_hits;
     } else {
         const auto it = blocks_.find(key(page, off, mode));
         b = it != blocks_.end() ? it->second.get() : build(host - off, off, page, mode);
@@ -344,8 +346,9 @@ unsigned BlockEngine::run(Block& b, u64 limit) {
                 jit_->flush(*this);
                 if (!jit_->compile(b, cpu_, *this)) b.jit_failed = true;
             }
-            ++b.jit_compiles;
-            ++link_epoch_;
+            // Links are only ever learned to blocks with native code, so a first translation leaves every existing link
+            // as valid as it was; a translation again (the block's assumptions changed) may not (a flush bumped it).
+            if (++b.jit_compiles > 1) ++link_epoch_;
         }
         // The last native exit's slot learns where it led, when a chain there could be valid (same snapshot).
         if (pending_slot_) {
@@ -384,7 +387,7 @@ namespace mv::p6 {
 // as `exec` would have set it.
 unsigned BlockEngine::run_native(Run& r) {
     Memory& mem = cpu_.memory();
-    JitCtx c{};
+    JitCtx c;  // default member initialisers: everything but the store log
     c.st = &cpu_.state();
     c.cpu = &cpu_;
     c.engine = this;
@@ -450,6 +453,7 @@ unsigned BlockEngine::run_native(Run& r) {
     const u64 left = mem.take_penalty();
     c.base += left;
     stats_.penalty_cycles += c.penalties + left;
+    ++stats_.run_end[kind == kJitEnd ? (c.stop_why & 15u) : kind == kJitFault ? 17u : 16u];
     if (kind == kJitEnd) {
         if (c.ended) {
             cpu_.set_cycles_only(c.end_cycles);  // the exit was costed where the chain stopped
@@ -496,11 +500,29 @@ void* BlockEngine::chain(JitCtx& c, Block::Link* slot) {
     c.last_target = cpu_.state().eip;
     Block* b = slot->to;
     if (exit) ++c.mispredicts;
-    if (!b || slot->epoch != link_epoch_ || !b->native) return c.stop_why = 1, nullptr;
+    const CpuState& s = cpu_.state();
+    if (!b || slot->epoch != link_epoch_ || !b->native || b->jit_eip != s.eip) {
+        // No link, a stale one, or one to where the exit went last time (a return, a jump table): the block the
+        // dispatcher would run next, from the fast cache, under the conditions a link to it is learned (run()), and
+        // the slot learns it now instead of after a trip through the dispatcher.
+        b = nullptr;
+        const u32 at = s.seg[kCs].base + s.eip;
+        const FastEntry& f = fast_[fast_index(at, a.mode)];
+        if (f.epoch == epoch_ && f.lin == at && f.mode == a.mode) {
+            Block* n = f.block;
+            if (n->native && n->jit_eip == s.eip && n->jit_dirty == a.jit_dirty && same_segments(*n, a) && s.eip != idle_[0] && s.eip != idle_[1] &&
+                s.eip + n->bytes - 1u >= s.eip && s.eip + n->bytes - 1u <= s.seg[kCs].limit) {
+                b = n;
+                slot->to = n;
+                slot->epoch = link_epoch_;
+                ++stats_.relinks;
+            }
+        }
+        if (!b) return c.stop_why = 1, nullptr;
+    }
     // Past the budget a run goes on (a little) until it is back where it began: the spin skip compares the two.
     // (only while the run could still be a skippable pass, and not from where that already failed)
     if (c.chain_budget == 0 && (back_at_start(c) || c.chain_extra == 0 || c.helpers || c.penalties || not_a_fixed_point(c.start_eip))) return c.stop_why = 2, nullptr;
-    const CpuState& s = cpu_.state();
     if (b->jit_eip != s.eip || s.eip == idle_[0] || s.eip == idle_[1]) return c.stop_why = 3, nullptr;
     constexpr u64 kSlowestFetch = tp::kL2Latency + tp::kDramLatency;
     if (end + b->cycles + kSlowestFetch >= c.limit) return c.stop_why = 4, nullptr;

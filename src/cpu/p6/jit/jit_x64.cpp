@@ -24,7 +24,10 @@
 namespace mv::p6 {
 
 namespace {
-constexpr std::size_t kBufferBytes = 64u << 20;
+// The working set of a title runs to hundreds of MiB of generated code (Forza: ~140 k live blocks, ~2.5 KiB each):
+// at 64 MiB the cache flushed every few seconds and every block was translated about five times. Address space,
+// not memory: only the pages written are backed.
+constexpr std::size_t kBufferBytes = std::size_t{512} << 20;
 }
 
 Jit::Jit() {
@@ -1557,7 +1560,7 @@ private:
         const bool scalar = in.rep == 1;
         const u8 op = in.opcode;
         const unsigned d = in.reg;
-        enum class K { None, Load, Store, Arith, Logic, Shuf, Unpack, Cmp, MovMsk, LoadLow64, StoreLow64, LoadHigh64, StoreHigh64 } k = K::None;
+        enum class K { None, Load, Store, Arith, Logic, Shuf, Unpack, Cmp, MovMsk, LoadLow64, StoreLow64, LoadHigh64, StoreHigh64, Comi } k = K::None;
         switch (op) {
             case 0x10: case 0x28: k = K::Load; break;
             case 0x11: case 0x29: k = K::Store; break;
@@ -1572,13 +1575,14 @@ private:
             case 0x13: if (!scalar && in.mem) k = K::StoreLow64; break;
             case 0x16: if (!scalar) k = K::LoadHigh64; break;  // MOVHPS xmm, m64 | MOVLHPS
             case 0x17: if (!scalar && in.mem) k = K::StoreHigh64; break;
+            case 0x2E: case 0x2F: if (!scalar) k = K::Comi; break;  // UCOMISS / COMISS: a scalar compare into EFLAGS
             default: break;
         }
         if (k == K::None) return false;
         const bool store = k == K::Store || k == K::StoreLow64 || k == K::StoreHigh64;
-        const unsigned size = (k == K::LoadLow64 || k == K::StoreLow64 || k == K::LoadHigh64 || k == K::StoreHigh64) ? 8 : scalar ? 4 : 16;
+        const unsigned size = (k == K::LoadLow64 || k == K::StoreLow64 || k == K::LoadHigh64 || k == K::StoreHigh64) ? 8 : (scalar || k == K::Comi) ? 4 : 16;
         if (in.mem && !segment_ok(in.mem_seg, size, store)) return false;
-        const bool host_math = k == K::Arith || k == K::Cmp;
+        const bool host_math = k == K::Arith || k == K::Cmp || k == K::Comi;
         const bool sse_before = sse_active_;
         const Label f = fallback(i, after, cw_active_, cw_active_, sse_before, host_math || sse_before);
         sse_preamble(f);
@@ -1587,12 +1591,15 @@ private:
             // Packed forms the interpreter checks for alignment (MOVAPS, arithmetic, logic, ...) fault there; MOVUPS
             // and the 64-bit moves are only native when their elements stay in one line.
             const bool checked = !scalar && size == 16 && op != 0x10 && op != 0x11;
-            sse_memory(in, size, store, size == 16 ? 16 : 8, checked, f);
+            // A 4-byte element aligned to 4 stays in one cache line (it was held to 8 like the 64-bit moves: every
+            // scalar on an odd word went to the interpreter).
+            sse_memory(in, size, store, size == 16 ? 16 : size, checked, f);
         }
         a.sse(0, 0x10, 0, xmm_at(d));  // xmm0 = the destination register (movups)
-        if (k == K::Arith || k == K::Cmp) {
-            const unsigned lanes = scalar ? 1 : 15;
-            if (in.mem) a.sse(scalar ? 0xF3 : 0, 0x10, 1, mem(rsi));  // movss/movups xmm1, [rsi]
+        if (k == K::Arith || k == K::Cmp || k == K::Comi) {
+            const bool one = scalar || k == K::Comi;
+            const unsigned lanes = one ? 1 : 15;
+            if (in.mem) a.sse(one ? 0xF3 : 0, 0x10, 1, mem(rsi));  // movss/movups xmm1, [rsi]
             else a.sse(0, 0x10, 1, xmm_at(in.rm));
             if (op != 0x51) sse_lanes_ok(0, lanes, f);  // SQRT reads only its source
             sse_lanes_ok(1, lanes, f);
@@ -1630,6 +1637,22 @@ private:
                 a.sse_rr(scalar ? 0xF3 : 0, op, 0, 1);
                 a.sse(0, 0x11, 0, xmm_at(d));
                 break;
+            case K::Comi: {
+                // No NaN or denormal (checked above): the compare raises no MXCSR exception and its ZF, PF and CF are
+                // the architecture's; OF, SF and AF are cleared. It defines all six arithmetic flags, so the lazy record
+                // is simply replaced (no materialising).
+                a.sse_rr(0, op, 0, 1);
+                a.byte(0x9C);  // pushfq
+                a.pop(rax);
+                a.alu_imm(4, 4, rax, fl::ZF | fl::PF | fl::CF);
+                a.mov(4, rcx, st_at(kFlagsOff));
+                a.alu_imm(4, 4, rcx, ~(fl::ZF | fl::PF | fl::CF | fl::OF | fl::SF | fl::AF));
+                a.alu(4, 1, rcx, rax);
+                a.mov(4, st_at(kFlagsOff), rcx);
+                a.mov_imm(1, st_at(kLazyOp), static_cast<u32>(LazyOp::None));
+                known_ = Known::Unknown;
+                break;
+            }
             case K::Cmp:
                 a.sse_rr(scalar ? 0xF3 : 0, 0xC2, 0, 1);
                 a.byte(static_cast<u8>(in.imm & 7));
