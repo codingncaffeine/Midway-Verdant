@@ -503,7 +503,10 @@ RETRO_API void retro_run(void) {
         return w && *w ? std::strtol(w, nullptr, 10) : 1000L;
     }();
     const auto cap = wait_ms > 0 ? std::chrono::milliseconds(wait_ms) : std::chrono::hours(24 * 365);
-    if (machine->pump(t0 + cap, [target](mv::Machine& m) { return m.nv2a().vblanks() >= target; }) ==
+    // The vblank alone is not the frame's end: the CPU holds at the first boundary after it (Machine::pace_cpu). Released
+    // before it got there (the pipelined release below), it would run through the hold and take this frame's input a
+    // frame late — a race with the host's timing (one hold in thousands went missing in an oracle run).
+    if (machine->pump(t0 + cap, [target](mv::Machine& m) { return m.nv2a().vblanks() >= target && m.cpu_paused(); }) ==
         mv::Machine::StopReason::Duration) {
         if (frames_capped++ == 0) log(RETRO_LOG_WARN, "a frame took longer than the wait cap (MV_FRAME_WAIT_MS, default 1000) of host time; returned without its vblank");
     }
