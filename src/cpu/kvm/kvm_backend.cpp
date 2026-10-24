@@ -279,6 +279,18 @@ void KvmBackend::on_rom_hidden() { set_top_page(machine_->flash().window() + Fla
 void KvmBackend::on_rom_shown() { set_top_page(machine_->flash().overlay_page()); }
 
 void KvmBackend::reset() {
+    // An interrupt injected just before the stop stays queued in KVM until the next entry (the stop's kick returns
+    // from KVM_RUN before it is delivered): after the reset it would reach the boot code in real mode, through the old
+    // kernel's vector table still in RAM, and the console never came back. A reset clears pending events.
+    kvm_vcpu_events events{};
+    if (ioctl(vcpu_fd_, KVM_GET_VCPU_EVENTS, &events) == 0 &&
+        (events.interrupt.injected || events.exception.injected || events.exception.pending || events.nmi.injected || events.nmi.pending))
+        trace::log(trace::Cat::Cpu, "reset: dropped a pending event (interrupt {} vector {:02x}, exception {}, nmi {})", events.interrupt.injected, events.interrupt.nr,
+                   events.exception.injected | events.exception.pending, events.nmi.injected | events.nmi.pending);
+    events = {};
+    events.flags = KVM_VCPUEVENT_VALID_NMI_PENDING | KVM_VCPUEVENT_VALID_SHADOW;
+    ioctl(vcpu_fd_, KVM_SET_VCPU_EVENTS, &events);
+    if (run_) run_->request_interrupt_window = 0;
     kvm_sregs sregs{};
     ioctl(vcpu_fd_, KVM_GET_SREGS, &sregs);
     auto seg = [](u16 selector, u64 base, u32 limit, u8 type) {
