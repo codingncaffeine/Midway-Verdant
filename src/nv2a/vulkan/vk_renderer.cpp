@@ -152,6 +152,8 @@ VulkanRenderer::VulkanRenderer(vk::Device& device, const HandleResolver& handles
         // green = 8-15, blue = 16-23) wherever it writes colour: a flat white shader blended by the constant colour.
         debug_draw_id_ = s.find("drawid") != std::string::npos;
         debug_flip_front_ = s.find("flipfront") != std::string::npos;
+        // wball: every dirty target reaches RAM at each vblank (the control for write-back timing).
+        debug_wb_all_ = s.find("wball") != std::string::npos;
         // ffdump: each new fixed-function shader's state words and lighting values, to stderr (the first 400).
         debug_ff_dump_ = s.find("ffdump") != std::string::npos;
         // roundtrip: a sampled render target goes through guest RAM (write-back, decode, upload) instead of being
@@ -670,6 +672,17 @@ void VulkanRenderer::upload_color_from_ram(Surface& t) {
         fn_->vkCmdCopyBufferToImage(cb_, staging_.buffer.buffer, t.color.image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
         upload_barrier();
     }
+    remember_pages(t);
+}
+
+// A watch the FIFO thread asks for is applied at the CPU thread's next exit, and the log reports every page it shows
+// written then, including writes from before the target existed, whose bytes the image already took from RAM (a title
+// copied the last boot frame into its new buffers, cleared them on the GPU, and the late report put the copy back).
+void VulkanRenderer::remember_pages(Surface& s) {
+    constexpr u32 kPage = 4096;
+    const u32 first = s.phys / kPage, last = static_cast<u32>((static_cast<u64>(s.phys) + s.bytes() - 1) / kPage);
+    s.page_hashes.resize(last - first + 1);
+    for (u32 p = first; p <= last; ++p) s.page_hashes[p - first] = texture_content(p * kPage, kPage, 0);
 }
 
 bool VulkanRenderer::ensure_pass(Surface& t) {
@@ -999,6 +1012,7 @@ void VulkanRenderer::store_color(Surface& s, const u8* pixels) {
     }
     s.dirty = false;
     ++stats_.writebacks;
+    remember_pages(s);
     invalidate_textures(s.phys, s.bytes());
 }
 
@@ -1101,19 +1115,28 @@ void VulkanRenderer::cpu_wrote(const std::vector<u32>& pages) {
         auto lo = std::lower_bound(pages.begin(), pages.end(), first);
         if (lo == pages.end() || *lo > last) continue;
         const auto hi = std::upper_bound(lo, pages.end(), last);
-        if (debug_tex_log_) std::fprintf(stderr, "texlog: cpu wrote %zu pages (first %05x) of target %08x %ux%u dirty %d\n", static_cast<std::size_t>(hi - lo), *lo, s.phys, s.width, s.height, s.dirty ? 1 : 0);
+        // Only pages whose bytes changed since the image and RAM last agreed (remember_pages).
+        std::vector<u32> written;
+        for (auto p = lo; p != hi; ++p)
+            if (s.page_hashes.size() != last - first + 1 || texture_content(*p * kPage, kPage, 0) != s.page_hashes[*p - first]) written.push_back(*p);
+        if (debug_tex_log_)
+            std::fprintf(stderr, "texlog: cpu wrote %zu pages (first %05x, %zu reported) of target %08x %ux%u dirty %d\n", written.size(), *lo, static_cast<std::size_t>(hi - lo), s.phys, s.width, s.height, s.dirty ? 1 : 0);
+        if (written.empty()) {
+            handles_.watch_writes(s.phys, s.bytes());
+            continue;
+        }
         if (s.dirty) {
             // Keep the CPU's pages across the write-back of the rest.
-            std::vector<u8> kept(static_cast<std::size_t>(hi - lo) * kPage);
+            std::vector<u8> kept(written.size() * kPage);
             std::size_t i = 0;
-            for (auto p = lo; p != hi; ++p, ++i)
-                if (static_cast<u64>(*p + 1) * kPage <= ram_size_) std::memcpy(kept.data() + i * kPage, ram_ + static_cast<std::size_t>(*p) * kPage, kPage);
+            for (u32 p : written)
+                if (static_cast<u64>(p + 1) * kPage <= ram_size_) std::memcpy(kept.data() + i++ * kPage, ram_ + static_cast<std::size_t>(p) * kPage, kPage);
             wb_why_ = Stats::kWbRange;
             write_back(s);
             wb_why_ = Stats::kWbAll;
             i = 0;
-            for (auto p = lo; p != hi; ++p, ++i)
-                if (static_cast<u64>(*p + 1) * kPage <= ram_size_) std::memcpy(ram_ + static_cast<std::size_t>(*p) * kPage, kept.data() + i * kPage, kPage);
+            for (u32 p : written)
+                if (static_cast<u64>(p + 1) * kPage <= ram_size_) std::memcpy(ram_ + static_cast<std::size_t>(p) * kPage, kept.data() + i++ * kPage, kPage);
         }
         s.color_ram_newer = true;
         s.ram_newer = true;
@@ -2626,6 +2649,7 @@ bool VulkanRenderer::write_back_at(u32 phys) {
                 ++it;
             }
         }
+    if (debug_wb_all_) write_back_all();
     wb_why_ = Stats::kWbScanout;
     for (auto& [k, s] : surfaces_) {
         if (phys < s->phys || phys >= static_cast<u64>(s->phys) + s->bytes()) continue;  // the region holding the scanout

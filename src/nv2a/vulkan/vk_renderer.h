@@ -127,6 +127,9 @@ private:
         VkRenderPass pass{VK_NULL_HANDLE};
         VkFramebuffer framebuffer{VK_NULL_HANDLE};
         bool dirty{false};           // colour rendered since the last write-back
+        // Each page of its colour memory hashed when the image and RAM last agreed (loaded from RAM or written back):
+        // a page the write log reports is the CPU's only if its bytes changed since (cpu_wrote).
+        std::vector<u64> page_hashes;
         bool zeta_dirty{false};      // depth rendered since the last write-back of the zeta surface
         u32 depth_holds{0};          // the zeta address whose contents the depth image holds (0: none, undefined)
         u64 last_used_vblank{0};     // the last vblank it was drawn into or sampled
@@ -248,6 +251,7 @@ private:
     void destroy_surface_views(Surface& s);
     void invalidate_textures(u32 phys, u32 len);
     u64 texture_content(u32 phys, u32 length, u32 palette_phys) const;  // the bytes a decode reads, hashed
+    void remember_pages(Surface& s);  // s.page_hashes from RAM as it is now
     bool texture_current(TextureEntry& e);  // RAM still holds what e was decoded from (rehashed when pages were written)  // the decoded textures over a range (RAM now holds what a target wrote)
     VkSampler sampler(const TextureStage& ts, u32 levels);
     // A host buffer with one region per frame in flight; the recording frame allocates from its own region only.
@@ -386,7 +390,7 @@ private:
     VkFormat depth24_{VK_FORMAT_D24_UNORM_S8_UINT};
     Stats stats_;
     // Debug overrides from MV_RENDER_DEBUG (comma separated): flat (white fragments), nodepth, nocull, noblend.
-    bool debug_flat_{false}, debug_nodepth_{false}, debug_nocull_{false}, debug_noblend_{false}, debug_shadow_pass_{false}, debug_show_v0_{false}, debug_skip_blend_{false}, debug_draw_id_{false}, debug_flip_front_{false}, debug_ff_dump_{false};
+    bool debug_flat_{false}, debug_nodepth_{false}, debug_nocull_{false}, debug_noblend_{false}, debug_shadow_pass_{false}, debug_show_v0_{false}, debug_skip_blend_{false}, debug_draw_id_{false}, debug_flip_front_{false}, debug_ff_dump_{false}, debug_wb_all_{false};
     u64 frame_index_{1};  // frames ended so far, plus one
     bool attachments_written_{false}, sampled_since_barrier_{false};  // hazards the next surface_barrier() covers
     bool depth16_sampled_{false}, depth24_sampled_{false};  // the device samples (and filters) these depth formats

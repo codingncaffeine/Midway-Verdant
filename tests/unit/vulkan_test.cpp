@@ -601,3 +601,69 @@ TEST(Vulkan, ATargetWhoseMemoryAnotherEngineRewroteIsReloadedBeforeItIsDrawnInto
     EXPECT_EQ(pixel_at(ram, 8, 8) & 0x00FFFFFFu, 0x403000u) << "the draw adds to what RAM held, not to the GPU's earlier copy (0x800000)";
     EXPECT_EQ(renderer.stats().surface_reloads, 1u);
 }
+
+TEST(Vulkan, AWriteReportFromBeforeTheTargetExistedDoesNotUndoALaterClear) {
+    // A title copies the last boot frame into its new buffers with the CPU, then clears them on the GPU. The watch on a
+    // new target's pages is applied later, and the write log then reports pages written before the target existed:
+    // taken as fresh CPU writes, the copy went back over the clear (the old frame showed around the game's picture).
+    vk::Device device;
+    std::string error;
+    if (!device.init(error)) GTEST_SKIP() << "no Vulkan device: " << error;
+    std::vector<u8> ram(4u << 20, 0);
+    RamResolver handles;
+    handles.size = static_cast<u32>(ram.size());
+    VulkanRenderer renderer(device, handles, ram.data(), static_cast<u32>(ram.size()));
+    ASSERT_TRUE(renderer.init(error)) << error;
+    for (u32 y = 0; y < 64; ++y)
+        for (u32 x = 0; x < 64; ++x) {
+            const u32 green = 0xFF00FF00u;  // the copy, in RAM before the target exists
+            std::memcpy(&ram[0x10000 + y * 256 + x * 4], &green, 4);
+        }
+    Kelvin k;
+    k.set_sink(&renderer);
+    setup_target(k);
+    k.method(mthd::kColorClear, 0xFF000000u);
+    k.method(mthd::kClearRectH, 63u << 16);
+    k.method(mthd::kClearRectV, 63u << 16);
+    k.method(mthd::kClearSurface, 0xF0);
+    renderer.cpu_wrote({0x10, 0x11, 0x12, 0x13});  // the late report: the bytes are what the target loaded
+    renderer.end_frame();
+    for (const auto& e : renderer.stats().errors) ADD_FAILURE() << "renderer: " << e;
+    EXPECT_EQ(pixel_at(ram, 8, 8), 0xFF000000u) << "the clear came after the copy";
+    EXPECT_EQ(renderer.stats().cpu_written_targets, 0u);
+}
+
+TEST(Vulkan, ACpuWriteAfterTheTargetWasDrawnIsKeptAndDrawnOver) {
+    // One title copies its last frame into both buffers with the CPU when it pauses, then draws its menu over them.
+    vk::Device device;
+    std::string error;
+    if (!device.init(error)) GTEST_SKIP() << "no Vulkan device: " << error;
+    std::vector<u8> ram(4u << 20, 0);
+    RamResolver handles;
+    handles.size = static_cast<u32>(ram.size());
+    VulkanRenderer renderer(device, handles, ram.data(), static_cast<u32>(ram.size()));
+    ASSERT_TRUE(renderer.init(error)) << error;
+    Kelvin k;
+    k.set_sink(&renderer);
+    setup_target(k);
+    k.method(mthd::kVertexDataArrayFormat + 12, 2u);
+    k.method(mthd::kDiffuse4ub, 0xFF000040);  // a little red, added each draw
+    k.method(mthd::kBlendEnable, 1);
+    k.method(mthd::kBlendSfactor, 1);  // ONE
+    k.method(mthd::kBlendDfactor, 1);  // ONE
+    k.method(mthd::kBlendEquation, 0x8006);
+    draw_full_triangle(k, ram);
+    renderer.end_frame();
+    ASSERT_EQ(pixel_at(ram, 8, 8) & 0x00FFFFFFu, 0x400000u);
+    for (u32 y = 0; y < 64; ++y)
+        for (u32 x = 0; x < 64; ++x) {
+            const u32 blue = 0xFF000030u;  // the CPU's copy
+            std::memcpy(&ram[0x10000 + y * 256 + x * 4], &blue, 4);
+        }
+    renderer.cpu_wrote({0x10, 0x11, 0x12, 0x13});
+    draw_full_triangle(k, ram);
+    renderer.end_frame();
+    for (const auto& e : renderer.stats().errors) ADD_FAILURE() << "renderer: " << e;
+    EXPECT_EQ(pixel_at(ram, 8, 8) & 0x00FFFFFFu, 0x400030u) << "the draw adds to the CPU's bytes";
+    EXPECT_EQ(renderer.stats().cpu_written_targets, 1u);
+}
