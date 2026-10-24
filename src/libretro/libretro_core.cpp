@@ -195,6 +195,7 @@ RETRO_API void retro_set_environment(retro_environment_t cb) {
         {"midway_verdant_drive", "Hard drive; Drive 1|Drive 2|Drive 3"},
         {"midway_verdant_pipeline", "Run the next frame while the frontend shows this one (faster, up to a frame more input lag); enabled|disabled"},
         {"midway_verdant_cpu", "CPU; fast (hardware virtualization)|accurate (cycle-counted, recompiled)"},
+        {"midway_verdant_disc_speed", "Disc loading; fast (8x the console's drive)|console speed"},
         {nullptr, nullptr},
     };
     cb(RETRO_ENVIRONMENT_SET_VARIABLES, const_cast<retro_variable*>(vars));
@@ -294,9 +295,33 @@ RETRO_API bool retro_load_game(const retro_game_info* game) {
     cfg.shader_cache_dir = files.eeprom.parent_path() / "shader-cache";
     cfg.cpu = "kvm";
     if (const char* c = option("midway_verdant_cpu"); c && std::strncmp(c, "accurate", 8) == 0) cfg.cpu = "p6";
+    cfg.disc_speed = 8;
+    if (const char* d = option("midway_verdant_disc_speed"); d && std::strncmp(d, "console", 7) == 0) cfg.disc_speed = 1;
     cfg.frame_step = true;
     // Instrument: MV_RTC_TIME=UNIX fixes the clock's start, so two accurate-core runs of a title can be compared.
     if (const char* t = std::getenv("MV_RTC_TIME"); t && *t) cfg.rtc_base_time = std::strtoll(t, nullptr, 10);
+    // Instrument: MV_BREAK_EIP=HEX,... is the shell's --break-eip (registers and stack into the boot trace, MV_TRACE=boot).
+    if (const char* b = std::getenv("MV_BREAK_EIP"); b && *b)
+        for (const char* p = b; *p;) {
+            char* end = nullptr;
+            const unsigned long eip = std::strtoul(p, &end, 16);
+            if (end == p) break;
+            cfg.break_eips.push_back(static_cast<mv::u32>(eip));
+            p = *end ? end + 1 : end;
+        }
+    // Instrument: MV_BREAK_MMIO=ADDR[=VALUE][*N] is the shell's --break-mmio (a write to physical ADDR).
+    if (const char* b = std::getenv("MV_BREAK_MMIO"); b && *b) {
+        std::string spec = b;
+        mv::MachineConfig::MmioBreak brk;
+        if (const auto star = spec.find('*'); star != std::string::npos) {
+            brk.count = static_cast<mv::u32>(std::strtoul(spec.c_str() + star + 1, nullptr, 10));
+            spec.resize(star);
+        }
+        const auto eq = spec.find('=');
+        brk.address = static_cast<mv::u32>(std::strtoul(spec.substr(0, eq).c_str(), nullptr, 16));
+        if (eq != std::string::npos) brk.value = static_cast<mv::u32>(std::strtoul(spec.c_str() + eq + 1, nullptr, 16));
+        cfg.break_mmio_write = brk;
+    }
     cfg.pads = pads_plugged;
     if (game && game->path && *game->path) cfg.dvd_image = game->path;
     machine = std::make_unique<mv::Machine>(cfg);

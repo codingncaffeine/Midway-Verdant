@@ -106,6 +106,13 @@ public:
     // Puts a disc in the tray (before power-on: the kernel finds it at initialisation).
     void insert(std::unique_ptr<DvdImage> disc) { disc_ = std::move(disc); }
     bool has_disc() const { return disc_ != nullptr; }
+    // The fast core (12c): a DMA read the host has not delivered by its completion time comes due again later instead
+    // of holding the CPU thread, so frames and sound go on through a slow host read (a longer seek to the game). The
+    // accurate core keeps waiting for it: its runs must repeat exactly.
+    void set_host_paced_reads(bool on) { host_paced_reads_ = on; }
+    // Reads at a multiple of the drive's rate (faster loading; the commands per console second a disc-to-disk copy issues
+    // stay bounded, where transfers that took no time at all let one issue 2 000 port accesses a frame).
+    void set_read_speed(u32 times) { read_speed_ = times ? times : 1; }
     u64 sectors_read() const { return sectors_read_; }
 
 private:
@@ -123,6 +130,8 @@ private:
     void check_condition(u8 sense_key, u8 asc, u8 ascq);
     void finish_ok();
 
+    bool host_paced_reads_{false};
+    u32 read_speed_{1};
     Pending pending_{Pending::None};
     std::array<u8, 12> cdb_{};
     std::size_t cdb_pos_{0};

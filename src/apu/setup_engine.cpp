@@ -136,6 +136,9 @@ bool SetupEngine::method(u32 offset, u32 value) {
                 }
                 trace::log(trace::Cat::Apu, "vp: voice {:x} on: buffer +{:x} ebo {:x} lbo {:x} fmt {:08x}: rms {:.1f} dB peak {:.1f} dB, {} zero crossings, L != R in {} of {} samples", handle,
                            src.base, ebo, field(handle, kFieldPshSample) & kOffsetMask, fmt, 10 * std::log10(sum / n + 1e-12), 20 * std::log10(peak + 1e-9), crossings, differ, n);
+                trace::log(trace::Cat::Apu, "vp: voice {:x} on: vbin {:08x} vol {:08x} {:08x} {:08x} misc {:08x} env0 {:08x} enva {:08x} pitch {:08x}", handle, field(handle, kFieldVbin),
+                           field(handle, kFieldVolA), field(handle, kFieldVolB), field(handle, kFieldVolC), field(handle, kFieldMisc), field(handle, 0x08), field(handle, 0x0C),
+                           field(handle, kFieldPitchLink));
                 // Instrument: MV_DEBUG_VOICE_DUMP=HEX writes that voice's buffer, as decoded, to scratch/voice-HEX-N.wav
                 // (16-bit mono at the rate its pitch plays it), to hear or measure what the engine reads.
                 if (const char* d = std::getenv("MV_DEBUG_VOICE_DUMP"); d && std::strtoul(d, nullptr, 16) == handle) {

@@ -185,6 +185,9 @@ bool Machine::init(std::string& error) {
                    config_.hdd_locked ? ", locked" : "");
     }
     auto dvd = std::make_unique<AtapiCdrom>();
+    // The fast core does not hold its CPU thread on a slow host read (MV_HOST_PACED_READS=0, the control, does).
+    if (const char* hp = std::getenv("MV_HOST_PACED_READS"); config_.cpu != "p6" && !(hp && *hp == '0')) dvd->set_host_paced_reads(true);
+    dvd->set_read_speed(config_.disc_speed);
     if (config_.dvd_image) {
         auto disc = std::make_unique<DvdImage>();
         if (!disc->open(*config_.dvd_image, error)) return false;

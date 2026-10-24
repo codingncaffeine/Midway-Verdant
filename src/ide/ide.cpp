@@ -230,8 +230,14 @@ void IdeChannel::write_busmaster(u16 reg, unsigned size, u32 value) {
             bm_command_ = static_cast<u8>(value & 0x09);
             if ((bm_command_ & 1u) && !(was & 1u)) {
                 bm_status_ |= 0x01;  // active
-                // A device whose DMA command was already issued proceeds now that the engine runs.
-                if (IdeDevice* dev = selected()) schedule(*dev, cycles_from_ns(1000));
+                // A device whose DMA command was already issued proceeds now that the engine runs, but not before its
+                // data is there: a read still due later (the drive reading the disc) keeps its time. Pulling every
+                // transfer in to a microsecond after the engine started made the DVD and the disk ~50 times faster
+                // than their modelled rates, and a game copying from disc to disk issued commands as fast as it could.
+                if (IdeDevice* dev = selected()) {
+                    const TimerEvent& due = events_[devices_[0].get() == dev ? 0 : 1];
+                    if (!due.scheduled() || due.when <= sched_.now() + cycles_from_ns(1000)) schedule(*dev, cycles_from_ns(1000));
+                }
             } else if (!(bm_command_ & 1u)) {
                 bm_status_ &= static_cast<u8>(~0x01u);
             }

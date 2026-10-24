@@ -46,6 +46,8 @@ public:
     // has not delivered them yet). One read is in flight at a time; a new begin_read waits out the one before.
     void begin_read(u64 lba, u32 count);
     bool end_read(std::vector<u8>& out);
+    // Whether the read in flight has its sectors (end_read would not wait).
+    bool ready() const;
     // Instruments: host time the caller's thread spent reading or waiting for a read; reads the read-ahead answered.
     static u64 host_read_ns() { return host_read_ns_.load(std::memory_order_relaxed); }
     u64 read_ahead_hits() const { return read_ahead_hits_.load(std::memory_order_relaxed); }
@@ -66,7 +68,7 @@ private:
 
     // The reader thread: the request in hand, its result, and the read-ahead block.
     std::thread reader_;
-    std::mutex mutex_;
+    mutable std::mutex mutex_;
     std::condition_variable wake_, done_;
     bool stop_{false}, requested_{false}, finished_{true}, ok_{false};
     u64 req_lba_{0};

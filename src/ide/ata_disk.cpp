@@ -821,7 +821,7 @@ void AtapiCdrom::read_sectors(u64 lba, u32 count) {
     }
     sectors_read_ += count;
     const u32 bytes = count * DvdImage::kSectorSize;
-    const Cycles latency = kCommandLatency + cycles_from_ns(static_cast<u64>(bytes) * kDvdNsPerByte);
+    const Cycles latency = kCommandLatency + cycles_from_ns(static_cast<u64>(bytes) * kDvdNsPerByte / read_speed_);
     if (dma_) {
         // The sectors are read on the image's thread while the drive's time runs, and collected when the bus master
         // starts the data phase.
@@ -954,6 +954,11 @@ void AtapiCdrom::continue_command() {
             break;
         case Pending::DmaData: {
             if (!channel_->dma_active()) return;  // the engine starts us again
+            if (read_in_flight_ && host_paced_reads_ && !disc_->ready()) {
+                // The host is still reading: the drive is still busy, due again half a millisecond on.
+                channel_->schedule(*this, cycles_from_ns(500'000));
+                return;
+            }
             if (read_in_flight_) {
                 read_in_flight_ = false;
                 if (!disc_->end_read(buffer_)) {

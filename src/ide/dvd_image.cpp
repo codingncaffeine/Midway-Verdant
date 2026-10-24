@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <format>
 #if defined(__linux__)
@@ -96,6 +97,11 @@ void DvdImage::begin_read(u64 lba, u32 count) {
     wake_.notify_one();
 }
 
+bool DvdImage::ready() const {
+    std::lock_guard lock(mutex_);
+    return finished_;
+}
+
 bool DvdImage::end_read(std::vector<u8>& out) {
     const auto t0 = std::chrono::steady_clock::now();
     std::unique_lock lock(mutex_);
@@ -125,6 +131,9 @@ void DvdImage::reader_main() {
         } else {
             lock.unlock();
             ok = read_at(base_ + lba * kSectorSize, count * kSectorSize, out.data());
+            // Instrument: MV_DEBUG_DVD_DELAY_MS=N makes every read the read-ahead missed take N ms more (a cold spinning disc).
+            static const long delay_ms = [] { const char* d = std::getenv("MV_DEBUG_DVD_DELAY_MS"); return d && *d ? std::atol(d) : 0L; }();
+            if (delay_ms > 0) std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
             lock.lock();
         }
         result_ = std::move(out);
