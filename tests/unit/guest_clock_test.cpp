@@ -27,22 +27,24 @@ struct Driver {
         clock.mark_out(wall);
         clock.thread_started(cpu);
     }
-    void enter() {
-        const GuestClock::Exit e = clock.classify(wall);
-        if (e.long_exit) {
-            clock.excluded_until(cpu);
-            tsc.offset -= static_cast<double>(e.tsc_rewind);
+    void enter(Cycles device = 0) {
+        const GuestClock::Exit e = clock.classify(wall, device);
+        if (e.excluded) {
+            const u64 short_rewind = clock.excluded_until(cpu);
+            tsc.offset -= static_cast<double>(e.tsc_rewind + short_rewind);
         }
         wall += 300;  // the rewind's own call and the entry, which the TSC runs through
         cpu += 300;
         clock.entered(cpu, wall);
         EXPECT_GE(tsc.at(wall) + 1e-6, last_seen) << "the TSC stepped below a value the guest could have read";
     }
-    void run(u64 ns, u64 preempt = 0) {
+    // `exit_cost` ns at the run's end are the exit inside KVM_RUN (the guest no longer runs); `cap` is what the
+    // caller takes off for it (exact exits).
+    void run(u64 ns, u64 preempt = 0, u64 exit_cost = 0, u64 cap = 0) {
         wall += ns;
         cpu += ns - preempt;
-        clock.left(cpu, wall);
-        last_seen = tsc.at(wall);
+        clock.left(cpu, wall, cap);
+        last_seen = tsc.at(wall - exit_cost);
     }
     // A stretch outside the guest: the thread works through it (an exit handler, the pusher) unless `blocked` ns
     // of it it waited or was preempted.
@@ -159,4 +161,75 @@ TEST(GuestClock, WarpOnlyMovesForward) {
     EXPECT_EQ(skipped, 733'333u);
     EXPECT_EQ(c.now(), now + 733'333);
     EXPECT_EQ(c.stats().warped_cycles, 733'333u);
+}
+
+TEST(GuestClock, ExactExitsCountOnlyTheGuestAndTheDeviceCost) {
+    Driver d(2000);
+    d.clock.set_exact_exits(true);
+    d.enter();
+    const Cycles start = d.clock.now();
+    // 10 us in KVM_RUN, the last 4 of them the exit; 4 taken off. Then 2 us in the handler: not counted either.
+    d.run(10'000, 0, 4'000, 4'000);
+    EXPECT_EQ(d.clock.now() - start, cycles_from_ns(2 * 6'000));
+    d.outside(2'000);
+    const Cycles before = d.clock.now();
+    d.enter(160);  // an uncached read: 160 cycles of guest time, and of TSC
+    EXPECT_EQ(d.clock.now() - before, 160 + cycles_from_ns(2 * 300));
+    EXPECT_EQ(d.clock.stats().overhead_ns, 4'000u);
+    EXPECT_EQ(d.clock.stats().excluded_short_ns, 2'000u);
+    EXPECT_EQ(d.clock.stats().device_cycles, 160u);
+    EXPECT_NEAR(d.lead(), 0.0, 4.0);
+}
+
+TEST(GuestClock, ExactExitsTakeNoMoreThanTheRun) {
+    Driver d(2000);
+    d.clock.set_exact_exits(true);
+    d.enter();
+    const Cycles start = d.clock.now();
+    d.run(1'000, 0, 1'000, 5'000);  // a kick before the guest ran: the whole run was the call
+    EXPECT_EQ(d.clock.now(), start);
+    EXPECT_EQ(d.clock.stats().overhead_ns, 1'000u);
+    d.outside(500);
+    d.enter();
+    EXPECT_NEAR(d.lead(), 0.0, 4.0);
+}
+
+TEST(GuestClock, ExactExitsKeepTheTscMonotonicAndInStep) {
+    // Device exits of every length with the exit cost taken off (never more than it was): the guest never sees the TSC
+    // go back, and without preemption the TSC ends where the clock is.
+    Driver d(2000);
+    d.clock.set_exact_exits(true);
+    for (int i = 0; i < 3000; ++i) {
+        d.enter(i % 4 == 0 ? 300u : (i % 2 ? 8u : 160u));
+        const u64 exit_cost = 4'500 + static_cast<u64>(i % 5) * 200;
+        d.run(exit_cost + static_cast<u64>(i % 9) * 700, 0, exit_cost, 4'000);
+        d.outside(i % 100 == 0 ? 300'000u : 1'700u);
+    }
+    d.enter();
+    EXPECT_NEAR(d.lead(), 0.0, 3000.0 * 2);
+    EXPECT_EQ(d.clock.stats().preempted_ns, 0u);
+}
+
+TEST(GuestClock, ExactExitsKeepADeviceReadAtTheHostsPrice) {
+    // A device read (a poll) counts its stretch as guest time, as without exact exits; a write does not.
+    Driver d(2000);
+    d.clock.set_exact_exits(true);
+    d.enter();
+    d.run(10'000);
+    d.outside(2'000);
+    Cycles before = d.clock.now();
+    {
+        const GuestClock::Exit e = d.clock.classify(d.wall, 160, true);
+        EXPECT_FALSE(e.excluded);
+        d.wall += 300;
+        d.cpu += 300;
+        d.clock.entered(d.cpu, d.wall);
+    }
+    EXPECT_NEAR(static_cast<double>(d.clock.now() - before), static_cast<double>(cycles_from_ns(2 * (2'000 + 300))), 1.0);
+    d.run(10'000);
+    d.outside(2'000);
+    before = d.clock.now();
+    d.enter(8);
+    EXPECT_NEAR(static_cast<double>(d.clock.now() - before), static_cast<double>(8 + cycles_from_ns(2 * 300)), 1.0);
+    EXPECT_NEAR(d.lead(), 0.0, 6.0);
 }

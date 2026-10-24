@@ -180,7 +180,7 @@ void Nv2aStub::advance_flip_field(unsigned shift) {
 // status word of zero (done). The count is the z-pass sample count since CLEAR_REPORT_VALUE. A report says every pixel
 // of the screen passed, so a visibility test finds its object visible instead of a title polling for an unwritten
 // report for ever. MV_ZPASS_REPORTS=1 (accurate core with a renderer) writes the renderer's occlusion counts instead
-// (every draw before the report is counted by then: it waits for the GPU clock); not the default yet: Halo's flare
+// (every draw before the report is counted by then: it waits for the GPU clock); not the default yet: one title's flare
 // tests (a 4-vertex fan, depth LEQUAL, writes off, z cull mode) pass no sample in our renderer even with the depth
 // test and culling off, so every flare vanished (session 18; the transformed vertices are the next thing to look at).
 void Nv2aStub::write_report(u32 parameter) {

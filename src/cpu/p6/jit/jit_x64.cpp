@@ -24,7 +24,7 @@
 namespace mv::p6 {
 
 namespace {
-// The working set of a title runs to hundreds of MiB of generated code (Forza: ~140 k live blocks, ~2.5 KiB each):
+// The working set of a title runs to hundreds of MiB of generated code (one racing title: ~140 k live blocks, ~2.5 KiB each):
 // at 64 MiB the cache flushed every few seconds and every block was translated about five times. Address space,
 // not memory: only the pages written are backed.
 constexpr std::size_t kBufferBytes = std::size_t{512} << 20;

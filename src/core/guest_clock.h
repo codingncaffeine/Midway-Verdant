@@ -23,6 +23,14 @@ namespace mv {
 // is classified by its wall time and rewound by it. So the TSC leads the clock by exactly the time the thread was
 // preempted outside a long exit, never less. Guest time is kept in picoseconds, exact for every scale in
 // thousandths, and read as CPU cycles at 733.333 MHz.
+//
+// Exact exits (D33, `set_exact_exits`): a host whose CPU flushes its branch predictors on every VM exit (the IBPB
+// that the SRSO and VMSCAPE mitigations put there) spends ~4.5 us on each exit inside KVM_RUN plus ~1.7 us outside,
+// and a title that writes the APU voice by voice made 800 exits a frame, twelve times its real CPU work. With
+// exact exits no exit costs guest time: every stretch outside is excluded and rewound, the exit's own cost inside
+// KVM_RUN (`left`'s overhead, below the host's measured floor) comes off the guest time and the TSC, and a device
+// write costs the guest what the console's bus would (`classify`'s device cycles). A device read keeps the host's
+// price: guests poll by reading, and a poll at the bus price takes many times the host time per console second.
 class GuestClock {
 public:
     // A stretch outside the guest shorter than this counts as guest time: it is the cost of a device access, the
@@ -37,16 +45,25 @@ public:
     u32 tsc_khz() const;
 
     // The vCPU thread around each KVM_RUN, in this order:
-    //   classify(wall) → [long: excluded_until(cpu); apply the rewind] → entered(cpu, wall) → KVM_RUN → left(cpu, wall)
+    //   classify(wall) → [excluded: excluded_until(cpu); apply the rewind] → entered(cpu, wall) → KVM_RUN → left(cpu, wall)
     // classify may be called again before entered (the caller looped); entered consumes the stretch.
     struct Exit {
-        bool long_exit{false};
-        u64 tsc_rewind{0};  // guest TSC cycles to take off before entering
+        bool long_exit{false};  // longer than kShortExitNs (the io thread re-plans on the running clock)
+        bool excluded{false};   // not guest time: excluded_until(cpu), then the rewind
+        u64 tsc_rewind{0};      // guest TSC cycles to take off before entering
     };
-    Exit classify(u64 wall_ns);
-    void excluded_until(u64 cpu_ns);  // a long stretch: its CPU time up to here is not guest time
+    // `device_cycles`: what the exit's device access costs the guest (exact exits only). `counted`: the exit counts at
+    // the host's price even with exact exits (a device read: guests poll by reading, and a poll at the bus's price
+    // took 30 times the host time per console millisecond: a frame limiter reading the PM timer).
+    Exit classify(u64 wall_ns, Cycles device_cycles = 0, bool counted = false);
+    void set_exact_exits(bool on) { exact_ = on; }
+    bool exact_exits() const { return exact_; }
+    // An excluded stretch: its CPU time up to here is not guest time. Returns the TSC rewind of a short one (exact
+    // exits), to add to classify's.
+    u64 excluded_until(u64 cpu_ns);
     void entered(u64 cpu_ns, u64 wall_ns);
-    void left(u64 cpu_ns, u64 wall_ns);
+    // `overhead_cap_ns`: the exit's cost inside KVM_RUN, taken off the run (exact exits; at most the run).
+    void left(u64 cpu_ns, u64 wall_ns, u64 overhead_cap_ns = 0);
     // Start a stretch the guest did not run in (start-up, a reset): the next entry rewinds the TSC by it. The vCPU
     // thread gives its CPU clock when it starts (`thread_started`); until then the stretch is wall time only.
     void mark_out(u64 wall_ns);
@@ -87,12 +104,16 @@ public:
         u64 preempted_ns{0};    // inside KVM_RUN on the wall clock but not on the CPU: the host ran something else
         u64 warped_cycles{0};
         u64 short_excess_ns{0};  // short exits' wall time beyond their CPU time: the TSC ran through it, guest time did not
+        u64 overhead_ns{0};       // exact exits: the exits' cost inside KVM_RUN, not guest time
+        u64 excluded_short_ns{0}; // exact exits: short stretches outside, not guest time
+        u64 device_cycles{0};     // exact exits: device accesses at the console's cost
     };
     const Stats& stats() const { return stats_; }
 
 private:
     void add_host_ns(u64 ns);
     static Cycles cycles_from_ps(u64 ps);
+    u64 rewind_for(u64 stretch_ns) const;
     // The vCPU thread publishes its bracket for `estimate` under a sequence count (odd while writing).
     void publish(bool inside);
     std::atomic<u64> seq_{0};
@@ -106,6 +127,10 @@ private:
     u64 classified_at_ns_{0};     // wall time of the classification of the pending stretch
     u64 excluded_to_cpu_{0};      // a long stretch's CPU time is not counted up to here
     bool pending_long_{false};
+    bool pending_excluded_{false};
+    bool exact_{false};
+    u64 overhead_pending_ns_{0};  // taken off the last run, rewound at the next entry
+    Cycles device_pending_{0};    // the pending exit's device cost, added at the entry
     u64 entered_cpu_ns_{0}, entered_wall_ns_{0};
     Stats stats_;
 };

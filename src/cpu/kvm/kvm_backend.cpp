@@ -41,8 +41,21 @@ void kick_handler(int) {
     if (kvm_run* r = g_kick_target.load(std::memory_order_relaxed)) set_immediate_exit(r, 1);
     errno = saved;
 }
+// MV_PROFILE_EIP_US=N: a timer on the vCPU thread's CPU clock breaks KVM_RUN every N us of its CPU time, so the EIP
+// samples fall evenly over the time the guest takes (the kicks alone fall where devices wake it).
+constexpr int kProfileSignal = SIGUSR2;
+std::atomic<bool> g_profile_tick{false};
+void profile_handler(int) {
+    const int saved = errno;
+    g_profile_tick.store(true, std::memory_order_relaxed);
+    if (kvm_run* r = g_kick_target.load(std::memory_order_relaxed)) set_immediate_exit(r, 1);
+    errno = saved;
+}
 
 constexpr u32 kSlotRam = 0, kSlotRamAlias = 1, kSlotFlash = 2, kSlotTopPage = 3;
+// What a device write costs the console with exact exits (D33): the accurate core's model (tp::kDeviceStore,
+// kPortIo in cpu/p6/timing.h), a posted write and a port access. A read keeps the host's price (GuestClock::classify).
+constexpr Cycles kDeviceStoreCycles = 8, kPortIoCycles = 300;
 
 // The KVM structures end in flexible arrays: they are built in byte buffers, the entries addressed past the header.
 struct MsrsOne {
@@ -69,6 +82,13 @@ u64 thread_cpu_ns() { return clock_ns(CLOCK_THREAD_CPUTIME_ID); }
 KvmBackend::KvmBackend() {
     const char* p = std::getenv("MV_PROFILE_EIP");
     profile_eip_ = p && *p && *p != '0';
+    if (profile_eip_ && std::strchr(p, '-')) {
+        char* end = nullptr;
+        profile_from_ = std::strtoull(p, &end, 10);
+        profile_to_ = std::strtoull(end + 1, nullptr, 10);
+    }
+    debug_lead_ = std::getenv("MV_DEBUG_TSC_LEAD") != nullptr;
+    if (const char* us = std::getenv("MV_PROFILE_EIP_US"); profile_eip_ && us && *us) profile_us_ = std::min(999u, static_cast<unsigned>(std::strtoul(us, nullptr, 10)));
     if (const char* s = std::getenv("MV_IDLE_SKIP"); s && *s == '0') idle_skip_ = false;
     if (const char* w = std::getenv("MV_WATCH_AT_BREAK"); w && *w) {
         const std::string s = w;
@@ -234,6 +254,12 @@ bool KvmBackend::init(Machine& machine, std::string& error) {
         a.attr = KVM_VCPU_TSC_OFFSET;
         tsc_offset_ctl_ = ioctl(vcpu_fd_, KVM_HAS_DEVICE_ATTR, &a) == 0;
     }
+    // Exact exits (D33) need the rewinds; MV_EXIT_COST=host keeps the old account (exits cost guest time at the
+    // host's price), the control.
+    {
+        const char* ec = std::getenv("MV_EXIT_COST");
+        clock_.set_exact_exits(guest_clock_on_ && tsc_offset_ctl_ && !(ec && std::strcmp(ec, "host") == 0));
+    }
     if (guest_clock_on_ && tsc_offset_ctl_) {
         // The guest's own writes of the TSC come out here, so the clock keeps its account of where the TSC should be.
         kvm_enable_cap cap{};
@@ -256,6 +282,12 @@ bool KvmBackend::init(Machine& machine, std::string& error) {
     sigemptyset(&sa.sa_mask);
     sa.sa_flags = 0;
     sigaction(kKickSignal, &sa, nullptr);
+    if (profile_us_) {
+        struct sigaction ps{};
+        ps.sa_handler = profile_handler;
+        sigemptyset(&ps.sa_mask);
+        sigaction(kProfileSignal, &ps, nullptr);
+    }
 
     machine.flash().add_on_rom_hidden([this] { on_rom_hidden(); });
     machine.flash().add_on_rom_shown([this] { on_rom_shown(); });
@@ -351,20 +383,25 @@ u64 KvmBackend::read_tsc() {
 
 bool KvmBackend::tsc_offset_add(i64 delta) {
     if (!tsc_offset_ctl_) return false;
-    u64 offset = 0;
     kvm_device_attr a{};
     a.group = KVM_VCPU_TSC_CTRL;
     a.attr = KVM_VCPU_TSC_OFFSET;
-    a.addr = reinterpret_cast<u64>(&offset);
-    if (ioctl(vcpu_fd_, KVM_GET_DEVICE_ATTR, &a) < 0) {
-        ++tsc_adjust_failures_;
-        return false;
+    // The offset is read once and kept: only this thread moves it (exact exits rewind it at nearly every exit).
+    a.addr = reinterpret_cast<u64>(&tsc_offset_);
+    if (!tsc_offset_known_) {
+        if (ioctl(vcpu_fd_, KVM_GET_DEVICE_ATTR, &a) < 0) {
+            ++tsc_adjust_failures_;
+            return false;
+        }
+        tsc_offset_known_ = true;
     }
-    offset += static_cast<u64>(delta);
+    const u64 offset = tsc_offset_ + static_cast<u64>(delta);
+    a.addr = reinterpret_cast<u64>(&offset);
     if (ioctl(vcpu_fd_, KVM_SET_DEVICE_ATTR, &a) < 0) {
         ++tsc_adjust_failures_;
         return false;
     }
+    tsc_offset_ = offset;
     return true;
 }
 
@@ -377,6 +414,7 @@ void KvmBackend::set_tsc(u64 value) {
     msrs.entry()->index = 0x10;
     msrs.entry()->data = value;
     ioctl(vcpu_fd_, KVM_SET_MSRS, msrs.header());
+    tsc_offset_known_ = false;  // KVM moved the offset itself
 }
 
 Cycles KvmBackend::timeline_cycles() const {
@@ -463,6 +501,18 @@ std::string KvmBackend::report() const {
                      tsc_offset_ctl_ ? (tsc_adjust_failures_ ? std::format(" ({} failed)", tsc_adjust_failures_) : std::string()) : std::string(" (no TSC offset control: rewinds off)"),
                      us(tsc_lead_last_), tsc_lead_samples_ ? us(static_cast<i64>(tsc_lead_sum_ / static_cast<double>(tsc_lead_samples_))) : 0.0,
                      us(tsc_lead_min_), us(tsc_lead_max_), tsc_lead_samples_);
+    if (debug_lead_) {
+        r += "\nguest clock: MMIO runs by CPU time (100 ns buckets):";
+        for (std::size_t i = 0; i < run_hist_.size(); ++i) if (run_hist_[i]) r += std::format(" {}:{}", i, run_hist_[i]);
+        r += std::format("\nguest clock: TSC lead change (cycles) inside runs {}; across exits by reason:", lead_in_);
+        for (const auto& [reason, b] : lead_out_) r += std::format(" {}: x{} {} ({:.1f} a time);", reason, b.first, b.second, static_cast<double>(b.second) / static_cast<double>(b.first));
+    }
+    if (clock_.exact_exits())
+        r += std::format("\nguest clock: exact exits (D33, MV_EXIT_COST=host for the old account): {:.3f} s of exit cost inside KVM_RUN not counted "
+                         "({} ns a run, 1st percentile of MMIO runs about {} ns, {} device exits), {:.3f} s of short stretches outside not counted, device "
+                         "accesses {:.3f} s of guest time",
+                         sec(s.overhead_ns), exit_overhead_ns_, exit_overhead_ns_ * 5 / 4 + 100, device_exits_, sec(s.excluded_short_ns),
+                         static_cast<double>(s.device_cycles) / 733'333'333.0, poll_exits_);
     return r;
 }
 
@@ -479,6 +529,10 @@ void KvmBackend::stop() {
 
 void KvmBackend::join() {
     if (thread_.joinable()) thread_.join();
+    if (profile_timer_ok_) {
+        timer_delete(profile_timer_);
+        profile_timer_ok_ = false;
+    }
     if (profile_eip_ && !eip_samples_.empty()) {
         std::vector<std::pair<u32, u64>> top(eip_samples_.begin(), eip_samples_.end());
         std::sort(top.begin(), top.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
@@ -514,6 +568,7 @@ void KvmBackend::inject_interrupt_if_possible() {
         irq.irq = static_cast<u32>(pic.acknowledge());
         if (ioctl(vcpu_fd_, KVM_INTERRUPT, &irq) == 0) {
             ++stats_.irq_injections;
+            at_idle_ = false;
             ++stats_.by_vector[irq.irq & 0xFF];
             trace::log(trace::Cat::Irq, "injected vector {:02x}", irq.irq);
             const Cycles now = machine_->scheduler().now(), rose = machine_->intr_rose_at();
@@ -533,6 +588,73 @@ void KvmBackend::inject_interrupt_if_possible() {
 void KvmBackend::wait_for_interrupt() {
     // HLT with interrupts enabled: sleep until a device raises a line (the io thread kicks us) or a stop.
     machine_->wait_for_wake([this] { return stop_requested_.load() || machine_->pic().pending_vector() >= 0; });
+}
+
+bool KvmBackend::counted_device_exit() {
+    // Guests poll by reading, and some by a whole call made of writes and a read: a title asks its sound library for a
+    // stream's position over and over (a free-count read, voice select, lock, unlock, the same values every pass). At
+    // the bus's price such a wait took 1.6 times the host time (an intro 95 -> 61 fps). A device access sequence that
+    // repeats exactly (address, value, direction) with a period of up to 8 accesses, two periods running, is a poll;
+    // a loop that writes something new each pass (updating voice after voice) is work.
+    u64 key;
+    if (run_->exit_reason == KVM_EXIT_MMIO) {
+        if (!run_->mmio.is_write) return true;
+        u64 v = 0;
+        std::memcpy(&v, run_->mmio.data, std::min<u32>(run_->mmio.len, 8));
+        key = (run_->mmio.phys_addr << 4) ^ (v * 0x9E3779B97F4A7C15ull) ^ run_->mmio.len;
+    } else if (run_->exit_reason == KVM_EXIT_IO) {
+        if (run_->io.direction == KVM_EXIT_IO_IN) return true;
+        u32 v = 0;
+        std::memcpy(&v, reinterpret_cast<const u8*>(run_) + run_->io.data_offset, std::min<u32>(run_->io.size, 4));
+        key = (u64{run_->io.port} << 40) ^ (u64{v} * 0x9E3779B97F4A7C15ull) ^ run_->io.count;
+    } else {
+        return false;
+    }
+    return poll_step(key);  // the writes alone carry the pattern
+}
+
+bool KvmBackend::poll_step(u64 key) {
+    // at(1) is the last write recorded, at(2) the one before.
+    const auto at = [this](unsigned back) { return poll_ring_[(poll_pos_ + 1 - back) & (poll_ring_.size() - 1)]; };
+    if (poll_period_ && at(poll_period_) == key) {
+        ++poll_streak_;
+    } else {
+        poll_period_ = 0;
+        poll_streak_ = 0;
+        for (unsigned p = 1; p <= 8; ++p)
+            if (at(p) == key) {
+                poll_period_ = p;
+                poll_streak_ = 1;
+                break;
+            }
+    }
+    poll_ring_[++poll_pos_ & (poll_ring_.size() - 1)] = key;
+    const bool poll = poll_period_ && poll_streak_ >= 2 * poll_period_;
+    if (poll) ++poll_exits_;
+    return poll;
+}
+
+void KvmBackend::device_exit(Cycles cost, bool calibrates) {
+    // The exit's own cost inside KVM_RUN is no guest time with exact exits. MMIO runs (a string port access can come
+    // back without entering the guest) have a hard floor, the exit itself: on this host 5.0 us, with 1.7 M of 1.7 M
+    // runs between 5 and 6 us and a hundred stray ones below (most likely back without the guest running). Four fifths of the
+    // 1st percentile comes off every run, so a rewind stays out of the time the guest ran; a host without the IBPB on
+    // exits measures its own, smaller. MV_EXIT_OVERHEAD_NS fixes it; MV_DEVICE_COST=0 drops the device costs.
+    static const long force_ns = [] { const char* e = std::getenv("MV_EXIT_OVERHEAD_NS"); return e && *e ? std::strtol(e, nullptr, 10) : -1L; }();
+    static const bool no_cost = [] { const char* e = std::getenv("MV_DEVICE_COST"); return e && *e == '0'; }();
+    if (!no_cost) device_pending_ += cost;
+    ++device_exits_;
+    if (!calibrates || !clock_.exact_exits()) return;
+    ++run_hist_[std::min<u64>(last_run_cpu_ / 100, run_hist_.size() - 1)];
+    if (++calibration_runs_ % 4096) return;
+    if (force_ns >= 0) {
+        exit_overhead_ns_ = static_cast<u64>(force_ns);
+        return;
+    }
+    u64 seen = 0;
+    std::size_t b = 0;
+    while (b + 1 < run_hist_.size() && (seen += run_hist_[b]) * 100 < calibration_runs_) ++b;
+    exit_overhead_ns_ = b * 100 * 4 / 5;
 }
 
 void KvmBackend::handle_io() {
@@ -589,7 +711,20 @@ void KvmBackend::thread_main() {
     sigset_t unblock;
     sigemptyset(&unblock);
     sigaddset(&unblock, kKickSignal);
+    if (profile_us_) sigaddset(&unblock, kProfileSignal);
     pthread_sigmask(SIG_UNBLOCK, &unblock, nullptr);
+    if (profile_eip_ && profile_us_) {
+        sigevent sev{};
+        sev.sigev_notify = SIGEV_THREAD_ID;
+        sev.sigev_signo = kProfileSignal;
+        sev._sigev_un._tid = gettid();
+        if (timer_create(CLOCK_THREAD_CPUTIME_ID, &sev, &profile_timer_) == 0) {
+            profile_timer_ok_ = true;
+            itimerspec its{};
+            its.it_interval.tv_nsec = its.it_value.tv_nsec = static_cast<long>(profile_us_) * 1000;
+            timer_settime(profile_timer_, 0, &its, nullptr);
+        }
+    }
     if (guest_clock_on_) {
         // The io thread reads this thread's CPU clock to see guest time move while the guest runs.
         clockid_t id{};
@@ -658,20 +793,32 @@ void KvmBackend::thread_main() {
             inject_interrupt_if_possible();
         }
         if (guest_clock_on_) {
-            // The stretch since the exit: a short one is guest time, a long one is not and comes off the TSC. At every
-            // boundary the wall clock is read first and the CPU clock second, so the two accounts line up.
-            const GuestClock::Exit e = clock_.classify(mono_ns());
-            if (e.long_exit) {
-                clock_.excluded_until(thread_cpu_ns());
-                if (e.tsc_rewind && tsc_offset_add(-static_cast<i64>(e.tsc_rewind))) {
+            // The stretch since the exit: a short one is guest time and a long one is not and comes off the TSC; with exact
+            // exits (D33) only a device read's counts. At every boundary the wall clock is read first and the CPU clock
+            // second, so the two accounts line up.
+            const GuestClock::Exit e = clock_.classify(mono_ns(), device_pending_, read_exit_);
+            device_pending_ = 0;
+            if (e.excluded) {
+                const u64 rewind = e.tsc_rewind + clock_.excluded_until(thread_cpu_ns());
+                if (rewind && tsc_offset_add(-static_cast<i64>(rewind))) {
                     ++tsc_rewinds_;
-                    tsc_rewound_ += e.tsc_rewind;
+                    tsc_rewound_ += rewind;
                 }
             }
             {
                 const u64 wall = mono_ns();
                 const u64 cpu = thread_cpu_ns();
                 clock_.entered(cpu, wall);
+                run_entered_cpu_ = cpu;
+                if (debug_lead_) {
+                    const i64 l = static_cast<i64>(read_tsc()) - static_cast<i64>(clock_.now() - tsc_epoch_);
+                    if (lead_left_set_) {
+                        auto& b = lead_out_[lead_reason_];
+                        ++b.first;
+                        b.second += l - lead_left_;
+                    }
+                    lead_entered_ = l;
+                }
             }
             // The io thread may have backed off while this clock stood still: it re-plans on the running clock.
             if (e.long_exit) machine_->wake_io();
@@ -681,19 +828,31 @@ void KvmBackend::thread_main() {
             }
         }
         if (watch_pending_.load(std::memory_order_acquire)) apply_pending_watches();  // out of the guest: clears are cheap
-        const bool gpu_busy = profile_eip_ && machine_->nv2a().fifo_busy_now();
+        const bool gpu_busy = machine_->nv2a().fifo_busy_now();
+        const bool sampling = profile_eip_ && vblank_seen_ >= profile_from_ && vblank_seen_ < profile_to_;
+        const bool idle_run = at_idle_;
         const u64 guest_before = clock_.stats().in_guest_ns;
         const int rc = ioctl(vcpu_fd_, KVM_RUN, 0);
         if (guest_clock_on_) {
             const u64 wall = mono_ns();
             const u64 cpu = thread_cpu_ns();
-            clock_.left(cpu, wall);
+            // A device read or a poll keeps the host's price (see GuestClock::classify): nothing comes off its run either.
+            read_exit_ = rc == 0 && counted_device_exit();
+            clock_.left(cpu, wall, read_exit_ ? 0 : exit_overhead_ns_);
+            last_run_cpu_ = cpu - run_entered_cpu_;
+            if (debug_lead_) {
+                lead_left_ = static_cast<i64>(read_tsc()) - static_cast<i64>(clock_.now() - tsc_epoch_);
+                lead_left_set_ = true;
+                lead_in_ += lead_left_ - lead_entered_;
+                lead_reason_ = rc < 0 ? 255u : (run_->exit_reason < 64 ? run_->exit_reason : 254u);
+            }
             if (gpu_busy) busy_guest_ns_ += clock_.stats().in_guest_ns - guest_before;
+            if (idle_run) idle_spin_ns_ += clock_.stats().in_guest_ns - guest_before;
         }
         ++stats_.exits;
         if (rc < 0 && errno == EINTR) {
             ++stats_.intr_exits;
-            if (profile_eip_) {
+            if (sampling && (!profile_us_ || g_profile_tick.exchange(false, std::memory_order_relaxed))) {
                 kvm_regs r{};
                 if (ioctl(vcpu_fd_, KVM_GET_REGS, &r) == 0) {
                     ++eip_samples_[static_cast<u32>(r.rip)];
@@ -720,8 +879,14 @@ void KvmBackend::thread_main() {
         if (run_->exit_reason == KVM_EXIT_IO) ++exit_sources_[0x10000u | run_->io.port];
         else if (run_->exit_reason == KVM_EXIT_MMIO) ++exit_sources_[static_cast<u32>(run_->mmio.phys_addr) & ~0xFFFu];
         switch (run_->exit_reason) {
-            case KVM_EXIT_IO: handle_io(); break;
-            case KVM_EXIT_MMIO: handle_mmio(); break;
+            case KVM_EXIT_IO:
+                handle_io();
+                device_exit(run_->io.direction == KVM_EXIT_IO_OUT ? kPortIoCycles * run_->io.count : 0, false);
+                break;
+            case KVM_EXIT_MMIO:
+                handle_mmio();
+                device_exit(run_->mmio.is_write ? kDeviceStoreCycles : 0, true);
+                break;
             case KVM_EXIT_HLT:
                 ++stats_.hlt_exits;
                 // With the guest clock, an idle CPU skips guest time (the loop above); with interrupts off it has
@@ -755,6 +920,7 @@ void KvmBackend::thread_main() {
                 if (idle_eip_ && (run_->debug.arch.pc == idle_eips_[0] || run_->debug.arch.pc == idle_eips_[1]) && break_eips_.empty() && !watch_va_) {
                     // The idle loop. A turn of it with no interrupt injected since the last hit found no work: halt.
                     ++idle_hits_;
+                    at_idle_ = true;
                     const bool quiet = stats_.irq_injections == idle_injections_at_hit_;
                     idle_injections_at_hit_ = stats_.irq_injections;
                     if (quiet && run_->if_flag && guest_clock_on_) {

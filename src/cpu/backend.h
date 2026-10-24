@@ -66,6 +66,12 @@ public:
     // events fired on the CPU's thread, held by pacing. Read while the CPU holds at a vblank.
     struct HostAccounts {
         u64 in_guest_ns{0}, handler_ns{0}, event_ns{0}, pause_ns{0};
+        u64 gpu_busy_guest_ns{0};  // in the guest while the GPU's FIFO thread had work in hand
+        u64 counted_out_ns{0};     // outside the guest but counted as guest time (short exits)
+        u64 idle_spin_ns{0};       // in the guest in the kernel idle loop (from a hit on it until an interrupt is injected)
+        u64 warped_cycles{0};      // guest time skipped while the CPU was halted
+        u64 halts{0};
+        u64 exits{0}, mmio_exits{0};
     };
     virtual HostAccounts host_accounts() const { return {}; }
 

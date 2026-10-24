@@ -7,6 +7,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <map>
 #include <unordered_map>
 #include <vector>
 
@@ -52,7 +53,10 @@ public:
     bool hardware_assisted() const override { return true; }
     std::string clock_name() const override;
     std::string report() const override;
-    HostAccounts host_accounts() const override { return {clock_.stats().in_guest_ns, handler_ns_, event_ns_, pause_ns_}; }
+    HostAccounts host_accounts() const override {
+        const auto& c = clock_.stats();
+        return {c.in_guest_ns, handler_ns_, event_ns_, pause_ns_, busy_guest_ns_, c.out_counted_ns, idle_spin_ns_, c.warped_cycles, idle_halts_, stats_.exits, stats_.mmio_exits};
+    }
 
     // Replace the top page's backing when the MCPX ROM is hidden, and again when a reset shows it.
     void on_rom_hidden();
@@ -91,7 +95,12 @@ private:
     Stats stats_;
     // MV_PROFILE_EIP=1: where the guest was each time the vCPU was kicked (a sampling profiler for spin loops
     // that make no exits), printed when the CPU thread ends.
+    // MV_PROFILE_EIP=FROM-TO samples only from vblank FROM to vblank TO (a stretch of gameplay, not the whole run).
     bool profile_eip_{false};
+    u64 profile_from_{0}, profile_to_{~0ull};
+    unsigned profile_us_{0};  // MV_PROFILE_EIP_US: sample on the vCPU thread's CPU clock every N us (0 = at kicks)
+    timer_t profile_timer_{};
+    bool profile_timer_ok_{false};
     std::unordered_map<u32, u64> eip_samples_;
     std::unordered_map<u32, u64> eip_busy_samples_;  // MV_PROFILE_EIP: the samples taken while the GPU thread had work
     u64 busy_guest_ns_{0};                          // and the vCPU time in the guest while it had
@@ -123,6 +132,25 @@ private:
     bool guest_clock_on_{true};
     GuestClock clock_;
     bool tsc_offset_ctl_{false};
+    u64 tsc_offset_{0};  // the vCPU's TSC offset as last set (read once)
+    bool tsc_offset_known_{false};
+    // Exact exits (D33): the pending exit's device cost, the last run's CPU time, the fastest device exit seen and the
+    // overhead taken off each run (four fifths of it).
+    Cycles device_pending_{0};
+    bool read_exit_{false};  // the last run ended in a device read or a polling write: it keeps the host's price
+    bool counted_device_exit();
+    bool poll_step(u64 key);
+    std::array<u64, 16> poll_ring_{};  // the last device writes (address, value, size)
+    unsigned poll_pos_{0}, poll_period_{0}, poll_streak_{0};
+    u64 poll_exits_{0};
+    u64 run_entered_cpu_{0}, last_run_cpu_{0}, exit_overhead_ns_{0}, device_exits_{0}, calibration_runs_{0};
+    std::array<u64, 200> run_hist_{};  // MMIO runs by CPU time, 100 ns buckets
+    void device_exit(Cycles cost, bool calibrates);
+    // MV_DEBUG_TSC_LEAD: the TSC lead's change inside runs and across exits, by exit reason (two MSR reads an exit).
+    bool debug_lead_{false}, lead_left_set_{false};
+    i64 lead_entered_{0}, lead_left_{0}, lead_in_{0};
+    unsigned lead_reason_{0};
+    std::map<unsigned, std::pair<u64, i64>> lead_out_;
     std::atomic<clockid_t> vcpu_cpu_clock_{CLOCK_THREAD_CPUTIME_ID};  // the vCPU thread's CPU clock, for other threads
     std::atomic<bool> vcpu_clock_known_{false};
     timer_t backstop_{};
@@ -139,6 +167,8 @@ private:
     u32 idle_eip_{0};                 // the first, 0 until found
     bool idle_skip_{true};
     u64 idle_injections_at_hit_{~0ull}, idle_hits_{0}, idle_halts_{0}, idle_scans_{0};
+    bool at_idle_{false};   // the guest is in the idle loop: a hit on it since the last injected interrupt
+    u64 idle_spin_ns_{0};
     void find_idle_loop();
     Cycles tsc_epoch_{0};   // guest time at which the TSC was zero
     u64 vblank_seen_{0};

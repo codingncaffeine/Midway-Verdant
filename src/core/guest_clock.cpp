@@ -30,23 +30,39 @@ void GuestClock::publish(bool inside) {
     seq_.store(seq_.load(std::memory_order_relaxed) + 1, std::memory_order_release);
 }
 
-GuestClock::Exit GuestClock::classify(u64 wall_ns) {
+GuestClock::Exit GuestClock::classify(u64 wall_ns, Cycles device_cycles, bool counted) {
     const u64 stretch = wall_ns > out_since_ns_ ? wall_ns - out_since_ns_ : 0;
     classified_at_ns_ = wall_ns;
     pending_long_ = stretch > kShortExitNs;
+    pending_excluded_ = pending_long_ || (exact_ && !counted);
     excluded_to_cpu_ = out_since_cpu_;
-    if (!pending_long_) return {};
-    // The guest TSC ran through the whole stretch at tsc_khz; take off no more than that (floor), so it never steps
-    // below a value the guest read before the exit.
-    return {true, muldiv64(stretch, tsc_khz(), 1'000'000)};
+    device_pending_ = exact_ && !counted ? device_cycles : 0;
+    if (!pending_excluded_) return {};
+    // A short stretch with exact exits is rewound by its CPU time, in excluded_until: its wall time starts at a clock
+    // read made just after the exit, where the host runs slowly (its branch predictors just flushed), so the wall
+    // stretch outgrew the CPU time the run had counted and the TSC fell behind the clock by ~0.15 us an exit.
+    if (!pending_long_) return {false, true, 0};
+    // The guest TSC ran through the whole stretch at tsc_khz, and through the exit's cost inside KVM_RUN taken off
+    // the run; take off no more than that (floor), so it never steps below a value the guest read before the exit.
+    // The device access moves guest time and the TSC alike.
+    return {true, true, rewind_for(stretch)};
 }
 
-void GuestClock::excluded_until(u64 cpu_ns) { excluded_to_cpu_ = std::max(cpu_ns, out_since_cpu_); }
+u64 GuestClock::rewind_for(u64 stretch_ns) const {
+    const u64 ran = muldiv64(stretch_ns + overhead_pending_ns_, tsc_khz(), 1'000'000);
+    return ran > device_pending_ ? ran - device_pending_ : 0;
+}
+
+u64 GuestClock::excluded_until(u64 cpu_ns) {
+    excluded_to_cpu_ = std::max(cpu_ns, out_since_cpu_);
+    // The CPU time since the exit never exceeds the wall time the guest did not run in: a safe rewind.
+    return pending_excluded_ && !pending_long_ ? rewind_for(excluded_to_cpu_ - out_since_cpu_) : 0;
+}
 
 void GuestClock::entered(u64 cpu_ns, u64 wall_ns) {
     // Counted: the thread's CPU time since the exit, but for a long stretch only what came after its exclusion
     // (the rewind and the entry, which the TSC runs through as well).
-    const u64 from = pending_long_ ? excluded_to_cpu_ : out_since_cpu_;
+    const u64 from = pending_excluded_ ? excluded_to_cpu_ : out_since_cpu_;
     const u64 counted = cpu_ns > from ? cpu_ns - from : 0;
     if (pending_long_) {
         const u64 stretch = classified_at_ns_ > out_since_ns_ ? classified_at_ns_ - out_since_ns_ : 0;
@@ -57,28 +73,38 @@ void GuestClock::entered(u64 cpu_ns, u64 wall_ns) {
         ++stats_.short_exits;
         const u64 stretch = wall_ns > out_since_ns_ ? wall_ns - out_since_ns_ : 0;
         if (stretch > counted) stats_.short_excess_ns += stretch - counted;
+        if (pending_excluded_) stats_.excluded_short_ns += classified_at_ns_ > out_since_ns_ ? classified_at_ns_ - out_since_ns_ : 0;
     }
     stats_.out_counted_ns += counted;
     pending_long_ = false;
+    if (pending_excluded_) overhead_pending_ns_ = 0;
+    pending_excluded_ = false;
+    const Cycles device = device_pending_;
+    device_pending_ = 0;
+    stats_.device_cycles += device;
     entered_cpu_ns_ = cpu_ns;
     entered_wall_ns_ = wall_ns;
     // The count and the bracket's start change together for `estimate`.
     seq_.store(seq_.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
     std::atomic_thread_fence(std::memory_order_release);
     add_host_ns(counted);
+    if (device) guest_ps_.store(guest_ps_.load(std::memory_order_relaxed) + muldiv64_ceil(device, kCyclesPerPsDen, kCyclesPerPsNum), std::memory_order_relaxed);
     pub_entered_cpu_ns_.store(entered_cpu_ns_, std::memory_order_relaxed);
     pub_inside_.store(true, std::memory_order_relaxed);
     seq_.store(seq_.load(std::memory_order_relaxed) + 1, std::memory_order_release);
 }
 
-void GuestClock::left(u64 cpu_ns, u64 wall_ns) {
+void GuestClock::left(u64 cpu_ns, u64 wall_ns, u64 overhead_cap_ns) {
     const u64 cpu = cpu_ns > entered_cpu_ns_ ? cpu_ns - entered_cpu_ns_ : 0;
+    const u64 overhead = exact_ ? std::min(overhead_cap_ns, cpu) : 0;
+    stats_.overhead_ns += overhead;
+    overhead_pending_ns_ += overhead;
     const u64 wall = wall_ns > entered_wall_ns_ ? wall_ns - entered_wall_ns_ : 0;
     stats_.in_guest_ns += cpu;
     if (wall > cpu) stats_.preempted_ns += wall - cpu;
     seq_.store(seq_.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
     std::atomic_thread_fence(std::memory_order_release);
-    add_host_ns(cpu);
+    add_host_ns(cpu - overhead);
     pub_inside_.store(false, std::memory_order_relaxed);
     seq_.store(seq_.load(std::memory_order_relaxed) + 1, std::memory_order_release);
     out_since_ns_ = wall_ns;
@@ -88,6 +114,7 @@ void GuestClock::left(u64 cpu_ns, u64 wall_ns) {
 void GuestClock::mark_out(u64 wall_ns) {
     out_since_ns_ = wall_ns;
     pending_long_ = false;
+    pending_excluded_ = false;
     publish(false);
 }
 
