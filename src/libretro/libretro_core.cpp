@@ -527,6 +527,29 @@ RETRO_API void retro_run(void) {
         std::lock_guard g(machine->lock());
         frame_log_line(ms);
     }
+    // MV_DUMP_RAM=FRAME:FILE[,FRAME:FILE...]: the guest RAM to FILE when that frame holds (with MV_RENDER_DEBUG=wball every
+    // GPU target is in it), for finding what the guest copied from where.
+    static const std::vector<std::pair<unsigned long long, std::string>> ram_dumps = [] {
+        std::vector<std::pair<unsigned long long, std::string>> v;
+        if (const char* e = std::getenv("MV_DUMP_RAM")) {
+            std::string s = e;
+            for (std::size_t at = 0; at < s.size();) {
+                const std::size_t comma = std::min(s.find(',', at), s.size()), colon = s.find(':', at);
+                if (colon < comma) v.emplace_back(std::strtoull(s.c_str() + at, nullptr, 10), s.substr(colon + 1, comma - colon - 1));
+                at = comma + 1;
+            }
+        }
+        return v;
+    }();
+    for (const auto& [at, path] : ram_dumps) {
+        if (at != frames_run) continue;
+        std::lock_guard g(machine->lock());
+        if (std::FILE* f = std::fopen(path.c_str(), "wb")) {
+            std::fwrite(machine->bus().ram(), 1, machine->bus().ram_size(), f);
+            std::fclose(f);
+            log(RETRO_LOG_INFO, "frame %llu: guest RAM written to %s", at, path.c_str());
+        }
+    }
     grab_frame();
     hold_grab_ms_sum += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t1).count();
     if (pipeline) {

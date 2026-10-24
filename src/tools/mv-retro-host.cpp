@@ -2,6 +2,7 @@
 // library, answers the environment calls (system directory, pixel format, options, log), runs N frames, saves
 // pictures of chosen frames and holds RetroPad buttons over chosen frame ranges.
 //   mv-retro-host CORE.so SYSTEM_DIR [GAME] --frames N [--png-every K DIR [--png-from N --png-to M]] [--press BUTTON@FROM-TO ...]
+//     [--reset@FRAME ...]: retro_reset before that frame, as a frontend's restart button does (Emutastic calls it on its loop).
 // Buttons: a b x y l r l2 r2 start select up down left right.
 #include <dlfcn.h>
 #if defined(__linux__)
@@ -160,7 +161,7 @@ int main(int argc, char** argv) {
     if (const char* p = std::getenv("MV_ALLOW_PROFILER"); p && *p == '1') prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY, 0, 0, 0);
 #endif
     if (argc < 3) {
-        std::fprintf(stderr, "usage: mv-retro-host CORE.so SYSTEM_DIR [GAME] --frames N [--png-every K DIR [--png-from N --png-to M]] [--press BUTTON@FROM-TO ...] [--option KEY=VALUE ...] [--wav FILE] [--frontend-ms N] [--realtime]\n");
+        std::fprintf(stderr, "usage: mv-retro-host CORE.so SYSTEM_DIR [GAME] --frames N [--png-every K DIR [--png-from N --png-to M]] [--press BUTTON@FROM-TO ...] [--option KEY=VALUE ...] [--wav FILE] [--frontend-ms N] [--realtime] [--reset@FRAME ...]\n");
         return 2;
     }
     const char* core_path = argv[1];
@@ -170,6 +171,7 @@ int main(int argc, char** argv) {
     double frontend_ms = 0;  // --frontend-ms N: time a frontend spends presenting each frame, spent here as a sleep
     bool realtime = false;  // --realtime: call retro_run no faster than the core's frame rate, as a frontend synced to the display does
     std::filesystem::path png_dir;
+    std::vector<unsigned> resets;  // --reset@F
     for (int i = 3; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--frames" && i + 1 < argc) frames = static_cast<unsigned>(std::atoi(argv[++i]));
@@ -187,6 +189,8 @@ int main(int argc, char** argv) {
             }
             presses.push_back({button_id(spec.substr(0, at)), static_cast<unsigned>(std::atoi(spec.c_str() + at + 1)),
                                static_cast<unsigned>(std::atoi(spec.c_str() + dash + 1))});
+        } else if (a.rfind("--reset@", 0) == 0) {
+            resets.push_back(static_cast<unsigned>(std::atoi(a.c_str() + 8)));
         } else if (a == "--frontend-ms" && i + 1 < argc) {
             frontend_ms = std::atof(argv[++i]);
         } else if (a == "--realtime") {
@@ -233,10 +237,15 @@ int main(int argc, char** argv) {
     std::printf("av: %ux%u base, %.3f fps, %.0f Hz\n", av.geometry.base_width, av.geometry.base_height, av.timing.fps, av.timing.sample_rate);
     if (png_every) std::filesystem::create_directories(png_dir);
     auto run = sym<void (*)()>(lib, "retro_run");
+    auto reset = sym<void (*)()>(lib, "retro_reset");
     const auto t0 = std::chrono::steady_clock::now();
     double call_ms_max = 0;
     unsigned long long over17 = 0, over33 = 0;  // calls slower than a frame and than two (a frontend shows them as hitches)
     for (current_frame = 0; current_frame < frames; ++current_frame) {
+        if (std::find(resets.begin(), resets.end(), current_frame) != resets.end()) {
+            std::printf("frame %u: retro_reset\n", current_frame);
+            reset();
+        }
         audio_this_call = 0;
         const auto c0 = std::chrono::steady_clock::now();
         run();
