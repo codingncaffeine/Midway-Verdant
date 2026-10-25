@@ -856,6 +856,7 @@ void AtapiCdrom::read_sectors(u64 lba, u32 count) {
         buffer_pos_ = 0;
         tf_.status = ata::kStatusBsy;
         pending_ = Pending::DmaData;
+        read_due_ = channel_->scheduler().now() + latency;
         channel_->schedule(*this, latency);
         return;
     }
@@ -978,8 +979,11 @@ void AtapiCdrom::continue_command() {
             break;
         case Pending::DmaData: {
             if (!channel_->dma_active()) return;  // the engine starts us again
-            if (read_in_flight_ && host_paced_reads_ && !disc_->ready()) {
-                // The host is still reading: the drive is still busy, due again half a millisecond on.
+            // The host is still reading: the drive is still busy, due again half a millisecond on  14 for at most a
+            // quarter second of console time past its own completion, as long as a slow seek on the console's drive; a
+            // host stalled longer than that (a busy spinning disk) holds the console instead of letting it give up on
+            // the disc ("insert a disc" in a title's boot under heavy host disk load).
+            if (read_in_flight_ && host_paced_reads_ && !disc_->ready() && channel_->scheduler().now() - read_due_ < cycles_from_ns(250'000'000)) {
                 channel_->schedule(*this, cycles_from_ns(500'000));
                 return;
             }

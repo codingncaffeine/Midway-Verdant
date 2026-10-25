@@ -133,6 +133,9 @@ void DiskImage::reader_main() {
         lock.unlock();
         std::vector<u8> out(static_cast<std::size_t>(count) * 512);
         const bool ok = read_at(lba, count, out.data());
+        // Instrument: MV_DEBUG_HDD_DELAY_MS=N makes every read on this thread take N ms more (a cold, busy host disk).
+        static const long delay_ms = [] { const char* d = std::getenv("MV_DEBUG_HDD_DELAY_MS"); return d && *d ? std::atol(d) : 0L; }();
+        if (delay_ms > 0) std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
         lock.lock();
         result_ = std::move(out);
         ok_ = ok;

@@ -187,12 +187,12 @@ bool Machine::init(std::string& error) {
                    config_.hdd_locked ? ", locked" : "");
     }
     auto dvd = std::make_unique<AtapiCdrom>();
-    // The fast core does not hold its CPU thread on a slow host read of the disc or the hard disk (MV_HOST_PACED_READS=0,
-    // the control, does).
-    if (const char* hp = std::getenv("MV_HOST_PACED_READS"); config_.cpu != "p6" && !(hp && *hp == '0')) {
-        dvd->set_host_paced_reads(true);
-        if (hdd_) hdd_->set_host_paced_reads(true);
-    }
+    // The fast core does not hold its CPU thread on a slow host read of the disc (MV_HOST_PACED_READS=0, the control,
+    // does). The hard disk's reads still start on the image's thread at the command, but their completion waits for
+    // the host: a disk the console sees take tens of milliseconds a read stalls the kernel's boot and made a title
+    // report its settings unreadable (House of the Dead III, a cold host disk), where the console's drive takes a few.
+    if (const char* hp = std::getenv("MV_HOST_PACED_READS"); config_.cpu != "p6" && !(hp && *hp == '0')) dvd->set_host_paced_reads(true);
+    if (const char* hp = std::getenv("MV_HOST_PACED_HDD"); hdd_ && hp && *hp == '1') hdd_->set_host_paced_reads(true);  // the old behaviour, a control
     dvd->set_read_speed(config_.disc_speed);
     if (config_.dvd_image) {
         auto disc = std::make_unique<DvdImage>();
