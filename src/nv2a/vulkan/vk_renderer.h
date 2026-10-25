@@ -60,13 +60,19 @@ public:
     // picture (no target there, or another engine wrote it since): the caller widens the RAM picture instead.
     bool scaled_scanout(u32 phys, u32 pitch, u32 bpp, bool rgb565, u32 w, u32 h, std::vector<u32>& xrgb, u32& scale) const;
     // The same picture where it lies (no copy): the rectangle's first pixel, its row pitch and its scale, in the frame
-    // buffer's format. It stays valid until the next vblank (the CPU holds at that one while the frontend takes it).
+    // buffer's format. The copy that lands it was submitted at the vblank and not waited for there (D36): picture_ready
+    // waits, with no lock held, so the CPU can run the next frame meanwhile. The frontend holds the picture from
+    // scaled_picture until picture_done: no capture writes its buffer in between (the next vblank's goes to the
+    // target's other one).
     struct ScaledPicture {
         const u8* pixels{nullptr};
         u32 pitch{0}, sc{1};
         bool xrgb{false};  // finished XRGB8888 (the colour table applied, alpha clear), not the frame buffer's format
+        VkFence ready{VK_NULL_HANDLE};
     };
     bool scaled_picture(u32 phys, u32 pitch, u32 bpp, u32 w, u32 h, ScaledPicture& out) const;
+    void picture_ready(const ScaledPicture& p) const;
+    void picture_done() const;
 
     void clear(const KelvinState& state, u32 clear_bits) override;
     void draw(const KelvinState& state, const DrawBatch& batch) override;
@@ -126,6 +132,8 @@ public:
         u64 zeta_conversions{0};  // depth buffers converted on the GPU for a colour texture at their address
         u64 cpu_written_targets{0};  // render targets whose memory the CPU wrote: reloaded from RAM
         u64 depth_handovers{0}, depth_uploads{0};  // depth buffers moved between targets sharing an address; loaded from RAM
+        u64 depth_unparks{0}, parked_samples{0};  // parked depth images bound again; sampled in place
+        u64 depth_loads_skipped{0};  // depth buffers bound for a clear of the whole buffer: nothing loaded
         u64 evicted{0}, retired_unused{0};  // targets another target overlapped; targets nothing used for 10 s
         u64 subrect_copies{0};  // rectangles of a pitch-linear region copied for a texture
         u64 cube_assemblies{0};  // cube maps put together on the GPU from six render targets (cube_texture)
@@ -190,6 +198,7 @@ private:
         std::vector<u64> page_hashes;
         bool zeta_dirty{false};      // depth rendered since the last write-back of the zeta surface
         u32 depth_holds{0};          // the zeta address whose contents the depth image holds (0: none, undefined)
+        u32 holds_pitch{0};          // that address's zeta pitch when it was bound
         u64 last_used_vblank{0};     // the last vblank it was drawn into or sampled
         bool rendered_this_frame{false};
         u64 draws_this_frame{0}, clears_this_frame{0};
@@ -218,6 +227,23 @@ private:
         VkImageView zcolor_x8_view{VK_NULL_HANDLE};
         TextureEntry zcolor_tex, zcolor_x8_tex;
         u64 zcolor_serial{~0ull};
+        // Depth images of other zeta addresses the target bound before, kept on the GPU with their contents (D35): a
+        // target that alternates between depth buffers (the boot animation's two shadow depths, each frame) swaps
+        // images instead of writing one back and loading the other through RAM. A parked image is owned
+        // (depth_owner_) like the bound one and is sampled in place; anything else touching its memory sends it to
+        // RAM first (drop_parked, flush_parked). One that holds nothing (depth_holds 0) is a spare.
+        struct ParkedDepth {
+            vk::Image depth;
+            VkImageView depth_view{VK_NULL_HANDLE};
+            TextureEntry depth_tex;
+            VkFramebuffer framebuffer{VK_NULL_HANDLE};
+            bool zeta_dirty{false};
+            u32 depth_holds{0}, holds_pitch{0};
+            u64 used{0};
+        };
+        std::vector<ParkedDepth> parked;
+        u32 parked_bytes(const ParkedDepth& p) const { return swizzled ? (zeta_format == 1 ? 2u : 4u) * width * height : p.holds_pitch * height; }
+        u32 held_bytes() const { return swizzled ? (zeta_format == 1 ? 2u : 4u) * width * height : (holds_pitch ? holds_pitch : zeta_pitch) * height; }
         // The frame the target was last drawn in, and whether a GPU-side copy (a blit) wrote its memory since: a clean
         // target drawn this frame or the last, with nothing written over it, still holds what RAM holds.
         u64 last_rendered_frame{0};
@@ -253,7 +279,9 @@ private:
     struct View {
         u32 x{0}, y{0}, w{0}, h{0};
     } view_;
-    bool ensure_pass(Surface& t);
+    // writes_color: the draw or clear writes the colour image; a pass that does not leaves a colour reload from RAM for
+    // later (the boot animation's depth-only target sat over kernel memory the CPU writes every frame).
+    bool ensure_pass(Surface& t, bool writes_color = true);
     void upload_color_from_ram(Surface& t);
     // Write-backs come in batches: each queued surface records its copy after the frame's draws, and
     // finish_write_backs() waits once for all of them, then stores each into guest RAM in the order queued.
@@ -312,9 +340,25 @@ private:
     // The depth buffer at each zeta address lives in one target's depth image at a time: the target that last drew with
     // it. Another target binding the same address takes the contents first (a GPU copy, or through RAM).
     std::unordered_map<u32, Surface*> depth_owner_;
-    void bind_depth(Surface& t);
+    // cleared: the caller clears the whole depth buffer (and its stencil) before anything reads it, so what the address
+    // held is not loaded (Half-Life 2's four targets of two shapes sharing one depth buffer, each through RAM).
+    void bind_depth(Surface& t, bool cleared = false);
+    void write_back_held(Surface& s);  // the bound image to the address it holds, when newer there
     void upload_depth_from_ram(Surface& t);
     void release_depth(Surface& s);  // a target going away: its depth contents to RAM, its ownership dropped
+    // Parked depth images (Surface::parked). swap_depth exchanges the bound image with a parked one; park_for takes z's
+    // parked image back, or parks the bound one and binds a spare (made, or the least recently used written back);
+    // flush_parked writes back the dirty ones over a range and keeps them; drop_parked writes back and lets them go.
+    static constexpr std::size_t kMaxParked = 3;
+    u64 park_clock_{0};
+    void swap_depth(Surface& s, Surface::ParkedDepth& p);
+    bool park_for(Surface& t, u32 z);  // true: z's own image came back (no load needed)
+    bool spare_depth(Surface& t, Surface::ParkedDepth& p);
+    void write_back_parked(Surface& s, Surface::ParkedDepth& p);
+    void flush_parked(u64 b0, u64 b1);
+    bool drop_parked(Surface& s, u64 b0, u64 b1, bool write);
+    void drop_parked(u64 b0, u64 b1);
+    TextureEntry* parked_texture(Surface& s, const TextureStage& ts, u32 phys, u32 w, u32 h, bool linear, bool depth16);
     // Finishes with a target: what it rendered reaches RAM, its depth goes back to its address, its images retire once
     // the GPU is done with them. Returns the next entry.
     std::unordered_map<u32, std::unique_ptr<Surface>>::iterator erase_surface(std::unordered_map<u32, std::unique_ptr<Surface>>::iterator it);
@@ -451,7 +495,6 @@ private:
         Surface* surface{nullptr};
         bool zeta{false};
         VkDeviceSize offset{0};  // where its copy lands in the read-back buffer
-        bool display{false};     // the scaled picture of the scanout target, into its capture's buffer (capture_display)
     };
     std::vector<PendingWriteBack> write_backs_;
     unsigned wb_why_{Stats::kWbAll};  // the cause the write-backs being queued count under
@@ -509,10 +552,9 @@ private:
     // Colour between the scaled image and its stored-size copy (lo): down before a write-back, up after a load.
     bool ensure_lo(Surface& s);
     void blit_lo(Surface& s, bool down);
-    // The scanout target's scaled picture, read back at the vblank beside its write-back into its capture's buffer, which
-    // scaled_scanout reads in place from another thread once finish_write_backs has marked it stored.
+    // The scanout target's scaled picture, read back after its write-back at the vblank into one of the target's two
+    // capture buffers, with a fence of its own that the frontend waits for (D36).
     void capture_display(Surface& s);
-    void store_display(Surface& s);
     // A scaled target's depth write-back: the middle row of every sc-row block, whole (depth words, then stencil bytes,
     // rows padded to four bytes), then thinned to the stored size in the layout store_zeta takes.
     std::size_t zeta_rows_bytes(const Surface& s) const;
@@ -522,13 +564,22 @@ private:
     std::vector<u8> thin_zeta_rows(const Surface& s, const u8* rows) const;
     struct Capture {
         u32 phys{0}, width{0}, height{0}, pitch{0}, bpp{0}, sc{1};
-        bool valid{false};         // the buffer holds the picture these describe (false while a copy is on its way)
+        bool valid{false};         // the buffer holds (once its fence signals) the picture these describe
         bool xrgb{false};          // converted on the GPU to XRGB8888 with the colour table applied (else the target's bytes)
+        bool submitted{false};     // its fence was submitted since it was last reset
+        bool retired{false};       // the scale changed while the frontend held it: it goes once let go
         u64 serial{0};             // the target's draw serial when read
+        u64 taken{0};              // when (capture_clock_): the newer of a target's two is its latest picture
         vk::Buffer buffer;         // sc x width by sc x height, tightly packed (host-visible: read in place)
+        VkFence fence{VK_NULL_HANDLE};
     };
-    std::vector<Capture> captures_;  // the last few targets scanned out (a double or triple buffer), newest last
-    u32 shown_{0};  // the capture that holds the picture the last vblank scanned out (by its target's address; 0: RAM does)
+    static constexpr std::size_t kMaxCaptures = 6;  // two each for a triple buffer's targets
+    std::vector<std::unique_ptr<Capture>> captures_;
+    u64 capture_clock_{0};
+    const Capture* shown_{nullptr};          // the picture the last vblank scanned out (null: RAM holds it)
+    mutable const Capture* held_{nullptr};   // the picture the frontend reads (scaled_picture to picture_done)
+    Capture* last_capture_{nullptr};         // the capture that last used the conversion's descriptor set and table
+    void destroy_capture(Capture& c);        // waits for its copy, then frees it
     mutable std::mutex display_mutex_;
     // The capture's conversion on the GPU: a compute pass from the target image to XRGB8888 words in the capture's
     // buffer, the colour table applied (made on first use; failing that, captures copy the target's bytes).

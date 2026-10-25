@@ -1,13 +1,16 @@
 // The video overlay: YUV 4:2:2 to RGB (BT.601 video range), placement, scaling and the colour key.
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <array>
+#include <format>
 #include <vector>
 
 #include "core/bus.h"
 #include "core/scheduler.h"
 #include "nv2a/nv2a_stub.h"
 #include "nv2a/overlay.h"
+#include "nv2a/yuv.h"
 
 using namespace mv;
 
@@ -80,4 +83,66 @@ TEST(Ramdac, TheColourTableIsWrittenThroughTheDacPortsAndAppliedPerChannel) {
     for (u32 i = 0; i < 256; ++i)
         for (int c = 0; c < 3; ++c) gpu.mmio_write(Nv2aStub::kDacData, 1, i);
     EXPECT_FALSE(gpu.gamma_lut().has_value());
+}
+
+namespace {
+
+// The overlay as it was first drawn, one screen pixel at a time (each converted from its texel): the reference the
+// row-at-a-time drawing must match exactly.
+void draw_overlay_per_pixel(const Overlay& ov, const u8* ram, u8* xrgb, u32 pitch, u32 w, u32 h) {
+    const u32 x_end = std::min(w, ov.out_x + ov.out_w), y_end = std::min(h, ov.out_y + ov.out_h);
+    for (u32 y = ov.out_y; y < y_end; ++y) {
+        const u64 t = (static_cast<u64>(ov.t0) << 16) + static_cast<u64>(y - ov.out_y) * ov.dtdy;
+        const u32 sy = std::min(static_cast<u32>(t >> 20), ov.in_h - 1);
+        const u8* row = ram + ov.address + static_cast<u64>(sy) * ov.pitch;
+        for (u32 x = ov.out_x; x < x_end; ++x) {
+            u32* px = reinterpret_cast<u32*>(xrgb + static_cast<u64>(y) * pitch + 4u * x);
+            if (ov.color_key && (*px & 0xFFFFFFu) != (ov.key & 0xFFFFFFu)) continue;
+            const u64 s = (static_cast<u64>(ov.s0) << 16) + static_cast<u64>(x - ov.out_x) * ov.dsdx;
+            const u32 sx = std::min(static_cast<u32>(s >> 20), ov.in_w - 1);
+            const u8* pair = row + (sx & ~1u) * 2u;
+            const int y0 = ov.yuy2 ? pair[0] : pair[1], u = ov.yuy2 ? pair[1] : pair[0], y1 = ov.yuy2 ? pair[2] : pair[3], v = ov.yuy2 ? pair[3] : pair[2];
+            *px = yuv601_to_xrgb((sx & 1u) ? y1 : y0, u, v);
+        }
+    }
+}
+
+}  // namespace
+
+// A movie over a picture at 6x and at an odd scale, keyed and not, in bands as the frontend draws it: the same pixels
+// as one conversion per screen pixel.
+TEST(Overlay, DrawingRowAtATimeMatchesDrawingEachPixel) {
+    std::vector<u8> ram(0x40000);
+    u32 seed = 12345;
+    for (u8& b : ram) b = static_cast<u8>((seed = seed * 1103515245u + 12345u) >> 16);
+    for (bool key : {false, true})
+        for (bool yuy2 : {false, true})
+            for (u32 sc : {1u, 6u}) {
+                SCOPED_TRACE(std::format("key {} yuy2 {} scale {}", key, yuy2, sc));
+                Overlay ov;
+                ov.address = 0x1000;
+                ov.pitch = 160;
+                ov.in_w = 80;  // 80x60 source
+                ov.in_h = 60;
+                ov.s0 = 3u << 4;  // starting three texels in
+                ov.out_x = 5 * sc;
+                ov.out_y = 3 * sc;
+                ov.out_w = 100 * sc;
+                ov.out_h = 70 * sc;
+                ov.dsdx = static_cast<u32>((70ull << 20) / (100 * sc));  // 70 texels over 100 pixels, then the scale
+                ov.dtdy = static_cast<u32>((55ull << 20) / (70 * sc));
+                ov.yuy2 = yuy2;
+                ov.color_key = key;
+                ov.key = 0x00FF00u;
+                const u32 w = 120 * sc, h = 80 * sc;
+                std::vector<u32> base(static_cast<std::size_t>(w) * h);
+                for (std::size_t i = 0; i < base.size(); ++i) base[i] = (i / 7) % 3 == 0 ? 0x00FF00u : 0x123456u;
+                std::vector<u32> want = base, got = base;
+                draw_overlay_per_pixel(ov, ram.data(), reinterpret_cast<u8*>(want.data()), w * 4, w, h);
+                for (u32 y0 = 0; y0 < h; y0 += 37 * sc) draw_overlay(ov, ram.data(), ram.size(), reinterpret_cast<u8*>(got.data()), w * 4, w, h, y0, y0 + 37 * sc);
+                std::size_t differ = 0, first = got.size();
+                for (std::size_t i = 0; i < got.size(); ++i)
+                    if (got[i] != want[i] && differ++ == 0) first = i;
+                EXPECT_EQ(differ, 0u) << "first at pixel " << first;
+            }
 }

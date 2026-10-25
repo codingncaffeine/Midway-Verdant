@@ -23,7 +23,8 @@ struct Overlay {
 // Passes every pixel of an XRGB8888 picture through the RAMDAC's colour table (red, green, blue per entry).
 void apply_gamma(const std::array<u8, 768>& lut, u8* xrgb, u32 pitch, u32 w, u32 h);
 
-// Draws the overlay into an XRGB8888 picture of the frame buffer (w x h, pitch bytes per line).
-void draw_overlay(const Overlay& ov, const u8* ram, u64 ram_size, u8* xrgb, u32 pitch, u32 w, u32 h);
+// Draws the overlay into an XRGB8888 picture of the frame buffer (w x h, pitch bytes per line); rows y_from to y_to
+// of it only, when given (bands drawn on several threads).
+void draw_overlay(const Overlay& ov, const u8* ram, u64 ram_size, u8* xrgb, u32 pitch, u32 w, u32 h, u32 y_from = 0, u32 y_to = ~0u);
 
 }  // namespace mv

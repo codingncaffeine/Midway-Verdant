@@ -1230,8 +1230,141 @@ TEST(Vulkan, TheScaledPictureComesBackThroughTheColourTable) {
     VulkanRenderer::ScaledPicture p;
     ASSERT_TRUE(f.renderer->scaled_picture(0x10000, 256, 4, 64, 64, p));
     EXPECT_TRUE(p.xrgb);
+    f.renderer->picture_ready(p);
     u32 v;
     std::memcpy(&v, p.pixels + 10 * p.pitch + 10 * 4, 4);
+    f.renderer->picture_done();
     EXPECT_EQ(v, 0x00EFDFCFu) << "each channel through the table, the unused byte clear";
     EXPECT_EQ(pixel_at(f.ram, 5, 5), 0xFF102030u) << "RAM keeps the frame buffer's own values";
+}
+
+namespace {
+
+// A triangle over the whole 64x64 target at one depth (a fraction of the 24-bit range), tested LESS and written.
+void depth_triangle(Kelvin& k, u32 abgr, float depth) {
+    k.method(mthd::kDepthTestEnable, 1);
+    k.method(mthd::kDepthFunc, 0x201);  // LESS
+    k.method(mthd::kDepthMask, 1);
+    k.method(mthd::kBeginEnd, 5);
+    k.method(mthd::kDiffuse4ub, abgr);
+    for (const auto& p : {std::array<float, 2>{0.0f, 0.0f}, std::array<float, 2>{128.0f, 0.0f}, std::array<float, 2>{0.0f, 128.0f}}) {
+        k.method(mthd::kVertexData4fM + 0, bits(p[0]));
+        k.method(mthd::kVertexData4fM + 4, bits(p[1]));
+        k.method(mthd::kVertexData4fM + 8, bits(depth * 16777215.0f));
+        k.method(mthd::kVertexData4fM + 12, bits(1.0f));
+    }
+    k.method(mthd::kBeginEnd, 0);
+}
+
+// The depth (and stencil) of the bound zeta buffer cleared to `zstencil` over columns x0..x1 of every row.
+void clear_depth(Kelvin& k, u32 zstencil, u32 x0 = 0, u32 x1 = 63) {
+    k.method(mthd::kZstencilClear, zstencil);
+    k.method(mthd::kClearRectH, (x1 << 16) | x0);
+    k.method(mthd::kClearRectV, 63u << 16);
+    k.method(mthd::kClearSurface, 0x03);
+}
+
+u32 zeta_word(const std::vector<u8>& ram, u32 zeta, u32 x, u32 y) {
+    u32 v;
+    std::memcpy(&v, &ram[zeta + y * 256 + x * 4], 4);
+    return v;
+}
+
+}  // namespace
+
+// One target alternating between two depth buffers (the boot animation's two shadow depths, every frame): each
+// buffer's image stays on the GPU while the other is bound (D35), and each draw tests against its own buffer's
+// contents; both reach RAM when everything is written back.
+TEST(Vulkan, ATargetAlternatingBetweenTwoDepthBuffersKeepsEachOnTheGpu) {
+    for (u32 scale : {1u, 3u}) {
+        SCOPED_TRACE(std::format("scale {}", scale));
+        ScaledFixture f;
+        std::string error;
+        if (!f.init(scale, error)) GTEST_SKIP() << "no Vulkan device: " << error;
+        Kelvin& k = f.k;
+        setup_target(k);  // zeta at 0x20000
+        k.method(mthd::kColorClear, 0xFF000080);
+        k.method(mthd::kClearRectH, 63u << 16);
+        k.method(mthd::kClearRectV, 63u << 16);
+        k.method(mthd::kClearSurface, 0xF0);
+        clear_depth(k, 0xBFFFFF00);  // A: 0.75
+        k.method(mthd::kSurfaceZetaOffset, 0x40000);
+        clear_depth(k, 0x3FFFFF00);  // B: 0.25
+        k.method(mthd::kSurfaceZetaOffset, 0x20000);
+        depth_triangle(k, 0xFF00FF00, 0.5f);  // A holds 0.75: drawn, and A becomes 0.5
+        k.method(mthd::kSurfaceZetaOffset, 0x40000);
+        depth_triangle(k, 0xFF0000FF, 0.5f);  // B holds 0.25: not drawn
+        f.renderer->end_frame();
+        EXPECT_EQ(pixel_at(f.ram, 8, 8) & 0x00FFFFFFu, 0x00FF00u) << "each draw tested against its own depth buffer";
+        f.renderer->write_back_all();
+        for (const auto& e : f.renderer->stats().errors) ADD_FAILURE() << "renderer: " << e;
+        for (u32 at : {0u, 30u, 63u}) {
+            EXPECT_NEAR(static_cast<double>(zeta_word(f.ram, 0x20000, at, at) >> 8), 0x7FFFFF, 2) << "A: the green triangle's depth";
+            EXPECT_EQ(zeta_word(f.ram, 0x40000, at, at), 0x3FFFFF00u) << "B: its clear";
+        }
+        const auto& st = f.renderer->stats();
+        EXPECT_EQ(st.depth_uploads, 0u) << "nothing loaded from RAM";
+        EXPECT_GE(st.depth_unparks, 2u) << "each buffer's image bound again from the GPU";
+        EXPECT_EQ(st.writebacks_by[VulkanRenderer::Stats::kWbRange], 0u) << "no depth sent to RAM at the switches";
+    }
+}
+
+// The CPU writes the memory of a depth buffer whose image is parked: the next draw tests against what the CPU wrote.
+TEST(Vulkan, ACpuWriteToAParkedDepthBufferIsWhatTheNextDrawTests) {
+    for (u32 scale : {1u, 3u}) {
+        SCOPED_TRACE(std::format("scale {}", scale));
+        ScaledFixture f;
+        std::string error;
+        if (!f.init(scale, error)) GTEST_SKIP() << "no Vulkan device: " << error;
+        Kelvin& k = f.k;
+        setup_target(k);
+        k.method(mthd::kColorClear, 0xFF000080);
+        k.method(mthd::kClearRectH, 63u << 16);
+        k.method(mthd::kClearRectV, 63u << 16);
+        k.method(mthd::kClearSurface, 0xF0);
+        clear_depth(k, 0xBFFFFF00);  // A: 0.75
+        k.method(mthd::kSurfaceZetaOffset, 0x40000);
+        clear_depth(k, 0x3FFFFF00);  // B bound, A parked
+        f.renderer->flush_frame();
+        for (u32 y = 0; y < 64; ++y)
+            for (u32 x = 0; x < 64; ++x) {
+                const u32 v = 0x3FFFFF00;  // the CPU writes 0.25 over A
+                std::memcpy(&f.ram[0x20000 + y * 256 + x * 4], &v, 4);
+            }
+        f.renderer->cpu_wrote({0x20, 0x21, 0x22, 0x23});
+        k.method(mthd::kSurfaceZetaOffset, 0x20000);
+        depth_triangle(k, 0xFF00FF00, 0.5f);  // against the CPU's 0.25: not drawn
+        f.renderer->end_frame();
+        for (const auto& e : f.renderer->stats().errors) ADD_FAILURE() << "renderer: " << e;
+        EXPECT_EQ(pixel_at(f.ram, 8, 8) & 0x00FFFFFFu, 0x000080u) << "the CPU's depth, not the parked image's";
+        EXPECT_EQ(pixel_at(f.ram, 60, 3) & 0x00FFFFFFu, 0x000080u);
+    }
+}
+
+// Only a clear of the whole depth buffer may skip loading it: a partial one keeps what RAM holds elsewhere.
+TEST(Vulkan, APartialDepthClearStillLoadsTheRestFromRam) {
+    for (u32 scale : {1u, 3u}) {
+        SCOPED_TRACE(std::format("scale {}", scale));
+        ScaledFixture f;
+        std::string error;
+        if (!f.init(scale, error)) GTEST_SKIP() << "no Vulkan device: " << error;
+        Kelvin& k = f.k;
+        for (u32 y = 0; y < 64; ++y)
+            for (u32 x = 0; x < 64; ++x) {
+                const u32 v = 0x3FFFFF00;  // RAM holds 0.25
+                std::memcpy(&f.ram[0x20000 + y * 256 + x * 4], &v, 4);
+            }
+        setup_target(k);
+        k.method(mthd::kColorClear, 0xFF000080);
+        k.method(mthd::kClearRectH, 63u << 16);
+        k.method(mthd::kClearRectV, 63u << 16);
+        k.method(mthd::kClearSurface, 0xF0);
+        clear_depth(k, 0xBFFFFF00, 0, 31);  // the left half to 0.75
+        depth_triangle(k, 0xFF00FF00, 0.5f);
+        f.renderer->end_frame();
+        for (const auto& e : f.renderer->stats().errors) ADD_FAILURE() << "renderer: " << e;
+        EXPECT_EQ(pixel_at(f.ram, 8, 8) & 0x00FFFFFFu, 0x00FF00u) << "the cleared half passes";
+        EXPECT_EQ(pixel_at(f.ram, 48, 8) & 0x00FFFFFFu, 0x000080u) << "the other half kept RAM's 0.25";
+        EXPECT_EQ(f.renderer->stats().depth_loads_skipped, 0u);
+    }
 }

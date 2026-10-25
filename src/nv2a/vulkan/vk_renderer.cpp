@@ -266,7 +266,7 @@ VulkanRenderer::~VulkanRenderer() {
     dev_.destroy_buffer(uniform_ring_.buffer);
     dev_.destroy_buffer(staging_.buffer);
     dev_.destroy_buffer(readback_);
-    for (Capture& c : captures_) dev_.destroy_buffer(c.buffer);
+    for (auto& c : captures_) destroy_capture(*c);
     for (Frame& fr : frames_) {
         if (fr.pool) f.vkDestroyDescriptorPool(dev_.device(), fr.pool, nullptr);
         for (VkFence fence : fr.fences) f.vkDestroyFence(dev_.device(), fence, nullptr);
@@ -701,6 +701,7 @@ VulkanRenderer::Surface* VulkanRenderer::target_for(const KelvinState& s) {
         for (auto o = surfaces_.begin(); o != surfaces_.end();) {
             Surface& other = *o->second;
             if (other.depth_holds && other.depth_holds < b1 && b0 < static_cast<u64>(other.depth_holds) + other.zeta_bytes()) release_depth(other);
+            drop_parked(other, b0, b1, true);
             if (other.phys < b1 && b0 < static_cast<u64>(other.phys) + other.bytes()) {
                 ++stats_.evicted;
                 o = erase_surface(o);
@@ -730,6 +731,7 @@ VulkanRenderer::Surface* VulkanRenderer::target_for(const KelvinState& s) {
 // engine has rewritten its memory (one title resets a glare buffer each frame with a 2D blit, then draws into it
 // additively; drawing on over the GPU's stale copy saturated it to white).
 void VulkanRenderer::upload_color_from_ram(Surface& t) {
+    if (debug_tex_log_) std::fprintf(stderr, "texlog: reload colour %08x %ux%u frame %llu\n", t.phys, t.width, t.height, static_cast<unsigned long long>(frame_index_));
     ++t.draw_serial;
     const u32 bpp = t.color_bytes();
     std::vector<u8> pixels(static_cast<std::size_t>(t.width) * t.height * bpp, 0);
@@ -765,10 +767,10 @@ void VulkanRenderer::remember_pages(Surface& s) {
     for (u32 p = first; p <= last; ++p) s.page_hashes[p - first] = texture_content(p * kPage, kPage, 0);
 }
 
-bool VulkanRenderer::ensure_pass(Surface& t) {
-    if (pass_open_ && pass_target_ == &t) return true;
+bool VulkanRenderer::ensure_pass(Surface& t, bool writes_color) {
+    if (pass_open_ && pass_target_ == &t && !(writes_color && t.color_ram_newer)) return true;
     end_pass();
-    if (t.color_ram_newer) {
+    if (t.color_ram_newer && writes_color) {
         upload_color_from_ram(t);
         t.color_ram_newer = false;
         ++stats_.surface_reloads;
@@ -776,7 +778,7 @@ bool VulkanRenderer::ensure_pass(Surface& t) {
     if (sampled_since_barrier_) surface_barrier();  // draws that sampled a target finish before it is drawn into again
     t.last_rendered_frame = frame_index_;
     t.last_used_vblank = vblank_index_;
-    t.ram_newer = false;
+    if (!t.color_ram_newer) t.ram_newer = false;  // a colour image still to reload is not what RAM holds
     attachments_written_ = true;
     VkRenderPassBeginInfo rbi{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
     rbi.renderPass = t.pass;
@@ -796,30 +798,53 @@ bool VulkanRenderer::ensure_pass(Surface& t) {
 // address. The target that last drew with it owns them; another target binding it takes them (a GPU copy when the
 // shapes match, else through RAM), and a target whose image held another address hands that back to RAM first. Two
 // targets sharing one depth buffer each kept their own copy, and whichever reached RAM last won.
-void VulkanRenderer::bind_depth(Surface& t) {
+void VulkanRenderer::bind_depth(Surface& t, bool cleared) {
     const u32 z = t.zeta_phys;
     if (t.zeta_format == 0 || z == 0) return;
     const auto found = depth_owner_.find(z);
     Surface* owner = found == depth_owner_.end() ? nullptr : found->second;
     if (owner == &t && t.depth_holds == z) return;
     end_pass();
+    // Another target holds the address in a parked image: back to RAM with it, and this one loads it from there.
+    if (owner && owner != &t && owner->depth_holds != z && drop_parked(*owner, z, static_cast<u64>(z) + 1, true)) owner = nullptr;
+    // This target parked the address's image earlier, or binds a new one while its image holds another address: the
+    // image parks (D35) and the address's own comes back, or a spare takes the new address.
+    if (park_for(t, z)) {
+        depth_owner_[z] = &t;
+        t.holds_pitch = t.zeta_pitch;
+        handles_.watch_writes(z, t.zeta_bytes());
+        return;
+    }
     if (t.depth_holds && t.depth_holds != z) {
         // The image held another address's depth: it goes back to RAM when newer there.
         const auto o = depth_owner_.find(t.depth_holds);
         if (o != depth_owner_.end() && o->second == &t) {
-            if (t.zeta_dirty) {
-                const u32 bound = t.zeta_phys;
-                t.zeta_phys = t.depth_holds;
-                wb_why_ = Stats::kWbRange;
-                write_back_zeta(t);
-                wb_why_ = Stats::kWbAll;
-                t.zeta_phys = bound;
-            }
+            wb_why_ = Stats::kWbRange;
+            write_back_held(t);
+            wb_why_ = Stats::kWbAll;
             depth_owner_.erase(o);
         }
         t.depth_holds = 0;
+        t.zeta_dirty = false;
     }
-    if (owner && owner != &t && owner->depth_holds == z && owner->width == t.width && owner->height == t.height && owner->sc == t.sc && owner->zeta_format == t.zeta_format) {
+    // Cleared whole before anything reads it: what the address held is dead. The owner's contents need not reach RAM
+    // when the clear covers every byte of them (the hardware's clear overwrites that memory), and nothing is loaded.
+    if (cleared && owner && owner != &t && owner->depth_holds == z) {
+        const u64 held = owner->swizzled ? static_cast<u64>(owner->zeta_format == 1 ? 2u : 4u) * owner->width * owner->height : static_cast<u64>(owner->holds_pitch) * owner->height;
+        if (held <= t.zeta_bytes()) {
+            owner->zeta_dirty = false;
+        } else {
+            wb_why_ = Stats::kWbRange;
+            write_back_held(*owner);
+            wb_why_ = Stats::kWbAll;
+        }
+        owner->depth_holds = 0;
+        ++stats_.depth_handovers;
+        owner = nullptr;
+    }
+    if (cleared && (!owner || owner == &t)) {
+        ++stats_.depth_loads_skipped;
+    } else if (owner && owner != &t && owner->depth_holds == z && owner->width == t.width && owner->height == t.height && owner->sc == t.sc && owner->zeta_format == t.zeta_format) {
         const VkImageAspectFlags aspects = VK_IMAGE_ASPECT_DEPTH_BIT | (t.zeta_format == 1 ? 0u : static_cast<u32>(VK_IMAGE_ASPECT_STENCIL_BIT));
         VkMemoryBarrier before{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
         before.srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -845,7 +870,7 @@ void VulkanRenderer::bind_depth(Surface& t) {
         if (owner && owner != &t) {
             if (owner->zeta_dirty && owner->depth_holds == z) {
                 wb_why_ = Stats::kWbRange;
-                write_back_zeta(*owner);
+                write_back_held(*owner);  // the owner may bind another address by now
                 wb_why_ = Stats::kWbAll;
             }
             owner->depth_holds = 0;
@@ -855,12 +880,195 @@ void VulkanRenderer::bind_depth(Surface& t) {
     }
     depth_owner_[z] = &t;
     t.depth_holds = z;
+    t.holds_pitch = t.zeta_pitch;
     handles_.watch_writes(z, t.zeta_bytes());  // a CPU write to the depth buffer's memory reloads it
+}
+
+// The bound depth image's contents to the address it holds, which the target may no longer bind, when newer there.
+void VulkanRenderer::write_back_held(Surface& s) {
+    if (!s.zeta_dirty || !s.depth_holds) return;
+    if (debug_tex_log_)
+        std::fprintf(stderr, "texlog: held depth %08x of target %08x (binds %08x) to RAM, cause %u\n", s.depth_holds, s.phys, s.zeta_phys, static_cast<unsigned>(wb_why_));
+    finish_write_backs();  // a queued write-back of this target is stored with its own address
+    const u32 bound = s.zeta_phys, pitch = s.zeta_pitch;
+    s.zeta_phys = s.depth_holds;
+    if (s.holds_pitch) s.zeta_pitch = s.holds_pitch;
+    write_back_zeta(s);
+    s.zeta_phys = bound;
+    s.zeta_pitch = pitch;
+}
+
+// ── parked depth images (D35) ────────────────────────────────────────────────────────────────────────────────────
+
+void VulkanRenderer::swap_depth(Surface& s, Surface::ParkedDepth& p) {
+    if (pass_open_ && pass_target_ == &s) end_pass();  // the open pass draws into the image bound now
+    std::swap(s.depth, p.depth);
+    std::swap(s.depth_view, p.depth_view);
+    std::swap(s.depth_tex, p.depth_tex);
+    std::swap(s.framebuffer, p.framebuffer);
+    std::swap(s.zeta_dirty, p.zeta_dirty);
+    std::swap(s.depth_holds, p.depth_holds);
+    std::swap(s.holds_pitch, p.holds_pitch);
+    ++s.draw_serial;  // a depth-as-colour conversion was of the other image
+    stage_cache_.fill({});  // a stage may point at an entry that moved
+}
+
+// Binding z: true when the target's parked image for z is bound again (its contents current). Otherwise, when the
+// bound image holds another address the target owns, that image parks and a spare is bound, holding nothing; the
+// caller fills it (a handover or a load from RAM). False with the target as it was when nothing could park.
+bool VulkanRenderer::park_for(Surface& t, u32 z) {
+    const bool owns_bound = t.depth_holds && t.depth_holds != z && [&] {
+        const auto o = depth_owner_.find(t.depth_holds);
+        return o != depth_owner_.end() && o->second == &t;
+    }();
+    const auto found = depth_owner_.find(z);
+    const bool owns_z = found != depth_owner_.end() && found->second == &t;
+    if (owns_z) {
+        for (Surface::ParkedDepth& p : t.parked) {
+            if (p.depth_holds != z) continue;
+            // The bound image parks in its place when it holds an address of this target's; else that slot is a spare.
+            if (!owns_bound) {
+                t.zeta_dirty = false;
+                t.depth_holds = 0;
+            }
+            swap_depth(t, p);
+            p.used = ++park_clock_;
+            ++stats_.depth_unparks;
+            return true;
+        }
+    }
+    if (!owns_bound) return false;
+    Surface::ParkedDepth* spare = nullptr;
+    for (Surface::ParkedDepth& p : t.parked)
+        if (p.depth_holds == 0) spare = &p;
+    if (!spare && t.parked.size() < kMaxParked) {
+        Surface::ParkedDepth p;
+        if (spare_depth(t, p)) {
+            t.parked.push_back(std::move(p));
+            stage_cache_.fill({});  // the list moved
+            spare = &t.parked.back();
+        }
+    }
+    if (!spare) {
+        // Full: the least recently used parked image goes back to RAM, and its image is the spare.
+        Surface::ParkedDepth* lru = nullptr;
+        for (Surface::ParkedDepth& p : t.parked)
+            if (!lru || p.used < lru->used) lru = &p;
+        if (!lru) return false;
+        write_back_parked(t, *lru);
+        const auto o = depth_owner_.find(lru->depth_holds);
+        if (o != depth_owner_.end() && o->second == &t) depth_owner_.erase(o);
+        lru->depth_holds = 0;
+        lru->zeta_dirty = false;
+        spare = lru;
+    }
+    swap_depth(t, *spare);  // the bound image (owned, at its address) parks; the spare is bound, holding nothing
+    spare->used = ++park_clock_;
+    return false;
+}
+
+// A depth image of the target's shape and format, with a framebuffer pairing it with the colour image.
+bool VulkanRenderer::spare_depth(Surface& t, Surface::ParkedDepth& p) {
+    std::string error;
+    const VkFormat df = t.zeta_format == 1 ? VK_FORMAT_D16_UNORM : depth24_;
+    if (!dev_.create_image(df, t.iw(), t.ih(), 1, 1, 1, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                               ((t.zeta_format == 1 ? depth16_sampled_ : depth24_sampled_) ? static_cast<u32>(VK_IMAGE_USAGE_SAMPLED_BIT) : 0u),
+                           VK_IMAGE_ASPECT_DEPTH_BIT | (t.zeta_format == 1 ? 0u : static_cast<u32>(VK_IMAGE_ASPECT_STENCIL_BIT)), false, p.depth, error)) {
+        note("parked depth image: " + error);
+        return false;
+    }
+    end_pass();
+    fresh_image(p.depth);
+    VkImageView views[2] = {t.color.view, p.depth.view};
+    VkFramebufferCreateInfo fbi{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
+    fbi.renderPass = t.pass;
+    fbi.attachmentCount = 2;
+    fbi.pAttachments = views;
+    fbi.width = t.iw();
+    fbi.height = t.ih();
+    fbi.layers = 1;
+    if (fn_->vkCreateFramebuffer(dev_.device(), &fbi, nullptr, &p.framebuffer) != VK_SUCCESS) {
+        retire(p.depth);
+        return false;
+    }
+    return true;
+}
+
+// A parked image's contents to RAM when newer there (it stays parked, clean).
+void VulkanRenderer::write_back_parked(Surface& s, Surface::ParkedDepth& p) {
+    if (!p.zeta_dirty || !p.depth_holds) return;
+    finish_write_backs();  // a queued write-back of the bound image is stored with the target's own address
+    swap_depth(s, p);
+    write_back_held(s);
+    swap_depth(s, p);
+}
+
+void VulkanRenderer::flush_parked(u64 b0, u64 b1) {
+    for (auto& [k, sp] : surfaces_)
+        for (Surface::ParkedDepth& p : sp->parked)
+            if (p.depth_holds && p.zeta_dirty && p.depth_holds < b1 && b0 < static_cast<u64>(p.depth_holds) + sp->parked_bytes(p)) write_back_parked(*sp, p);
+}
+
+// The parked images of s over [b0, b1) go: their contents to RAM first when `write` and newer there, their ownership
+// dropped; each stays as a spare. True when one did.
+bool VulkanRenderer::drop_parked(Surface& s, u64 b0, u64 b1, bool write) {
+    bool any = false;
+    for (Surface::ParkedDepth& p : s.parked) {
+        if (!p.depth_holds || p.depth_holds >= b1 || b0 >= static_cast<u64>(p.depth_holds) + s.parked_bytes(p)) continue;
+        if (write) write_back_parked(s, p);
+        const auto o = depth_owner_.find(p.depth_holds);
+        if (o != depth_owner_.end() && o->second == &s) depth_owner_.erase(o);
+        p.depth_holds = 0;
+        p.zeta_dirty = false;
+        any = true;
+    }
+    return any;
+}
+
+void VulkanRenderer::drop_parked(u64 b0, u64 b1) {
+    for (auto& [k, sp] : surfaces_) drop_parked(*sp, b0, b1, true);
+}
+
+// A texture at a parked image's address, sampled in place: the image holds what the address holds.
+VulkanRenderer::TextureEntry* VulkanRenderer::parked_texture(Surface& s, const TextureStage& ts, u32 phys, u32 w, u32 h, bool linear, bool depth16) {
+    if (s.width != w || s.height != h || (s.zeta_format == 1) != depth16 || !(depth16 ? depth16_sampled_ : depth24_sampled_) || linear == s.swizzled) return nullptr;
+    for (Surface::ParkedDepth& p : s.parked) {
+        if (p.depth_holds != phys || (linear && ts.pitch() != p.holds_pitch)) continue;
+        TextureEntry& e = p.depth_tex;
+        if (!e.valid) {
+            VkImageViewCreateInfo vci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+            vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+            vci.image = p.depth.image;
+            vci.format = p.depth.format;
+            vci.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1};
+            if (fn_->vkCreateImageView(dev_.device(), &vci, nullptr, &p.depth_view) != VK_SUCCESS) return nullptr;
+            e.image = p.depth;
+            e.image.view = p.depth_view;
+            e.image.levels = 1;
+            e.width = w;
+            e.height = h;
+            e.surface = true;
+            e.valid = true;
+        }
+        e.phys = phys;
+        e.linear = linear;
+        e.length = texture_size_in_memory(ts);
+        if (attachments_written_) surface_barrier();
+        sampled_since_barrier_ = true;
+        ++stats_.surface_samples;
+        ++stats_.parked_samples;
+        s.last_used_vblank = vblank_index_;
+        p.used = ++park_clock_;
+        return &e;
+    }
+    return nullptr;
 }
 
 // The depth image takes what RAM holds at the zeta address: Z16 words, or Z24S8 words (the depth in bits 31-8 above
 // the stencil byte) split into the depth aspect's 24-bit words (or floats) and the stencil aspect's bytes.
 void VulkanRenderer::upload_depth_from_ram(Surface& t) {
+    if (debug_tex_log_)
+        std::fprintf(stderr, "texlog: load depth %08x for target %08x %ux%u frame %llu\n", t.zeta_phys, t.phys, t.width, t.height, static_cast<unsigned long long>(frame_index_));
     ++t.draw_serial;
     const bool z16 = t.zeta_format == 1, float_depth = depth24_ == VK_FORMAT_D32_SFLOAT_S8_UINT;
     const u32 bpp = z16 ? 2u : 4u;
@@ -949,14 +1157,9 @@ void VulkanRenderer::release_depth(Surface& s) {
     if (!s.depth_holds) return;
     const auto o = depth_owner_.find(s.depth_holds);
     if (o != depth_owner_.end() && o->second == &s) {
-        if (s.zeta_dirty) {
-            const u32 bound = s.zeta_phys;
-            s.zeta_phys = s.depth_holds;
-            wb_why_ = Stats::kWbRelayout;
-            write_back_zeta(s);
-            wb_why_ = Stats::kWbAll;
-            s.zeta_phys = bound;
-        }
+        wb_why_ = Stats::kWbRelayout;
+        write_back_held(s);
+        wb_why_ = Stats::kWbAll;
         depth_owner_.erase(o);
     }
     s.depth_holds = 0;
@@ -968,7 +1171,14 @@ std::unordered_map<u32, std::unique_ptr<VulkanRenderer::Surface>>::iterator Vulk
     wb_why_ = Stats::kWbRelayout;
     if (s0.dirty) write_back(s0);
     release_depth(s0);
+    drop_parked(s0, 0, ~0ull, true);
     wb_why_ = Stats::kWbAll;
+    for (Surface::ParkedDepth& p : s0.parked) {
+        retire(p.depth_view);
+        retire(p.framebuffer);
+        retire(p.depth);
+    }
+    s0.parked.clear();
     for (auto o = depth_owner_.begin(); o != depth_owner_.end();) o = o->second == &s0 ? depth_owner_.erase(o) : std::next(o);
     if (draw_target_ == &s0) draw_target_ = nullptr;
     // Draws already recorded or still on the GPU may use the old images: they go once those are done.
@@ -1114,8 +1324,7 @@ void VulkanRenderer::finish_write_backs() {
     // Into RAM in the order queued, which is the order the surfaces were written back one at a time before.
     const u8* base = static_cast<const u8*>(readback_.mapped);
     for (const PendingWriteBack& w : write_backs_) {
-        if (w.display) store_display(*w.surface);
-        else if (w.zeta && w.surface->sc > 1) store_zeta(*w.surface, thin_zeta_rows(*w.surface, base + w.offset).data());
+        if (w.zeta && w.surface->sc > 1) store_zeta(*w.surface, thin_zeta_rows(*w.surface, base + w.offset).data());
         else if (w.zeta) store_zeta(*w.surface, base + w.offset);
         else store_color(*w.surface, base + w.offset);
     }
@@ -1252,21 +1461,29 @@ void VulkanRenderer::store_zeta(Surface& s, const u8* px) {
 void VulkanRenderer::write_back_all() {
     for (auto& [k, s] : surfaces_) {
         queue_write_back(*s);
-        queue_write_back_zeta(*s);
+        if (s->depth_holds == s->zeta_phys) queue_write_back_zeta(*s);
     }
     finish_write_backs();
+    // Depth images holding an address their target no longer binds, and the parked ones.
+    for (auto& [k, s] : surfaces_) {
+        if (s->depth_holds != s->zeta_phys) write_back_held(*s);
+        for (Surface::ParkedDepth& p : s->parked) write_back_parked(*s, p);
+    }
 }
 
 void VulkanRenderer::write_back_range(u32 phys, u32 len) {
     wb_why_ = Stats::kWbRange;
     const u64 b0 = phys, b1 = static_cast<u64>(phys) + len;
+    const auto held_over = [&](const Surface& s) { return s.depth_holds && s.depth_holds < b1 && b0 < static_cast<u64>(s.depth_holds) + s.held_bytes(); };
     for (auto& [k, s] : surfaces_) {
         const u64 a0 = s->phys, a1 = static_cast<u64>(s->phys) + s->bytes();
         if (s->dirty && a0 < b1 && b0 < a1) queue_write_back(*s);
-        const u64 z0 = s->zeta_phys, z1 = static_cast<u64>(s->zeta_phys) + s->zeta_bytes();
-        if (s->zeta_dirty && z0 < b1 && b0 < z1) queue_write_back_zeta(*s);
+        if (s->zeta_dirty && s->depth_holds == s->zeta_phys && held_over(*s)) queue_write_back_zeta(*s);
     }
     finish_write_backs();
+    for (auto& [k, s] : surfaces_)
+        if (s->zeta_dirty && s->depth_holds != s->zeta_phys && held_over(*s)) write_back_held(*s);
+    flush_parked(b0, b1);
     wb_why_ = Stats::kWbAll;
 }
 
@@ -1337,7 +1554,8 @@ void VulkanRenderer::invalidate(u32 phys, u32 len) {
     for (auto& [k, s] : surfaces_) {
         const u64 a0 = s->phys, a1 = a0 + s->bytes(), z0 = s->zeta_phys, z1 = z0 + s->zeta_bytes();
         if ((a0 < b1 && b0 < a1) || (z0 < b1 && b0 < z1)) s->ram_newer = true;
-        if (s->depth_holds && s->depth_holds < b1 && b0 < static_cast<u64>(s->depth_holds) + s->zeta_bytes()) release_depth(*s);  // reloads from RAM
+        if (s->depth_holds && s->depth_holds < b1 && b0 < static_cast<u64>(s->depth_holds) + s->held_bytes()) release_depth(*s);  // reloads from RAM
+        drop_parked(*s, b0, b1, true);
         if (a0 < b1 && b0 < a1) {
             s->color_ram_newer = true;
             if (pass_open_ && pass_target_ == s.get()) end_pass();  // the next draw into it reopens the pass, reloaded
@@ -1390,23 +1608,34 @@ void VulkanRenderer::cpu_wrote(const std::vector<u32>& pages) {
     }
     // A depth buffer's memory written by the CPU: the contents go back to RAM around the CPU's pages, and the next
     // target binding the address loads it from there.
-    for (auto& [k, sp] : surfaces_) {
-        Surface& s = *sp;
-        if (!s.depth_holds) continue;
-        const u32 first = s.depth_holds / kPage, last = static_cast<u32>((static_cast<u64>(s.depth_holds) + s.zeta_bytes() - 1) / kPage);
+    // The parked images (D35) the same way, each let go.
+    const auto around = [&](u32 addr, u32 bytes, const auto& release) {
+        const u32 first = addr / kPage, last = static_cast<u32>((static_cast<u64>(addr) + bytes - 1) / kPage);
         auto lo = std::lower_bound(pages.begin(), pages.end(), first);
-        if (lo == pages.end() || *lo > last) continue;
+        if (lo == pages.end() || *lo > last) return;
         const auto hi = std::upper_bound(lo, pages.end(), last);
         std::vector<u8> kept(static_cast<std::size_t>(hi - lo) * kPage);
         std::size_t i = 0;
         for (auto p = lo; p != hi; ++p, ++i)
             if (static_cast<u64>(*p + 1) * kPage <= ram_size_) std::memcpy(kept.data() + i * kPage, ram_ + static_cast<std::size_t>(*p) * kPage, kPage);
-        if (pass_open_ && pass_target_ == &s) end_pass();
-        release_depth(s);
+        release();
         i = 0;
         for (auto p = lo; p != hi; ++p, ++i)
             if (static_cast<u64>(*p + 1) * kPage <= ram_size_) std::memcpy(ram_ + static_cast<std::size_t>(*p) * kPage, kept.data() + i * kPage, kPage);
         ++stats_.cpu_written_targets;
+    };
+    for (auto& [k, sp] : surfaces_) {
+        Surface& s = *sp;
+        if (s.depth_holds)
+            around(s.depth_holds, s.held_bytes(), [&] {
+                if (pass_open_ && pass_target_ == &s) end_pass();
+                release_depth(s);
+            });
+        for (Surface::ParkedDepth& p : s.parked)
+            if (p.depth_holds) {
+                const u32 addr = p.depth_holds;
+                around(addr, s.parked_bytes(p), [&] { drop_parked(s, addr, static_cast<u64>(addr) + 1, true); });
+            }
     }
 }
 
@@ -1789,6 +2018,12 @@ const VulkanRenderer::TextureEntry* VulkanRenderer::texture(const KelvinState& s
         if (surf->zeta_dirty && z0 < static_cast<u64>(phys) + length && static_cast<u64>(phys) < z1) queue_write_back_zeta(*surf);
     }
     finish_write_backs();
+    // A depth image holding an address its target no longer binds, and the parked ones (D35).
+    for (auto& [k, surf] : surfaces_)
+        if (surf->zeta_dirty && surf->depth_holds && surf->depth_holds != surf->zeta_phys && surf->depth_holds < static_cast<u64>(phys) + length &&
+            static_cast<u64>(phys) < static_cast<u64>(surf->depth_holds) + surf->held_bytes())
+            write_back_held(*surf);
+    flush_parked(phys, static_cast<u64>(phys) + length);
     wb_why_ = Stats::kWbAll;
     if (same && sc.entry->valid && !sc.entry->surface && texture_current(*sc.entry)) return sc.entry;
     struct Ident {
@@ -1954,17 +2189,19 @@ VulkanRenderer::TextureEntry* VulkanRenderer::surface_texture(const TextureStage
         // The layout the target was last set up with does not matter: its image holds pixels, and the guest clears in
         // pitch layout (one colour, the same either way) and draws in the layout it samples.
         if (s.width != w || s.height != h) continue;
+        if (!color && !s.parked.empty())
+            if (TextureEntry* e = parked_texture(s, ts, phys, w, h, linear, depth16)) return e;
         const bool recent = !s.ram_newer && s.last_rendered_frame + 1 >= frame_index_;
         // The depth buffer read as colour at its own address: converted on the GPU (Z24S8 on a device with D24S8).
-        if (want == VK_FORMAT_B8G8R8A8_UNORM && s.zeta_phys == phys && s.depth_holds == phys && s.phys != phys && s.zeta_format == 2 && depth24_ == VK_FORMAT_D24_UNORM_S8_UINT && s.aa_x == 1 && s.aa_y == 1 &&
-            (s.zeta_dirty || recent) && linear == !s.swizzled && (!linear || ts.pitch() == s.zeta_pitch))
+        if (want == VK_FORMAT_B8G8R8A8_UNORM && s.depth_holds == phys && s.phys != phys && s.zeta_format == 2 && depth24_ == VK_FORMAT_D24_UNORM_S8_UINT && s.aa_x == 1 && s.aa_y == 1 &&
+            (s.zeta_dirty || recent) && linear == !s.swizzled && (!linear || ts.pitch() == (s.holds_pitch ? s.holds_pitch : s.zeta_pitch)))
             return zeta_color_texture(s, ts, phys, w, h, linear, x8);
         if (color) {
             if (s.phys != phys || !(s.dirty || recent) || color_vk_format(s.color_format) != want) continue;
             if (linear && ts.pitch() != s.pitch) continue;
         } else {
-            if (s.zeta_phys != phys || s.depth_holds != phys || !(s.zeta_dirty || recent) || (s.zeta_format == 1) != depth16) continue;
-            if (!(depth16 ? depth16_sampled_ : depth24_sampled_) || (linear && ts.pitch() != s.zeta_pitch)) continue;
+            if (s.depth_holds != phys || !(s.zeta_dirty || recent) || (s.zeta_format == 1) != depth16) continue;
+            if (!(depth16 ? depth16_sampled_ : depth24_sampled_) || (linear && ts.pitch() != (s.holds_pitch ? s.holds_pitch : s.zeta_pitch))) continue;
         }
         if (&s == draw_target_) {
             if (!color) return nullptr;  // a draw sampling its own depth buffer: through RAM
@@ -1993,6 +2230,7 @@ VulkanRenderer::TextureEntry* VulkanRenderer::surface_texture(const TextureStage
             e.surface = true;
             e.valid = true;
         }
+        e.phys = phys;  // a depth entry moves with its image between addresses (parked, D35)
         e.length = texture_size_in_memory(ts);
         if (attachments_written_) surface_barrier();
         sampled_since_barrier_ = true;
@@ -2676,16 +2914,6 @@ void VulkanRenderer::clear(const KelvinState& s, u32 bits) {
         ++stats_.skipped;
         return;
     }
-    // The depth buffer is bound only when the clear touches it: a target's passes that never use depth leave the
-    // buffer at its address where it is (a title drew three shapes at one address a frame, each binding it through RAM).
-    if (bits & 3u) bind_depth(*t);
-    ensure_pass(*t);
-    if (bits & 3u) t->zeta_dirty = true;
-    if (bits & 0xF0u) t->dirty = true;
-    ++t->clears_this_frame;
-    ++t->draw_serial;
-    VkClearAttachment att[2]{};
-    u32 n = 0;
     const u32 rect_h = s.reg(mthd::kClearRectH), rect_v = s.reg(mthd::kClearRectV);
     u32 x0 = rect_h & 0xFFFFu, x1 = rect_h >> 16, y0 = rect_v & 0xFFFFu, y1 = rect_v >> 16;
     if (x1 < x0 || y1 < y0 || (x0 == 0 && x1 == 0 && y0 == 0 && y1 == 0)) {
@@ -2701,6 +2929,21 @@ void VulkanRenderer::clear(const KelvinState& s, u32 bits) {
     }
     x1 = std::min(x1, view_.w - 1);
     y1 = std::min(y1, view_.h - 1);
+    // The depth buffer is bound only when the clear touches it: a target's passes that never use depth leave the
+    // buffer at its address where it is (a title drew three shapes at one address a frame, each binding it through RAM).
+    // A clear of all of it (and of the stencil a Z24S8 buffer has) needs nothing it held.
+    const bool whole = view_.x == 0 && view_.y == 0 && view_.w == t->width && view_.h == t->height && x0 == 0 && y0 == 0 && x1 + 1 == t->width && y1 + 1 == t->height;
+    if (debug_tex_log_ && (bits & 3u))
+        std::fprintf(stderr, "texlog: clear %08x zeta %08x bits %02x rect %u,%u..%u,%u view %u,%u %ux%u of %ux%u\n", t->phys, t->zeta_phys, bits, x0, y0, x1, y1, view_.x, view_.y, view_.w,
+                     view_.h, t->width, t->height);
+    if (bits & 3u) bind_depth(*t, whole && (bits & 1u) && (t->zeta_format == 1 || (bits & 2u)));
+    ensure_pass(*t, (bits & 0xF0u) != 0);
+    if (bits & 3u) t->zeta_dirty = true;
+    if (bits & 0xF0u) t->dirty = true;
+    ++t->clears_this_frame;
+    ++t->draw_serial;
+    VkClearAttachment att[2]{};
+    u32 n = 0;
     if (debug_draw_id_)
         std::fprintf(stderr, "drawid clear: surface %08x bits %02x colour %08x zstencil %08x rect %u,%u..%u,%u of %ux%u (registers %08x %08x)\n", t->phys, bits, s.clear_color(),
                      s.clear_zstencil(), x0, y0, x1, y1, t->width, t->height, rect_h, rect_v);
@@ -3104,9 +3347,16 @@ void VulkanRenderer::draw(const KelvinState& s, const DrawBatch& batch) {
     stats_.ns_descriptors += ns_since(t_part);
     t_part = std::chrono::steady_clock::now();
     // Record.
-    const bool uses_depth = s.depth_test() || s.stencil_test();
+    // A depth test that always passes and writes nothing leaves the buffer alone: its contents do not matter to the
+    // draw (Half-Life 2 draws two small targets so over a depth buffer of another shape, each bind a write-back and a
+    // load through RAM).
+    const bool uses_depth = (s.depth_test() && (s.depth_write() || s.reg(mthd::kDepthFunc) != 0x207)) || s.stencil_test();
+    if (debug_tex_log_ && uses_depth && t->depth_holds != t->zeta_phys)
+        std::fprintf(stderr, "texlog: draw binds depth %08x into %08x: test %d func %03x write %d stencil %d func %03x ops %03x/%03x/%03x\n", t->zeta_phys, t->phys, s.depth_test() ? 1 : 0,
+                     s.reg(mthd::kDepthFunc), s.depth_write() ? 1 : 0, s.stencil_test() ? 1 : 0, s.reg(mthd::kStencilFunc), s.reg(mthd::kStencilOpFail), s.reg(mthd::kStencilOpZfail),
+                     s.reg(mthd::kStencilOpZpass));
     if (uses_depth) bind_depth(*t);  // only a draw that tests depth or stencil needs the buffer in place
-    ensure_pass(*t);
+    ensure_pass(*t, s.color_mask() != 0);
     if ((s.depth_test() && s.depth_write()) || s.stencil_test()) t->zeta_dirty = true;
     if (s.color_mask() != 0) t->dirty = true;
     ++t->draws_this_frame;
@@ -3222,14 +3472,14 @@ bool VulkanRenderer::write_back_at(u32 phys) {
     if (debug_wb_all_) write_back_all();
     if (scale_ > 1) {
         std::lock_guard g(display_mutex_);
-        shown_ = 0;  // until a target below holds the picture
+        shown_ = nullptr;  // until a target below holds the picture
     }
     wb_why_ = Stats::kWbScanout;
     for (auto& [k, s] : surfaces_) {
         if (phys < s->phys || phys >= static_cast<u64>(s->phys) + s->bytes()) continue;  // the region holding the scanout
         if (s->dirty) queue_write_back(*s);
-        capture_display(*s);  // a scaled target: its picture at the internal resolution, beside the write-back
         finish_write_backs();
+        capture_display(*s);  // a scaled target: its picture at the internal resolution, not waited for here
         wb_why_ = Stats::kWbAll;
         return true;
     }
@@ -3264,10 +3514,20 @@ void VulkanRenderer::apply_scale() {
     dev_.destroy_buffer(zc_out_);
     zc_capacity_ = 0;
     {
+        // The GPU is idle (finish above). The picture the frontend holds goes once it is let go.
         std::lock_guard g(display_mutex_);
-        for (Capture& c : captures_) dev_.destroy_buffer(c.buffer);  // the GPU is idle (finish above)
-        captures_.clear();
-        shown_ = 0;
+        for (auto it = captures_.begin(); it != captures_.end();) {
+            if (it->get() == held_) {
+                (*it)->retired = true;
+                (*it)->valid = false;
+                ++it;
+            } else {
+                destroy_capture(**it);
+                it = captures_.erase(it);
+            }
+        }
+        shown_ = nullptr;
+        last_capture_ = nullptr;
     }
     scale_ = next;
 }
@@ -3396,10 +3656,12 @@ void VulkanRenderer::write_back_zeta_banded(Surface& s) {
     store_zeta(s, out.data());
 }
 
-// The scanout target's picture at the internal resolution, read beside its write-back into a host buffer of its own
-// (one per target scanned out, a double or triple buffer's few): retaken only when it was drawn into (or reloaded)
+// The scanout target's picture at the internal resolution, read after its write-back into a host buffer: one of two
+// per target scanned out (a double or triple buffer's few), retaken only when the target was drawn into (or reloaded)
 // since. A target whose memory another engine wrote shows RAM's picture until it is drawn again. The buffer is read in
-// place by scaled_scanout: at 8x a picture is 78 MB, and every extra copy of it cost milliseconds a frame.
+// place by the frontend: at 6x a picture is 44 MB, and every extra copy of it cost milliseconds a frame. Its copy
+// carries a fence of its own and the vblank does not wait for it (D36): the frontend does, while the CPU runs on, and
+// the next vblank writes the target's other buffer, never the one the frontend holds.
 void VulkanRenderer::capture_display(Surface& s) {
     if (s.sc <= 1 || s.swizzled || s.color_ram_newer) return;
     const bool convert = init_display_convert();
@@ -3407,42 +3669,77 @@ void VulkanRenderer::capture_display(Surface& s) {
     Capture* c = nullptr;
     {
         std::lock_guard g(display_mutex_);
-        auto it = std::find_if(captures_.begin(), captures_.end(), [&](const Capture& e) { return e.phys == s.phys; });
+        // Captures retired by a scale change go once the frontend lets them go.
+        for (auto it = captures_.begin(); it != captures_.end();) {
+            if ((*it)->retired && it->get() != held_) {
+                destroy_capture(**it);
+                it = captures_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        Capture* newest = nullptr;
+        for (auto& e : captures_)
+            if (e->phys == s.phys && (!newest || e->taken > newest->taken)) newest = e.get();
         // A colour table that changed since (a fade) needs the picture again even when the target did not.
-        if (it != captures_.end() && it->valid && it->serial == s.draw_serial && it->sc == s.sc && it->width == s.width && it->height == s.height && it->pitch == s.pitch &&
-            !(convert && display_lut_on_)) {
-            shown_ = s.phys;
+        if (newest && newest->valid && newest->serial == s.draw_serial && newest->sc == s.sc && newest->width == s.width && newest->height == s.height &&
+            newest->pitch == s.pitch && !(convert && display_lut_on_)) {
+            shown_ = newest;
             return;
         }
-        if (it == captures_.end()) {
-            if (captures_.size() >= 3) {
-                // The oldest goes. Nothing in flight writes it: every capture is stored before the vblank that took it returns.
-                dev_.destroy_buffer(captures_.front().buffer);
-                captures_.erase(captures_.begin());
+        // The target's other buffer, when it has one the frontend does not hold; else a new one, the least recent of
+        // the others going when there are enough.
+        for (auto& e : captures_)
+            if (e->phys == s.phys && e.get() != newest && e.get() != held_) c = e.get();
+        if (!c) {
+            if (captures_.size() >= kMaxCaptures) {
+                auto oldest = captures_.end();
+                for (auto it = captures_.begin(); it != captures_.end(); ++it)
+                    if (it->get() != held_ && it->get() != newest && it->get() != shown_ && (oldest == captures_.end() || (*it)->taken < (*oldest)->taken)) oldest = it;
+                if (oldest != captures_.end()) {
+                    if (oldest->get() == last_capture_) last_capture_ = nullptr;
+                    destroy_capture(**oldest);
+                    captures_.erase(oldest);
+                }
             }
-            captures_.emplace_back();
-            it = std::prev(captures_.end());
+            auto fresh = std::make_unique<Capture>();
+            VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+            if (fn_->vkCreateFence(dev_.device(), &fci, nullptr, &fresh->fence) != VK_SUCCESS) return;
+            c = fresh.get();
+            captures_.push_back(std::move(fresh));
         }
-        c = &*it;
         c->valid = false;
+        if (c->submitted) {
+            // Taken two of its target's vblanks ago: long landed, normally.
+            fn_->vkWaitForFences(dev_.device(), 1, &c->fence, VK_TRUE, ~0ull);
+            c->submitted = false;
+        }
         if (c->buffer.size < bytes) {
             dev_.destroy_buffer(c->buffer);
             std::string error;
             if (!dev_.create_buffer(bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, vk::BufferMemory::HostRead, c->buffer, error)) {
                 note("scaled picture buffer: " + error);
-                captures_.erase(it);
+                if (c == last_capture_) last_capture_ = nullptr;
+                destroy_capture(*c);
+                captures_.erase(std::find_if(captures_.begin(), captures_.end(), [&](const auto& e) { return e.get() == c; }));
                 return;
             }
         }
         c->phys = s.phys;
         c->xrgb = convert;
     }
+    // The conversion's descriptor set and colour table were last used by the previous capture, which may still be on
+    // its way.
+    if (last_capture_ && last_capture_->submitted) fn_->vkWaitForFences(dev_.device(), 1, &last_capture_->fence, VK_TRUE, ~0ull);
+    fn_->vkResetFences(dev_.device(), 1, &c->fence);
     end_pass();
     VkMemoryBarrier before{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
     before.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
     before.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_SHADER_READ_BIT;
     fn_->vkCmdPipelineBarrier(cb_, VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1,
                               &before, 0, nullptr, 0, nullptr);
+    VkMemoryBarrier after{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    after.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
     if (convert) {
         // The colour table as 768 words (the identity when the RAMDAC has none), then the pass over the image.
         auto* lut = static_cast<u32*>(dc_lut_.mapped);
@@ -3459,39 +3756,45 @@ void VulkanRenderer::capture_display(Surface& s) {
             if (i == 0) writes[i].pImageInfo = &img;
             else writes[i].pBufferInfo = &bufs[i - 1];
         }
-        // The set is free to update: the last capture that used it was waited for at its own vblank.
         fn_->vkUpdateDescriptorSets(dev_.device(), 3, writes, 0, nullptr);
         fn_->vkCmdBindPipeline(cb_, VK_PIPELINE_BIND_POINT_COMPUTE, dc_pipeline_);
         fn_->vkCmdBindDescriptorSets(cb_, VK_PIPELINE_BIND_POINT_COMPUTE, dc_layout_, 0, 1, &dc_set_, 0, nullptr);
         const u32 push[2] = {s.iw(), s.ih()};
         fn_->vkCmdPushConstants(cb_, dc_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof push, push);
         fn_->vkCmdDispatch(cb_, (s.iw() + 15) / 16, (s.ih() + 15) / 16, 1);
-        VkMemoryBarrier after{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
         after.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-        after.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
         fn_->vkCmdPipelineBarrier(cb_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &after, 0, nullptr, 0, nullptr);
     } else {
         VkBufferImageCopy r{};
         r.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
         r.imageExtent = {s.iw(), s.ih(), 1};
         fn_->vkCmdCopyImageToBuffer(cb_, s.color.image, VK_IMAGE_LAYOUT_GENERAL, c->buffer.buffer, 1, &r);
+        after.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        fn_->vkCmdPipelineBarrier(cb_, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &after, 0, nullptr, 0, nullptr);
     }
-    write_backs_.push_back({&s, false, 0, true});
+    // Submitted now, and an empty submission after it signals the capture's fence once everything before it is done.
+    submit();
+    fn_->vkQueueSubmit(dev_.queue(), 0, nullptr, c->fence);
+    last_capture_ = c;
+    std::lock_guard g(display_mutex_);
+    c->submitted = true;
+    c->width = s.width;
+    c->height = s.height;
+    c->pitch = s.pitch;
+    c->bpp = s.color_bytes();
+    c->sc = s.sc;
+    c->serial = s.draw_serial;
+    c->taken = ++capture_clock_;
+    c->valid = true;
+    shown_ = c;
 }
 
-// The copy has landed (finish_write_backs waited for it): the capture describes the target as it is now.
-void VulkanRenderer::store_display(Surface& s) {
-    std::lock_guard g(display_mutex_);
-    auto it = std::find_if(captures_.begin(), captures_.end(), [&](const Capture& e) { return e.phys == s.phys; });
-    if (it == captures_.end()) return;
-    it->width = s.width;
-    it->height = s.height;
-    it->pitch = s.pitch;
-    it->bpp = s.color_bytes();
-    it->sc = s.sc;
-    it->serial = s.draw_serial;
-    it->valid = true;
-    shown_ = s.phys;
+void VulkanRenderer::destroy_capture(Capture& c) {
+    if (c.submitted) fn_->vkWaitForFences(dev_.device(), 1, &c.fence, VK_TRUE, ~0ull);
+    if (c.fence) fn_->vkDestroyFence(dev_.device(), c.fence, nullptr);
+    c.fence = VK_NULL_HANDLE;
+    c.submitted = false;
+    dev_.destroy_buffer(c.buffer);
 }
 
 bool VulkanRenderer::init_display_convert() {
@@ -3584,26 +3887,39 @@ bool VulkanRenderer::init_display_convert() {
 
 bool VulkanRenderer::scaled_picture(u32 phys, u32 pitch, u32 bpp, u32 w, u32 h, ScaledPicture& out) const {
     std::lock_guard g(display_mutex_);
-    if (!shown_) return false;
-    for (const Capture& c : captures_) {
-        if (c.phys != shown_ || !c.valid || phys < c.phys || c.pitch != pitch || c.bpp != bpp) continue;
-        const u32 off = phys - c.phys;
-        if ((off % pitch) % bpp) return false;
-        const u32 x0 = (off % pitch) / bpp, y0 = off / pitch;
-        if (x0 + w > c.width || y0 + h > c.height) return false;
-        const u32 px = c.xrgb ? 4u : bpp;  // bytes a pixel in the buffer
-        out.sc = c.sc;
-        out.xrgb = c.xrgb;
-        out.pitch = c.width * c.sc * px;
-        out.pixels = static_cast<const u8*>(c.buffer.mapped) + static_cast<std::size_t>(y0) * c.sc * out.pitch + static_cast<std::size_t>(x0) * c.sc * px;
-        return true;
-    }
-    return false;
+    const Capture* c = shown_;
+    if (!c || !c->valid || phys < c->phys || c->pitch != pitch || c->bpp != bpp) return false;
+    const u32 off = phys - c->phys;
+    if ((off % pitch) % bpp) return false;
+    const u32 x0 = (off % pitch) / bpp, y0 = off / pitch;
+    if (x0 + w > c->width || y0 + h > c->height) return false;
+    const u32 px = c->xrgb ? 4u : bpp;  // bytes a pixel in the buffer
+    out.sc = c->sc;
+    out.xrgb = c->xrgb;
+    out.pitch = c->width * c->sc * px;
+    out.pixels = static_cast<const u8*>(c->buffer.mapped) + static_cast<std::size_t>(y0) * c->sc * out.pitch + static_cast<std::size_t>(x0) * c->sc * px;
+    out.ready = c->submitted ? c->fence : VK_NULL_HANDLE;
+    held_ = c;
+    return true;
+}
+
+void VulkanRenderer::picture_ready(const ScaledPicture& p) const {
+    if (p.ready) fn_->vkWaitForFences(dev_.device(), 1, &p.ready, VK_TRUE, ~0ull);
+}
+
+void VulkanRenderer::picture_done() const {
+    std::lock_guard g(display_mutex_);
+    held_ = nullptr;
 }
 
 bool VulkanRenderer::scaled_scanout(u32 phys, u32 pitch, u32 bpp, bool rgb565, u32 w, u32 h, std::vector<u32>& xrgb, u32& scale) const {
     ScaledPicture p;
     if (!scaled_picture(phys, pitch, bpp, w, h, p)) return false;
+    picture_ready(p);
+    struct Done {
+        const VulkanRenderer* r;
+        ~Done() { r->picture_done(); }
+    } done{this};
     const u32 fw = w * p.sc, fh = h * p.sc;
     xrgb.resize(static_cast<std::size_t>(fw) * fh);
     if (p.xrgb) {

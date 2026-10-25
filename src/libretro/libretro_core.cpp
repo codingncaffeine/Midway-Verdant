@@ -49,9 +49,11 @@ std::unique_ptr<mv::Machine> machine;
 std::vector<mv::u32> frame(640 * 480, 0);
 mv::u32 frame_w = 640, frame_h = 480;
 // What video_cb gets: `frame`, or at an internal resolution above 1x the GPU's finished picture where it lies (read back
-// already converted, the colour table applied; valid until the next vblank, which the CPU does not reach until it is shown).
+// already converted, the colour table applied). That one is the frontend's from grab_frame to picture_done: its copy
+// may still be landing (frame_pic.ready, waited for after the CPU is let go), and no vblank writes it meanwhile (D36).
 const void* frame_ptr = nullptr;
 std::size_t frame_pitch = 0;
+mv::pgraph::VulkanRenderer::ScaledPicture frame_pic;
 std::vector<mv::u8> composed;
 
 std::FILE* trace_file = nullptr;  // MV_TRACE_FILE
@@ -194,9 +196,10 @@ bool find_console_files(const std::filesystem::path& dir, ConsoleFiles& out, std
 }
 
 // Rows [0, rows) split into bands on up to four threads: a picture at a high internal resolution is tens of MB a frame.
+// `big`: the work is large however few the rows (each a block of rows at the internal resolution).
 template <typename F>
-void parallel_rows(mv::u32 rows, F&& f) {
-    const mv::u32 n = rows >= 1024 ? 4u : 1u, step = (rows + n - 1) / n;
+void parallel_rows(mv::u32 rows, F&& f, bool big = false) {
+    const mv::u32 n = (rows >= 1024 || big) && rows >= 4 ? 4u : 1u, step = (rows + n - 1) / n;
     std::vector<std::thread> helpers;
     for (mv::u32 i = 1; i < n; ++i)
         if (const mv::u32 a = i * step; a < rows) helpers.emplace_back([&f, a, b = std::min(rows, a + step)] { f(a, b); });
@@ -235,8 +238,10 @@ void grab_frame() {
         frame_h = h * sc;
         frame_ptr = pic.pixels;
         frame_pitch = pic.pitch;
+        frame_pic = pic;  // retro_run waits for it once the CPU is let go, and lets it go after video_cb
         return;
     }
+    if (rendered) renderer->picture_ready(pic);  // read here: landed first
     const mv::u32 fw = w * sc, fh = h * sc;
     frame_w = fw;
     frame_h = fh;
@@ -276,22 +281,41 @@ void grab_frame() {
                 }
             }
         });
+        renderer->picture_done();
     } else if (sc > 1) {
+        // RAM's picture finished at its own size (colour table, the video overlay: a movie samples its nearest texel
+        // either way), then each pixel widened to a block on a few threads, a block row built once and copied down.
+        // Done at the internal resolution on one thread this took 50 ms a frame at 6x (a title's intro movie).
         composed.resize(static_cast<std::size_t>(w) * h * 4);
-        mv::scanout_to_xrgb(fb, pitch, bpp, gpu.scanout_rgb565(), w, h, composed.data());
-        const mv::u32* src = reinterpret_cast<const mv::u32*>(composed.data());
-        for (mv::u32 y = 0; y < fh; ++y) {
-            const mv::u32* row = src + static_cast<std::size_t>(y / sc) * w;
-            mv::u32* dst = frame.data() + static_cast<std::size_t>(y) * fw;
-            for (mv::u32 x = 0; x < fw; ++x) dst[x] = row[x / sc];
-        }
+        mv::u8* c = composed.data();
+        mv::scanout_to_xrgb(fb, pitch, bpp, gpu.scanout_rgb565(), w, h, c);
+        if (lut) mv::apply_gamma(*lut, c, w * 4, w, h);
+        if (const auto ov = gpu.overlay()) mv::draw_overlay(*ov, bus.ram(), bus.ram_size(), c, w * 4, w, h);
+        const mv::u32* src = reinterpret_cast<const mv::u32*>(c);
+        parallel_rows(
+            h,
+            [&](mv::u32 y0, mv::u32 y1) {
+                for (mv::u32 y = y0; y < y1; ++y) {
+                    const mv::u32* row = src + static_cast<std::size_t>(y) * w;
+                    mv::u32* dst = frame.data() + static_cast<std::size_t>(y) * sc * fw;
+                    for (mv::u32 x = 0; x < w; ++x) std::fill_n(dst + static_cast<std::size_t>(x) * sc, sc, row[x] & 0x00FFFFFFu);
+                    for (mv::u32 k = 1; k < sc; ++k) std::memcpy(dst + static_cast<std::size_t>(k) * fw, dst, static_cast<std::size_t>(fw) * 4);
+                }
+            },
+            true);
+        frame_ptr = frame.data();
+        frame_pitch = static_cast<std::size_t>(fw) * 4;
+        return;
     } else {
         mv::scanout_to_xrgb(fb, pitch, bpp, gpu.scanout_rgb565(), w, h, out);
     }
     if (lut && !rendered) mv::apply_gamma(*lut, out, fw * 4, fw, fh);
     const auto ov = gpu.overlay();
+    // The scanout ignores the alpha byte; the frontend's XRGB8888 wants it clear of meaning too (a rendered 32-bit
+    // picture came with it cleared).
     if (ov) {
-        // The overlay's rectangle and steps are in scanout pixels: sc times as many at the internal resolution.
+        // The overlay's rectangle and steps are in scanout pixels: sc times as many at the internal resolution; drawn
+        // over the rendered picture in bands.
         mv::Overlay o = *ov;
         o.out_x *= sc;
         o.out_y *= sc;
@@ -299,14 +323,15 @@ void grab_frame() {
         o.out_h *= sc;
         o.dsdx /= sc;
         o.dtdy /= sc;
-        mv::draw_overlay(o, bus.ram(), bus.ram_size(), out, fw * 4, fw, fh);
+        parallel_rows(fh, [&](mv::u32 y0, mv::u32 y1) {
+            mv::draw_overlay(o, bus.ram(), bus.ram_size(), out, fw * 4, fw, fh, y0, y1);
+            for (std::size_t i = static_cast<std::size_t>(y0) * fw; i < static_cast<std::size_t>(y1) * fw; ++i) frame[i] &= 0x00FFFFFFu;
+        });
+    } else if (!rendered) {
+        for (auto& px : frame) px &= 0x00FFFFFFu;
     }
-    // The scanout ignores the alpha byte; the frontend's XRGB8888 wants it clear of meaning too (a rendered 32-bit
-    // picture came with it cleared).
     frame_ptr = frame.data();
     frame_pitch = static_cast<std::size_t>(fw) * 4;
-    if (!rendered || ov)
-        for (auto& px : frame) px &= 0x00FFFFFFu;
 }
 
 // The frame's geometry follows the internal resolution: the base is the console's 640x480 times it, the largest the
@@ -585,6 +610,9 @@ RETRO_API void retro_unload_game(void) {
                 static_cast<unsigned long long>(st.depth_handovers), static_cast<unsigned long long>(st.depth_uploads), static_cast<unsigned long long>(st.evicted), static_cast<unsigned long long>(st.retired_unused), static_cast<unsigned long long>(st.subrect_copies));
             if (st.surface_reloads) log(RETRO_LOG_INFO, "gpu: %llu render targets reloaded from RAM after a 2D write", static_cast<unsigned long long>(st.surface_reloads));
             if (st.cube_assemblies) log(RETRO_LOG_INFO, "gpu: %llu cube maps put together on the GPU from their face targets", static_cast<unsigned long long>(st.cube_assemblies));
+            if (st.depth_unparks || st.parked_samples || st.depth_loads_skipped)
+                log(RETRO_LOG_INFO, "gpu: depth buffers: %llu parked images bound again, %llu sampled in place, %llu loads skipped for a whole clear",
+                    static_cast<unsigned long long>(st.depth_unparks), static_cast<unsigned long long>(st.parked_samples), static_cast<unsigned long long>(st.depth_loads_skipped));
             if (st.mip_assemblies) log(RETRO_LOG_INFO, "gpu: %llu mip chains put together on the GPU from their level targets", static_cast<unsigned long long>(st.mip_assemblies));
             log(RETRO_LOG_INFO, "gpu: submits mid-frame: %llu with the draw rings full, %llu with the upload staging full; %llu 2D copies made on the GPU", static_cast<unsigned long long>(st.batch_flushes), static_cast<unsigned long long>(st.staging_flushes), static_cast<unsigned long long>(st.gpu_copies));
             for (const auto& e : st.errors) log(RETRO_LOG_INFO, "gpu: renderer note: %s", e.c_str());
@@ -763,7 +791,8 @@ RETRO_API void retro_run(void) {
     hold_grab_ms_sum += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t1).count();
     // The picture is taken while the CPU holds at the vblank; then it runs the next frame while the frontend shows this
     // one and the input for it arrives at the next call. A picture handed over where it lies (the GPU's read-back
-    // buffer) is shown first: the next vblank may write that buffer again.
+    // buffer) is the frontend's until picture_done, the next vblank writing the target's other buffer (D36): the CPU
+    // runs on while that copy lands and the frontend takes it.
     const auto release = [] {
         std::lock_guard g(machine->lock());
         released_to = machine->nv2a().vblanks() + 1;
@@ -771,9 +800,10 @@ RETRO_API void retro_run(void) {
         cpu_released = true;
     };
     const bool in_place = frame_ptr != frame.data();
-    if (pipeline && !in_place) release();
+    if (pipeline) release();
+    if (in_place) machine->renderer()->picture_ready(frame_pic);
     video_cb(frame_ptr, frame_w, frame_h, frame_pitch);
-    if (pipeline && in_place) release();
+    if (in_place) machine->renderer()->picture_done();
     // The audio the console played since the last frame, as it played it: the AC'97 output runs on the console's
     // own clock, so a frame carries about 800 stereo samples, a few more or fewer as the reads fall. Padding a short
     // frame with silence would put a click in the sound, so the frontend's queue absorbs the jitter instead. While
