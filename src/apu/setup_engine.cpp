@@ -684,7 +684,8 @@ std::array<SetupEngine::Send, 8> SetupEngine::sends(u32 handle) const {
         } else {
             headroom = submix_headroom_[bin];
         }
-        out[k] = {bin, attenuation(vols[k]) / static_cast<float>(1u << headroom)};
+        const float level = attenuation(vols[k]);
+        out[k] = {bin, level / static_cast<float>(1u << headroom), bins[k], level / static_cast<float>(1u << submix_headroom_[bins[k]])};
     }
     return out;
 }
@@ -719,7 +720,8 @@ void SetupEngine::mix_voice(u32 handle, const Frame& samples, float gain) {
         }
     const auto voice_sends = sends(handle);
     for (u32 k = 0; k < 8; ++k) {
-        const auto [bin, send_gain] = voice_sends[k];
+        const u32 bin = voice_sends[k].bin;
+        const float send_gain = voice_sends[k].gain;
         const float g = gain * send_gain;
         if (g == 0.0f) continue;
         const u32 channel = stereo ? (k & 1u) : 0u;
@@ -732,12 +734,14 @@ void SetupEngine::mix_voice(u32 handle, const Frame& samples, float gain) {
 }
 
 // The direct mix: the voice's two channels (a mono voice has its sample in both) straight into stereo at its loudest
-// send. Sends to a bin a multipass voice reads are left out, or a submix's sources would be heard twice.
+// send, as the reference emulator plays it: the bin the voice names with that bin's headroom, a 3D voice's HRTF sends
+// included (it would be routed to the HRTF submixes otherwise). Sends to a bin a multipass voice reads are left out, or
+// a submix's sources would be heard twice.
 void SetupEngine::direct_voice(u32 handle, const Frame& samples, float gain) {
     if (gain <= 0.0f || !soloed(handle)) return;
     float g = 0.0f;
-    for (const auto& [bin, send_gain] : sends(handle))
-        if (!(direct_skip_ & (1u << bin))) g = std::max(g, send_gain);
+    for (const Send& s : sends(handle))
+        if (!(direct_skip_ & (1u << s.own_bin))) g = std::max(g, s.own_gain);
     g *= gain;
     if (g == 0.0f) return;
     for (u32 i = 0; i < kSamplesPerFrame; ++i) {

@@ -168,10 +168,13 @@ private:
     void mix_voice(u32 handle, const Frame& samples, float gain);
     static u32 dump_handle();         // MV_DEBUG_VOICE_DUMP, or kNoVoice
     void dump_voice(u32 handle);      // the instrument's files (see the .cpp)
-    // A voice's eight sends: the bin each lands in and its gain (volume and headroom).
+    // A voice's eight sends: the bin each lands in and its gain (volume and headroom); own_* is the bin the voice names
+    // and its headroom before a 3D voice's first four go to the HRTF submixes (the direct mix uses those).
     struct Send {
         u32 bin;
         float gain;
+        u32 own_bin;
+        float own_gain;
     };
     std::array<Send, 8> sends(u32 handle) const;
     void direct_voice(u32 handle, const Frame& samples, float gain);

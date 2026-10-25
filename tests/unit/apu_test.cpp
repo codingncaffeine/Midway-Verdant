@@ -898,3 +898,31 @@ TEST(ApuVoices, AnIdleReportRaisedWhileTheFrontEndIsBusyNeverReachesAHostThatToo
     EXPECT_FALSE(r.irq);
     EXPECT_FALSE(r.apu.front_end_trapped());
 }
+
+TEST(ApuDirectMix, A3dVoiceIsHeardAtTheHeadroomOfTheBinItNamesNotTheHrtfSubmix) {
+    using SE = apu::SetupEngine;
+    SynthRig r;
+    r.apu.set_direct_mix(true);
+    r.fill_pcm(64);
+    constexpr u32 k3d = 0x10;  // a 3D voice: its first four sends go to the HRTF submixes
+    r.vp(SE::kMethodSubmixHeadroomFirst + 6 * 4, 1);  // bin 6: headroom 1
+    r.vp(SE::kMethodHrtfHeadroom, 0);
+    r.vp(SE::kMethodHrtfSubmixes, 0x03020100u);  // HRTF submixes = bins 0-3
+    r.vp(SE::kMethodSetCurrentVoice, k3d);
+    r.vp(0x300, 6u | (31u << 5) | (31u << 10) | (31u << 16) | (31u << 21) | (31u << 26));  // V0 names bin 6
+    r.vp(0x304, kPcm16Mono | 31u | (31u << 5));
+    r.vp(0x360, 0xFFF00000u | 0x000F000Fu);  // V0 at full volume
+    r.vp(0x364, 0xFFFFFFFFu);
+    r.vp(0x368, 0xFFFFFFFFu);
+    r.vp(0x37C, 0);
+    r.vp(SE::kMethodBufBase, 0);
+    r.vp(SE::kMethodBufEbo, 63);
+    r.vp(SE::kMethodBufLbo, 0);
+    r.vp(SE::kMethodSetAntecedentVoice, 0x2FFFFu);  // the top of the 3D list
+    r.vp(SE::kMethodVoiceOn, k3d);
+    r.sched.advance_to(Rig::frame(1));
+    for (u32 i = 0; i < 32; ++i) {
+        EXPECT_FLOAT_EQ(r.bin(0, i), SynthRig::pcm(i) / 32768.0f) << "the console path: HRTF submix 0, HRTF headroom 0";
+        EXPECT_FLOAT_EQ(r.apu.setup_engine().direct()[i][0], SynthRig::pcm(i) / 32768.0f / 2.0f) << "direct: bin 6's headroom";
+    }
+}
