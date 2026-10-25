@@ -660,7 +660,16 @@ RETRO_API bool retro_load_game(const retro_game_info* game) {
     // Instruments for a core run under a frontend: MV_TRACE=apu,boot,... (the shell's --trace list) into
     // MV_TRACE_FILE (default stderr).
     if (const char* f = std::getenv("MV_FRAME_LOG"); f && *f && !frame_log) {
-        frame_log = std::fopen(f, "w");
+        // A folder: one log per game and start, named after the disc (a frontend session runs several games).
+        std::filesystem::path path = f;
+        if (std::error_code ec; std::filesystem::is_directory(path, ec)) {
+            const std::time_t now = std::time(nullptr);
+            char stamp[32];
+            std::strftime(stamp, sizeof stamp, "%Y%m%d-%H%M%S", std::localtime(&now));
+            const std::string disc = game && game->path ? std::filesystem::path(game->path).stem().string() : "dashboard";
+            path /= disc + "-" + stamp + ".tsv";
+        }
+        frame_log = std::fopen(path.string().c_str(), "w");
         frame_log_index = 0;
         if (frame_log) std::fprintf(frame_log, "frame\tperiod\twait\tguest\thandlers\tevents\theld\tpusher\tdraw\tfetch\ttexture\tupload\tflush\twriteback\tsetup\tdspwait\tdraws\tdecodes\twritebacks\twaits\tflips\tio\tgpubusy\tcounted\tidlespin\twarp\thalts\texits\tmmio\n");
     }
