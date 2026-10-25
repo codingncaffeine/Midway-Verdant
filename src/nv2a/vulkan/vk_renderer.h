@@ -1,6 +1,7 @@
 #pragma once
 #include <array>
 #include <filesystem>
+#include <map>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -349,6 +350,7 @@ private:
     };
     std::array<StageCache, 4> stage_cache_{};
     std::unordered_map<u64, VkSampler> samplers_;
+    std::map<std::pair<u64, u32>, VkSampler> border_samplers_;  // samplers that read the stage's border colour, by it
     VkDescriptorSetLayout set_layout_{VK_NULL_HANDLE};
     VkPipelineLayout pipeline_layout_{VK_NULL_HANDLE};
     Ring vertex_ring_, index_ring_, uniform_ring_, staging_;

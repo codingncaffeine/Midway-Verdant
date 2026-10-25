@@ -44,6 +44,10 @@ public:
     bool ready() const { return device_ != VK_NULL_HANDLE; }
     // Exact occlusion counts, enabled when the device has them.
     bool occlusion_precise() const { return occlusion_precise_; }
+    // Sampler border colours of our own (VK_EXT_custom_border_color): the NV2A's per-stage BORDER_COLOR. Without it a
+    // sampler takes the nearest of Vulkan's three built-in borders; `_unformatted` = no image format needed.
+    bool custom_border() const { return custom_border_; }
+    bool custom_border_unformatted() const { return custom_border_unformatted_; }
 
     const Functions& fn() const { return fn_; }
     VkDevice device() const { return device_; }
@@ -74,6 +78,7 @@ private:
     VkPhysicalDevice physical_{VK_NULL_HANDLE};
     VkDevice device_{VK_NULL_HANDLE};
     bool occlusion_precise_{false};
+    bool custom_border_{false}, custom_border_unformatted_{false};
     VkQueue queue_{VK_NULL_HANDLE};
     u32 queue_family_{0};
     VkCommandPool pool_{VK_NULL_HANDLE};

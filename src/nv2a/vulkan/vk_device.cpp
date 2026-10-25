@@ -1,8 +1,11 @@
 #include "nv2a/vulkan/vk_device.h"
 
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <format>
+#include <string_view>
+#include <vector>
 
 namespace mv::vk {
 
@@ -100,6 +103,32 @@ bool Device::init(std::string& error, bool software) {
     dci.queueCreateInfoCount = 1;
     dci.pQueueCreateInfos = &qci;
     dci.pEnabledFeatures = &features;
+    // Custom sampler border colours, where the device offers them.
+    std::vector<const char*> extensions;
+    VkPhysicalDeviceCustomBorderColorFeaturesEXT border{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_FEATURES_EXT};
+    {
+        u32 n_ext = 0;
+        fn_.vkEnumerateDeviceExtensionProperties(physical_, nullptr, &n_ext, nullptr);
+        std::vector<VkExtensionProperties> props(n_ext);
+        fn_.vkEnumerateDeviceExtensionProperties(physical_, nullptr, &n_ext, props.data());
+        const bool offered = std::ranges::any_of(props, [](const VkExtensionProperties& p) {
+            return std::string_view(p.extensionName) == VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME;
+        });
+        if (offered && fn_.vkGetPhysicalDeviceFeatures2) {
+            VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+            f2.pNext = &border;
+            fn_.vkGetPhysicalDeviceFeatures2(physical_, &f2);
+            if (border.customBorderColors) {
+                extensions.push_back(VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME);
+                border.pNext = nullptr;
+                dci.pNext = &border;
+                custom_border_ = true;
+                custom_border_unformatted_ = border.customBorderColorWithoutFormat;
+            }
+        }
+    }
+    dci.enabledExtensionCount = static_cast<u32>(extensions.size());
+    dci.ppEnabledExtensionNames = extensions.data();
     if (VkResult r = fn_.vkCreateDevice(physical_, &dci, nullptr, &device_); r != VK_SUCCESS) {
         error = std::format("vkCreateDevice: {}", result_name(r));
         return false;

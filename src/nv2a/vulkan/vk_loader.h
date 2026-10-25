@@ -24,6 +24,7 @@ namespace mv::vk {
     X(vkGetPhysicalDeviceMemoryProperties) \
     X(vkGetPhysicalDeviceFormatProperties) \
     X(vkGetPhysicalDeviceFeatures)        \
+    X(vkGetPhysicalDeviceFeatures2)       \
     X(vkCreateDevice)                     \
     X(vkGetDeviceProcAddr)                \
     X(vkEnumerateDeviceExtensionProperties)

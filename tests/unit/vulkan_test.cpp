@@ -667,3 +667,31 @@ TEST(Vulkan, ACpuWriteAfterTheTargetWasDrawnIsKeptAndDrawnOver) {
     EXPECT_EQ(pixel_at(ram, 8, 8) & 0x00FFFFFFu, 0x400030u) << "the draw adds to the CPU's bytes";
     EXPECT_EQ(renderer.stats().cpu_written_targets, 1u);
 }
+
+// A clamp-to-border stage shows its BORDER_COLOR (0x1B24, A8R8G8B8) outside the texture, as the hardware captures show
+// (nxdk_pgraph_tests TextureBorderColor); it was always opaque black.
+TEST(Vulkan, AClampToBorderStageShowsItsBorderColour) {
+    TextureShaderFixture f;
+    std::string error;
+    if (!f.init(error)) GTEST_SKIP() << "no Vulkan device: " << error;
+    Kelvin& k = f.k;
+    load_texture(k, f.ram, 0, 0x200000, 0, [](u32, u32) { return 0xFFFFFFFFu; });
+    const u32 b = mthd::kTextureBase;
+    k.method(b + 0x8, 0x00030404);   // border in u and v
+    k.method(b + 0x24, 0x80FF2200);  // the border colour
+    k.method(mthd::kShaderStageProgram, 1u);  // stage 0: 2D
+    output_texture_stage(k, 0);
+    texcoord(k, 0, 2.0f, 2.0f, 0.0f, 1.0f);  // outside the texture
+    draw_full_triangle(k, f.ram);
+    f.renderer->end_frame();
+    for (const auto& e : f.renderer->stats().errors) ADD_FAILURE() << "renderer: " << e;
+    if (!f.device.custom_border()) {
+        EXPECT_EQ(pixel_at(f.ram, 8, 8), 0xFF000000u) << "no custom border colours: the nearest built-in one (opaque black)";
+        return;
+    }
+    EXPECT_EQ(pixel_at(f.ram, 8, 8), 0x80FF2200u);
+    texcoord(k, 0, 0.5f, 0.5f, 0.0f, 1.0f);  // inside: the texel
+    draw_full_triangle(k, f.ram);
+    f.renderer->end_frame();
+    EXPECT_EQ(pixel_at(f.ram, 8, 8), 0xFFFFFFFFu);
+}

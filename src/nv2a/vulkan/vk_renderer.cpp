@@ -205,6 +205,7 @@ VulkanRenderer::~VulkanRenderer() {
     if (clear_fs_) f.vkDestroyShaderModule(dev_.device(), clear_fs_, nullptr);
     for (auto& [k, t] : textures_) dev_.destroy_image(t->image);
     for (auto& [k, s] : samplers_) f.vkDestroySampler(dev_.device(), s, nullptr);
+    for (auto& [k, s] : border_samplers_) f.vkDestroySampler(dev_.device(), s, nullptr);
     if (dummy_sampler_) f.vkDestroySampler(dev_.device(), dummy_sampler_, nullptr);
     dev_.destroy_image(dummy2d_);
     dev_.destroy_image(dummycube_);
@@ -2053,10 +2054,41 @@ void VulkanRenderer::destroy_surface_views(Surface& s) {
     s.color_tex = s.color_x8_tex = s.depth_tex = s.snap_tex = s.snap_x8_tex = s.zcolor_tex = s.zcolor_x8_tex = TextureEntry{};
 }
 
+// The border a clamp-to-border stage shows is its BORDER_COLOR (0x1B24, A8R8G8B8), as the hardware captures show; a
+// device without custom border colours takes the nearest built-in one (transparent black, opaque black or opaque white).
 VkSampler VulkanRenderer::sampler(const TextureStage& ts, u32 levels) {
     const u64 key = (static_cast<u64>(ts.filter) << 32) | ts.address | (static_cast<u64>(levels) << 28);
-    if (auto it = samplers_.find(key); it != samplers_.end()) return it->second;
+    // Colour textures only: a depth or 16-bit luminance texture (one channel, read through the depth path) keeps the opaque
+    // black border it always had; the register colour on it flooded a title's intro movie white (not yet checked against
+    // a hardware capture of a depth texture's border).
+    const FormatInfo fi = format_info(ts.color_format());
+    const bool colour_texture = !fi.depth && ts.color_format() != 0x32 && ts.color_format() != 0x35;
+    const bool border = colour_texture && (ts.wrap_u() == 4 || ts.wrap_v() == 4 || ts.wrap_p() == 4);
+    if (!border) {
+        if (auto it = samplers_.find(key); it != samplers_.end()) return it->second;
+    } else if (auto it = border_samplers_.find({key, ts.border_color}); it != border_samplers_.end()) {
+        return it->second;
+    }
     VkSamplerCreateInfo sci{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+    VkSamplerCustomBorderColorCreateInfoEXT custom{VK_STRUCTURE_TYPE_SAMPLER_CUSTOM_BORDER_COLOR_CREATE_INFO_EXT};
+    sci.borderColor = VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK;
+    if (border) {
+        const u32 c = ts.border_color;
+        const float a = static_cast<float>(c >> 24) / 255.0f, r = static_cast<float>((c >> 16) & 0xFFu) / 255.0f,
+                    g = static_cast<float>((c >> 8) & 0xFFu) / 255.0f, b = static_cast<float>(c & 0xFFu) / 255.0f;
+        if (dev_.custom_border()) {
+            custom.customBorderColor.float32[0] = r;
+            custom.customBorderColor.float32[1] = g;
+            custom.customBorderColor.float32[2] = b;
+            custom.customBorderColor.float32[3] = a;
+            custom.format = dev_.custom_border_unformatted() ? VK_FORMAT_UNDEFINED : VK_FORMAT_R8G8B8A8_UNORM;
+            sci.pNext = &custom;
+            sci.borderColor = VK_BORDER_COLOR_FLOAT_CUSTOM_EXT;
+        } else {
+            sci.borderColor = a < 0.5f ? VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK
+                              : (r + g + b) > 1.5f ? VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE : VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK;
+        }
+    }
     const u32 min = ts.min_filter(), mag = ts.mag_filter();
     sci.magFilter = (mag == 1) ? VK_FILTER_NEAREST : VK_FILTER_LINEAR;
     sci.minFilter = (min == 1 || min == 3 || min == 5) ? VK_FILTER_NEAREST : VK_FILTER_LINEAR;
@@ -2065,10 +2097,14 @@ VkSampler VulkanRenderer::sampler(const TextureStage& ts, u32 levels) {
     sci.addressModeV = wrap_mode(ts.wrap_v());
     sci.addressModeW = wrap_mode(ts.wrap_p());
     sci.maxLod = (min >= 3 && min <= 6) ? static_cast<float>(levels) : 0.25f;
-    sci.borderColor = VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK;
     VkSampler sm = VK_NULL_HANDLE;
     fn_->vkCreateSampler(dev_.device(), &sci, nullptr, &sm);
-    samplers_[key] = sm;
+    // Instrument: MV_DEBUG_BORDER=1 names every border sampler as it is made.
+    static const bool log_border = [] { const char* e = std::getenv("MV_DEBUG_BORDER"); return e && *e == '1'; }();
+    if (border && log_border)
+        std::fprintf(stderr, "border sampler: colour %08x address %08x format %08x filter %08x\n", ts.border_color, ts.address, ts.format, ts.filter);
+    if (border) border_samplers_[{key, ts.border_color}] = sm;
+    else samplers_[key] = sm;
     return sm;
 }
 
