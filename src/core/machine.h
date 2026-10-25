@@ -101,6 +101,9 @@ struct MachineConfig {
     bool async_shaders{false};
     // The least anisotropic filtering a linearly filtered texture gets (1 = what each texture asks for).
     u32 anisotropy{1};
+    // The internal resolution (PLAN D34): render targets at this many times their size, 1-4 (the fast core only; the
+    // accurate core always renders at 1x).
+    u32 resolution_scale{1};
     // Pacing of a CPU that runs free (the fast mode with its guest clock): frame steps stop the CPU at every vblank
     // until the front end asks for the next frame (the libretro core); otherwise guest time keeps to the host clock
     // times `speed` (1 = real time), or runs as fast as it can with speed 0.
@@ -154,6 +157,7 @@ public:
     Lpc& lpc() { return lpc_; }
     CpuBackend* cpu() { return cpu_.get(); }
     const pgraph::VulkanRenderer* renderer() const { return renderer_.get(); }
+    pgraph::VulkanRenderer* renderer() { return renderer_.get(); }
     std::string gpu_name() const;  // the Vulkan device's name when --gpu is on, else empty
 
     // The machine lock and the wake-ups: `wake_cpu` for the CPU thread's waits (HLT, pacing), `wake` for those and

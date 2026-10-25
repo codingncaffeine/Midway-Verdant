@@ -1,8 +1,10 @@
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstring>
+#include <format>
 #include <memory>
 #include <string>
 #include <thread>
@@ -723,4 +725,230 @@ TEST(Vulkan, WithBackgroundCompilesANewShadersDrawIsSkippedUntilItIsReady) {
     for (const auto& e : f.renderer->stats().errors) ADD_FAILURE() << "renderer: " << e;
     EXPECT_EQ(pixel_at(f.ram, 8, 8), 0xFF336699u) << "drawn once ready";
     EXPECT_EQ(f.renderer->stats().skipped, 0u) << "a pending draw is not an error";
+}
+
+// ── the internal resolution (PLAN D34) ──────────────────────────────────────────────────────────────────────────────
+
+namespace {
+
+// A renderer whose targets are drawn at `scale` times their size.
+struct ScaledFixture {
+    vk::Device device;
+    std::vector<u8> ram = std::vector<u8>(4u << 20, 0);
+    RamResolver handles;
+    std::unique_ptr<VulkanRenderer> renderer;
+    Kelvin k;
+    bool init(u32 scale, std::string& error) {
+        if (!device.init(error)) return false;
+        handles.size = static_cast<u32>(ram.size());
+        renderer = std::make_unique<VulkanRenderer>(device, handles, ram.data(), static_cast<u32>(ram.size()));
+        if (!renderer->init(error)) return false;
+        renderer->set_resolution_scale(scale);
+        k.set_sink(renderer.get());
+        return true;
+    }
+};
+
+// The triangle of RendersATriangleIntoGuestRam (green over the lower-right half of the 64x64 target, on dark blue).
+void draw_half_triangle(Kelvin& k) {
+    k.method(mthd::kColorClear, 0xFF000080);
+    k.method(mthd::kZstencilClear, 0xFFFFFF00);
+    k.method(mthd::kClearRectH, 63u << 16);
+    k.method(mthd::kClearRectV, 63u << 16);
+    k.method(mthd::kClearSurface, 0xF3);
+    k.method(mthd::kBeginEnd, 5);
+    k.method(mthd::kDiffuse4ub, 0xFF00FF00);
+    for (const auto& p : {std::array<float, 2>{63.0f, 0.0f}, std::array<float, 2>{63.0f, 63.0f}, std::array<float, 2>{0.0f, 63.0f}}) {
+        k.method(mthd::kVertexData4fM + 0, bits(p[0]));
+        k.method(mthd::kVertexData4fM + 4, bits(p[1]));
+        k.method(mthd::kVertexData4fM + 8, bits(0.5f * 16777215.0f));
+        k.method(mthd::kVertexData4fM + 12, bits(1.0f));
+    }
+    k.method(mthd::kBeginEnd, 0);
+}
+
+}  // namespace
+
+// What a scaled target leaves in RAM is what a 1x target would: clears in every format, a flat draw into a two-byte
+// format, and depth with its stencil.
+TEST(Vulkan, AScaledTargetReachesRamAsA1xTargetWould) {
+    for (u32 scale : {2u, 3u, 4u}) {
+        SCOPED_TRACE(std::format("scale {}", scale));
+        ScaledFixture f;
+        std::string error;
+        if (!f.init(scale, error)) GTEST_SKIP() << "no Vulkan device: " << error;
+        Kelvin& k = f.k;
+        auto clear = [&](u32 format, u32 offset, u32 value, u32 bits) {
+            setup_target(k, format, offset);
+            k.method(mthd::kColorClear, value);
+            k.method(mthd::kClearRectH, 63u << 16);
+            k.method(mthd::kClearRectV, 63u << 16);
+            k.method(mthd::kClearSurface, bits);
+        };
+        auto word16 = [&](u32 offset, u32 x, u32 y) {
+            u16 v;
+            std::memcpy(&v, &f.ram[offset + y * 256 + x * 2], 2);
+            return v;
+        };
+        auto word32 = [&](u32 offset, u32 x, u32 y) {
+            u32 v;
+            std::memcpy(&v, &f.ram[offset + y * 256 + x * 4], 4);
+            return v;
+        };
+        clear(3, 0x100000, 0x0000F81F, 0xF0);
+        clear(1, 0x110000, 0xFFFF7C00, 0xF0);
+        clear(4, 0x130000, 0xFF102030, 0xF0);
+        clear(8, 0x150000, 0x11223344, 0xF0);
+        clear(8, 0x150000, 0xAABBCCDD, 0x90);
+        setup_target(k, 10, 0x160000);  // G8B8, drawn flat
+        std::memset(&f.ram[0x160000], 0xEE, 64 * 256);
+        k.method(mthd::kVertexDataArrayFormat + 12, 2u);
+        k.method(mthd::kDiffuse4ub, 0xFF208040);
+        k.method(mthd::kColorClear, 0);
+        k.method(mthd::kClearSurface, 0xF0);
+        draw_full_triangle(k, f.ram);
+        setup_target(k);  // depth and stencil
+        k.method(mthd::kZstencilClear, 0x80000042);
+        k.method(mthd::kClearSurface, 0x03);
+        f.renderer->end_frame();
+        f.renderer->write_back_all();
+        for (const auto& e : f.renderer->stats().errors) ADD_FAILURE() << "renderer: " << e;
+        for (u32 at : {0u, 8u, 63u}) {
+            EXPECT_EQ(word16(0x100000, at, at), 0xF81Fu);
+            EXPECT_EQ(word16(0x110000, at, at), 0x7C00u);
+            EXPECT_EQ(word32(0x130000, at, at), 0x00102030u);
+            EXPECT_EQ(word32(0x150000, at, at), 0xAABB3344u);
+            EXPECT_EQ(f.ram[0x160000 + at * 256 + at * 2 + 1], 0x80);
+            EXPECT_EQ(word32(0x20000, at, at), 0x80000042u) << "the zeta word: depth over the stencil byte";
+        }
+        EXPECT_EQ(f.ram[0x160000 + 8 * 256 + 128], 0xEE) << "nothing written past the G8B8 line's 64 pixels";
+        EXPECT_EQ(f.ram[0x150000 + 64 * 256], 0) << "nothing written past the surface";
+    }
+}
+
+// A scaled target loads what RAM holds (each pixel widened to a block) and writes back exactly those bytes around
+// what it drew: colour and depth.
+TEST(Vulkan, AScaledTargetKeepsRamsPixelsAroundADraw) {
+    for (u32 scale : {2u, 3u, 4u}) {
+        SCOPED_TRACE(std::format("scale {}", scale));
+        ScaledFixture f;
+        std::string error;
+        if (!f.init(scale, error)) GTEST_SKIP() << "no Vulkan device: " << error;
+        Kelvin& k = f.k;
+        auto pattern = [](u32 x, u32 y) { return 0xFF000000u | (x * 4) << 16 | (y * 4) << 8 | ((x ^ y) * 4); };
+        auto zpattern = [](u32 x, u32 y) { return ((x * 977u + y * 131071u) & 0xFFFFFFu) << 8 | ((x + 3 * y) & 0xFFu); };
+        for (u32 y = 0; y < 64; ++y)
+            for (u32 x = 0; x < 64; ++x) {
+                const u32 c = pattern(x, y), z = zpattern(x, y);
+                std::memcpy(&f.ram[0x10000 + y * 256 + x * 4], &c, 4);
+                std::memcpy(&f.ram[0x20000 + y * 256 + x * 4], &z, 4);
+            }
+        setup_target(k);
+        k.method(mthd::kDepthTestEnable, 1);
+        k.method(mthd::kDepthFunc, 0x207);  // ALWAYS: the triangle writes its depth, the rest keeps RAM's
+        k.method(mthd::kDepthMask, 1);
+        k.method(mthd::kBeginEnd, 5);
+        k.method(mthd::kDiffuse4ub, 0xFF00FF00);
+        for (const auto& p : {std::array<float, 2>{0.0f, 0.0f}, std::array<float, 2>{16.0f, 0.0f}, std::array<float, 2>{0.0f, 16.0f}}) {
+            k.method(mthd::kVertexData4fM + 0, bits(p[0]));
+            k.method(mthd::kVertexData4fM + 4, bits(p[1]));
+            k.method(mthd::kVertexData4fM + 8, bits(0.25f * 16777215.0f));
+            k.method(mthd::kVertexData4fM + 12, bits(1.0f));
+        }
+        k.method(mthd::kBeginEnd, 0);
+        f.renderer->end_frame();
+        f.renderer->write_back_all();
+        for (const auto& e : f.renderer->stats().errors) ADD_FAILURE() << "renderer: " << e;
+        u32 colour_misses = 0, depth_misses = 0;
+        for (u32 y = 0; y < 64; ++y)
+            for (u32 x = 0; x < 64; ++x) {
+                if (x + y < 20) continue;  // the triangle and its edge
+                u32 c, z;
+                std::memcpy(&c, &f.ram[0x10000 + y * 256 + x * 4], 4);
+                std::memcpy(&z, &f.ram[0x20000 + y * 256 + x * 4], 4);
+                colour_misses += c != pattern(x, y);
+                depth_misses += z != zpattern(x, y);
+            }
+        EXPECT_EQ(colour_misses, 0u);
+        EXPECT_EQ(depth_misses, 0u);
+        EXPECT_EQ(pixel_at(f.ram, 2, 2), 0xFF00FF00u) << "inside the triangle";
+        u32 z;
+        std::memcpy(&z, &f.ram[0x20000 + 2 * 256 + 2 * 4], 4);
+        EXPECT_NEAR(static_cast<double>(z >> 8), 0x400000, 2.0) << "the triangle's depth (a quarter of the range)";
+        EXPECT_EQ(z & 0xFFu, zpattern(2, 2) & 0xFFu) << "its stencil kept";
+    }
+}
+
+// The picture of the scanned-out target is the scaled image: a diagonal edge steps on the image's pixels, not on
+// blocks of them (a 1x picture widened has every edge on a block boundary).
+TEST(Vulkan, TheScanoutPictureIsTheScaledImage) {
+    ScaledFixture f;
+    std::string error;
+    if (!f.init(2, error)) GTEST_SKIP() << "no Vulkan device: " << error;
+    setup_target(f.k);
+    draw_half_triangle(f.k);
+    f.renderer->flush_frame();
+    ASSERT_TRUE(f.renderer->write_back_at(0x10000));
+    for (const auto& e : f.renderer->stats().errors) ADD_FAILURE() << "renderer: " << e;
+    std::vector<u8> px;
+    u32 scale = 0;
+    ASSERT_TRUE(f.renderer->scaled_scanout(0x10000, 256, 4, 64, 64, px, scale));
+    EXPECT_EQ(scale, 2u);
+    ASSERT_EQ(px.size(), 128u * 128u * 4u);
+    auto at = [&](u32 x, u32 y) {
+        u32 v;
+        std::memcpy(&v, &px[(y * 128 + x) * 4], 4);
+        return v & 0x00FFFFFFu;
+    };
+    EXPECT_EQ(at(8, 8), 0x000080u);
+    EXPECT_EQ(at(120, 120), 0x00FF00u);
+    u32 odd_edges = 0, green = 0, green_1x = 0;
+    for (u32 y = 0; y < 128; ++y) {
+        u32 first = 128;
+        for (u32 x = 0; x < 128; ++x) {
+            if (at(x, y) == 0x00FF00u) {
+                ++green;
+                first = std::min(first, x);
+            }
+        }
+        odd_edges += first < 128 && first % 2 == 1;
+    }
+    for (u32 y = 0; y < 64; ++y)
+        for (u32 x = 0; x < 64; ++x) green_1x += (pixel_at(f.ram, x, y) & 0x00FFFFFFu) == 0x00FF00u;
+    EXPECT_GT(odd_edges, 16u) << "the edge steps on the image's own pixels";
+    EXPECT_NEAR(static_cast<double>(green), 4.0 * green_1x, 2.0 * 128) << "the same triangle, four times the pixels (within an edge)";
+    EXPECT_FALSE(f.renderer->scaled_scanout(0x10100, 256, 4, 64, 64, px, scale)) << "a scanout one line down runs past the target";
+    // Another engine writes the target's memory: RAM holds the picture until the target is drawn again.
+    f.renderer->invalidate(0x10000, 64 * 256);
+    ASSERT_TRUE(f.renderer->write_back_at(0x10000));
+    EXPECT_FALSE(f.renderer->scaled_scanout(0x10000, 256, 4, 64, 64, px, scale));
+}
+
+// The scale changes while targets live: at the vblank they reach RAM and go, and come back from RAM at the new size.
+TEST(Vulkan, TheInternalResolutionChangesAtTheVblank) {
+    ScaledFixture f;
+    std::string error;
+    if (!f.init(1, error)) GTEST_SKIP() << "no Vulkan device: " << error;
+    setup_target(f.k);
+    draw_half_triangle(f.k);
+    f.renderer->flush_frame();
+    ASSERT_TRUE(f.renderer->write_back_at(0x10000));
+    std::vector<u8> px;
+    u32 scale = 0;
+    EXPECT_FALSE(f.renderer->scaled_scanout(0x10000, 256, 4, 64, 64, px, scale)) << "1x: RAM holds the picture";
+    const std::vector<u8> before(f.ram.begin() + 0x10000, f.ram.begin() + 0x10000 + 64 * 256);
+    f.renderer->set_resolution_scale(3);
+    EXPECT_FALSE(f.renderer->write_back_at(0x10000)) << "the targets went at the change";
+    EXPECT_TRUE(std::equal(before.begin(), before.end(), f.ram.begin() + 0x10000)) << "RAM kept what they drew";
+    f.k.method(mthd::kClearRectH, 15u << 16);  // a corner cleared at the new scale, the rest from RAM
+    f.k.method(mthd::kClearRectV, 15u << 16);
+    f.k.method(mthd::kColorClear, 0xFFFF0000);
+    f.k.method(mthd::kClearSurface, 0xF0);
+    f.renderer->flush_frame();
+    ASSERT_TRUE(f.renderer->write_back_at(0x10000));
+    for (const auto& e : f.renderer->stats().errors) ADD_FAILURE() << "renderer: " << e;
+    ASSERT_TRUE(f.renderer->scaled_scanout(0x10000, 256, 4, 64, 64, px, scale));
+    EXPECT_EQ(scale, 3u);
+    EXPECT_EQ(pixel_at(f.ram, 4, 4), 0xFFFF0000u);
+    EXPECT_EQ(pixel_at(f.ram, 60, 60) & 0x00FFFFFFu, 0x00FF00u) << "the triangle came back from RAM";
 }

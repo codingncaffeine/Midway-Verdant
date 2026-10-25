@@ -42,7 +42,16 @@ public:
     void set_async_compile(bool on);
     // Anisotropic filtering of linearly filtered textures: at least `n` (1 = only what each stage asks for), up to the
     // device's limit (the libretro core's "Anisotropic filtering" option).
-    void set_min_anisotropy(u32 n) { min_anisotropy_ = std::max(n, 1u); }
+    void set_min_anisotropy(u32 n) { min_anisotropy_.store(std::max(n, 1u), std::memory_order_relaxed); }  // any thread: new samplers take it
+    // Internal resolution (PLAN D34, the libretro core's option; any thread): render targets drawn at `s` times their
+    // size (1-4), RAM still at the console's. A change takes effect at the next vblank, where every target is written
+    // back and dropped (each comes back from RAM at the new scale), or at once while there are no targets yet.
+    void set_resolution_scale(u32 s) { requested_scale_.store(std::clamp(s, 1u, 4u), std::memory_order_relaxed); }
+    // The scanned-out picture at the internal resolution: the target holding the scanout as read back at the last
+    // vblank, cropped to the scanout (w x h pixels of bpp bytes at phys, rows pitch bytes apart in RAM), as `scale`
+    // x w by `scale` x h pixels in the frame buffer's format (rows tightly packed). False at 1x, or when RAM holds the
+    // picture (no target there, or another engine wrote it since): the caller widens the RAM picture instead.
+    bool scaled_scanout(u32 phys, u32 pitch, u32 bpp, u32 w, u32 h, std::vector<u8>& pixels, u32& scale) const;
 
     void clear(const KelvinState& state, u32 clear_bits) override;
     void draw(const KelvinState& state, const DrawBatch& batch) override;
@@ -137,6 +146,15 @@ private:
         u32 width{0}, height{0};
         u32 log_w{0}, log_h{0};
         u32 aa_x{1}, aa_y{1};  // the anti-aliasing scale from logical to stored pixels
+        // The internal resolution's scale from stored pixels (RAM's) to the images' (D34): width and height stay the
+        // stored size, the colour and depth images are iw() x ih().
+        u32 sc{1};
+        u32 iw() const { return width * sc; }
+        u32 ih() const { return height * sc; }
+        // At sc > 1: a stored-size copy of the colour image, between the image and RAM (blitted down for a write-back,
+        // up after a load).
+        vk::Image lo;
+        bool lo_linear{false};  // the device filters the format: the way down is a box filter, not one sample in sc x sc
         u32 pitch{0}, zeta_pitch{0};
         bool swizzled{false};
         u32 color_format{0}, zeta_format{0};
@@ -252,6 +270,7 @@ private:
     u64 vblank_index_{0};  // vblanks seen (write_back_at), for retiring targets nothing uses
     TextureEntry* zeta_color_texture(Surface& s, const TextureStage& ts, u32 phys, u32 w, u32 h, bool linear, bool x8);
     bool init_zeta_convert();
+    bool zc_buffers();
     // The depth-to-colour conversion: a compute pass over two device buffers (the copied depth words and stencil
     // bytes in, the Z24S8 words out), made on first use.
     static constexpr u32 kZetaConvertMaxTexels = 1024 * 1024;
@@ -315,6 +334,7 @@ private:
         u32 queries{0};
         u64 first_ticket{1};
         std::vector<u32> aa_scale;
+        std::vector<u32> res_scale;  // and its internal resolution's samples per stored pixel (sc squared)
         bool harvested{true};
     };
     static constexpr u32 kQueriesPerFrame = 4096;
@@ -375,6 +395,7 @@ private:
         Surface* surface{nullptr};
         bool zeta{false};
         VkDeviceSize offset{0};  // where its copy lands in the read-back buffer
+        bool display{false};     // the scaled picture of the scanout target, in display_rb_ (capture_display)
     };
     std::vector<PendingWriteBack> write_backs_;
     unsigned wb_why_{Stats::kWbAll};  // the cause the write-backs being queued count under
@@ -420,7 +441,37 @@ private:
     void submit(std::function<void()> job);
     void stop_workers();
     bool async_compile_{false};
-    u32 min_anisotropy_{1};
+    std::atomic<u32> min_anisotropy_{1};
+    // The internal resolution (D34): the scale new targets get, and the one asked for (applied by apply_scale).
+    u32 scale_{1};
+    std::atomic<u32> requested_scale_{1};
+    // At the vblank, or before the first target: every target written back and dropped, the new scale taken.
+    void apply_scale();
+    // The scale a new target of this colour format and stored size gets: the renderer's, or less where the device cannot
+    // blit the format or make an image that large.
+    u32 scale_for(VkFormat color, u32 width, u32 height) const;
+    // Colour between the scaled image and its stored-size copy (lo): down before a write-back, up after a load.
+    bool ensure_lo(Surface& s);
+    void blit_lo(Surface& s, bool down);
+    // The scanout target's scaled picture, read back at the vblank beside its write-back (display_rb_ holds it until
+    // finish_write_backs stores it in captures_, which scaled_scanout reads from another thread).
+    void capture_display(Surface& s);
+    void store_display(Surface& s);
+    // A scaled target's depth write-back: the middle row of every sc-row block, whole (depth words, then stencil bytes,
+    // rows padded to four bytes), then thinned to the stored size in the layout store_zeta takes.
+    std::size_t zeta_rows_bytes(const Surface& s) const;
+    void read_back_zeta_rows(Surface& s, VkDeviceSize offset);
+    std::vector<u8> thin_zeta_rows(const Surface& s, const u8* rows) const;
+    struct Capture {
+        u32 phys{0}, width{0}, height{0}, pitch{0}, bpp{0}, sc{1};
+        u64 serial{0};             // the target's draw serial when read
+        std::vector<u8> pixels;    // sc x width by sc x height, tightly packed
+    };
+    std::vector<Capture> captures_;  // the last few targets scanned out (a double or triple buffer), newest last
+    u32 shown_{0};  // the capture that holds the picture the last vblank scanned out (by its target's address; 0: RAM does)
+    mutable std::mutex display_mutex_;
+    vk::Buffer display_rb_;
+    u32 zc_capacity_{0};  // texels the depth-to-colour buffers hold
     std::unordered_map<std::string, std::shared_ptr<PendingShader>> vs_pending_, fs_pending_;
     std::unordered_map<std::string, std::shared_ptr<PipelineBuild>> pipelines_pending_;
     std::vector<std::thread> workers_;

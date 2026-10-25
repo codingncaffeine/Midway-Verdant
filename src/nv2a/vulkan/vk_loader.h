@@ -110,6 +110,7 @@ namespace mv::vk {
     X(vkCmdCopyImageToBuffer)       \
     X(vkCmdCopyBuffer)              \
     X(vkCmdCopyImage)               \
+    X(vkCmdBlitImage)               \
     X(vkCmdSetStencilReference)     \
     X(vkCmdSetBlendConstants)       \
     X(vkCmdSetDepthBias)

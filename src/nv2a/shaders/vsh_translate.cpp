@@ -243,7 +243,7 @@ void append_head(std::string& g) {
     g += std::format(
         "\nlayout(std140, set = 0, binding = 0) uniform VshUniforms {{\n"
         "    vec4 c[{}];\n"
-        "    vec4 surface_size;       // width, height of the render target in pixels\n"
+        "    vec4 surface_size;       // width, height of the render target in pixels; z: image pixels per pixel (the internal resolution)\n"
         "    vec4 clip_range;         // z min, z max (depth units)\n"
         "    vec4 ff_emission_alpha;  // fixed function: material emission rgb, material alpha\n"
         "    vec4 ff_scene_ambient;   // fixed function: scene ambient rgb\n"
@@ -330,7 +330,8 @@ void append_tail(std::string& g, const Options& options) {
     g +=
         "\n    // The program leaves oPos in screen space (x, y in pixels and z in depth units, all already divided by w,\n"
         "    // w kept for perspective-correct interpolation); the host rasteriser wants clip space, so undo that.\n"
-        "    oPos.xy = trunc(oPos.xy * 16.0) / 16.0;\n"
+        "    // Snapped to the hardware's 1/16 pixel, in the image's pixels (finer at an internal resolution above 1x).\n"
+        "    oPos.xy = trunc(oPos.xy * (16.0 * surface_size.z)) / (16.0 * surface_size.z);\n"
         "    oPos.w = vp_clamp_away(oPos.w);\n"
         "    vtx_pos = oPos;\n"
         "    vec2 ndc = (2.0 * oPos.xy - surface_size.xy) / surface_size.xy;\n"
@@ -339,7 +340,7 @@ void append_tail(std::string& g, const Options& options) {
         "    // hardware does; with |w| their mirrored positions drew large wedges over the picture.\n"
         "    float wa = oPos.w;\n"
         "    gl_Position = vec4(ndc * wa, zndc * wa, wa);\n"
-        "    gl_PointSize = max(oPts.x, 1.0);\n"
+        "    gl_PointSize = max(oPts.x, 1.0) * surface_size.z;\n"
         "    vtx_d0 = clamp(oD0, 0.0, 1.0);\n"
         "    vtx_d1 = clamp(oD1, 0.0, 1.0);\n"
         "    vtx_b0 = clamp(oB0, 0.0, 1.0);\n"

@@ -3,6 +3,8 @@
 // pictures of chosen frames and holds RetroPad buttons over chosen frame ranges.
 //   mv-retro-host CORE.so SYSTEM_DIR [GAME] --frames N [--png-every K DIR [--png-from N --png-to M]] [--press BUTTON@FROM-TO ...]
 //     [--reset@FRAME ...]: retro_reset before that frame, as a frontend's restart button does (Emutastic calls it on its loop).
+//     [--option@FRAME KEY=VALUE ...]: the option changes before that frame, as a frontend's live options menu does (the next
+//     GET_VARIABLE_UPDATE reports it).
 // Buttons: a b x y l r l2 r2 start select up down left right.
 #include <dlfcn.h>
 #if defined(__linux__)
@@ -45,6 +47,7 @@ struct Press {
 };
 std::vector<Press> presses;
 std::vector<std::pair<std::string, std::string>> options;  // --option key=value
+bool options_changed = false;  // since the core last asked (GET_VARIABLE_UPDATE)
 unsigned current_frame = 0;
 
 void core_log(retro_log_level, const char* fmt, ...) {
@@ -72,6 +75,10 @@ bool environment(unsigned cmd, void* data) {
         case RETRO_ENVIRONMENT_SET_SUPPORT_NO_GAME:
         case RETRO_ENVIRONMENT_SET_VARIABLES:
         case RETRO_ENVIRONMENT_SET_CONTROLLER_INFO:
+            return true;
+        case RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE:
+            *static_cast<bool*>(data) = options_changed;
+            options_changed = false;
             return true;
         case RETRO_ENVIRONMENT_GET_VARIABLE:
             for (const auto& [k, v] : options)
@@ -161,7 +168,7 @@ int main(int argc, char** argv) {
     if (const char* p = std::getenv("MV_ALLOW_PROFILER"); p && *p == '1') prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY, 0, 0, 0);
 #endif
     if (argc < 3) {
-        std::fprintf(stderr, "usage: mv-retro-host CORE.so SYSTEM_DIR [GAME] --frames N [--png-every K DIR [--png-from N --png-to M]] [--press BUTTON@FROM-TO ...] [--option KEY=VALUE ...] [--wav FILE] [--frontend-ms N] [--realtime] [--reset@FRAME ...]\n");
+        std::fprintf(stderr, "usage: mv-retro-host CORE.so SYSTEM_DIR [GAME] --frames N [--png-every K DIR [--png-from N --png-to M]] [--press BUTTON@FROM-TO ...] [--option KEY=VALUE ...] [--option@FRAME KEY=VALUE ...] [--wav FILE] [--frontend-ms N] [--realtime] [--reset@FRAME ...]\n");
         return 2;
     }
     const char* core_path = argv[1];
@@ -172,6 +179,7 @@ int main(int argc, char** argv) {
     bool realtime = false;  // --realtime: call retro_run no faster than the core's frame rate, as a frontend synced to the display does
     std::filesystem::path png_dir;
     std::vector<unsigned> resets;  // --reset@F
+    std::vector<std::pair<unsigned, std::string>> option_changes;  // --option@F KEY=VALUE
     for (int i = 3; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--frames" && i + 1 < argc) frames = static_cast<unsigned>(std::atoi(argv[++i]));
@@ -189,6 +197,8 @@ int main(int argc, char** argv) {
             }
             presses.push_back({button_id(spec.substr(0, at)), static_cast<unsigned>(std::atoi(spec.c_str() + at + 1)),
                                static_cast<unsigned>(std::atoi(spec.c_str() + dash + 1))});
+        } else if (a.rfind("--option@", 0) == 0 && i + 1 < argc) {
+            option_changes.emplace_back(static_cast<unsigned>(std::atoi(a.c_str() + 9)), argv[++i]);
         } else if (a.rfind("--reset@", 0) == 0) {
             resets.push_back(static_cast<unsigned>(std::atoi(a.c_str() + 8)));
         } else if (a == "--frontend-ms" && i + 1 < argc) {
@@ -245,6 +255,17 @@ int main(int argc, char** argv) {
         if (std::find(resets.begin(), resets.end(), current_frame) != resets.end()) {
             std::printf("frame %u: retro_reset\n", current_frame);
             reset();
+        }
+        for (const auto& [at, kv] : option_changes) {
+            if (at != current_frame) continue;
+            const auto eq = kv.find('=');
+            if (eq == std::string::npos) continue;
+            const std::string key = kv.substr(0, eq), value = kv.substr(eq + 1);
+            auto it = std::find_if(options.begin(), options.end(), [&](const auto& o) { return o.first == key; });
+            if (it != options.end()) it->second = value;
+            else options.emplace_back(key, value);
+            options_changed = true;
+            std::printf("frame %u: option %s = %s\n", current_frame, key.c_str(), value.c_str());
         }
         audio_this_call = 0;
         const auto c0 = std::chrono::steady_clock::now();

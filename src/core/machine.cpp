@@ -246,6 +246,7 @@ bool Machine::init(std::string& error) {
             if (const char* a = std::getenv("MV_ASYNC_SHADERS"); a && (*a == '0' || *a == '1')) async = *a == '1';
             renderer_->set_async_compile(async);
             renderer_->set_min_anisotropy(config_.anisotropy);
+            renderer_->set_resolution_scale(config_.cpu == "kvm" ? config_.resolution_scale : 1u);
         }
         if (const char* w = std::getenv("MV_DEBUG_NO_WRITE_TRACKING"); !(w && *w == '1')) nv2a_.set_write_tracking(cpu_.get());  // 1: a measurement control (stale textures)
         nv2a_.set_renderer(renderer_.get());

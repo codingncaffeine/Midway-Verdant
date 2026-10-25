@@ -55,6 +55,10 @@ std::vector<mv::i16> audio;  // interleaved stereo at 48 kHz, filled on the mach
 // The audio option: the console's output (the AC'97 playing what the GP and EP made) or the direct mix (every voice
 // straight to stereo, no DSP effects; mv::Apu::set_direct_mix). Read at load and whenever the frontend changes it.
 std::atomic<bool> direct_audio{false};
+// The internal resolution option (PLAN D34): the frame is res_scale times the scanout each way. The fast core only.
+unsigned res_scale = 1;
+bool fast_core = true;
+std::vector<mv::u8> scaled;  // the scanned-out target's picture at the internal resolution
 constexpr unsigned kPads = 4;
 unsigned pads_plugged = 1;
 // Frame pipelining: the CPU is let into the next frame before retro_run returns, up to the vblank it holds at.
@@ -110,6 +114,16 @@ const char* option(const char* key) {
 bool direct_mix_option() {
     const char* a = option("midway_verdant_audio");
     return a && std::strncmp(a, "direct", 6) == 0;
+}
+
+unsigned resolution_option() {
+    const char* r = option("midway_verdant_resolution");
+    return r && r[0] >= '1' && r[0] <= '4' ? static_cast<unsigned>(r[0] - '0') : 1u;
+}
+
+unsigned anisotropy_option() {
+    const char* an = option("midway_verdant_anisotropy");
+    return an && std::isdigit(static_cast<unsigned char>(an[0])) ? static_cast<unsigned>(std::atoi(an)) : 1u;
 }
 
 // Interleaved 16-bit stereo samples the console played, for the next retro_run to hand over.
@@ -189,16 +203,73 @@ void grab_frame() {
         std::fill(frame.begin(), frame.end(), 0u);
         return;
     }
-    frame_w = w;
-    frame_h = h;
-    frame.resize(static_cast<std::size_t>(w) * h);
     const mv::u8* fb = bus.ram() + start;
-    mv::scanout_to_xrgb(fb, pitch, bpp, gpu.scanout_rgb565(), w, h, reinterpret_cast<mv::u8*>(frame.data()));
-    if (const auto lut = gpu.gamma_lut()) mv::apply_gamma(*lut, reinterpret_cast<mv::u8*>(frame.data()), w * 4, w, h);
-    if (const auto ov = gpu.overlay())
-        mv::draw_overlay(*ov, bus.ram(), bus.ram_size(), reinterpret_cast<mv::u8*>(frame.data()), w * 4, w, h);
+    // At an internal resolution above 1x the picture is the scanned-out target as the GPU rendered it; one only RAM
+    // holds (the CPU or a blit wrote it, nothing drew it) is widened, each pixel to a block.
+    mv::u32 sc = 1;
+    const mv::pgraph::VulkanRenderer* renderer = machine->renderer();
+    const bool rendered = res_scale > 1 && renderer && renderer->scaled_scanout(start, pitch, bpp, w, h, scaled, sc);
+    if (!rendered) sc = res_scale;
+    const mv::u32 fw = w * sc, fh = h * sc;
+    frame_w = fw;
+    frame_h = fh;
+    frame.resize(static_cast<std::size_t>(fw) * fh);
+    mv::u8* out = reinterpret_cast<mv::u8*>(frame.data());
+    if (rendered) {
+        mv::scanout_to_xrgb(scaled.data(), fw * bpp, bpp, gpu.scanout_rgb565(), fw, fh, out);
+    } else if (sc > 1) {
+        composed.resize(static_cast<std::size_t>(w) * h * 4);
+        mv::scanout_to_xrgb(fb, pitch, bpp, gpu.scanout_rgb565(), w, h, composed.data());
+        const mv::u32* src = reinterpret_cast<const mv::u32*>(composed.data());
+        for (mv::u32 y = 0; y < fh; ++y) {
+            const mv::u32* row = src + static_cast<std::size_t>(y / sc) * w;
+            mv::u32* dst = frame.data() + static_cast<std::size_t>(y) * fw;
+            for (mv::u32 x = 0; x < fw; ++x) dst[x] = row[x / sc];
+        }
+    } else {
+        mv::scanout_to_xrgb(fb, pitch, bpp, gpu.scanout_rgb565(), w, h, out);
+    }
+    if (const auto lut = gpu.gamma_lut()) mv::apply_gamma(*lut, out, fw * 4, fw, fh);
+    if (auto ov = gpu.overlay()) {
+        // The overlay's rectangle and steps are in scanout pixels: sc times as many at the internal resolution.
+        ov->out_x *= sc;
+        ov->out_y *= sc;
+        ov->out_w *= sc;
+        ov->out_h *= sc;
+        ov->dsdx /= sc;
+        ov->dtdy /= sc;
+        mv::draw_overlay(*ov, bus.ram(), bus.ram_size(), out, fw * 4, fw, fh);
+    }
     // The scanout ignores the alpha byte; the frontend's XRGB8888 wants it clear of meaning too.
     for (auto& px : frame) px &= 0x00FFFFFFu;
+}
+
+// The frame's geometry follows the internal resolution: the base is the console's 640x480 times it, the largest the
+// HD modes' 1920x1080 times it.
+void set_geometry(retro_game_geometry& g) {
+    g.base_width = 640 * res_scale;
+    g.base_height = 480 * res_scale;
+    g.max_width = 1920 * res_scale;
+    g.max_height = 1080 * res_scale;
+    g.aspect_ratio = 4.0f / 3.0f;
+}
+
+// The visual options take effect while the game runs: the internal resolution at the next vblank (the targets come
+// back from RAM at the new size; the frontend is told the new geometry), anisotropic filtering with the next sampler.
+void apply_visual_options() {
+    mv::pgraph::VulkanRenderer* renderer = machine->renderer();
+    if (!renderer) return;
+    renderer->set_min_anisotropy(anisotropy_option());
+    const unsigned s = fast_core ? resolution_option() : 1u;
+    if (s == res_scale) return;
+    res_scale = s;
+    renderer->set_resolution_scale(s);
+    retro_system_av_info av{};
+    set_geometry(av.geometry);
+    av.timing.fps = kFps;
+    av.timing.sample_rate = kSampleRate;
+    env_cb(RETRO_ENVIRONMENT_SET_SYSTEM_AV_INFO, &av);
+    log(RETRO_LOG_INFO, "internal resolution: %ux", s);
 }
 
 }  // namespace
@@ -217,6 +288,7 @@ RETRO_API void retro_set_environment(retro_environment_t cb) {
         {"midway_verdant_pipeline", "Run the next frame while the frontend shows this one (faster, up to a frame more input lag); enabled|disabled"},
         {"midway_verdant_cpu", "CPU; fast (hardware virtualization)|accurate (cycle-counted, recompiled)"},
         {"midway_verdant_disc_speed", "Disc loading; fast (8x the console's drive)|console speed"},
+        {"midway_verdant_resolution", "Internal resolution (the fast CPU only); 1x (native)|2x|3x|4x"},
         {"midway_verdant_anisotropy", "Anisotropic filtering; off (as the game asks)|2x|4x|8x|16x"},
         {"midway_verdant_shaders", "Shader compiling; in the background (no stutter; a new effect can appear a frame late)|in the frame (stutters the first time a scene is seen)"},
         {"midway_verdant_audio", "Audio; console (DSP effects such as reverb)|direct mix (every voice straight to stereo, no DSP effects)"},
@@ -250,11 +322,7 @@ RETRO_API void retro_get_system_info(retro_system_info* info) {
 
 RETRO_API void retro_get_system_av_info(retro_system_av_info* info) {
     std::memset(info, 0, sizeof *info);
-    info->geometry.base_width = 640;
-    info->geometry.base_height = 480;
-    info->geometry.max_width = 1920;
-    info->geometry.max_height = 1080;
-    info->geometry.aspect_ratio = 4.0f / 3.0f;
+    set_geometry(info->geometry);
     info->timing.fps = kFps;
     info->timing.sample_rate = kSampleRate;
 }
@@ -322,7 +390,11 @@ RETRO_API bool retro_load_game(const retro_game_info* game) {
     cfg.disc_speed = 8;
     if (const char* d = option("midway_verdant_disc_speed"); d && std::strncmp(d, "console", 7) == 0) cfg.disc_speed = 1;
     { const char* sh = option("midway_verdant_shaders"); cfg.async_shaders = !(sh && std::strncmp(sh, "in the frame", 12) == 0); }
-    if (const char* an = option("midway_verdant_anisotropy"); an && std::isdigit(static_cast<unsigned char>(an[0]))) cfg.anisotropy = static_cast<mv::u32>(std::atoi(an));
+    cfg.anisotropy = anisotropy_option();
+    // The internal resolution needs the fast core (the accurate core's pictures and pixel counts stay the console's).
+    fast_core = cfg.cpu == "kvm";
+    res_scale = fast_core ? resolution_option() : 1u;
+    cfg.resolution_scale = res_scale;
     cfg.frame_step = true;
     // Instrument: MV_RTC_TIME=UNIX fixes the clock's start, so two accurate-core runs of a title can be compared.
     if (const char* t = std::getenv("MV_RTC_TIME"); t && *t) cfg.rtc_base_time = std::strtoll(t, nullptr, 10);
@@ -537,14 +609,17 @@ static void frame_log_line(double wait_ms) {
 RETRO_API void retro_run(void) {
     if (!machine) return;
     input_poll_cb();
-    // The audio option switches while the game runs: what was queued from the other path is dropped.
-    if (bool changed = false; env_cb(RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE, &changed) && changed && direct_mix_option() != direct_audio) {
-        std::lock_guard g(machine->lock());
-        direct_audio = !direct_audio;
-        machine->apu().set_direct_mix(direct_audio);
-        std::lock_guard a(audio_lock);
-        audio.clear();
-        log(RETRO_LOG_INFO, "audio: %s", direct_audio ? "direct mix" : "console");
+    if (bool changed = false; env_cb(RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE, &changed) && changed) {
+        // The audio option switches while the game runs: what was queued from the other path is dropped.
+        if (direct_mix_option() != direct_audio) {
+            std::lock_guard g(machine->lock());
+            direct_audio = !direct_audio;
+            machine->apu().set_direct_mix(direct_audio);
+            std::lock_guard a(audio_lock);
+            audio.clear();
+            log(RETRO_LOG_INFO, "audio: %s", direct_audio ? "direct mix" : "console");
+        }
+        apply_visual_options();
     }
     {
         // The guest sees the new state where the CPU holds for a frame (with pipelining, the end of the frame it runs).
