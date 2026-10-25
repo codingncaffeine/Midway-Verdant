@@ -65,6 +65,7 @@ Nv2aStub::Nv2aStub(Bus& bus, Scheduler& sched, std::function<void(bool)> irq)
         // The scanout reads the frame buffer now: a rendered one comes down from the device first.
         if (renderer_) {
             renderer_->set_display_lut(gamma_lut());  // applied to the scaled picture as it is read back
+            renderer_->set_display_overlay(overlay());  // drawn over it by the same pass
             renderer_->write_back_at(reg(kPcrtcStart));
         }
         // The GPU idle for two whole frames (a title paused, loading or starting): what it drew is in RAM on the hardware;

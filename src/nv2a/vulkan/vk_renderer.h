@@ -15,6 +15,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "nv2a/overlay.h"
 #include "nv2a/pgraph/kelvin.h"
 #include "nv2a/pgraph/texture.h"
 #include "nv2a/shaders/psh_translate.h"
@@ -54,6 +55,9 @@ public:
         display_lut_on_ = lut.has_value();
         if (lut) display_lut_ = *lut;
     }
+    // The video overlay (PVIDEO) the next vblank scans out over the picture (none: off), drawn in by the same pass on
+    // the GPU as grab_frame would on the CPU (a movie over a rendered picture at 6x was 20 ms a frame on four threads).
+    void set_display_overlay(const std::optional<Overlay>& ov) { display_ov_ = ov; }
     // The scanned-out picture at the internal resolution: the target holding the scanout as read back at the last
     // vblank, cropped to the scanout (w x h pixels of bpp bytes at phys, rows pitch bytes apart in RAM), as `scale`
     // x w by `scale` x h XRGB8888 pixels (alpha clear, rows tightly packed). False at 1x, or when RAM holds the
@@ -68,6 +72,7 @@ public:
         const u8* pixels{nullptr};
         u32 pitch{0}, sc{1};
         bool xrgb{false};  // finished XRGB8888 (the colour table applied, alpha clear), not the frame buffer's format
+        bool overlaid{false};  // the video overlay drawn in on the GPU (set_display_overlay)
         VkFence ready{VK_NULL_HANDLE};
     };
     bool scaled_picture(u32 phys, u32 pitch, u32 bpp, u32 w, u32 h, ScaledPicture& out) const;
@@ -579,6 +584,7 @@ private:
         u32 phys{0}, width{0}, height{0}, pitch{0}, bpp{0}, sc{1};
         bool valid{false};         // the buffer holds (once its fence signals) the picture these describe
         bool xrgb{false};          // converted on the GPU to XRGB8888 with the colour table applied (else the target's bytes)
+        bool overlaid{false};      // the video overlay drawn in by the same pass
         bool submitted{false};     // its fence was submitted since it was last reset
         bool retired{false};       // the scale changed while the frontend held it: it goes once let go
         u64 serial{0};             // the target's draw serial when read
@@ -606,6 +612,20 @@ private:
     vk::Buffer dc_lut_;
     bool dc_failed_{false};
     std::array<u8, 768> display_lut_{};
+    // The picture conversion's push constants (init_display_convert's shader): the image size, then the video overlay:
+    // on, the scanout's origin in the image, its rectangle relative to that (scaled pixels, end exclusive), the source
+    // start split into whole texels and the 20-bit fraction, the steps per scaled pixel, the source's size and pitch, its
+    // byte order, the colour key.
+    struct DisplayConvertPush {
+        u32 width, height, ov_on, ox, oy, x0, y0, x1, y1;
+        u32 s_hi, s_lo, t_hi, t_lo, dsdx, dtdy, in_w, in_h, pitch, yuy2, key_on, key;
+    };
+    // The overlay's part of the push constants and its source in dc_ov_; true when the pass finishes the picture with it
+    // (false: grab_frame draws it on the CPU, as when the steps would not fit the shader's 32-bit arithmetic).
+    bool overlay_push(const Surface& s, DisplayConvertPush& push);
+    std::optional<Overlay> display_ov_;
+    vk::Buffer dc_ov_;        // the overlay's source bytes, copied from RAM for the pass
+    u32 scan_phys_{0};        // the scanout's start (write_back_at): the overlay's rectangle is relative to it
     bool display_lut_on_{false};
     u32 zc_capacity_{0};  // texels the depth-to-colour buffers hold
     std::unordered_map<std::string, std::shared_ptr<PendingShader>> vs_pending_, fs_pending_;

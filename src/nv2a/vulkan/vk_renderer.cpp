@@ -258,6 +258,7 @@ VulkanRenderer::~VulkanRenderer() {
     if (dc_pool_) f.vkDestroyDescriptorPool(dev_.device(), dc_pool_, nullptr);
     if (dc_sampler_) f.vkDestroySampler(dev_.device(), dc_sampler_, nullptr);
     dev_.destroy_buffer(dc_lut_);
+    dev_.destroy_buffer(dc_ov_);
     dev_.destroy_buffer(zc_in_);
     dev_.destroy_buffer(zc_out_);
     if (set_layout_) f.vkDestroyDescriptorSetLayout(dev_.device(), set_layout_, nullptr);
@@ -3531,6 +3532,7 @@ bool VulkanRenderer::write_back_at(u32 phys) {
         std::lock_guard g(display_mutex_);
         shown_ = nullptr;  // until a target below holds the picture
     }
+    scan_phys_ = phys;
     wb_why_ = Stats::kWbScanout;
     for (auto& [k, s] : surfaces_) {
         if (phys < s->phys || phys >= static_cast<u64>(s->phys) + s->bytes()) continue;  // the region holding the scanout
@@ -3742,9 +3744,10 @@ void VulkanRenderer::capture_display(Surface& s) {
         Capture* newest = nullptr;
         for (auto& e : captures_)
             if (e->phys == s.phys && (!newest || e->taken > newest->taken)) newest = e.get();
-        // A colour table that changed since (a fade) needs the picture again even when the target did not.
+        // A colour table that changed since (a fade) needs the picture again even when the target did not, and so does
+        // a video overlay (its next frame).
         if (newest && newest->valid && newest->serial == s.draw_serial && newest->sc == s.sc && newest->width == s.width && newest->height == s.height &&
-            newest->pitch == s.pitch && !(convert && display_lut_on_)) {
+            newest->pitch == s.pitch && !(convert && display_lut_on_) && !(convert && display_ov_)) {
             shown_ = newest;
             return;
         }
@@ -3801,14 +3804,19 @@ void VulkanRenderer::capture_display(Surface& s) {
                               &before, 0, nullptr, 0, nullptr);
     VkMemoryBarrier after{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
     after.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+    bool overlaid = false;
     if (convert) {
         // The colour table as 768 words (the identity when the RAMDAC has none), then the pass over the image.
         auto* lut = static_cast<u32*>(dc_lut_.mapped);
         for (u32 i = 0; i < 768; ++i) lut[i] = display_lut_on_ ? display_lut_[i] : i / 3;
+        DisplayConvertPush push{};
+        push.width = s.iw();
+        push.height = s.ih();
+        overlaid = overlay_push(s, push);
         VkDescriptorImageInfo img{dc_sampler_, s.color.view, VK_IMAGE_LAYOUT_GENERAL};
-        VkDescriptorBufferInfo bufs[2] = {{c->buffer.buffer, 0, VK_WHOLE_SIZE}, {dc_lut_.buffer, 0, VK_WHOLE_SIZE}};
-        VkWriteDescriptorSet writes[3]{};
-        for (u32 i = 0; i < 3; ++i) {
+        VkDescriptorBufferInfo bufs[3] = {{c->buffer.buffer, 0, VK_WHOLE_SIZE}, {dc_lut_.buffer, 0, VK_WHOLE_SIZE}, {dc_ov_.buffer, 0, VK_WHOLE_SIZE}};
+        VkWriteDescriptorSet writes[4]{};
+        for (u32 i = 0; i < 4; ++i) {
             writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
             writes[i].dstSet = dc_set_;
             writes[i].dstBinding = i;
@@ -3817,11 +3825,10 @@ void VulkanRenderer::capture_display(Surface& s) {
             if (i == 0) writes[i].pImageInfo = &img;
             else writes[i].pBufferInfo = &bufs[i - 1];
         }
-        fn_->vkUpdateDescriptorSets(dev_.device(), 3, writes, 0, nullptr);
+        fn_->vkUpdateDescriptorSets(dev_.device(), 4, writes, 0, nullptr);
         fn_->vkCmdBindPipeline(cb_, VK_PIPELINE_BIND_POINT_COMPUTE, dc_pipeline_);
         fn_->vkCmdBindDescriptorSets(cb_, VK_PIPELINE_BIND_POINT_COMPUTE, dc_layout_, 0, 1, &dc_set_, 0, nullptr);
-        const u32 push[2] = {s.iw(), s.ih()};
-        fn_->vkCmdPushConstants(cb_, dc_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof push, push);
+        fn_->vkCmdPushConstants(cb_, dc_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof push, &push);
         fn_->vkCmdDispatch(cb_, (s.iw() + 15) / 16, (s.ih() + 15) / 16, 1);
         after.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
         fn_->vkCmdPipelineBarrier(cb_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &after, 0, nullptr, 0, nullptr);
@@ -3845,9 +3852,60 @@ void VulkanRenderer::capture_display(Surface& s) {
     c->bpp = s.color_bytes();
     c->sc = s.sc;
     c->serial = s.draw_serial;
+    c->overlaid = overlaid;
     c->taken = ++capture_clock_;
     c->valid = true;
     shown_ = c;
+}
+
+bool VulkanRenderer::overlay_push(const Surface& s, DisplayConvertPush& push) {
+    if (!display_ov_) return false;
+    const Overlay& ov = *display_ov_;
+    const u32 sc = s.sc, bpp = s.color_bytes();
+    // The scanout's first pixel in the target (it may start inside it): the overlay's rectangle is relative to it.
+    if (scan_phys_ < s.phys || s.pitch == 0) return false;
+    const u32 off = scan_phys_ - s.phys;
+    if ((off % s.pitch) % bpp) return false;
+    push.ox = (off % s.pitch) / bpp * sc;
+    push.oy = off / s.pitch * sc;
+    // Nothing to draw, as draw_overlay decides it: the picture is finished as it is.
+    const u64 bytes = static_cast<u64>(ov.pitch) * ov.in_h;
+    if (ov.in_w == 0 || ov.in_h == 0 || ov.out_w == 0 || ov.out_h == 0 || ov.pitch == 0 || ov.address + bytes > ram_size_) return true;
+    // The rectangle and the steps as grab_frame scales them for the CPU (whole steps per scaled pixel), and the products
+    // the shader forms kept within 32 bits.
+    const u64 x0 = static_cast<u64>(ov.out_x) * sc, y0 = static_cast<u64>(ov.out_y) * sc;
+    const u64 w = static_cast<u64>(ov.out_w) * sc, h = static_cast<u64>(ov.out_h) * sc;
+    const u32 dsdx = ov.dsdx / sc, dtdy = ov.dtdy / sc;
+    if (x0 + w > (1ull << 30) || y0 + h > (1ull << 30) || w * dsdx >= (1ull << 32) || h * dtdy >= (1ull << 32)) return false;
+    const VkDeviceSize need = (bytes + 3) / 4 * 4;
+    if (dc_ov_.size < need) {
+        dev_.destroy_buffer(dc_ov_);  // the last capture to use it has landed (capture_display waited for it)
+        std::string error;
+        if (!dev_.create_buffer(need, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, vk::BufferMemory::HostWrite, dc_ov_, error)) {
+            note("picture overlay source: " + error);
+            dev_.create_buffer(4096, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, vk::BufferMemory::HostWrite, dc_ov_, error);
+            return false;
+        }
+    }
+    std::memcpy(dc_ov_.mapped, ram_ + ov.address, static_cast<std::size_t>(bytes));
+    push.ov_on = 1;
+    push.x0 = static_cast<u32>(x0);
+    push.y0 = static_cast<u32>(y0);
+    push.x1 = static_cast<u32>(x0 + w);
+    push.y1 = static_cast<u32>(y0 + h);
+    push.s_hi = ov.s0 >> 4;
+    push.s_lo = (ov.s0 & 0xFu) << 16;
+    push.t_hi = ov.t0 >> 4;
+    push.t_lo = (ov.t0 & 0xFu) << 16;
+    push.dsdx = dsdx;
+    push.dtdy = dtdy;
+    push.in_w = ov.in_w;
+    push.in_h = ov.in_h;
+    push.pitch = ov.pitch;
+    push.yuy2 = ov.yuy2 ? 1u : 0u;
+    push.key_on = ov.color_key ? 1u : 0u;
+    push.key = ov.key & 0xFFFFFFu;
+    return true;
 }
 
 void VulkanRenderer::destroy_capture(Capture& c) {
@@ -3868,19 +3926,46 @@ bool VulkanRenderer::init_display_convert() {
         note("picture conversion table: " + error);
         return false;
     }
-    // Pixel (x, y) of the image as the scanout shows it: 8-bit channels through the colour table, the unused byte clear.
+    if (!dev_.create_buffer(4096, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, vk::BufferMemory::HostWrite, dc_ov_, error)) {  // grows with the overlay
+        note("picture overlay source: " + error);
+        return false;
+    }
+    // Pixel (x, y) of the image as the scanout shows it: 8-bit channels through the colour table, the unused byte clear;
+    // then the video overlay over it where it covers (and the colour key, when on, matches the finished pixel), each
+    // pixel worked out as draw_overlay does it on the CPU: the source texel in 12.20 fixed point from the 12.4 start
+    // (the 32-bit sum split so nothing carries out), BT.601 with 8.8 coefficients (yuv601_to_xrgb).
     const CompiledShader cs = compile_glsl(ShaderStage::Compute,
                                            "#version 450\n"
                                            "layout(local_size_x = 16, local_size_y = 16) in;\n"
                                            "layout(binding = 0) uniform sampler2D src;\n"
                                            "layout(std430, binding = 1) writeonly buffer Out { uint px[]; } dst;\n"
                                            "layout(std430, binding = 2) readonly buffer Lut { uint v[768]; } lut;\n"
-                                           "layout(push_constant) uniform P { uint width; uint height; } pc;\n"
+                                           "layout(std430, binding = 3) readonly buffer Ov { uint v[]; } ov;\n"
+                                           "layout(push_constant) uniform P {\n"
+                                           "    uint width, height, ov_on, ox, oy, x0, y0, x1, y1;\n"
+                                           "    uint s_hi, s_lo, t_hi, t_lo, dsdx, dtdy, in_w, in_h, pitch, yuy2, key_on, key;\n"
+                                           "} pc;\n"
+                                           "uint ov_byte(uint o) { return (ov.v[o >> 2] >> ((o & 3u) * 8u)) & 0xFFu; }\n"
+                                           "uint step_at(uint hi, uint lo, uint b) { return hi + (b >> 20) + ((lo + (b & 0xFFFFFu)) >> 20); }\n"
                                            "void main() {\n"
                                            "    uvec2 p = gl_GlobalInvocationID.xy;\n"
                                            "    if (p.x >= pc.width || p.y >= pc.height) return;\n"
                                            "    uvec3 c = uvec3(round(clamp(texelFetch(src, ivec2(p), 0).rgb, 0.0, 1.0) * 255.0));\n"
-                                           "    dst.px[p.y * pc.width + p.x] = (lut.v[c.r * 3u] << 16) | (lut.v[c.g * 3u + 1u] << 8) | lut.v[c.b * 3u + 2u];\n"
+                                           "    uint px = (lut.v[c.r * 3u] << 16) | (lut.v[c.g * 3u + 1u] << 8) | lut.v[c.b * 3u + 2u];\n"
+                                           "    if (pc.ov_on != 0u && p.x >= pc.ox + pc.x0 && p.y >= pc.oy + pc.y0 && p.x < pc.ox + pc.x1 && p.y < pc.oy + pc.y1 &&\n"
+                                           "        (pc.key_on == 0u || px == pc.key)) {\n"
+                                           "        uint sx = min(step_at(pc.s_hi, pc.s_lo, (p.x - pc.ox - pc.x0) * pc.dsdx), pc.in_w - 1u);\n"
+                                           "        uint sy = min(step_at(pc.t_hi, pc.t_lo, (p.y - pc.oy - pc.y0) * pc.dtdy), pc.in_h - 1u);\n"
+                                           "        uint o = sy * pc.pitch + (sx & ~1u) * 2u;\n"
+                                           "        int b0 = int(ov_byte(o)), b1 = int(ov_byte(o + 1u)), b2 = int(ov_byte(o + 2u)), b3 = int(ov_byte(o + 3u));\n"
+                                           "        int y0 = pc.yuy2 != 0u ? b0 : b1, u = pc.yuy2 != 0u ? b1 : b0, y1 = pc.yuy2 != 0u ? b2 : b3, v = pc.yuy2 != 0u ? b3 : b2;\n"
+                                           "        int cc = (((sx & 1u) != 0u ? y1 : y0) - 16) * 298, d = u - 128, e = v - 128;\n"
+                                           "        int r = clamp((cc + 409 * e + 128) >> 8, 0, 255);\n"
+                                           "        int g = clamp((cc - 100 * d - 208 * e + 128) >> 8, 0, 255);\n"
+                                           "        int b = clamp((cc + 516 * d + 128) >> 8, 0, 255);\n"
+                                           "        px = (uint(r) << 16) | (uint(g) << 8) | uint(b);\n"
+                                           "    }\n"
+                                           "    dst.px[p.y * pc.width + p.x] = px;\n"
                                            "}\n",
                                            "picture-to-xrgb");
     if (!cs.ok()) {
@@ -3888,17 +3973,17 @@ bool VulkanRenderer::init_display_convert() {
         return false;
     }
     VkShaderModule mod = module(cs.spirv);
-    VkDescriptorSetLayoutBinding bindings[3]{};
-    for (u32 i = 0; i < 3; ++i) {
+    VkDescriptorSetLayoutBinding bindings[4]{};
+    for (u32 i = 0; i < 4; ++i) {
         bindings[i].binding = i;
         bindings[i].descriptorCount = 1;
         bindings[i].descriptorType = i == 0 ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         bindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
     }
     VkDescriptorSetLayoutCreateInfo dli{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    dli.bindingCount = 3;
+    dli.bindingCount = 4;
     dli.pBindings = bindings;
-    VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, 8};
+    VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(DisplayConvertPush)};
     VkPipelineLayoutCreateInfo pli{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
     pli.setLayoutCount = 1;
     pli.pSetLayouts = &dc_set_layout_;
@@ -3919,7 +4004,7 @@ bool VulkanRenderer::init_display_convert() {
     cpi.stage.module = mod;
     cpi.stage.pName = "main";
     cpi.layout = dc_layout_;
-    VkDescriptorPoolSize sizes[2] = {{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2}};
+    VkDescriptorPoolSize sizes[2] = {{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3}};
     VkDescriptorPoolCreateInfo dpi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     dpi.maxSets = 1;
     dpi.poolSizeCount = 2;
@@ -3957,6 +4042,7 @@ bool VulkanRenderer::scaled_picture(u32 phys, u32 pitch, u32 bpp, u32 w, u32 h, 
     const u32 px = c->xrgb ? 4u : bpp;  // bytes a pixel in the buffer
     out.sc = c->sc;
     out.xrgb = c->xrgb;
+    out.overlaid = c->overlaid;
     out.pitch = c->width * c->sc * px;
     out.pixels = static_cast<const u8*>(c->buffer.mapped) + static_cast<std::size_t>(y0) * c->sc * out.pitch + static_cast<std::size_t>(x0) * c->sc * px;
     out.ready = c->submitted ? c->fence : VK_NULL_HANDLE;

@@ -10,6 +10,7 @@
 #include <thread>
 #include <vector>
 
+#include "nv2a/overlay.h"
 #include "nv2a/pgraph/kelvin.h"
 #include "nv2a/pgraph/texture.h"
 #include "nv2a/vulkan/vk_device.h"
@@ -1410,5 +1411,106 @@ TEST(Vulkan, ASmallerTargetDrawsIntoTheDepthImageOfABiggerOneOfTheSamePitch) {
         EXPECT_GE(st.depth_borrows, 1u);
         EXPECT_EQ(st.depth_uploads, 0u) << "nothing loaded from RAM";
         EXPECT_EQ(st.writebacks_by[VulkanRenderer::Stats::kWbRange], 0u) << "no depth sent to RAM at the switches";
+    }
+}
+
+// Above 1x the video overlay is drawn in by the pass that finishes the picture on the GPU (a movie over a rendered
+// picture cost 20 ms a frame at 6x on the CPU): the result is what grab_frame draws on the CPU over the same picture,
+// pixel for pixel, for both byte orders, with and without the colour key and the colour table.
+TEST(Vulkan, TheVideoOverlayDrawnOnTheGpuIsTheOneTheCpuDraws) {
+    for (u32 scale : {2u, 3u}) {
+        for (u32 variant = 0; variant < 4; ++variant) {
+            const bool yuy2 = variant & 1u, keyed = variant & 2u;
+            SCOPED_TRACE(std::format("scale {} yuy2 {} key {}", scale, yuy2, keyed));
+            ScaledFixture f;
+            std::string error;
+            if (!f.init(scale, error)) GTEST_SKIP() << "no Vulkan device: " << error;
+            Kelvin& k = f.k;
+            setup_target(k);
+            k.method(mthd::kColorClear, 0xFF102030u);
+            k.method(mthd::kClearRectH, 63u << 16);
+            k.method(mthd::kClearRectV, 63u << 16);
+            k.method(mthd::kClearSurface, 0xF0);
+            k.method(mthd::kColorClear, 0xFF00FF00u);  // the key colour over part of the overlay's rectangle
+            k.method(mthd::kClearRectH, (30u << 16) | 10u);
+            k.method(mthd::kClearRectV, (40u << 16) | 12u);
+            k.method(mthd::kClearSurface, 0xF0);
+            // A 16x12 YUV 4:2:2 source of varied bytes at 0x80000.
+            u32 seed = 12345;
+            for (u32 i = 0; i < 32 * 12; ++i) {
+                seed = seed * 1103515245u + 12345u;
+                f.ram[0x80000 + i] = static_cast<u8>(seed >> 16);
+            }
+            Overlay ov;
+            ov.address = 0x80000;
+            ov.pitch = 32;
+            ov.in_w = 16;
+            ov.in_h = 12;
+            ov.s0 = 0x13;  // 1.1875 texels in
+            ov.t0 = 0x08;
+            ov.dsdx = (15u << 20) / 40 + 77;
+            ov.dtdy = (11u << 20) / 30 + 5;
+            ov.out_x = 5;
+            ov.out_y = 7;
+            ov.out_w = 40;
+            ov.out_h = 30;
+            ov.yuy2 = yuy2;
+            ov.color_key = keyed;
+            ov.key = 0x0000FF00u;
+            std::array<u8, 768> lut{};
+            for (u32 i = 0; i < 768; ++i) lut[i] = static_cast<u8>(i / 3 ^ (variant * 17));
+            // The key is compared with the finished pixel: the key colour through the table.
+            ov.key = variant ? (static_cast<u32>(lut[0]) << 16) | (static_cast<u32>(lut[255 * 3 + 1]) << 8) | lut[2] : 0x0000FF00u;
+            // The picture without the overlay, then the CPU's overlay over it as grab_frame draws it.
+            f.renderer->set_display_lut(variant ? std::optional(lut) : std::nullopt);
+            f.renderer->set_display_overlay(std::nullopt);
+            f.renderer->flush_frame();
+            ASSERT_TRUE(f.renderer->write_back_at(0x10000));
+            const u32 fw = 64 * scale, fh = 64 * scale;
+            std::vector<u32> want(static_cast<std::size_t>(fw) * fh);
+            {
+                VulkanRenderer::ScaledPicture p;
+                ASSERT_TRUE(f.renderer->scaled_picture(0x10000, 256, 4, 64, 64, p));
+                ASSERT_TRUE(p.xrgb);
+                f.renderer->picture_ready(p);
+                for (u32 y = 0; y < fh; ++y) std::memcpy(&want[static_cast<std::size_t>(y) * fw], p.pixels + static_cast<std::size_t>(y) * p.pitch, fw * 4);
+                f.renderer->picture_done();
+            }
+            Overlay o = ov;
+            o.out_x *= scale;
+            o.out_y *= scale;
+            o.out_w *= scale;
+            o.out_h *= scale;
+            o.dsdx /= scale;
+            o.dtdy /= scale;
+            draw_overlay(o, f.ram.data(), f.ram.size(), reinterpret_cast<u8*>(want.data()), fw * 4, fw, fh);
+            // The same vblank with the overlay on: drawn in by the GPU.
+            f.renderer->set_display_overlay(ov);
+            ASSERT_TRUE(f.renderer->write_back_at(0x10000));
+            for (const auto& e : f.renderer->stats().errors) ADD_FAILURE() << "renderer: " << e;
+            VulkanRenderer::ScaledPicture p;
+            ASSERT_TRUE(f.renderer->scaled_picture(0x10000, 256, 4, 64, 64, p));
+            EXPECT_TRUE(p.overlaid);
+            f.renderer->picture_ready(p);
+            u32 differ = 0, first_x = 0, first_y = 0, got_px = 0, want_px = 0;
+            for (u32 y = 0; y < fh; ++y)
+                for (u32 x = 0; x < fw; ++x) {
+                    u32 v;
+                    std::memcpy(&v, p.pixels + static_cast<std::size_t>(y) * p.pitch + x * 4, 4);
+                    if (v != want[static_cast<std::size_t>(y) * fw + x] && differ++ == 0) {
+                        first_x = x;
+                        first_y = y;
+                        got_px = v;
+                        want_px = want[static_cast<std::size_t>(y) * fw + x];
+                    }
+                }
+            f.renderer->picture_done();
+            EXPECT_EQ(differ, 0u) << std::format("first at {},{}: {:08x}, the CPU's {:08x}", first_x, first_y, got_px, want_px);
+            // The overlay drew (inside the key's area when keyed), and a keyed one left the rest of its rectangle alone.
+            const auto at = [&](u32 x, u32 y) { return want[static_cast<std::size_t>(y * scale) * fw + x * scale]; };
+            EXPECT_NE(at(15, 20), at(60, 60)) << "drawn";
+            if (keyed) EXPECT_EQ(at(6, 8), at(60, 60)) << "not the key colour: kept";
+            else EXPECT_NE(at(6, 8), at(60, 60)) << "drawn";
+        }
     }
 }

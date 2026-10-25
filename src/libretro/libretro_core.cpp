@@ -237,8 +237,8 @@ void grab_frame() {
     if (debug_grab)
         std::fprintf(stderr, "grab: frame %llu start %08x %ux%u bpp %u rendered %d xrgb %d overlay %d\n", static_cast<unsigned long long>(frames_run), start, w, h, bpp, rendered ? 1 : 0,
                      rendered && pic.xrgb ? 1 : 0, gpu.overlay() ? 1 : 0);
-    if (rendered && pic.xrgb && !gpu.overlay()) {
-        // The GPU's finished picture goes to the frontend as it lies: no pass over it here at all.
+    if (rendered && pic.xrgb && (!gpu.overlay() || pic.overlaid)) {
+        // The GPU's finished picture (the video overlay drawn in too) goes to the frontend as it lies: no pass over it here.
         frame_w = w * sc;
         frame_h = h * sc;
         frame_ptr = pic.pixels;
