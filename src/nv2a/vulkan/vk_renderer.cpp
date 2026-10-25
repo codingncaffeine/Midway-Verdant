@@ -2112,7 +2112,14 @@ void VulkanRenderer::destroy_surface_views(Surface& s) {
 // The border a clamp-to-border stage shows is its BORDER_COLOR (0x1B24, A8R8G8B8), as the hardware captures show; a
 // device without custom border colours takes the nearest built-in one (transparent black, opaque black or opaque white).
 VkSampler VulkanRenderer::sampler(const TextureStage& ts, u32 levels) {
-    const u64 key = (static_cast<u64>(ts.filter) << 32) | ts.address | (static_cast<u64>(levels) << 28);
+    // Anisotropy for a linearly filtered minification: the stage's own (TEXCTL0 bits 5:4), raised to the option's minimum,
+    // within the device's limit; its log2 rides in key bits 27:25 (unused by ADDRESS).
+    const u32 min_f = ts.min_filter();
+    const bool linear_min = !(min_f == 1 || min_f == 3 || min_f == 5);
+    u32 aniso = linear_min && dev_.anisotropy() ? std::max(1u << ts.log_max_anisotropy(), min_anisotropy_) : 1u;
+    aniso = std::min(aniso, std::max(1u, static_cast<u32>(dev_.limits().maxSamplerAnisotropy)));
+    const u32 aniso_log = static_cast<u32>(std::bit_width(aniso) - 1);
+    const u64 key = (static_cast<u64>(ts.filter) << 32) | ts.address | (static_cast<u64>(levels) << 28) | (static_cast<u64>(aniso_log & 7u) << 25);
     // Colour textures only: a depth or 16-bit luminance texture (one channel, read through the depth path) keeps the opaque
     // black border it always had; the register colour on it flooded a title's intro movie white (not yet checked against
     // a hardware capture of a depth texture's border).
@@ -2152,12 +2159,16 @@ VkSampler VulkanRenderer::sampler(const TextureStage& ts, u32 levels) {
     sci.addressModeV = wrap_mode(ts.wrap_v());
     sci.addressModeW = wrap_mode(ts.wrap_p());
     sci.maxLod = (min >= 3 && min <= 6) ? static_cast<float>(levels) : 0.25f;
+    if (aniso > 1) {
+        sci.anisotropyEnable = VK_TRUE;
+        sci.maxAnisotropy = static_cast<float>(aniso);
+    }
     VkSampler sm = VK_NULL_HANDLE;
     fn_->vkCreateSampler(dev_.device(), &sci, nullptr, &sm);
-    // Instrument: MV_DEBUG_BORDER=1 names every border sampler as it is made.
-    static const bool log_border = [] { const char* e = std::getenv("MV_DEBUG_BORDER"); return e && *e == '1'; }();
-    if (border && log_border)
-        std::fprintf(stderr, "border sampler: colour %08x address %08x format %08x filter %08x\n", ts.border_color, ts.address, ts.format, ts.filter);
+    // Instrument: MV_DEBUG_SAMPLERS=1 names every sampler that reads a border colour or filters anisotropically as it is made.
+    static const bool log_samplers = [] { const char* e = std::getenv("MV_DEBUG_SAMPLERS"); return e && *e == '1'; }();
+    if ((border || aniso > 1) && log_samplers)
+        std::fprintf(stderr, "sampler: border %s colour %08x anisotropy %u address %08x format %08x filter %08x\n", border ? "yes" : "no", ts.border_color, aniso, ts.address, ts.format, ts.filter);
     if (border) border_samplers_[{key, ts.border_color}] = sm;
     else samplers_[key] = sm;
     return sm;

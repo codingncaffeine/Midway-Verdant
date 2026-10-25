@@ -99,6 +99,8 @@ struct MachineConfig {
     // Shaders and pipelines compiled on worker threads, a draw that needs one not ready yet skipped (the fast core only:
     // the accurate core's pictures must not depend on host timing). MV_ASYNC_SHADERS=0/1 overrides it.
     bool async_shaders{false};
+    // The least anisotropic filtering a linearly filtered texture gets (1 = what each texture asks for).
+    u32 anisotropy{1};
     // Pacing of a CPU that runs free (the fast mode with its guest clock): frame steps stop the CPU at every vblank
     // until the front end asks for the next frame (the libretro core); otherwise guest time keeps to the host clock
     // times `speed` (1 = real time), or runs as fast as it can with speed 0.

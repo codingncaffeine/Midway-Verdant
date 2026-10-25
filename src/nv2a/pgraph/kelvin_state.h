@@ -107,6 +107,7 @@ struct TextureStage {
     u32 mag_filter() const { return (filter >> 24) & 0xFu; }
     u32 min_lod() const { return (control0 >> 18) & 0xFFFu; }  // 4.8 fixed point
     u32 max_lod() const { return (control0 >> 6) & 0xFFFu; }
+    u32 log_max_anisotropy() const { return (control0 >> 4) & 3u; }  // the stage's own anisotropy: 1, 2, 4 or 8
 };
 
 struct SurfaceState {

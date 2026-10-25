@@ -5,6 +5,7 @@
 // image, the EEPROM and the hard-disk image) come from <system>/midway-verdant/.
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cstdarg>
 #include <cstdio>
@@ -216,6 +217,7 @@ RETRO_API void retro_set_environment(retro_environment_t cb) {
         {"midway_verdant_pipeline", "Run the next frame while the frontend shows this one (faster, up to a frame more input lag); enabled|disabled"},
         {"midway_verdant_cpu", "CPU; fast (hardware virtualization)|accurate (cycle-counted, recompiled)"},
         {"midway_verdant_disc_speed", "Disc loading; fast (8x the console's drive)|console speed"},
+        {"midway_verdant_anisotropy", "Anisotropic filtering; off (as the game asks)|2x|4x|8x|16x"},
         {"midway_verdant_shaders", "Shader compiling; in the background (no stutter; a new effect can appear a frame late)|in the frame (stutters the first time a scene is seen)"},
         {"midway_verdant_audio", "Audio; console (DSP effects such as reverb)|direct mix (every voice straight to stereo, no DSP effects)"},
         {nullptr, nullptr},
@@ -320,6 +322,7 @@ RETRO_API bool retro_load_game(const retro_game_info* game) {
     cfg.disc_speed = 8;
     if (const char* d = option("midway_verdant_disc_speed"); d && std::strncmp(d, "console", 7) == 0) cfg.disc_speed = 1;
     { const char* sh = option("midway_verdant_shaders"); cfg.async_shaders = !(sh && std::strncmp(sh, "in the frame", 12) == 0); }
+    if (const char* an = option("midway_verdant_anisotropy"); an && std::isdigit(static_cast<unsigned char>(an[0]))) cfg.anisotropy = static_cast<mv::u32>(std::atoi(an));
     cfg.frame_step = true;
     // Instrument: MV_RTC_TIME=UNIX fixes the clock's start, so two accurate-core runs of a title can be compared.
     if (const char* t = std::getenv("MV_RTC_TIME"); t && *t) cfg.rtc_base_time = std::strtoll(t, nullptr, 10);

@@ -95,6 +95,7 @@ bool Device::init(std::string& error, bool software) {
     fn_.vkGetPhysicalDeviceFeatures(physical_, &available);
     features.fillModeNonSolid = available.fillModeNonSolid;
     features.samplerAnisotropy = available.samplerAnisotropy;
+    anisotropy_ = available.samplerAnisotropy;
     features.independentBlend = available.independentBlend;
     features.largePoints = available.largePoints;
     features.occlusionQueryPrecise = available.occlusionQueryPrecise;

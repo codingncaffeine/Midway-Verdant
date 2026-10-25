@@ -1,4 +1,5 @@
 #pragma once
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <condition_variable>
@@ -39,6 +40,9 @@ public:
     // stalling the frame for tens of milliseconds as each new scene appears. Never for the accurate core: what a
     // frame shows would depend on host timing.
     void set_async_compile(bool on);
+    // Anisotropic filtering of linearly filtered textures: at least `n` (1 = only what each stage asks for), up to the
+    // device's limit (the libretro core's "Anisotropic filtering" option).
+    void set_min_anisotropy(u32 n) { min_anisotropy_ = std::max(n, 1u); }
 
     void clear(const KelvinState& state, u32 clear_bits) override;
     void draw(const KelvinState& state, const DrawBatch& batch) override;
@@ -416,6 +420,7 @@ private:
     void submit(std::function<void()> job);
     void stop_workers();
     bool async_compile_{false};
+    u32 min_anisotropy_{1};
     std::unordered_map<std::string, std::shared_ptr<PendingShader>> vs_pending_, fs_pending_;
     std::unordered_map<std::string, std::shared_ptr<PipelineBuild>> pipelines_pending_;
     std::vector<std::thread> workers_;

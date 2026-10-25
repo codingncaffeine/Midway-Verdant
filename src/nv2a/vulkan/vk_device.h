@@ -48,6 +48,7 @@ public:
     // sampler takes the nearest of Vulkan's three built-in borders; `_unformatted` = no image format needed.
     bool custom_border() const { return custom_border_; }
     bool custom_border_unformatted() const { return custom_border_unformatted_; }
+    bool anisotropy() const { return anisotropy_; }  // samplerAnisotropy enabled
 
     const Functions& fn() const { return fn_; }
     VkDevice device() const { return device_; }
@@ -79,6 +80,7 @@ private:
     VkDevice device_{VK_NULL_HANDLE};
     bool occlusion_precise_{false};
     bool custom_border_{false}, custom_border_unformatted_{false};
+    bool anisotropy_{false};
     VkQueue queue_{VK_NULL_HANDLE};
     u32 queue_family_{0};
     VkCommandPool pool_{VK_NULL_HANDLE};
