@@ -2115,9 +2115,20 @@ const VulkanRenderer::TextureEntry* VulkanRenderer::texture(const KelvinState& s
         const u64 a0 = surf->phys, a1 = static_cast<u64>(surf->phys) + surf->bytes();
         if (debug_tex_log_ && ((surf->dirty && a0 < static_cast<u64>(phys) + length && static_cast<u64>(phys) < a1) || (surf->zeta_dirty && surf->zeta_phys < static_cast<u64>(phys) + length && static_cast<u64>(phys) < static_cast<u64>(surf->zeta_phys) + surf->zeta_bytes())))
             std::fprintf(stderr, "texlog: forced write-back %08x/%08x for a texture at %08x fmt %02x %ux%u: open %d ram_newer %d\n", surf->phys, surf->zeta_phys, phys, ts.color_format(), surf->width, surf->height, (pass_open_ && pass_target_ == surf.get()) ? 1 : 0, surf->ram_newer ? 1 : 0);
-        if (surf->dirty && a0 < static_cast<u64>(phys) + length && static_cast<u64>(phys) < a1) queue_write_back(*surf);
+        const auto forced = [&](const char* what) {
+            ++stats_.forced_by[std::format("{} of {:08x} {}x{} {} fmt {:x} <- texture {:08x} fmt {:02x} {}x{} {}", what, surf->phys, surf->width, surf->height, surf->swizzled ? "swizzled" : "linear",
+                                           surf->color_format, phys, ts.color_format(), format_info(ts.color_format()).linear ? ts.rect_width() : 1u << ts.log_width(),
+                                           format_info(ts.color_format()).linear ? ts.rect_height() : 1u << ts.log_height(), ts.cubemap() ? "cube" : ts.mip_levels() > 1 ? "mips" : "")];
+        };
+        if (surf->dirty && a0 < static_cast<u64>(phys) + length && static_cast<u64>(phys) < a1) {
+            forced("colour");
+            queue_write_back(*surf);
+        }
         const u64 z0 = surf->zeta_phys, z1 = static_cast<u64>(surf->zeta_phys) + surf->zeta_bytes();
-        if (surf->zeta_dirty && z0 < static_cast<u64>(phys) + length && static_cast<u64>(phys) < z1) queue_write_back_zeta(*surf);
+        if (surf->zeta_dirty && z0 < static_cast<u64>(phys) + length && static_cast<u64>(phys) < z1) {
+            forced("depth");
+            queue_write_back_zeta(*surf);
+        }
     }
     finish_write_backs();
     // A depth image holding an address its target no longer binds, and the parked ones (D35).

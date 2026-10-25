@@ -167,6 +167,8 @@ public:
         u64 compiles_queued{0}, pipelines_queued{0}, pending_skips{0};  // background compiles started; draws skipped waiting
         u64 pipeline_cache_hits{0};  // pipelines the cache held, made at once with background compiles on
         u64 textures_unchanged{0};
+        // Instrument: the write-backs a texture forced, by target and texture (what is not sampled in place, and why).
+        std::map<std::string, u64> forced_by;
         u64 surface_reloads{0};  // render targets reloaded from RAM after another engine wrote them  // textures whose pages were written but whose bytes hashed the same: kept
         // Write-backs by cause: frame end, a texture sampling the target, the scanout at vblank, a 2D or CPU range,
         // a target relaid out, the idle vblank (all).

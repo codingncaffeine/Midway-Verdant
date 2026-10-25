@@ -809,6 +809,12 @@ RETRO_API void retro_unload_game(void) {
                 log(RETRO_LOG_INFO, "gpu: depth buffers: %llu parked images bound again, %llu sampled in place, %llu loads skipped for a whole clear, %llu drawn with a bigger target's image",
                     static_cast<unsigned long long>(st.depth_unparks), static_cast<unsigned long long>(st.parked_samples), static_cast<unsigned long long>(st.depth_loads_skipped), static_cast<unsigned long long>(st.depth_borrows));
             if (st.mip_assemblies) log(RETRO_LOG_INFO, "gpu: %llu mip chains put together on the GPU from their level targets", static_cast<unsigned long long>(st.mip_assemblies));
+            if (!st.forced_by.empty()) {
+                // The write-backs a texture forced, most first: what is sampled through RAM instead of in place.
+                std::vector<std::pair<std::string, mv::u64>> forced(st.forced_by.begin(), st.forced_by.end());
+                std::sort(forced.begin(), forced.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+                for (std::size_t i = 0; i < forced.size() && i < 8; ++i) log(RETRO_LOG_INFO, "gpu: forced by a texture x%llu: %s", static_cast<unsigned long long>(forced[i].second), forced[i].first.c_str());
+            }
             log(RETRO_LOG_INFO, "gpu: submits mid-frame: %llu with the draw rings full, %llu with the upload staging full; %llu 2D copies made on the GPU", static_cast<unsigned long long>(st.batch_flushes), static_cast<unsigned long long>(st.staging_flushes), static_cast<unsigned long long>(st.gpu_copies));
             for (const auto& e : st.errors) log(RETRO_LOG_INFO, "gpu: renderer note: %s", e.c_str());
         }
