@@ -342,6 +342,14 @@ void Apu::on_frame(Cycles now) {
         se_.frame();
         se_host_ns_ += static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
     }
+    if (direct_sink_ && se_.direct_mix()) {
+        std::array<i16, apu::SetupEngine::kSamplesPerFrame * 2> pcm;
+        const auto& direct = se_.direct();
+        for (u32 i = 0; i < apu::SetupEngine::kSamplesPerFrame; ++i)
+            for (u32 c = 0; c < 2; ++c)
+                pcm[i * 2 + c] = static_cast<i16>(std::clamp(std::lround(static_cast<double>(direct[i][c]) * 32768.0), -32768L, 32767L));
+        direct_sink_(pcm.data(), apu::SetupEngine::kSamplesPerFrame);
+    }
     if (!fe_trapped_ && !trap_queue_.empty()) {
         const auto [method, parameter] = trap_queue_.front();
         trap_queue_.pop_front();

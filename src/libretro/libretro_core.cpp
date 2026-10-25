@@ -4,6 +4,7 @@
 // in that frame, and the pads' state from the RetroPads. The console's own files (the MCPX boot ROM, the flash
 // image, the EEPROM and the hard-disk image) come from <system>/midway-verdant/.
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdarg>
 #include <cstdio>
@@ -50,6 +51,9 @@ std::FILE* trace_file = nullptr;  // MV_TRACE_FILE
 
 std::mutex audio_lock;
 std::vector<mv::i16> audio;  // interleaved stereo at 48 kHz, filled on the machine's thread
+// The audio option: the console's output (the AC'97 playing what the GP and EP made) or the direct mix (every voice
+// straight to stereo, no DSP effects; mv::Apu::set_direct_mix). Read at load and whenever the frontend changes it.
+std::atomic<bool> direct_audio{false};
 constexpr unsigned kPads = 4;
 unsigned pads_plugged = 1;
 // Frame pipelining: the CPU is let into the next frame before retro_run returns, up to the vblank it holds at.
@@ -100,6 +104,22 @@ const char* option(const char* key) {
     retro_variable var{key, nullptr};
     if (env_cb && env_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value) return var.value;
     return nullptr;
+}
+
+bool direct_mix_option() {
+    const char* a = option("midway_verdant_audio");
+    return a && std::strncmp(a, "direct", 6) == 0;
+}
+
+// Interleaved 16-bit stereo samples the console played, for the next retro_run to hand over.
+void queue_audio(const void* samples, std::size_t n) {
+    std::lock_guard g(audio_lock);
+    const std::size_t at = audio.size();
+    audio.resize(at + n);
+    std::memcpy(audio.data() + at, samples, n * 2);
+    // A frontend that stops calling retro_run must not build up latency: keep at most a quarter second.
+    constexpr std::size_t kMaxBacklog = kSampleRate / 4 * 2;
+    if (audio.size() > kMaxBacklog) audio.erase(audio.begin(), audio.begin() + static_cast<std::ptrdiff_t>(audio.size() - kMaxBacklog));
 }
 
 // The console's files in <system>/midway-verdant: the MCPX ROM is the 512-byte file, the flash image the
@@ -196,6 +216,7 @@ RETRO_API void retro_set_environment(retro_environment_t cb) {
         {"midway_verdant_pipeline", "Run the next frame while the frontend shows this one (faster, up to a frame more input lag); enabled|disabled"},
         {"midway_verdant_cpu", "CPU; fast (hardware virtualization)|accurate (cycle-counted, recompiled)"},
         {"midway_verdant_disc_speed", "Disc loading; fast (8x the console's drive)|console speed"},
+        {"midway_verdant_audio", "Audio; console (DSP effects such as reverb)|direct mix (every voice straight to stereo, no DSP effects)"},
         {nullptr, nullptr},
     };
     cb(RETRO_ENVIRONMENT_SET_VARIABLES, const_cast<retro_variable*>(vars));
@@ -330,16 +351,14 @@ RETRO_API bool retro_load_game(const retro_game_info* game) {
         machine.reset();
         return false;
     }
+    direct_audio = direct_mix_option();
+    machine->apu().set_direct_mix(direct_audio);
+    machine->apu().set_direct_sink([](const mv::i16* stereo, mv::u32 frames) {
+        if (direct_audio) queue_audio(stereo, frames * 2);
+    });
     machine->aci().set_sample_sink([](mv::Aci::Channel c, const mv::u8* data, mv::u32 bytes) {
-        if (c != mv::Aci::PcmOut) return;
-        std::lock_guard g(audio_lock);
-        const std::size_t n = bytes / 2;
-        const std::size_t at = audio.size();
-        audio.resize(at + n);
-        std::memcpy(audio.data() + at, data, n * 2);
-        // A frontend that stops calling retro_run must not build up latency: keep at most a quarter second.
-        constexpr std::size_t kMaxBacklog = kSampleRate / 4 * 2;
-        if (audio.size() > kMaxBacklog) audio.erase(audio.begin(), audio.begin() + static_cast<std::ptrdiff_t>(audio.size() - kMaxBacklog));
+        if (c != mv::Aci::PcmOut || direct_audio) return;
+        queue_audio(data, bytes / 2);
     });
     if (have_rumble) {
         for (unsigned p = 0; p < pads_plugged; ++p)
@@ -351,6 +370,7 @@ RETRO_API bool retro_load_game(const retro_game_info* game) {
     log(RETRO_LOG_INFO, "booting %s with %u pad(s); files from %s", cfg.dvd_image ? cfg.dvd_image->string().c_str() : "no disc", pads_plugged,
         files.mcpx.parent_path().string().c_str());
     log(RETRO_LOG_INFO, "timeline: %s; one console frame per retro_run", machine->cpu()->clock_name().c_str());
+    log(RETRO_LOG_INFO, "audio: %s", direct_audio ? "direct mix" : "console");
     frames_run = frames_capped = 0;
     frame_ms_sum = frame_ms_max = 0;
     hold_wake_ms_sum = hold_grab_ms_sum = hold_wake_ms_max = 0;
@@ -511,6 +531,15 @@ static void frame_log_line(double wait_ms) {
 RETRO_API void retro_run(void) {
     if (!machine) return;
     input_poll_cb();
+    // The audio option switches while the game runs: what was queued from the other path is dropped.
+    if (bool changed = false; env_cb(RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE, &changed) && changed && direct_mix_option() != direct_audio) {
+        std::lock_guard g(machine->lock());
+        direct_audio = !direct_audio;
+        machine->apu().set_direct_mix(direct_audio);
+        std::lock_guard a(audio_lock);
+        audio.clear();
+        log(RETRO_LOG_INFO, "audio: %s", direct_audio ? "direct mix" : "console");
+    }
     {
         // The guest sees the new state where the CPU holds for a frame (with pipelining, the end of the frame it runs).
         std::lock_guard g(machine->lock());
@@ -607,7 +636,7 @@ RETRO_API void retro_run(void) {
         bool halted;
         {
             std::lock_guard g(machine->lock());
-            halted = machine->aci().channel(mv::Aci::PcmOut).sr & mv::Aci::kSrDch;
+            halted = direct_audio ? !machine->apu().frame_clock_running() : (machine->aci().channel(mv::Aci::PcmOut).sr & mv::Aci::kSrDch) != 0;
         }
         if (halted) out.assign(static_cast<std::size_t>(kSampleRate * 1001 / 60000) * 2, 0);
     }

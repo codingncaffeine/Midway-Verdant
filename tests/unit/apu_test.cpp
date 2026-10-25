@@ -568,6 +568,25 @@ TEST(ApuSynthesis, XboxAdpcmBlocksDecodeAsImaAdpcm) {
     for (u32 i = 0; i < 5; ++i) EXPECT_FLOAT_EQ(r.bin(0, i), expect[i] / 32768.0f) << "sample " << i;
 }
 
+TEST(ApuSynthesis, AnAdpcmVoicePlaysSixtyFourSamplesABlockSoSample64IsTheNextBlocksHeader) {
+    SynthRig r;
+    // Two mono blocks of zero nibbles (no change): the first's predictor 0, the second's 1000. DirectSound sizes the
+    // buffer at 64 samples a block (EBO 127 for two blocks).
+    u8 blocks[72]{};
+    blocks[36] = 1000 & 0xFF;
+    blocks[37] = 1000 >> 8;
+    ASSERT_TRUE(r.bus.write_ram(SynthRig::kPage, blocks, sizeof blocks));
+    r.start(0x80000000u, 127, 0, 0, 0);
+    r.sched.advance_to(Rig::frame(2));
+    EXPECT_FLOAT_EQ(r.bin(0, 31), 0.0f) << "sample 63: the first block";
+    r.sched.advance_to(Rig::frame(3));
+    EXPECT_FLOAT_EQ(r.bin(0, 0), 1000 / 32768.0f) << "sample 64: the second block's header";
+    r.sched.advance_to(Rig::frame(4));
+    EXPECT_FLOAT_EQ(r.bin(0, 31), 1000 / 32768.0f) << "sample 127, the buffer's last";
+    r.sched.advance_to(Rig::frame(5));
+    EXPECT_EQ(r.apu.setup_engine().voices_retired(), 1u) << "and the one-shot ended there";
+}
+
 TEST(ApuSynthesis, TheAmplitudeEnvelopeRampsInItsAttackAndTheVoiceEndsWithItsRelease) {
     using SE = apu::SetupEngine;
     SynthRig r;
@@ -771,6 +790,68 @@ TEST(ApuSynthesis, AMultipassVoiceReadsItsSubmixBinAndClearMixEmptiesIt) {
         EXPECT_FLOAT_EQ(r.bin(0, i), SynthRig::pcm(32 + i) / 32768.0f) << "sample " << (32 + i);
         EXPECT_FLOAT_EQ(r.bin(20, i), SynthRig::pcm(32 + i) / 32768.0f) << "without CLEAR_MIX the bin keeps its sum";
     }
+}
+
+TEST(ApuDirectMix, AVoiceOnlyInTheCentreBinReachesBothChannelsAtItsLoudestSendAndTheSinkGetsTheFrame) {
+    using SE = apu::SetupEngine;
+    SynthRig r;
+    std::vector<i16> heard;
+    r.apu.set_direct_sink([&](const i16* stereo, u32 frames) { heard.insert(heard.end(), stereo, stereo + frames * 2); });
+    r.fill_pcm(128);
+    r.start(kPcm16Mono, 127, 0, 0, 384);  // V0 at 6 dB
+    r.vp(SE::kMethodSetCurrentVoice, SynthRig::kVoice);
+    r.vp(0x300, 2u | (1u << 5));  // V0 to bin 2 (the centre); V1 (silent) to bin 1
+    r.sched.advance_to(Rig::frame(1));
+    EXPECT_TRUE(heard.empty()) << "the option is off: the sink hears nothing";
+    for (u32 i = 0; i < 32; ++i) EXPECT_EQ(r.apu.setup_engine().direct()[i][0], 0.0f);
+    r.apu.set_direct_mix(true);
+    r.sched.advance_to(Rig::frame(2));
+    const float g = std::pow(10.0f, -6.0f / 20.0f);
+    ASSERT_EQ(heard.size(), 64u) << "one frame of 32 stereo samples";
+    for (u32 i = 0; i < 32; ++i) {
+        const float want = SynthRig::pcm(32 + i) / 32768.0f * g;
+        EXPECT_NEAR(r.apu.setup_engine().direct()[i][0], want, 1e-6f) << "left, sample " << i;
+        EXPECT_NEAR(r.apu.setup_engine().direct()[i][1], want, 1e-6f) << "right, sample " << i;
+        EXPECT_NEAR(r.bin(2, i), want, 1e-6f) << "the bins are mixed as before";
+        EXPECT_EQ(heard[i * 2], static_cast<i16>(std::lround(static_cast<double>(want) * 32768.0))) << "sample " << i;
+        EXPECT_EQ(heard[i * 2 + 1], heard[i * 2]);
+    }
+}
+
+TEST(ApuDirectMix, AStereoVoiceKeepsItsChannels) {
+    using SE = apu::SetupEngine;
+    SynthRig r;
+    r.apu.set_direct_mix(true);
+    r.fill_pcm(128);
+    r.start(kPcm16Mono | SE::kFmtStereo, 63, 0, 0, 0);
+    r.sched.advance_to(Rig::frame(1));
+    for (u32 i = 0; i < 32; ++i) {
+        EXPECT_FLOAT_EQ(r.apu.setup_engine().direct()[i][0], SynthRig::pcm(2 * i) / 32768.0f) << "left, sample " << i;
+        EXPECT_FLOAT_EQ(r.apu.setup_engine().direct()[i][1], SynthRig::pcm(2 * i + 1) / 32768.0f) << "right, sample " << i;
+    }
+}
+
+TEST(ApuDirectMix, ASubmixSourceIsHeardOnceThroughItsMultipassVoice) {
+    using SE = apu::SetupEngine;
+    SynthRig r;
+    r.apu.set_direct_mix(true);
+    r.fill_pcm(64);
+    r.start(kPcm16Mono, 63, 0, 0, 0);
+    r.vp(SE::kMethodSetCurrentVoice, SynthRig::kVoice);
+    r.vp(0x300, 20);  // the source's V0 goes to bin 20 only
+    const u32 mp = SynthRig::kVoice + 1;
+    r.vp(SE::kMethodSetCurrentVoice, mp);
+    r.vp(0x300, 0);
+    r.vp(0x304, SE::kFmtMultipass | (20u << SE::kFmtSamplesPerBlockShift) | SE::kFmtClearMix | 31u | (31u << 5));
+    r.vp(0x360, 0xFFF00000u | 0x000F000Fu);
+    r.vp(0x364, 0xFFFFFFFFu);
+    r.vp(0x368, 0xFFFFFFFFu);
+    r.vp(0x37C, 0);
+    r.vp(SE::kMethodSetAntecedentVoice, 0x3FFFFu);
+    r.vp(SE::kMethodVoiceOn, mp);
+    r.sched.advance_to(Rig::frame(1));
+    for (u32 i = 0; i < 32; ++i)
+        EXPECT_FLOAT_EQ(r.apu.setup_engine().direct()[i][0], SynthRig::pcm(i) / 32768.0f) << "once, not twice, sample " << i;
 }
 
 TEST(ApuRegisters, AFrontEndMemoryFenceStoresItsValueAtTheFenceAddress) {

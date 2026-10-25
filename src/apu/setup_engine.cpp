@@ -139,26 +139,9 @@ bool SetupEngine::method(u32 offset, u32 value) {
                 trace::log(trace::Cat::Apu, "vp: voice {:x} on: vbin {:08x} vol {:08x} {:08x} {:08x} misc {:08x} env0 {:08x} enva {:08x} pitch {:08x}", handle, field(handle, kFieldVbin),
                            field(handle, kFieldVolA), field(handle, kFieldVolB), field(handle, kFieldVolC), field(handle, kFieldMisc), field(handle, 0x08), field(handle, 0x0C),
                            field(handle, kFieldPitchLink));
-                // Instrument: MV_DEBUG_VOICE_DUMP=HEX writes that voice's buffer, as decoded, to scratch/voice-HEX-N.wav
-                // (16-bit mono at the rate its pitch plays it), to hear or measure what the engine reads.
-                if (const char* d = std::getenv("MV_DEBUG_VOICE_DUMP"); d && std::strtoul(d, nullptr, 16) == handle) {
-                    static u32 dumps = 0;
-                    const i32 pitch = static_cast<i16>(field(handle, kFieldPitchLink) >> 16);
-                    const u32 rate = static_cast<u32>(48000.0 * std::exp2(pitch / 4096.0));
-                    if (std::FILE* w = std::fopen(std::format("scratch/voice-{:x}-{}.wav", handle, dumps++).c_str(), "wb")) {
-                        const u32 bytes = n * 2;
-                        const u32 hdr[11] = {0x46464952u, 36 + bytes, 0x45564157u, 0x20746D66u, 16, 0x00010001u, rate, rate * 2, 0x00100002u, 0x61746164u, bytes};
-                        std::fwrite(hdr, 4, 11, w);
-                        for (u32 i = 0; i < n; ++i) {
-                            float s[2];
-                            read_sample(handle, src, i, s);
-                            const i16 v = static_cast<i16>(std::clamp(s[0] * 32767.0f, -32768.0f, 32767.0f));
-                            std::fwrite(&v, 2, 1, w);
-                        }
-                        std::fclose(w);
-                    }
-                    trace::log(trace::Cat::Apu, "vp: voice {:x} dumped: {} samples at {} Hz", handle, n, rate);
-                }
+                // Instrument: MV_DEBUG_VOICE_DUMP=HEX writes that voice's buffer as it stands (dump_voice), here and twice a
+                // second while it plays (frame()), to measure what the engine reads and whether the title rewrites it.
+                if (dump_handle() == handle) dump_voice(handle);
                 b.adpcm_key = ~0ull;  // the reads above filled the ADPCM block cache; playback starts from a clean one
             }
             return true;
@@ -273,6 +256,9 @@ void SetupEngine::link_on(u32 handle) {
 
 void SetupEngine::frame() {
     for (auto& bin : mix_) bin.fill(0.0f);
+    direct_on_ = direct_mix();
+    for (auto& s : direct_) s = {0.0f, 0.0f};
+    direct_skip_ = direct_on_ ? multipass_bins() : 0u;
     for (u32 list = 0; list < kRegListTop.size(); ++list) walk(list);
     for (u32 b = 0; b < kBins; ++b)
         for (float s : mix_[b]) bin_energy_[b] += static_cast<double>(s) * static_cast<double>(s);
@@ -285,6 +271,7 @@ void SetupEngine::frame() {
                                     (field(h, kFieldVolA) >> 4) & 0xFFFu, field(h, kFieldVolA) >> 20, (field(h, kFieldMisc) >> 16) & 3u, field(h, kFieldFcA), field(h, kFieldFcB),
                                     (field(h, kFieldState) & kStatePaused) ? " paused" : "");
         trace::log(trace::Cat::Apu, "vp: frame {} voices:{}", frames_, line.empty() ? " none" : line);
+        if (const u32 d = dump_handle(); d < kMaxVoices && (field(d, kFieldState) & kStateActive)) dump_voice(d);
         // And the RMS level of each bin that carried sound over the half second, in dB of full scale.
         std::string bins;
         for (u32 b = 0; b < kBins; ++b) {
@@ -349,6 +336,7 @@ void SetupEngine::walk(u32 list) {
                                   : (fmt & kFmtStream) ? render_stream(handle, fmt, step, samples) : render_buffer(handle, fmt, step, samples);
                 filter(handle, fmt, samples);
                 mix_voice(handle, samples, ea);
+                if (direct_on_) direct_voice(handle, samples, ea);
                 // A stream that runs dry and a one-shot buffer that reaches its end both turn off: the voice leaves its
                 // list with its notifier written and the idle report, which is how DirectSound learns a buffer stopped
                 // (a title waiting for a sound to finish otherwise waits for ever). The reference emulator turns it off too.
@@ -515,7 +503,7 @@ u32 SetupEngine::read_bytes(const Source& src, u32 byte_offset, u32 bytes) const
 // Sample `index` of a source, both channels (a mono source repeats its one), full scale = 1.0.
 void SetupEngine::read_sample(u32 handle, const Source& src, u32 index, float out[2]) {
     if (src.adpcm) {
-        const u32 block = index / kAdpcmSamplesPerBlock, within = index % kAdpcmSamplesPerBlock;
+        const u32 block = index / kAdpcmSamplesPlayed, within = index % kAdpcmSamplesPlayed;
         const u32 block_bytes = 36u * src.channels;
         Bookkeeping& b = book_[handle];
         const u64 key = (static_cast<u64>(src.stream ? src.segment : src.base) << 24) ^ block;
@@ -678,23 +666,7 @@ void SetupEngine::filter(u32 handle, u32 fmt, Frame& samples) {
 // Eight bins per voice (V0-V5 in CFG_VBIN, V6-V7 in CFG_FMT), each with a 12-bit attenuation from TAR_VOLA-C
 // (V6 and V7 split a nibble per word); even bins take the left channel, odd the right. The 3D voices' first four
 // bins are the HRTF submixes. A bin's headroom divides what is added to it by 2^headroom.
-void SetupEngine::mix_voice(u32 handle, const Frame& samples, float gain) {
-    if (gain <= 0.0f) return;
-    // Instrument: MV_DEBUG_VOICES=41,4a mixes only the listed voices (hex handles); the rest still play silently.
-    static const std::array<bool, kMaxVoices> solo = [] {
-        std::array<bool, kMaxVoices> s{};
-        const char* e = std::getenv("MV_DEBUG_VOICES");
-        if (!e) s.fill(true);
-        for (; e && *e; ) {
-            char* end = nullptr;
-            const unsigned long h = std::strtoul(e, &end, 16);
-            if (end == e) break;
-            if (h < kMaxVoices) s[h] = true;
-            e = *end ? end + 1 : end;
-        }
-        return s;
-    }();
-    if (!solo[handle]) return;
+std::array<SetupEngine::Send, 8> SetupEngine::sends(u32 handle) const {
     const u32 vbin = field(handle, kFieldVbin), fmt = field(handle, kFieldFmt);
     const u32 vola = field(handle, kFieldVolA), volb = field(handle, kFieldVolB), volc = field(handle, kFieldVolC);
     const std::array<u32, 8> bins{vbin & 0x1Fu, (vbin >> 5) & 0x1Fu, (vbin >> 10) & 0x1Fu, (vbin >> 16) & 0x1Fu, (vbin >> 21) & 0x1Fu,
@@ -702,12 +674,7 @@ void SetupEngine::mix_voice(u32 handle, const Frame& samples, float gain) {
     const std::array<u32, 8> vols{(vola >> 4) & 0xFFFu, vola >> 20, (volb >> 4) & 0xFFFu, volb >> 20, (volc >> 4) & 0xFFFu, volc >> 20,
                                   (vola & 0xFu) | ((volb & 0xFu) << 4) | ((volc & 0xFu) << 8),
                                   ((vola >> 16) & 0xFu) | (((volb >> 16) & 0xFu) << 4) | (((volc >> 16) & 0xFu) << 8)};
-    const bool stereo = (fmt & kFmtStereo) != 0;
-    if (stereo)
-        for (const auto& s : samples) {
-            ++stereo_samples_;
-            if (s[0] != s[1]) ++stereo_differ_;
-        }
+    std::array<Send, 8> out{};
     for (u32 k = 0; k < 8; ++k) {
         u32 bin = bins[k];
         u32 headroom;
@@ -717,7 +684,43 @@ void SetupEngine::mix_voice(u32 handle, const Frame& samples, float gain) {
         } else {
             headroom = submix_headroom_[bin];
         }
-        const float g = gain * attenuation(vols[k]) / static_cast<float>(1u << headroom);
+        out[k] = {bin, attenuation(vols[k]) / static_cast<float>(1u << headroom)};
+    }
+    return out;
+}
+
+namespace {
+// Instrument: MV_DEBUG_VOICES=41,4a mixes only the listed voices (hex handles); the rest still play silently.
+bool soloed(u32 handle) {
+    static const std::array<bool, SetupEngine::kMaxVoices> solo = [] {
+        std::array<bool, SetupEngine::kMaxVoices> s{};
+        const char* e = std::getenv("MV_DEBUG_VOICES");
+        if (!e) s.fill(true);
+        for (; e && *e; ) {
+            char* end = nullptr;
+            const unsigned long h = std::strtoul(e, &end, 16);
+            if (end == e) break;
+            if (h < SetupEngine::kMaxVoices) s[h] = true;
+            e = *end ? end + 1 : end;
+        }
+        return s;
+    }();
+    return solo[handle];
+}
+}  // namespace
+
+void SetupEngine::mix_voice(u32 handle, const Frame& samples, float gain) {
+    if (gain <= 0.0f || !soloed(handle)) return;
+    const bool stereo = (field(handle, kFieldFmt) & kFmtStereo) != 0;
+    if (stereo)
+        for (const auto& s : samples) {
+            ++stereo_samples_;
+            if (s[0] != s[1]) ++stereo_differ_;
+        }
+    const auto voice_sends = sends(handle);
+    for (u32 k = 0; k < 8; ++k) {
+        const auto [bin, send_gain] = voice_sends[k];
+        const float g = gain * send_gain;
         if (g == 0.0f) continue;
         const u32 channel = stereo ? (k & 1u) : 0u;
         for (u32 i = 0; i < kSamplesPerFrame; ++i) {
@@ -726,6 +729,78 @@ void SetupEngine::mix_voice(u32 handle, const Frame& samples, float gain) {
         }
     }
     ++frames_mixed_;
+}
+
+// The direct mix: the voice's two channels (a mono voice has its sample in both) straight into stereo at its loudest
+// send. Sends to a bin a multipass voice reads are left out, or a submix's sources would be heard twice.
+void SetupEngine::direct_voice(u32 handle, const Frame& samples, float gain) {
+    if (gain <= 0.0f || !soloed(handle)) return;
+    float g = 0.0f;
+    for (const auto& [bin, send_gain] : sends(handle))
+        if (!(direct_skip_ & (1u << bin))) g = std::max(g, send_gain);
+    g *= gain;
+    if (g == 0.0f) return;
+    for (u32 i = 0; i < kSamplesPerFrame; ++i) {
+        direct_[i][0] += g * samples[i][0];
+        direct_[i][1] += g * samples[i][1];
+    }
+}
+
+u32 SetupEngine::multipass_bins() const {
+    u32 bins = 0;
+    for (u32 list = 0; list < kRegListTop.size(); ++list)
+        for (u32 h = host_.global_reg(kRegListTop[list]) & kHandleMask, guard = 0; h < kMaxVoices && guard < kMaxVoices;
+             h = field(h, kFieldPitchLink) & kHandleMask, ++guard) {
+            const u32 fmt = field(h, kFieldFmt);
+            if ((fmt & kFmtMultipass) && (field(h, kFieldState) & kStateActive)) bins |= 1u << ((fmt >> kFmtSamplesPerBlockShift) & 0x1Fu);
+        }
+    return bins;
+}
+
+u32 SetupEngine::dump_handle() {
+    static const u32 h = [] {
+        const char* d = std::getenv("MV_DEBUG_VOICE_DUMP");
+        return d && *d ? static_cast<u32>(std::strtoul(d, nullptr, 16)) : kNoVoice;
+    }();
+    return h;
+}
+
+// scratch/voice-HEX-N.wav: the buffer as decoded (16-bit mono at the rate its pitch plays it); an ADPCM buffer's bytes as
+// stored go to scratch/voice-HEX-N.adpcm too, for a decoder of our own choosing.
+void SetupEngine::dump_voice(u32 handle) {
+    static u32 dumps = 0;
+    if (dumps >= 64) return;
+    const u32 fmt = field(handle, kFieldFmt);
+    if (fmt & kFmtStream) return;
+    Source src = source_for(fmt);
+    src.base = field(handle, kFieldPslStart) & kOffsetMask;
+    const u32 n = std::min((field(handle, kFieldNext) & kOffsetMask) + 1, 1u << 20);
+    const i32 pitch = static_cast<i16>(field(handle, kFieldPitchLink) >> 16);
+    const u32 rate = static_cast<u32>(48000.0 * std::exp2(pitch / 4096.0));
+    const u32 at = dumps++;
+    if (std::FILE* w = std::fopen(std::format("scratch/voice-{:x}-{}.wav", handle, at).c_str(), "wb")) {
+        const u32 bytes = n * 2;
+        const u32 hdr[11] = {0x46464952u, 36 + bytes, 0x45564157u, 0x20746D66u, 16, 0x00010001u, rate, rate * 2, 0x00100002u, 0x61746164u, bytes};
+        std::fwrite(hdr, 4, 11, w);
+        for (u32 i = 0; i < n; ++i) {
+            float s[2];
+            read_sample(handle, src, i, s);
+            const i16 v = static_cast<i16>(std::clamp(s[0] * 32767.0f, -32768.0f, 32767.0f));
+            std::fwrite(&v, 2, 1, w);
+        }
+        std::fclose(w);
+    }
+    if (src.adpcm)
+        if (std::FILE* w = std::fopen(std::format("scratch/voice-{:x}-{}.adpcm", handle, at).c_str(), "wb")) {
+            const u32 bytes = (n + kAdpcmSamplesPlayed - 1) / kAdpcmSamplesPlayed * 36u * src.channels;
+            for (u32 i = 0; i < bytes; i += 4) {
+                const u32 v = read_bytes(src, i, 4);
+                std::fwrite(&v, 4, 1, w);
+            }
+            std::fclose(w);
+        }
+    book_[handle].adpcm_key = ~0ull;  // the reads filled the ADPCM block cache
+    trace::log(trace::Cat::Apu, "vp: voice {:x} dumped as {}: {} samples at {} Hz, cbo {}", handle, at, n, rate, field(handle, kFieldOffset) & kOffsetMask);
 }
 
 void SetupEngine::write_notifier(u32 handle, u32 index) {

@@ -112,6 +112,14 @@ public:
         return (ep ? ep_memory_ : gp_memory_).fifo_in_bytes(fifo);
     }
     apu::SetupEngine& setup_engine() { return se_; }
+    // The direct-mix option (SetupEngine::set_direct_mix): each frame's 32 stereo samples go to the sink as 16-bit
+    // pairs, the host's audio output in place of the AC'97's while the option is on. The GP, the EP and the AC'97 run
+    // as before, so the console sees no difference.
+    using DirectSink = std::function<void(const i16* stereo, u32 frames)>;
+    void set_direct_mix(bool on) { se_.set_direct_mix(on); }
+    bool direct_mix() const { return se_.direct_mix(); }
+    void set_direct_sink(DirectSink sink) { direct_sink_ = std::move(sink); }
+    bool frame_clock_running() const { return counting_; }
     u64 traps() const { return traps_; }
     u64 fence_writes() const { return fence_writes_; }
     bool front_end_trapped() const { return fe_trapped_; }
@@ -199,6 +207,7 @@ private:
     Memory gp_memory_, ep_memory_;
     apu::Processor gp_, ep_;
     apu::SetupEngine se_;
+    DirectSink direct_sink_;
     FrameStats gp_stats_, ep_stats_;
     u64 se_host_ns_{0};
     mutable std::atomic<u64> dsp_wait_ns_{0}, dsp_waits_{0};

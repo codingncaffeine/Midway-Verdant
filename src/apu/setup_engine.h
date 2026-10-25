@@ -1,6 +1,7 @@
 #pragma once
 #include <vector>
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdlib>
 
@@ -74,7 +75,10 @@ public:
     static constexpr u32 kRegTrapForce1 = 0x1504, kTrapForceIdleVoice = 1u << 15;
     static constexpr u32 kSe2FeIdleVoice = 0x8000;
     static constexpr u32 kSamplesPerFrame = 32, kBins = 32;
-    static constexpr u32 kAdpcmSamplesPerBlock = 65;  // the header sample and 64 nibbles per channel [verify]
+    // A block (36 bytes a channel) decodes to 65 samples: the header's and one per nibble. The voice plays 64 of them, the
+    // header's first: DirectSound sizes a buffer at 64 samples a block (a title's EBO is 64 x blocks - 1), as the
+    // reference emulator plays it; 65 dropped the last 1.5 % of every buffer and drifted from the title's cursor.
+    static constexpr u32 kAdpcmSamplesPerBlock = 65, kAdpcmSamplesPlayed = 64;
 
     using Mix = std::array<std::array<float, kSamplesPerFrame>, kBins>;
     using Frame = std::array<std::array<float, 2>, kSamplesPerFrame>;  // left, right per sample
@@ -91,6 +95,14 @@ public:
     bool repeats_idle_reports() const { return retrap_; }
     // The frame's mix bins (full scale = 1.0), what the global processor's MIXBUF receives.
     const Mix& mix() const { return mix_; }
+    // Direct mix (an option, off by default): every voice also goes straight to stereo at the level of its loudest
+    // send, the way the reference emulator plays sound by default, so a title whose DSP program never folds a bin
+    // into stereo is still heard. What the GP and EP do with the bins (effects such as reverb) is not heard then.
+    // A send to a bin a multipass voice reads is skipped: that sound reaches stereo through the multipass voice.
+    void set_direct_mix(bool on) { direct_mix_.store(on, std::memory_order_relaxed); }
+    bool direct_mix() const { return direct_mix_.load(std::memory_order_relaxed); }
+    // The frame's direct mix (full scale = 1.0); silence while the option is off.
+    const Frame& direct() const { return direct_; }
 
     u32 current_voice() const { return current_; }
     u64 voices_started() const { return started_; }
@@ -154,6 +166,16 @@ private:
     // The voice's DLS2 low-pass filter where its filter mode asks for one (see the .cpp).
     void filter(u32 handle, u32 fmt, Frame& samples);
     void mix_voice(u32 handle, const Frame& samples, float gain);
+    static u32 dump_handle();         // MV_DEBUG_VOICE_DUMP, or kNoVoice
+    void dump_voice(u32 handle);      // the instrument's files (see the .cpp)
+    // A voice's eight sends: the bin each lands in and its gain (volume and headroom).
+    struct Send {
+        u32 bin;
+        float gain;
+    };
+    std::array<Send, 8> sends(u32 handle) const;
+    void direct_voice(u32 handle, const Frame& samples, float gain);
+    u32 multipass_bins() const;  // the bins the listed, active multipass voices read, one bit each
     void notify(u32 handle, u32 ssl);
     void write_notifier(u32 handle, u32 index);
     Source source_for(u32 fmt) const;
@@ -172,6 +194,10 @@ private:
     u8 hrtf_headroom_{0};
     std::array<u8, 4> hrtf_submix_{0, 1, 2, 3};
     Mix mix_{};
+    std::atomic<bool> direct_mix_{false};
+    Frame direct_{};
+    bool direct_on_{false};  // the option as this frame read it
+    u32 direct_skip_{0};     // this frame's multipass_bins()
     u64 started_{0}, retired_{0}, frames_mixed_{0};
     std::vector<Started> handles_started_;
     u64 frames_{0};
