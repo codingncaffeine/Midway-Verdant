@@ -2,22 +2,38 @@
 
 # Midway Verdant
 
-A clean-room, low-level emulator of the original Xbox for Linux (Windows to follow). The console's own boot ROM, BIOS and kernel run unmodified on an emulated machine: MCPX southbridge, NV2A graphics, the APU with its DSPs, IDE storage, USB controllers and the SMBus devices. Nothing in the firmware is patched or replaced with a high-level substitute. The goal is cycle accuracy, with a hardware-virtualised fast mode for play speed.
+A clean-room, low-level emulator of the original Xbox for Linux, built to play games at full speed. The console's own boot ROM, BIOS and kernel run unmodified on an emulated machine: MCPX southbridge, NV2A graphics, the APU with its DSPs, IDE storage, USB controllers and the SMBus devices. Nothing in the firmware is patched or replaced with a high-level substitute. The CPU runs under hardware virtualisation (KVM), so the console's Pentium III code executes natively while every device around it is emulated in software.
 
-**Status:** early development, past first boot. Under the fast mode the firmware boots, initialises every device and plays its boot animation with sound: the graphics render live through the Vulkan backend and the animation's audio runs on our DSP56300 cores. Retail game discs (XISO or full dumps) load through the emulated DVD drive; USB gamepads work with rumble; titles reach their menus and gameplay, several at their full frame rate on a desktop CPU, with known inaccuracies and some titles that still stall. A standalone SDL3 window and a libretro core run the machine. The wiki describes every hardware block and keeps the [status page](https://github.com/codingncaffeine/Midway-Verdant/wiki/Status) current.
+It ships as a libretro core, `midway_verdant_libretro`, for libretro frontends; [Emutastic for Linux](https://github.com/codingncaffeine/Emutastic-For-Linux) offers it as an optional Xbox core. A standalone SDL3 window is included for development.
+
+**Status:** many retail games boot and play, a good number at their full frame rate on a desktop CPU; others still stall, glitch or sound wrong. The wiki describes every hardware block and keeps the [status page](https://github.com/codingncaffeine/Midway-Verdant/wiki/Status) current.
 
 | Area | State |
 |---|---|
 | Boot chain | Boot ROM, second-stage loader and kernel run unmodified; the kernel mounts its hard disk and starts a disc or the dashboard. Warm reboot works. |
-| CPU | KVM fast mode (Linux, default). Our own Pentium III interpreter with a P6 pipeline cycle model (`--cpu p6`), checked instruction by instruction against a KVM oracle; not yet fast enough for play. |
-| Graphics (NV2A) | Pushbuffer walker, Kelvin state machine, vertex-program and register-combiner translators (including the fixed-function pipeline and the texture-shader modes), texture decoder, 2D engine, video overlay, colour table. A Vulkan renderer with render targets kept on the GPU, on its own FIFO thread by default, with a persistent shader and pipeline cache. |
-| Audio | APU voice processor (PCM, ADPCM, streams, envelopes, filters, multipass voices), two DSP56300 cores (a compiled execution path) on their own thread, AC'97 output. |
+| CPU | KVM on Linux: the guest's code runs on the host CPU at full speed, with the console's own clock kept from the work it does. A Pentium III interpreter and recompiler serve as the reference for testing. |
+| Graphics (NV2A) | Pushbuffer walker, Kelvin state machine, vertex-program and register-combiner translators (including the fixed-function pipeline and the texture-shader modes), texture decoder, 2D engine, video overlay, colour table. A Vulkan renderer with render targets kept on the GPU, on its own thread, shaders compiled in the background, and a persistent shader and pipeline cache. |
+| Audio | APU voice processor (PCM, ADPCM, streams, envelopes, filters, multipass voices), two DSP56300 cores running the console's own audio programs, AC'97 output; an optional direct mix that plays every voice straight to stereo. |
+| Video | Full-motion video through the video overlay and through game-decoded movies. |
 | Input | Two OHCI USB controllers, the front-panel hub and the gamepad (four ports, rumble) from any SDL3 gamepad, the keyboard or a libretro RetroPad. |
 | Storage | ATA hard disk with the security lock, a blank retail-layout drive created on demand, ATAPI DVD drive reading XISO and full-dump images on a reader thread. |
 | Network | Controller with no cable plugged in; no frames are sent or received. |
-| Shells | `midway-verdant` (SDL3 window and headless runner), `midway_verdant_libretro` (core for libretro frontends), and the test tools `mv-pbcap`, `mv-retro-host`, `mv-dsp-bench` and `mv-fatx`. |
+| Shells | `midway_verdant_libretro` (the core), `midway-verdant` (SDL3 window and headless runner), and the test tools `mv-pbcap`, `mv-retro-host`, `mv-dsp-bench` and `mv-fatx`. |
 
-Not yet: the cycle-counted core at play speed, a Windows hypervisor backend, save states, memory units and the headset, and network traffic. Compatibility is partial; the wiki's status page says what is open.
+Not yet: internal resolution scaling, save states, memory units and the headset, network traffic, and Windows and macOS builds of the core. Compatibility is partial; the wiki's status page says what is open.
+
+## Core options
+
+| Option | Values |
+|---|---|
+| CPU | fast (hardware virtualization) · accurate (the reference interpreter; not play speed) |
+| Audio | console (the console's DSP effects, such as reverb) · direct mix (every voice straight to stereo, no DSP effects) |
+| Shader compiling | in the background (no stutter; a new effect can appear a frame late) · in the frame |
+| Anisotropic filtering | off (as the game asks) · 2x · 4x · 8x · 16x |
+| Disc loading | fast (8x the console's drive) · console speed |
+| Run the next frame while the frontend shows this one | enabled (faster, up to a frame more input lag) · disabled |
+| Controllers plugged in | 1 to 4 |
+| Hard drive | Drive 1 · Drive 2 · Drive 3 |
 
 ## Clean room
 
