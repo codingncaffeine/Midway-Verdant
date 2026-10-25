@@ -118,6 +118,8 @@ public:
     u64 notifications() const { return notifications_; }
     u64 frames_mixed() const { return frames_mixed_; }  // voice-frames that reached the bins
     float peak() const { return peak_; }  // the loudest bin sample so far (full scale = 1.0)
+    // Instrument: the MV_VOICE_CENSUS file (null when unset), shared with the APU for the processors' output level.
+    static std::FILE* census_file();
     u32 field(u32 handle, u32 offset) const;
     void set_field(u32 handle, u32 offset, u32 value);
 
@@ -135,6 +137,9 @@ private:
         std::array<i16, kAdpcmSamplesPerBlock * 2> adpcm{};
         // The voice filter's state per channel: the state-variable filter's low-pass and band-pass outputs.
         std::array<std::array<float, 2>, 2> svf{};
+        // Instrument (the census): what the voice played since the last census line, after its envelope.
+        double energy{0};
+        u32 energy_samples{0};
     };
     // Where a voice reads its samples: a buffer (through the scatter-gather table) or a stream segment (physical).
     struct Source {

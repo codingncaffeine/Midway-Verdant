@@ -61,6 +61,11 @@ float attenuation(u32 vol) {
 
 }  // namespace
 
+std::FILE* SetupEngine::census_file() {
+    static std::FILE* census = [] { const char* c = std::getenv("MV_VOICE_CENSUS"); return c && *c ? std::fopen(c, "w") : nullptr; }();
+    return census;
+}
+
 PhysAddr SetupEngine::voice_address(u32 handle) const { return host_.global_reg(kRegVoiceBase) + handle * kVoiceSize; }
 
 u32 SetupEngine::field(u32 handle, u32 offset) const {
@@ -265,14 +270,22 @@ void SetupEngine::frame() {
         for (float s : mix_[b]) bin_energy_[b] += static_cast<double>(s) * static_cast<double>(s);
     // Twice a second, under the APU trace or into MV_VOICE_CENSUS=FILE alone (a census to leave on while playing): every
     // voice on a list with its position, envelope level and V0/V1 volumes, and each bin's level.
-    static std::FILE* census = [] { const char* c = std::getenv("MV_VOICE_CENSUS"); return c && *c ? std::fopen(c, "w") : nullptr; }();
+    std::FILE* const census = census_file();
     if (++frames_ % 750 == 0 && (census || trace::on(trace::Cat::Apu))) {
         std::string line;
         for (u32 list = 0; list < kRegListTop.size(); ++list)
-            for (u32 h = host_.global_reg(kRegListTop[list]) & kHandleMask, guard = 0; h < kMaxVoices && guard < kMaxVoices; h = field(h, kFieldPitchLink) & kHandleMask, ++guard)
-                line += std::format(" {:x}(cbo {} ea {} v0 {:x} v1 {:x} fmode {} fca {:08x} fcb {:08x}{})", h, field(h, kFieldOffset) & kOffsetMask, field(h, kFieldOffset) >> 24,
-                                    (field(h, kFieldVolA) >> 4) & 0xFFFu, field(h, kFieldVolA) >> 20, (field(h, kFieldMisc) >> 16) & 3u, field(h, kFieldFcA), field(h, kFieldFcB),
-                                    (field(h, kFieldState) & kStatePaused) ? " paused" : "");
+            for (u32 h = host_.global_reg(kRegListTop[list]) & kHandleMask, guard = 0; h < kMaxVoices && guard < kMaxVoices; h = field(h, kFieldPitchLink) & kHandleMask, ++guard) {
+                // Also the pitch, the two envelopes' phases and what the voice played (RMS after its envelope, dB).
+                Bookkeeping& b = book_[h];
+                const double rms = b.energy_samples ? 10 * std::log10(b.energy / b.energy_samples + 1e-12) : -120.0;
+                b.energy = 0;
+                b.energy_samples = 0;
+                const u32 st = field(h, kFieldState);
+                line += std::format(" {:x}(cbo {} ea {} v0 {:x} v1 {:x} fmode {} fca {:08x} fcb {:08x} pitch {} ph {}/{} lvl {:.1f}{})", h, field(h, kFieldOffset) & kOffsetMask,
+                                    field(h, kFieldOffset) >> 24, (field(h, kFieldVolA) >> 4) & 0xFFFu, field(h, kFieldVolA) >> 20, (field(h, kFieldMisc) >> 16) & 3u, field(h, kFieldFcA),
+                                    field(h, kFieldFcB), static_cast<i16>(field(h, kFieldPitchLink) >> 16), (st >> kStateEaShift) & 0xFu, (st >> kStateEfShift) & 0xFu, rms,
+                                    (st & kStatePaused) ? " paused" : "");
+            }
         trace::log(trace::Cat::Apu, "vp: frame {} voices:{}", frames_, line.empty() ? " none" : line);
         if (census) std::fprintf(census, "%.1f s voices:%s\n", static_cast<double>(frames_) / 1500.0, line.empty() ? " none" : line.c_str());
         if (const u32 d = dump_handle(); d < kMaxVoices && (field(d, kFieldState) & kStateActive)) dump_voice(d);
@@ -343,6 +356,14 @@ void SetupEngine::walk(u32 list) {
                 const bool more = (fmt & kFmtMultipass) ? read_submix(fmt, samples)
                                   : (fmt & kFmtStream) ? render_stream(handle, fmt, step, samples) : render_buffer(handle, fmt, step, samples);
                 filter(handle, fmt, samples);
+                if (census_file()) {
+                    Bookkeeping& b = book_[handle];
+                    for (const auto& s : samples) {
+                        const double l = static_cast<double>(s[0] * ea), r = static_cast<double>(s[1] * ea);
+                        b.energy += l * l + r * r;
+                    }
+                    b.energy_samples += 2 * kSamplesPerFrame;
+                }
                 mix_voice(handle, samples, ea);
                 if (direct_on_) direct_voice(handle, samples, ea);
                 // A stream that runs dry and a one-shot buffer that reaches its end both turn off: the voice leaves its

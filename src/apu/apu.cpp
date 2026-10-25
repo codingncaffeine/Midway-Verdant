@@ -400,8 +400,9 @@ void Apu::on_frame(Cycles now) {
             }
         }
     }
-    // Instrument, twice a second under the APU trace: the RMS level each processor wrote to its output FIFO 0.
-    if (frames_ % 750 == 0 && trace::on(trace::Cat::Apu)) {
+    // Instrument, twice a second under the APU trace or into the voice census: the RMS level each processor wrote to
+    // its output FIFO 0.
+    if (frames_ % 750 == 0 && (trace::on(trace::Cat::Apu) || apu::SetupEngine::census_file())) {
         auto level = [](Memory& m) {
             const double v = m.out0_samples_ ? 10 * std::log10(m.out0_energy_ / static_cast<double>(m.out0_samples_) / (32768.0 * 32768.0) + 1e-12) : -120.0;
             m.out0_energy_ = 0;
@@ -410,6 +411,8 @@ void Apu::on_frame(Cycles now) {
         };
         const double gp_db = level(gp_memory_), ep_db = level(ep_memory_);
         trace::log(trace::Cat::Apu, "fifo0 rms dB: gp {:.1f} ep {:.1f}", gp_db, ep_db);
+        if (std::FILE* census = apu::SetupEngine::census_file())
+            std::fprintf(census, "%.1f s fifo0 rms dB: gp %.1f ep %.1f\n", static_cast<double>(frames_) / 1500.0, gp_db, ep_db);
         // Where a stereo source turns mono: the frames whose two channels differ in MIXBUF bins 0/1 (counted every
         // frame below) and in what the GP and the EP wrote to their output FIFO 0.
         trace::log(trace::Cat::Apu, "stereo L != R: mixbuf bins 0/1 {} of {} samples, gp fifo0 {} of {} frames, ep fifo0 {} of {} frames", mix_differ_, mix_samples_,
