@@ -232,6 +232,10 @@ VulkanRenderer::~VulkanRenderer() {
     if (clear_vs_) f.vkDestroyShaderModule(dev_.device(), clear_vs_, nullptr);
     if (clear_fs_) f.vkDestroyShaderModule(dev_.device(), clear_fs_, nullptr);
     for (auto& [k, t] : textures_) dev_.destroy_image(t->image);
+    for (auto& [k, m] : mips_) {
+        if (m.x8_view) f.vkDestroyImageView(dev_.device(), m.x8_view, nullptr);
+        dev_.destroy_image(m.image);
+    }
     for (auto& [k, c] : cubes_) {
         if (c.x8_view) f.vkDestroyImageView(dev_.device(), c.x8_view, nullptr);
         dev_.destroy_image(c.image);
@@ -248,6 +252,12 @@ VulkanRenderer::~VulkanRenderer() {
     if (zc_set_layout_) f.vkDestroyDescriptorSetLayout(dev_.device(), zc_set_layout_, nullptr);
     if (zc_pool_) f.vkDestroyDescriptorPool(dev_.device(), zc_pool_, nullptr);
     if (zc_module_) f.vkDestroyShaderModule(dev_.device(), zc_module_, nullptr);
+    if (dc_pipeline_) f.vkDestroyPipeline(dev_.device(), dc_pipeline_, nullptr);
+    if (dc_layout_) f.vkDestroyPipelineLayout(dev_.device(), dc_layout_, nullptr);
+    if (dc_set_layout_) f.vkDestroyDescriptorSetLayout(dev_.device(), dc_set_layout_, nullptr);
+    if (dc_pool_) f.vkDestroyDescriptorPool(dev_.device(), dc_pool_, nullptr);
+    if (dc_sampler_) f.vkDestroySampler(dev_.device(), dc_sampler_, nullptr);
+    dev_.destroy_buffer(dc_lut_);
     dev_.destroy_buffer(zc_in_);
     dev_.destroy_buffer(zc_out_);
     if (set_layout_) f.vkDestroyDescriptorSetLayout(dev_.device(), set_layout_, nullptr);
@@ -974,6 +984,9 @@ std::unordered_map<u32, std::unique_ptr<VulkanRenderer::Surface>>::iterator Vulk
     retire(s0.zcolor);
     retire(s0.lo);
     retire_subs(s0);
+    for (auto& [k, m] : mips_)  // nor the level these came from
+        for (const void*& level : m.levels)
+            if (level == &s0) level = nullptr;
     for (auto& [k, c] : cubes_)  // a later target at the same place is not the face these copies came from
         for (const void*& face : c.faces)
             if (face == &s0) face = nullptr;
@@ -1760,7 +1773,7 @@ const VulkanRenderer::TextureEntry* VulkanRenderer::texture(const KelvinState& s
             return nullptr;
         }
     }
-    if (TextureEntry* e = ts.cubemap() ? cube_texture(ts, phys) : surface_texture(ts, phys)) {
+    if (TextureEntry* e = ts.cubemap() ? cube_texture(ts, phys) : ts.mip_levels() > 1 ? mip_texture(ts, phys) : surface_texture(ts, phys)) {
         sc = StageCache{regs, phys, length, e};
         return e;
     }
@@ -1908,8 +1921,18 @@ const VulkanRenderer::TextureEntry* VulkanRenderer::texture(const KelvinState& s
 VulkanRenderer::TextureEntry* VulkanRenderer::surface_texture(const TextureStage& ts, u32 phys) {
     if (debug_roundtrip_ || ts.cubemap() || ts.dimensionality() != 2 || ts.mip_levels() > 1) return nullptr;
     const u32 fmt = ts.color_format();
-    const bool color = fmt == 0x06 || fmt == 0x12 || fmt == 0x07 || fmt == 0x1E;  // A8R8G8B8 and X8R8G8B8
-    const bool x8 = fmt == 0x07 || fmt == 0x1E;
+    // The colour formats whose texels are a target image's bytes: A8R8G8B8 and X8R8G8B8 (B8G8R8A8), R5G6B5, A1R5G5B5 and
+    // X1R5G5B5 (A1R5G5B5); the X formats read alpha as one. 16-bit targets went through RAM every time (Fable's 16-bit
+    // picture, sampled each frame).
+    VkFormat want = VK_FORMAT_UNDEFINED;
+    switch (fmt) {
+        case 0x06: case 0x12: case 0x07: case 0x1E: want = VK_FORMAT_B8G8R8A8_UNORM; break;
+        case 0x05: case 0x11: want = VK_FORMAT_R5G6B5_UNORM_PACK16; break;
+        case 0x02: case 0x10: case 0x03: case 0x1C: want = VK_FORMAT_A1R5G5B5_UNORM_PACK16; break;
+        default: break;
+    }
+    const bool color = want != VK_FORMAT_UNDEFINED;
+    const bool x8 = fmt == 0x07 || fmt == 0x1E || fmt == 0x03 || fmt == 0x1C;
     const bool depth16 = fmt == 0x2C || fmt == 0x30, depth24 = fmt == 0x2A || fmt == 0x2E;  // the fixed-point depths
     if (!color && !depth16 && !depth24) return nullptr;
     const bool linear = format_info(fmt).linear;
@@ -1922,7 +1945,7 @@ VulkanRenderer::TextureEntry* VulkanRenderer::surface_texture(const TextureStage
                          s.color_format, s.zeta_format, s.dirty ? 1 : 0, s.zeta_dirty ? 1 : 0, s.aa_x, s.aa_y, (pass_open_ && pass_target_ == &s) ? 1 : 0);
         // A rectangle of a pitch-linear region (a view drawn inside it, or a smaller shape at its base): a copy of that
         // rectangle taken on the GPU.
-        if (color && linear && !s.swizzled && (s.width != w || s.height != h || s.phys != phys) && ts.pitch() == s.pitch && s.color_bytes() == 4 &&
+        if (want == VK_FORMAT_B8G8R8A8_UNORM && linear && !s.swizzled && (s.width != w || s.height != h || s.phys != phys) && ts.pitch() == s.pitch && s.color_bytes() == 4 &&
             color_vk_format(s.color_format) == VK_FORMAT_B8G8R8A8_UNORM && phys >= s.phys && phys < static_cast<u64>(s.phys) + s.bytes() && !s.ram_newer && s.aa_x == 1 &&
             s.aa_y == 1 && ((phys - s.phys) % s.pitch) % 4 == 0) {
             const u32 x0 = ((phys - s.phys) % s.pitch) / 4, y0 = (phys - s.phys) / s.pitch;
@@ -1933,11 +1956,11 @@ VulkanRenderer::TextureEntry* VulkanRenderer::surface_texture(const TextureStage
         if (s.width != w || s.height != h) continue;
         const bool recent = !s.ram_newer && s.last_rendered_frame + 1 >= frame_index_;
         // The depth buffer read as colour at its own address: converted on the GPU (Z24S8 on a device with D24S8).
-        if (color && s.zeta_phys == phys && s.depth_holds == phys && s.phys != phys && s.zeta_format == 2 && depth24_ == VK_FORMAT_D24_UNORM_S8_UINT && s.aa_x == 1 && s.aa_y == 1 &&
+        if (want == VK_FORMAT_B8G8R8A8_UNORM && s.zeta_phys == phys && s.depth_holds == phys && s.phys != phys && s.zeta_format == 2 && depth24_ == VK_FORMAT_D24_UNORM_S8_UINT && s.aa_x == 1 && s.aa_y == 1 &&
             (s.zeta_dirty || recent) && linear == !s.swizzled && (!linear || ts.pitch() == s.zeta_pitch))
             return zeta_color_texture(s, ts, phys, w, h, linear, x8);
         if (color) {
-            if (s.phys != phys || !(s.dirty || recent) || s.color_bytes() != 4 || color_vk_format(s.color_format) != VK_FORMAT_B8G8R8A8_UNORM) continue;
+            if (s.phys != phys || !(s.dirty || recent) || color_vk_format(s.color_format) != want) continue;
             if (linear && ts.pitch() != s.pitch) continue;
         } else {
             if (s.zeta_phys != phys || s.depth_holds != phys || !(s.zeta_dirty || recent) || (s.zeta_format == 1) != depth16) continue;
@@ -2393,12 +2416,112 @@ VulkanRenderer::TextureEntry* VulkanRenderer::cube_texture(const TextureStage& t
     return &e;
 }
 
+// A chain of downsampled copies drawn as one render target per level (a bloom or blur pyramid), then sampled as one
+// mip-mapped texture: before, every level went through RAM each frame (two of Fable's write-backs a frame in play).
+// Here the level images are copied into the mips of one image on the GPU, at the targets' internal resolution.
+VulkanRenderer::TextureEntry* VulkanRenderer::mip_texture(const TextureStage& ts, u32 phys) {
+    if (debug_roundtrip_ || ts.cubemap() || ts.dimensionality() != 2 || ts.mip_levels() < 2) return nullptr;
+    const u32 fmt = ts.color_format();
+    if (fmt != 0x06 && fmt != 0x07) return nullptr;  // swizzled A8R8G8B8 and X8R8G8B8: a target's B8G8R8A8 bytes
+    const bool x8 = fmt == 0x07;
+    const u32 w = 1u << ts.log_width(), h = 1u << ts.log_height();
+    const u32 count = std::min(ts.mip_levels(), std::max(ts.log_width(), ts.log_height()) + 1);
+    std::vector<Surface*> levels(count);
+    u32 offset = phys;
+    for (u32 l = 0; l < count; ++l) {
+        const u32 lw = std::max(w >> l, 1u), lh = std::max(h >> l, 1u);
+        const auto it = surfaces_.find(offset);
+        if (it == surfaces_.end()) return nullptr;
+        Surface& s = *it->second;
+        const bool recent = !s.ram_newer && s.last_rendered_frame + 1 >= frame_index_;
+        if (s.width != lw || s.height != lh || color_vk_format(s.color_format) != VK_FORMAT_B8G8R8A8_UNORM || !(s.dirty || recent) || s.color_ram_newer ||
+            (l && s.sc != levels[0]->sc))
+            return nullptr;
+        levels[l] = &s;
+        offset += lw * lh * 4;
+    }
+    const u32 sc = levels[0]->sc;
+    MipEntry& m = mips_[phys];
+    if (!m.image.image || m.image.width != w * sc || m.image.height != h * sc || m.image.levels != count) {
+        retire(m.x8_view);
+        retire(m.image);
+        m = MipEntry{};
+        std::string error;
+        if (!dev_.create_image(VK_FORMAT_B8G8R8A8_UNORM, w * sc, h * sc, 1, count, 1, VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, VK_IMAGE_ASPECT_COLOR_BIT, false,
+                               m.image, error)) {
+            note("mip chain image: " + error);
+            mips_.erase(phys);
+            return nullptr;
+        }
+        end_pass();
+        fresh_image(m.image);
+        m.serials.assign(count, ~0ull);
+        m.levels.assign(count, nullptr);
+        stage_cache_.fill({});
+    }
+    bool stale = false;
+    for (u32 l = 0; l < count; ++l) stale = stale || m.levels[l] != levels[l] || m.serials[l] != levels[l]->draw_serial;
+    if (stale) {
+        end_pass();
+        VkMemoryBarrier before{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        before.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+        before.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+        fn_->vkCmdPipelineBarrier(cb_, VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &before, 0, nullptr, 0, nullptr);
+        for (u32 l = 0; l < count; ++l) {
+            VkImageCopy region{};
+            region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, l, 0, 1};
+            region.extent = {levels[l]->iw(), levels[l]->ih(), 1};
+            fn_->vkCmdCopyImage(cb_, levels[l]->color.image, VK_IMAGE_LAYOUT_GENERAL, m.image.image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+            m.levels[l] = levels[l];
+            m.serials[l] = levels[l]->draw_serial;
+        }
+        VkMemoryBarrier after{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        after.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT;
+        after.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        fn_->vkCmdPipelineBarrier(cb_, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT, 0, 1, &after, 0, nullptr, 0, nullptr);
+        ++stats_.mip_assemblies;
+    }
+    TextureEntry& e = x8 ? m.x8_tex : m.tex;
+    if (!e.valid) {
+        VkImageView view = m.image.view;
+        if (x8) {
+            VkImageViewCreateInfo vci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+            vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+            vci.image = m.image.image;
+            vci.format = m.image.format;
+            vci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, count, 0, 1};
+            vci.components.a = VK_COMPONENT_SWIZZLE_ONE;
+            if (fn_->vkCreateImageView(dev_.device(), &vci, nullptr, &view) != VK_SUCCESS) return nullptr;
+            m.x8_view = view;
+        }
+        e.image = m.image;
+        e.image.view = view;
+        e.image.levels = count;
+        e.phys = phys;
+        e.width = w;
+        e.height = h;
+        e.linear = false;
+        e.surface = true;
+        e.valid = true;
+    }
+    e.length = texture_size_in_memory(ts);
+    for (Surface* s : levels) s->last_used_vblank = vblank_index_;
+    ++stats_.surface_samples;
+    return &e;
+}
+
 void VulkanRenderer::retire_cubes() {
     for (auto& [k, c] : cubes_) {
         retire(c.x8_view);
         retire(c.image);
     }
     cubes_.clear();
+    for (auto& [k, m] : mips_) {
+        retire(m.x8_view);
+        retire(m.image);
+    }
+    mips_.clear();
     stage_cache_.fill({});
 }
 
@@ -3279,12 +3402,15 @@ void VulkanRenderer::write_back_zeta_banded(Surface& s) {
 // place by scaled_scanout: at 8x a picture is 78 MB, and every extra copy of it cost milliseconds a frame.
 void VulkanRenderer::capture_display(Surface& s) {
     if (s.sc <= 1 || s.swizzled || s.color_ram_newer) return;
-    const VkDeviceSize bytes = static_cast<VkDeviceSize>(s.iw()) * s.ih() * s.color_bytes();
+    const bool convert = init_display_convert();
+    const VkDeviceSize bytes = static_cast<VkDeviceSize>(s.iw()) * s.ih() * (convert ? 4u : s.color_bytes());
     Capture* c = nullptr;
     {
         std::lock_guard g(display_mutex_);
         auto it = std::find_if(captures_.begin(), captures_.end(), [&](const Capture& e) { return e.phys == s.phys; });
-        if (it != captures_.end() && it->valid && it->serial == s.draw_serial && it->sc == s.sc && it->width == s.width && it->height == s.height && it->pitch == s.pitch) {
+        // A colour table that changed since (a fade) needs the picture again even when the target did not.
+        if (it != captures_.end() && it->valid && it->serial == s.draw_serial && it->sc == s.sc && it->width == s.width && it->height == s.height && it->pitch == s.pitch &&
+            !(convert && display_lut_on_)) {
             shown_ = s.phys;
             return;
         }
@@ -3302,23 +3428,54 @@ void VulkanRenderer::capture_display(Surface& s) {
         if (c->buffer.size < bytes) {
             dev_.destroy_buffer(c->buffer);
             std::string error;
-            if (!dev_.create_buffer(bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, vk::BufferMemory::HostRead, c->buffer, error)) {
+            if (!dev_.create_buffer(bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, vk::BufferMemory::HostRead, c->buffer, error)) {
                 note("scaled picture buffer: " + error);
                 captures_.erase(it);
                 return;
             }
         }
         c->phys = s.phys;
+        c->xrgb = convert;
     }
     end_pass();
     VkMemoryBarrier before{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
     before.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
-    before.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-    fn_->vkCmdPipelineBarrier(cb_, VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &before, 0, nullptr, 0, nullptr);
-    VkBufferImageCopy r{};
-    r.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-    r.imageExtent = {s.iw(), s.ih(), 1};
-    fn_->vkCmdCopyImageToBuffer(cb_, s.color.image, VK_IMAGE_LAYOUT_GENERAL, c->buffer.buffer, 1, &r);
+    before.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_SHADER_READ_BIT;
+    fn_->vkCmdPipelineBarrier(cb_, VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1,
+                              &before, 0, nullptr, 0, nullptr);
+    if (convert) {
+        // The colour table as 768 words (the identity when the RAMDAC has none), then the pass over the image.
+        auto* lut = static_cast<u32*>(dc_lut_.mapped);
+        for (u32 i = 0; i < 768; ++i) lut[i] = display_lut_on_ ? display_lut_[i] : i / 3;
+        VkDescriptorImageInfo img{dc_sampler_, s.color.view, VK_IMAGE_LAYOUT_GENERAL};
+        VkDescriptorBufferInfo bufs[2] = {{c->buffer.buffer, 0, VK_WHOLE_SIZE}, {dc_lut_.buffer, 0, VK_WHOLE_SIZE}};
+        VkWriteDescriptorSet writes[3]{};
+        for (u32 i = 0; i < 3; ++i) {
+            writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[i].dstSet = dc_set_;
+            writes[i].dstBinding = i;
+            writes[i].descriptorCount = 1;
+            writes[i].descriptorType = i == 0 ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            if (i == 0) writes[i].pImageInfo = &img;
+            else writes[i].pBufferInfo = &bufs[i - 1];
+        }
+        // The set is free to update: the last capture that used it was waited for at its own vblank.
+        fn_->vkUpdateDescriptorSets(dev_.device(), 3, writes, 0, nullptr);
+        fn_->vkCmdBindPipeline(cb_, VK_PIPELINE_BIND_POINT_COMPUTE, dc_pipeline_);
+        fn_->vkCmdBindDescriptorSets(cb_, VK_PIPELINE_BIND_POINT_COMPUTE, dc_layout_, 0, 1, &dc_set_, 0, nullptr);
+        const u32 push[2] = {s.iw(), s.ih()};
+        fn_->vkCmdPushConstants(cb_, dc_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof push, push);
+        fn_->vkCmdDispatch(cb_, (s.iw() + 15) / 16, (s.ih() + 15) / 16, 1);
+        VkMemoryBarrier after{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        after.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        after.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+        fn_->vkCmdPipelineBarrier(cb_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &after, 0, nullptr, 0, nullptr);
+    } else {
+        VkBufferImageCopy r{};
+        r.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        r.imageExtent = {s.iw(), s.ih(), 1};
+        fn_->vkCmdCopyImageToBuffer(cb_, s.color.image, VK_IMAGE_LAYOUT_GENERAL, c->buffer.buffer, 1, &r);
+    }
     write_backs_.push_back({&s, false, 0, true});
 }
 
@@ -3337,6 +3494,94 @@ void VulkanRenderer::store_display(Surface& s) {
     shown_ = s.phys;
 }
 
+bool VulkanRenderer::init_display_convert() {
+    if (dc_pipeline_) return true;
+    if (dc_failed_) return false;
+    dc_failed_ = true;
+    const auto& f = *fn_;
+    std::string error;
+    if (!dev_.create_buffer(768 * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, vk::BufferMemory::HostWrite, dc_lut_, error)) {
+        note("picture conversion table: " + error);
+        return false;
+    }
+    // Pixel (x, y) of the image as the scanout shows it: 8-bit channels through the colour table, the unused byte clear.
+    const CompiledShader cs = compile_glsl(ShaderStage::Compute,
+                                           "#version 450\n"
+                                           "layout(local_size_x = 16, local_size_y = 16) in;\n"
+                                           "layout(binding = 0) uniform sampler2D src;\n"
+                                           "layout(std430, binding = 1) writeonly buffer Out { uint px[]; } dst;\n"
+                                           "layout(std430, binding = 2) readonly buffer Lut { uint v[768]; } lut;\n"
+                                           "layout(push_constant) uniform P { uint width; uint height; } pc;\n"
+                                           "void main() {\n"
+                                           "    uvec2 p = gl_GlobalInvocationID.xy;\n"
+                                           "    if (p.x >= pc.width || p.y >= pc.height) return;\n"
+                                           "    uvec3 c = uvec3(round(clamp(texelFetch(src, ivec2(p), 0).rgb, 0.0, 1.0) * 255.0));\n"
+                                           "    dst.px[p.y * pc.width + p.x] = (lut.v[c.r * 3u] << 16) | (lut.v[c.g * 3u + 1u] << 8) | lut.v[c.b * 3u + 2u];\n"
+                                           "}\n",
+                                           "picture-to-xrgb");
+    if (!cs.ok()) {
+        note("picture conversion shader: " + cs.log);
+        return false;
+    }
+    VkShaderModule mod = module(cs.spirv);
+    VkDescriptorSetLayoutBinding bindings[3]{};
+    for (u32 i = 0; i < 3; ++i) {
+        bindings[i].binding = i;
+        bindings[i].descriptorCount = 1;
+        bindings[i].descriptorType = i == 0 ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        bindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    }
+    VkDescriptorSetLayoutCreateInfo dli{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    dli.bindingCount = 3;
+    dli.pBindings = bindings;
+    VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, 8};
+    VkPipelineLayoutCreateInfo pli{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    pli.setLayoutCount = 1;
+    pli.pSetLayouts = &dc_set_layout_;
+    pli.pushConstantRangeCount = 1;
+    pli.pPushConstantRanges = &push;
+    VkSamplerCreateInfo sci{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+    sci.magFilter = sci.minFilter = VK_FILTER_NEAREST;
+    sci.addressModeU = sci.addressModeV = sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    if (f.vkCreateDescriptorSetLayout(dev_.device(), &dli, nullptr, &dc_set_layout_) != VK_SUCCESS || f.vkCreatePipelineLayout(dev_.device(), &pli, nullptr, &dc_layout_) != VK_SUCCESS ||
+        f.vkCreateSampler(dev_.device(), &sci, nullptr, &dc_sampler_) != VK_SUCCESS) {
+        note("picture conversion layouts failed");
+        f.vkDestroyShaderModule(dev_.device(), mod, nullptr);
+        return false;
+    }
+    VkComputePipelineCreateInfo cpi{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+    cpi.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    cpi.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    cpi.stage.module = mod;
+    cpi.stage.pName = "main";
+    cpi.layout = dc_layout_;
+    VkDescriptorPoolSize sizes[2] = {{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2}};
+    VkDescriptorPoolCreateInfo dpi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    dpi.maxSets = 1;
+    dpi.poolSizeCount = 2;
+    dpi.pPoolSizes = sizes;
+    const VkResult pr = f.vkCreateComputePipelines(dev_.device(), pipeline_cache_, 1, &cpi, nullptr, &dc_pipeline_);
+    f.vkDestroyShaderModule(dev_.device(), mod, nullptr);
+    if (pr != VK_SUCCESS || f.vkCreateDescriptorPool(dev_.device(), &dpi, nullptr, &dc_pool_) != VK_SUCCESS) {
+        note("picture conversion pipeline failed");
+        if (dc_pipeline_) f.vkDestroyPipeline(dev_.device(), dc_pipeline_, nullptr);
+        dc_pipeline_ = VK_NULL_HANDLE;
+        return false;
+    }
+    VkDescriptorSetAllocateInfo dai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    dai.descriptorPool = dc_pool_;
+    dai.descriptorSetCount = 1;
+    dai.pSetLayouts = &dc_set_layout_;
+    if (f.vkAllocateDescriptorSets(dev_.device(), &dai, &dc_set_) != VK_SUCCESS) {
+        note("picture conversion descriptor set failed");
+        f.vkDestroyPipeline(dev_.device(), dc_pipeline_, nullptr);
+        dc_pipeline_ = VK_NULL_HANDLE;
+        return false;
+    }
+    dc_failed_ = false;
+    return true;
+}
+
 bool VulkanRenderer::scaled_picture(u32 phys, u32 pitch, u32 bpp, u32 w, u32 h, ScaledPicture& out) const {
     std::lock_guard g(display_mutex_);
     if (!shown_) return false;
@@ -3346,9 +3591,11 @@ bool VulkanRenderer::scaled_picture(u32 phys, u32 pitch, u32 bpp, u32 w, u32 h, 
         if ((off % pitch) % bpp) return false;
         const u32 x0 = (off % pitch) / bpp, y0 = off / pitch;
         if (x0 + w > c.width || y0 + h > c.height) return false;
+        const u32 px = c.xrgb ? 4u : bpp;  // bytes a pixel in the buffer
         out.sc = c.sc;
-        out.pitch = c.width * c.sc * bpp;
-        out.pixels = static_cast<const u8*>(c.buffer.mapped) + static_cast<std::size_t>(y0) * c.sc * out.pitch + static_cast<std::size_t>(x0) * c.sc * bpp;
+        out.xrgb = c.xrgb;
+        out.pitch = c.width * c.sc * px;
+        out.pixels = static_cast<const u8*>(c.buffer.mapped) + static_cast<std::size_t>(y0) * c.sc * out.pitch + static_cast<std::size_t>(x0) * c.sc * px;
         return true;
     }
     return false;
@@ -3359,8 +3606,12 @@ bool VulkanRenderer::scaled_scanout(u32 phys, u32 pitch, u32 bpp, bool rgb565, u
     if (!scaled_picture(phys, pitch, bpp, w, h, p)) return false;
     const u32 fw = w * p.sc, fh = h * p.sc;
     xrgb.resize(static_cast<std::size_t>(fw) * fh);
-    scanout_to_xrgb(p.pixels, p.pitch, bpp, rgb565, fw, fh, reinterpret_cast<u8*>(xrgb.data()));
-    for (u32& px : xrgb) px &= 0x00FFFFFFu;
+    if (p.xrgb) {
+        for (u32 y = 0; y < fh; ++y) std::memcpy(xrgb.data() + static_cast<std::size_t>(y) * fw, p.pixels + static_cast<std::size_t>(y) * p.pitch, static_cast<std::size_t>(fw) * 4);
+    } else {
+        scanout_to_xrgb(p.pixels, p.pitch, bpp, rgb565, fw, fh, reinterpret_cast<u8*>(xrgb.data()));
+        for (u32& px : xrgb) px &= 0x00FFFFFFu;
+    }
     scale = p.sc;
     return true;
 }

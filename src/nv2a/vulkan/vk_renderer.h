@@ -9,6 +9,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -47,6 +48,12 @@ public:
     // size (1-8), RAM still at the console's. A change takes effect at the next vblank, where every target is written
     // back and dropped (each comes back from RAM at the new scale), or at once while there are no targets yet.
     void set_resolution_scale(u32 s) { requested_scale_.store(std::clamp(s, 1u, 8u), std::memory_order_relaxed); }
+    // The RAMDAC's colour table for the picture the next vblank captures (none: the identity), applied on the GPU as the
+    // scaled picture is read back (the vblank's thread, before write_back_at).
+    void set_display_lut(const std::optional<std::array<u8, 768>>& lut) {
+        display_lut_on_ = lut.has_value();
+        if (lut) display_lut_ = *lut;
+    }
     // The scanned-out picture at the internal resolution: the target holding the scanout as read back at the last
     // vblank, cropped to the scanout (w x h pixels of bpp bytes at phys, rows pitch bytes apart in RAM), as `scale`
     // x w by `scale` x h XRGB8888 pixels (alpha clear, rows tightly packed). False at 1x, or when RAM holds the
@@ -57,6 +64,7 @@ public:
     struct ScaledPicture {
         const u8* pixels{nullptr};
         u32 pitch{0}, sc{1};
+        bool xrgb{false};  // finished XRGB8888 (the colour table applied, alpha clear), not the frame buffer's format
     };
     bool scaled_picture(u32 phys, u32 pitch, u32 bpp, u32 w, u32 h, ScaledPicture& out) const;
 
@@ -121,6 +129,7 @@ public:
         u64 evicted{0}, retired_unused{0};  // targets another target overlapped; targets nothing used for 10 s
         u64 subrect_copies{0};  // rectangles of a pitch-linear region copied for a texture
         u64 cube_assemblies{0};  // cube maps put together on the GPU from six render targets (cube_texture)
+        u64 mip_assemblies{0};  // mip chains put together on the GPU from their level targets (mip_texture)
         u64 gpu_copies{0};  // 2D-engine copies made between target images (copy_rect)
         u64 shaders_from_disk{0};  // shader compiles the disk cache answered
         u64 compiles_queued{0}, pipelines_queued{0}, pending_skips{0};  // background compiles started; draws skipped waiting
@@ -287,6 +296,17 @@ private:
     };
     std::unordered_map<u32, CubeEntry> cubes_;
     void retire_cubes();
+    // A mip-mapped texture whose every level is a render target drawn this frame or the last (a chain of downsampled
+    // copies): the levels copied into one image's mips on the GPU, retaken when a level was drawn into since; or null.
+    TextureEntry* mip_texture(const TextureStage& ts, u32 phys);
+    struct MipEntry {
+        vk::Image image;
+        VkImageView x8_view{VK_NULL_HANDLE};
+        TextureEntry tex, x8_tex;
+        std::vector<u64> serials;
+        std::vector<const void*> levels;  // the targets the copies came from
+    };
+    std::unordered_map<u32, MipEntry> mips_;
     void retire_subs(Surface& s);
     Surface* draw_target_{nullptr};  // the target of the draw whose textures are being looked up
     // The depth buffer at each zeta address lives in one target's depth image at a time: the target that last drew with
@@ -503,12 +523,26 @@ private:
     struct Capture {
         u32 phys{0}, width{0}, height{0}, pitch{0}, bpp{0}, sc{1};
         bool valid{false};         // the buffer holds the picture these describe (false while a copy is on its way)
+        bool xrgb{false};          // converted on the GPU to XRGB8888 with the colour table applied (else the target's bytes)
         u64 serial{0};             // the target's draw serial when read
         vk::Buffer buffer;         // sc x width by sc x height, tightly packed (host-visible: read in place)
     };
     std::vector<Capture> captures_;  // the last few targets scanned out (a double or triple buffer), newest last
     u32 shown_{0};  // the capture that holds the picture the last vblank scanned out (by its target's address; 0: RAM does)
     mutable std::mutex display_mutex_;
+    // The capture's conversion on the GPU: a compute pass from the target image to XRGB8888 words in the capture's
+    // buffer, the colour table applied (made on first use; failing that, captures copy the target's bytes).
+    bool init_display_convert();
+    VkDescriptorSetLayout dc_set_layout_{VK_NULL_HANDLE};
+    VkPipelineLayout dc_layout_{VK_NULL_HANDLE};
+    VkPipeline dc_pipeline_{VK_NULL_HANDLE};
+    VkDescriptorPool dc_pool_{VK_NULL_HANDLE};
+    VkDescriptorSet dc_set_{VK_NULL_HANDLE};
+    VkSampler dc_sampler_{VK_NULL_HANDLE};
+    vk::Buffer dc_lut_;
+    bool dc_failed_{false};
+    std::array<u8, 768> display_lut_{};
+    bool display_lut_on_{false};
     u32 zc_capacity_{0};  // texels the depth-to-colour buffers hold
     std::unordered_map<std::string, std::shared_ptr<PendingShader>> vs_pending_, fs_pending_;
     std::unordered_map<std::string, std::shared_ptr<PipelineBuild>> pipelines_pending_;

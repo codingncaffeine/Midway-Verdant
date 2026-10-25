@@ -48,6 +48,10 @@ bool have_rumble = false;
 std::unique_ptr<mv::Machine> machine;
 std::vector<mv::u32> frame(640 * 480, 0);
 mv::u32 frame_w = 640, frame_h = 480;
+// What video_cb gets: `frame`, or at an internal resolution above 1x the GPU's finished picture where it lies (read back
+// already converted, the colour table applied; valid until the next vblank, which the CPU does not reach until it is shown).
+const void* frame_ptr = nullptr;
+std::size_t frame_pitch = 0;
 std::vector<mv::u8> composed;
 
 std::FILE* trace_file = nullptr;  // MV_TRACE_FILE
@@ -213,6 +217,8 @@ void grab_frame() {
     if (start == 0 || w < 64 || h < 64 || w > 1920 || h > 1080 || pitch < w * bpp ||
         static_cast<mv::u64>(start) + static_cast<mv::u64>(pitch) * h > bus.ram_size()) {
         std::fill(frame.begin(), frame.end(), 0u);
+        frame_ptr = frame.data();
+        frame_pitch = static_cast<std::size_t>(frame_w) * 4;
         return;
     }
     const mv::u8* fb = bus.ram() + start;
@@ -223,6 +229,14 @@ void grab_frame() {
     mv::pgraph::VulkanRenderer::ScaledPicture pic;
     const bool rendered = res_scale > 1 && renderer && renderer->scaled_picture(start, pitch, bpp, w, h, pic);
     sc = rendered ? pic.sc : res_scale;
+    if (rendered && pic.xrgb && !gpu.overlay()) {
+        // The GPU's finished picture goes to the frontend as it lies: no pass over it here at all.
+        frame_w = w * sc;
+        frame_h = h * sc;
+        frame_ptr = pic.pixels;
+        frame_pitch = pic.pitch;
+        return;
+    }
     const mv::u32 fw = w * sc, fh = h * sc;
     frame_w = fw;
     frame_h = fh;
@@ -245,7 +259,9 @@ void grab_frame() {
             for (mv::u32 y = y0; y < y1; ++y) {
                 const mv::u8* src = pic.pixels + static_cast<std::size_t>(y) * pic.pitch;
                 mv::u32* dst = frame.data() + static_cast<std::size_t>(y) * fw;
-                if (bpp != 4) {
+                if (pic.xrgb) {
+                    std::memcpy(dst, src, static_cast<std::size_t>(fw) * 4);  // finished on the GPU (an overlay follows)
+                } else if (bpp != 4) {
                     mv::scanout_to_xrgb(src, pic.pitch, bpp, rgb565, fw, 1, reinterpret_cast<mv::u8*>(dst));
                     if (lut) mv::apply_gamma(*lut, reinterpret_cast<mv::u8*>(dst), fw * 4, fw, 1);
                 } else if (lut) {
@@ -287,6 +303,8 @@ void grab_frame() {
     }
     // The scanout ignores the alpha byte; the frontend's XRGB8888 wants it clear of meaning too (a rendered 32-bit
     // picture came with it cleared).
+    frame_ptr = frame.data();
+    frame_pitch = static_cast<std::size_t>(fw) * 4;
     if (!rendered || ov)
         for (auto& px : frame) px &= 0x00FFFFFFu;
 }
@@ -335,7 +353,7 @@ RETRO_API void retro_set_environment(retro_environment_t cb) {
         {"midway_verdant_pipeline", "Run the next frame while the frontend shows this one (faster, up to a frame more input lag); enabled|disabled"},
         {"midway_verdant_cpu", "CPU; fast (hardware virtualization)|accurate (cycle-counted, recompiled)"},
         {"midway_verdant_disc_speed", "Disc loading; fast (8x the console's drive)|console speed"},
-        {"midway_verdant_resolution", "Internal resolution (the fast CPU only); 1x (native)|2x|4x|6x|8x"},
+        {"midway_verdant_resolution", "Internal resolution (the fast CPU only); 1x (native)|2x|4x|6x"},
         {"midway_verdant_anisotropy", "Anisotropic filtering; off (as the game asks)|2x|4x|8x|16x"},
         {"midway_verdant_shaders", "Shader compiling; in the background (no stutter; a new effect can appear a frame late)|in the frame (stutters the first time a scene is seen)"},
         {"midway_verdant_audio", "Audio; console (DSP effects such as reverb)|direct mix (every voice straight to stereo, no DSP effects)"},
@@ -567,6 +585,7 @@ RETRO_API void retro_unload_game(void) {
                 static_cast<unsigned long long>(st.depth_handovers), static_cast<unsigned long long>(st.depth_uploads), static_cast<unsigned long long>(st.evicted), static_cast<unsigned long long>(st.retired_unused), static_cast<unsigned long long>(st.subrect_copies));
             if (st.surface_reloads) log(RETRO_LOG_INFO, "gpu: %llu render targets reloaded from RAM after a 2D write", static_cast<unsigned long long>(st.surface_reloads));
             if (st.cube_assemblies) log(RETRO_LOG_INFO, "gpu: %llu cube maps put together on the GPU from their face targets", static_cast<unsigned long long>(st.cube_assemblies));
+            if (st.mip_assemblies) log(RETRO_LOG_INFO, "gpu: %llu mip chains put together on the GPU from their level targets", static_cast<unsigned long long>(st.mip_assemblies));
             log(RETRO_LOG_INFO, "gpu: submits mid-frame: %llu with the draw rings full, %llu with the upload staging full; %llu 2D copies made on the GPU", static_cast<unsigned long long>(st.batch_flushes), static_cast<unsigned long long>(st.staging_flushes), static_cast<unsigned long long>(st.gpu_copies));
             for (const auto& e : st.errors) log(RETRO_LOG_INFO, "gpu: renderer note: %s", e.c_str());
         }
@@ -742,15 +761,19 @@ RETRO_API void retro_run(void) {
     }
     grab_frame();
     hold_grab_ms_sum += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t1).count();
-    if (pipeline) {
-        // The picture is taken while the CPU holds at the vblank; now it runs the next frame while the frontend
-        // shows this one and the input for it arrives at the next call.
+    // The picture is taken while the CPU holds at the vblank; then it runs the next frame while the frontend shows this
+    // one and the input for it arrives at the next call. A picture handed over where it lies (the GPU's read-back
+    // buffer) is shown first: the next vblank may write that buffer again.
+    const auto release = [] {
         std::lock_guard g(machine->lock());
         released_to = machine->nv2a().vblanks() + 1;
         machine->set_frame_limit(released_to);
         cpu_released = true;
-    }
-    video_cb(frame.data(), frame_w, frame_h, frame_w * 4);
+    };
+    const bool in_place = frame_ptr != frame.data();
+    if (pipeline && !in_place) release();
+    video_cb(frame_ptr, frame_w, frame_h, frame_pitch);
+    if (pipeline && in_place) release();
     // The audio the console played since the last frame, as it played it: the AC'97 output runs on the console's
     // own clock, so a frame carries about 800 stereo samples, a few more or fewer as the reads fall. Padding a short
     // frame with silence would put a click in the sound, so the frontend's queue absorbs the jitter instead. While

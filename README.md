@@ -12,7 +12,7 @@ It ships as a libretro core, `midway_verdant_libretro`, for libretro frontends; 
 |---|---|
 | Boot chain | Boot ROM, second-stage loader and kernel run unmodified; the kernel mounts its hard disk and starts a disc or the dashboard. Warm reboot works. |
 | CPU | KVM on Linux: the guest's code runs on the host CPU at full speed, with the console's own clock kept from the work it does. A Pentium III interpreter and recompiler serve as the reference for testing. |
-| Graphics (NV2A) | Pushbuffer walker, Kelvin state machine, vertex-program and register-combiner translators (including the fixed-function pipeline and the texture-shader modes), texture decoder, 2D engine, video overlay, colour table. A Vulkan renderer with render targets kept on the GPU at up to 8x the internal resolution, on its own thread, shaders compiled in the background, and a persistent shader and pipeline cache. |
+| Graphics (NV2A) | Pushbuffer walker, Kelvin state machine, vertex-program and register-combiner translators (including the fixed-function pipeline and the texture-shader modes), texture decoder, 2D engine, video overlay, colour table. A Vulkan renderer with render targets kept on the GPU at up to 6x the internal resolution, on its own thread, shaders compiled in the background, and a persistent shader and pipeline cache. |
 | Audio | APU voice processor (PCM, ADPCM, streams, envelopes, filters, multipass voices), two DSP56300 cores running the console's own audio programs, AC'97 output; an optional direct mix that plays every voice straight to stereo. |
 | Video | Full-motion video through the video overlay and through game-decoded movies. |
 | Input | Two OHCI USB controllers, the front-panel hub and the gamepad (four ports, rumble) from any SDL3 gamepad, the keyboard or a libretro RetroPad. |
@@ -28,7 +28,7 @@ Not yet: save states, memory units and the headset, network traffic, and Windows
 |---|---|
 | CPU | fast (hardware virtualization) · accurate (the reference interpreter; not play speed) |
 | Audio | console (the console's DSP effects, such as reverb) · direct mix (every voice straight to stereo, no DSP effects) |
-| Internal resolution | 1x (native) · 2x · 4x · 6x · 8x (the fast CPU; render targets drawn at that many times their size, changed while a game runs) |
+| Internal resolution | 1x (native) · 2x · 4x · 6x (the fast CPU; render targets drawn at that many times their size, changed while a game runs) |
 | Shader compiling | in the background (no stutter; a new effect can appear a frame late) · in the frame |
 | Anisotropic filtering | off (as the game asks) · 2x · 4x · 8x · 16x |
 | Disc loading | fast (8x the console's drive) · console speed |

@@ -1122,3 +1122,116 @@ TEST(Vulkan, AScreenSpaceEdgeOnAPixelCentreCoversWholeBlocksAboveOneX) {
     EXPECT_EQ(blue, 0u) << "every image pixel covered, the first column's and row's blocks whole";
     EXPECT_EQ(pixel_at(f.ram, 0, 0) & 0x00FFFFFFu, 0x00FF00u) << "and the write-back at the console's size";
 }
+
+// A 16-bit render target sampled right after it was drawn: read in place (R5G6B5, and X1R5G5B5 with alpha one), not
+// written back and decoded (Fable samples its 16-bit picture every frame).
+TEST(Vulkan, A16BitTargetIsSampledInPlace) {
+    for (u32 scale : {1u, 4u}) {
+        SCOPED_TRACE(std::format("scale {}", scale));
+        TextureShaderFixture f;
+        std::string error;
+        if (!f.init(error)) GTEST_SKIP() << "no Vulkan device: " << error;
+        f.renderer->set_resolution_scale(scale);
+        Kelvin& k = f.k;
+        struct Case {
+            u32 surface_format, texture_format, clear, expect;
+        };
+        u32 n = 0;
+        for (const Case c : {Case{3, 0x11, 0x0000F81Fu, 0xFFFF00FFu}, Case{1, 0x1C, 0xFFFF7C00u, 0xFFFF0000u}}) {
+            const u32 at = 0x100000 + n++ * 0x10000;
+            setup_target(k, c.surface_format, at);
+            k.method(mthd::kColorClear, c.clear);
+            k.method(mthd::kClearRectH, 63u << 16);
+            k.method(mthd::kClearRectV, 63u << 16);
+            k.method(mthd::kClearSurface, 0xF0);
+            setup_target(k);
+            load_texcoord_program(k);
+            const u32 b = mthd::kTextureBase;
+            k.method(b + 0x0, at);
+            k.method(b + 0x4, (1u << 16) | (c.texture_format << 8) | (2u << 4) | 1u);  // a linear (rect) texture
+            k.method(b + 0x8, 0x00030303);
+            k.method(b + 0xC, 0x40000000);
+            k.method(b + 0x10, 256u << 16);  // its pitch
+            k.method(b + 0x14, (1u << 24) | (1u << 16));
+            k.method(b + 0x1C, (64u << 16) | 64u);  // its size
+            k.method(mthd::kShaderStageProgram, 1u);
+            output_texture_stage(k, 0);
+            texcoord(k, 0, 8.0f, 8.0f, 0.0f, 1.0f);  // texels
+            draw_full_triangle(k, f.ram);
+            f.renderer->end_frame();
+            EXPECT_EQ(pixel_at(f.ram, 8, 8), c.expect) << "texture format " << c.texture_format;
+        }
+        for (const auto& e : f.renderer->stats().errors) ADD_FAILURE() << "renderer: " << e;
+        EXPECT_EQ(f.renderer->stats().writebacks_by[VulkanRenderer::Stats::kWbTexture], 0u) << "nothing went through RAM";
+    }
+}
+
+// A mip chain drawn as one target per level, then sampled as one mip-mapped texture: put together on the GPU (at any
+// internal resolution), nothing through RAM.
+TEST(Vulkan, AMipChainOfRenderTargetsIsPutTogetherOnTheGpu) {
+    for (u32 scale : {1u, 2u}) {
+        SCOPED_TRACE(std::format("scale {}", scale));
+        TextureShaderFixture f;
+        std::string error;
+        if (!f.init(error)) GTEST_SKIP() << "no Vulkan device: " << error;
+        f.renderer->set_resolution_scale(scale);
+        Kelvin& k = f.k;
+        constexpr u32 kChain = 0x200000;
+        const u32 colours[3] = {0xFFFF0000u, 0xFF00FF00u, 0xFF0000FFu};
+        u32 at = kChain;
+        for (u32 level = 0; level < 3; ++level) {
+            const u32 log = 4 - level;
+            k.method(mthd::kSurfaceFormat, (log << 24) | (log << 16) | 0x200u | 0x8u);  // swizzled A8R8G8B8, no depth
+            k.method(mthd::kSurfaceClipH, (1u << log) << 16);
+            k.method(mthd::kSurfaceClipV, (1u << log) << 16);
+            k.method(mthd::kSurfaceColorOffset, at);
+            k.method(mthd::kColorClear, colours[level]);
+            k.method(mthd::kClearRectH, ((1u << log) - 1) << 16);
+            k.method(mthd::kClearRectV, ((1u << log) - 1) << 16);
+            k.method(mthd::kClearSurface, 0xF0);
+            at += (1u << log) * (1u << log) * 4;
+        }
+        setup_target(k);
+        load_texcoord_program(k);
+        const u32 b = mthd::kTextureBase;
+        k.method(b + 0x0, kChain);
+        k.method(b + 0x4, (4u << 24) | (4u << 20) | (3u << 16) | (0x06u << 8) | (2u << 4) | 1u);  // 16x16, three levels
+        k.method(b + 0x8, 0x00030303);
+        k.method(b + 0xC, 0x40000000);
+        k.method(b + 0x14, (1u << 24) | (1u << 16));
+        k.method(mthd::kShaderStageProgram, 1u);
+        output_texture_stage(k, 0);
+        texcoord(k, 0, 0.5f, 0.5f, 0.0f, 1.0f);
+        draw_full_triangle(k, f.ram);
+        f.renderer->end_frame();
+        for (const auto& e : f.renderer->stats().errors) ADD_FAILURE() << "renderer: " << e;
+        EXPECT_EQ(pixel_at(f.ram, 8, 8), colours[0]) << "level 0, magnified";
+        EXPECT_GE(f.renderer->stats().mip_assemblies, 1u);
+        EXPECT_EQ(f.renderer->stats().writebacks_by[VulkanRenderer::Stats::kWbTexture], 0u) << "no level went through RAM";
+    }
+}
+
+// Above 1x the picture is converted on the GPU as it is read back: XRGB8888, the RAMDAC's colour table applied.
+TEST(Vulkan, TheScaledPictureComesBackThroughTheColourTable) {
+    ScaledFixture f;
+    std::string error;
+    if (!f.init(2, error)) GTEST_SKIP() << "no Vulkan device: " << error;
+    setup_target(f.k);
+    f.k.method(mthd::kColorClear, 0xFF102030u);
+    f.k.method(mthd::kClearRectH, 63u << 16);
+    f.k.method(mthd::kClearRectV, 63u << 16);
+    f.k.method(mthd::kClearSurface, 0xF0);
+    std::array<u8, 768> invert{};
+    for (u32 i = 0; i < 768; ++i) invert[i] = static_cast<u8>(255 - i / 3);
+    f.renderer->set_display_lut(invert);
+    f.renderer->flush_frame();
+    ASSERT_TRUE(f.renderer->write_back_at(0x10000));
+    for (const auto& e : f.renderer->stats().errors) ADD_FAILURE() << "renderer: " << e;
+    VulkanRenderer::ScaledPicture p;
+    ASSERT_TRUE(f.renderer->scaled_picture(0x10000, 256, 4, 64, 64, p));
+    EXPECT_TRUE(p.xrgb);
+    u32 v;
+    std::memcpy(&v, p.pixels + 10 * p.pitch + 10 * 4, 4);
+    EXPECT_EQ(v, 0x00EFDFCFu) << "each channel through the table, the unused byte clear";
+    EXPECT_EQ(pixel_at(f.ram, 5, 5), 0xFF102030u) << "RAM keeps the frame buffer's own values";
+}

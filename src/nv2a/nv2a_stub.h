@@ -280,6 +280,7 @@ private:
     PushbufferWalker walker_;
     pgraph::Kelvin kelvin_;
     u64 methods_at_vblank_{0};  // Kelvin methods seen at the last vblank (an idle frame writes the surfaces back)
+    u32 idle_vblanks_{0};       // vblanks in a row with no Kelvin method between them
     pgraph::VulkanRenderer* renderer_{nullptr};
     std::unique_ptr<pgraph::TwoD> twod_;  // the 2D surfaces and image-blit classes
     u64 rendered_frames_{0};

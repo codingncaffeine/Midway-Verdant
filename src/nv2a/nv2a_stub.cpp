@@ -63,9 +63,15 @@ Nv2aStub::Nv2aStub(Bus& bus, Scheduler& sched, std::function<void(bool)> irq)
         ++vblanks_;
         sync_point(kSyncVblank);
         // The scanout reads the frame buffer now: a rendered one comes down from the device first.
-        if (renderer_) renderer_->write_back_at(reg(kPcrtcStart));
-        // A whole frame without a method: the GPU is idle, so what it drew is in RAM on the hardware; put it there.
-        if (renderer_ && kelvin_.methods_seen() == methods_at_vblank_) renderer_->write_back_all();
+        if (renderer_) {
+            renderer_->set_display_lut(gamma_lut());  // applied to the scaled picture as it is read back
+            renderer_->write_back_at(reg(kPcrtcStart));
+        }
+        // The GPU idle for two whole frames (a title paused, loading or starting): what it drew is in RAM on the hardware;
+        // put it there. One idle frame is not enough: a title at 30 frames a second leaves every other one idle, and
+        // writing every target back each time cost it most of a frame at a high internal resolution.
+        idle_vblanks_ = kelvin_.methods_seen() == methods_at_vblank_ ? idle_vblanks_ + 1 : 0;
+        if (renderer_ && idle_vblanks_ >= 2) renderer_->write_back_all();
         methods_at_vblank_ = kelvin_.methods_seen();
         if (vblank_hook_) vblank_hook_(sched_.now());
         regs_[kPcrtcIntr0] |= 1u;
