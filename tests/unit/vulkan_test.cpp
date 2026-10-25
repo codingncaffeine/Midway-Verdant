@@ -1084,3 +1084,41 @@ TEST(Vulkan, A2DCopyBetweenTwoTargetsStaysOnTheGpu) {
         EXPECT_FALSE(f.renderer->copy_rect(0x10000, 256, 0x40000, 256, 16, 8, 4));
     }
 }
+
+// A screen-space quad whose left and top edges lie on pixel centres (a blur pass on the half-pixel convention) covers the
+// first column and row whole at 1x; at 6x it must cover their whole blocks, not half of them (Fable's blur buffers kept
+// three image columns of stale memory, shown as green squares along the picture's edges).
+TEST(Vulkan, AScreenSpaceEdgeOnAPixelCentreCoversWholeBlocksAboveOneX) {
+    ScaledFixture f;
+    std::string error;
+    if (!f.init(6, error)) GTEST_SKIP() << "no Vulkan device: " << error;
+    Kelvin& k = f.k;
+    setup_target(k);
+    k.method(mthd::kColorClear, 0xFF0000FFu);  // blue underneath
+    k.method(mthd::kClearRectH, 63u << 16);
+    k.method(mthd::kClearRectV, 63u << 16);
+    k.method(mthd::kClearSurface, 0xF0);
+    k.method(mthd::kBeginEnd, 5);
+    k.method(mthd::kDiffuse4ub, 0xFF00FF00);
+    // Two triangles from (0.49, 0.49) to (64.5, 64.5): a hair off the centres, as the vertex maths leaves them.
+    for (const auto& p : {std::array<float, 2>{0.49f, 0.49f}, std::array<float, 2>{64.5f, 0.49f}, std::array<float, 2>{0.49f, 64.5f},
+                          std::array<float, 2>{64.5f, 0.49f}, std::array<float, 2>{64.5f, 64.5f}, std::array<float, 2>{0.49f, 64.5f}}) {
+        k.method(mthd::kVertexData4fM + 0, bits(p[0]));
+        k.method(mthd::kVertexData4fM + 4, bits(p[1]));
+        k.method(mthd::kVertexData4fM + 8, bits(0.0f));
+        k.method(mthd::kVertexData4fM + 12, bits(1.0f));
+    }
+    k.method(mthd::kBeginEnd, 0);
+    f.renderer->flush_frame();
+    ASSERT_TRUE(f.renderer->write_back_at(0x10000));
+    for (const auto& e : f.renderer->stats().errors) ADD_FAILURE() << "renderer: " << e;
+    std::vector<u32> px;
+    u32 scale = 0;
+    ASSERT_TRUE(f.renderer->scaled_scanout(0x10000, 256, 4, false, 64, 64, px, scale));
+    ASSERT_EQ(scale, 6u);
+    u32 blue = 0;
+    for (u32 y = 0; y < 384; ++y)
+        for (u32 x = 0; x < 384; ++x) blue += (px[y * 384 + x] & 0x00FFFFFFu) == 0x0000FFu;
+    EXPECT_EQ(blue, 0u) << "every image pixel covered, the first column's and row's blocks whole";
+    EXPECT_EQ(pixel_at(f.ram, 0, 0) & 0x00FFFFFFu, 0x00FF00u) << "and the write-back at the console's size";
+}

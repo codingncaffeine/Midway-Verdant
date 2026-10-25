@@ -257,6 +257,7 @@ private:
     void write_back_zeta(Surface& s);  // one surface's depth, queued and finished
     void store_color(Surface& s, const u8* pixels);
     void store_zeta(Surface& s, const u8* pixels);
+    void dump_target(Surface& s);  // MV_DEBUG_TARGET_DUMP: the scaled image to a PNG
     // Records the copy of one image into the read-back buffer at offset (depth and stencil together: the depth's
     // words, then the stencil bytes).
     void read_back(const vk::Image& image, VkImageAspectFlags aspect, u32 width, u32 height, VkDeviceSize offset);
