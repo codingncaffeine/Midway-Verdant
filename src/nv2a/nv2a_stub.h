@@ -184,6 +184,7 @@ public:
     void set_write_tracking(CpuBackend* cpu);
     u32 write_generation() const override { return write_generation_; }
     u32 newest_write(u32 phys, u32 len) const override;
+    u32 page_write(u32 page) const override { return write_tracking_ && page < page_generation_.size() ? page_generation_[page] : 0u; }
     void watch_writes(u32 phys, u32 len) const override;
     void collect_writes();
     void harvest_writes();  // the logs into dirty_pending_ (on the CPU's thread when the FIFO thread runs)

@@ -194,6 +194,11 @@ private:
         u32 generation{0};       // the RAM write generation its texels and palette were decoded (or last checked) at
         u32 palette_phys{0};
         u64 content{0};          // a hash of the texels and palette in RAM when decoded
+        // The texels' hash per 4 KiB page of RAM they lie in (each clipped to the texels) and the palette's: a write to
+        // some pages rehashes those alone (a title rewriting a texture's neighbours had whole textures rehashed ~24 times
+        // a frame).
+        std::vector<u64> page_hashes;
+        u64 palette_hash{0};
     };
     struct Surface {
         u32 phys{0};
@@ -420,6 +425,7 @@ private:
     u64 texture_content(u32 phys, u32 length, u32 palette_phys) const;  // the bytes a decode reads, hashed
     void remember_pages(Surface& s);  // s.page_hashes from RAM as it is now
     bool texture_current(TextureEntry& e);  // RAM still holds what e was decoded from (rehashed when pages were written)  // the decoded textures over a range (RAM now holds what a target wrote)
+    void hash_pages(TextureEntry& e) const;  // e.page_hashes and e.palette_hash from RAM as it is now
     VkSampler sampler(const TextureStage& ts, u32 levels);
     // A host buffer with one region per frame in flight; the recording frame allocates from its own region only.
     struct Ring {

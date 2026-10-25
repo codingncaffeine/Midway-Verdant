@@ -1607,3 +1607,75 @@ TEST(Vulkan, AHandedOverPictureIsTheOneTheHostWouldHaveRead) {
     EXPECT_EQ(read_handed_over(f.device, c), cpu);
     for (const auto& e : f.renderer->stats().errors) ADD_FAILURE() << "renderer: " << e;
 }
+
+namespace {
+
+// A resolver that records CPU writes per 4 KiB page, as the machine's write tracking does.
+struct TrackingResolver : HandleResolver {
+    u32 size{0};
+    u32 generation{1};
+    std::vector<u32> pages = std::vector<u32>((16u << 20) / 4096, 0);
+    DmaObject resolve(u32) const override { return {0, size - 1, 0x3D, true}; }
+    u32 write_generation() const override { return generation; }
+    u32 newest_write(u32 phys, u32 len) const override {
+        u32 n = 0;
+        for (u32 p = phys / 4096; p <= (phys + len - 1) / 4096; ++p) n = std::max(n, pages[p]);
+        return n;
+    }
+    u32 page_write(u32 page) const override { return pages[page]; }
+    void wrote(u32 page) { pages[page] = ++generation; }
+};
+
+}  // namespace
+
+// A texture whose pages the CPU writes is checked page by page: a written page holding the same bytes keeps the decoded
+// texture (no decode), a page with new texels decodes it again and the draw shows them.
+TEST(Vulkan, ATextureWrittenWithTheSameBytesIsKeptAndWithNewOnesDecodedAgain) {
+    vk::Device device;
+    std::string error;
+    if (!device.init(error)) GTEST_SKIP() << "no Vulkan device: " << error;
+    std::vector<u8> ram(16u << 20, 0);
+    TrackingResolver handles;
+    handles.size = static_cast<u32>(ram.size());
+    VulkanRenderer renderer(device, handles, ram.data(), static_cast<u32>(ram.size()));
+    ASSERT_TRUE(renderer.init(error)) << error;
+    Kelvin k;
+    k.set_sink(&renderer);
+    constexpr u32 kTex = 0x40000;  // 64x64 A8R8G8B8, swizzled: 16 KiB over four pages; texel (32,32) lies in the fourth
+    auto fill = [&](u32 argb) {
+        for (u32 i = 0; i < 64 * 64; ++i) std::memcpy(&ram[kTex + i * 4], &argb, 4);
+    };
+    fill(0xFF00FF00u);
+    auto draw = [&] {
+        setup_target(k);
+        load_texcoord_program(k);
+        const u32 b = mthd::kTextureBase;
+        k.method(b + 0x0, kTex);
+        k.method(b + 0x4, (6u << 24) | (6u << 20) | (1u << 16) | (0x06u << 8) | (2u << 4) | 1u);
+        k.method(b + 0x8, 0x00030303);
+        k.method(b + 0xC, 0x40000000);
+        k.method(b + 0x14, (1u << 24) | (1u << 16));
+        k.method(mthd::kShaderStageProgram, 1u);
+        output_texture_stage(k, 0);
+        texcoord(k, 0, 0.5f, 0.5f, 0.0f, 1.0f);
+        draw_full_triangle(k, ram);
+        renderer.end_frame();
+    };
+    draw();
+    EXPECT_EQ(pixel_at(ram, 8, 8) & 0x00FFFFFFu, 0x00FF00u);
+    const u64 decoded = renderer.stats().textures_decoded;
+    handles.wrote(kTex / 4096 + 1);  // the same bytes written again
+    draw();
+    EXPECT_EQ(renderer.stats().textures_decoded, decoded) << "kept";
+    EXPECT_GE(renderer.stats().textures_unchanged, 1u);
+    // New texels in the fourth page (where the sampled texel lies), only that page reported written.
+    for (u32 i = 3 * 1024; i < 4 * 1024; ++i) {
+        const u32 red = 0xFFFF0000u;
+        std::memcpy(&ram[kTex + i * 4], &red, 4);
+    }
+    handles.wrote(kTex / 4096 + 3);
+    draw();
+    EXPECT_EQ(renderer.stats().textures_decoded, decoded + 1) << "decoded again";
+    EXPECT_EQ(pixel_at(ram, 8, 8) & 0x00FFFFFFu, 0xFF0000u) << "the new texels drawn";
+    for (const auto& e : renderer.stats().errors) ADD_FAILURE() << "renderer: " << e;
+}

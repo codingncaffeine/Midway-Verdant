@@ -2051,10 +2051,32 @@ u64 VulkanRenderer::texture_content(u32 phys, u32 length, u32 palette_phys) cons
 // a texture shares its pages with whatever the title keeps beside it (one title rewrote such neighbours several times
 // a frame, and 70 % of its frame time went to decoding unchanged textures again), so a texture whose pages were
 // written is hashed before it is decoded again, and kept when its bytes are what they were.
+void VulkanRenderer::hash_pages(TextureEntry& e) const {
+    constexpr u32 kPage = 4096;
+    e.page_hashes.clear();
+    if (e.length == 0) return;
+    const u32 first = e.phys / kPage, last = static_cast<u32>((static_cast<u64>(e.phys) + e.length - 1) / kPage);
+    e.page_hashes.reserve(last - first + 1);
+    for (u32 page = first; page <= last; ++page) {
+        const u32 a = std::max(e.phys, page * kPage), b = static_cast<u32>(std::min<u64>(static_cast<u64>(e.phys) + e.length, static_cast<u64>(page + 1) * kPage));
+        e.page_hashes.push_back(texture_content(a, b - a, 0));
+    }
+    e.palette_hash = e.palette_phys ? texture_content(e.palette_phys, 256 * 4, 0) : 0;
+}
+
 bool VulkanRenderer::texture_current(TextureEntry& e) {
     const u32 newest = std::max(handles_.newest_write(e.phys, e.length), e.palette_phys ? handles_.newest_write(e.palette_phys, 256 * 4) : 0u);
     if (newest <= e.generation) return true;
-    if (texture_content(e.phys, e.length, e.palette_phys) != e.content) return false;
+    // Only the pages written since the decode are hashed again, each against its own hash.
+    constexpr u32 kPage = 4096;
+    const u32 first = e.phys / kPage;
+    for (std::size_t i = 0; i < e.page_hashes.size(); ++i) {
+        const u32 page = first + static_cast<u32>(i);
+        if (handles_.page_write(page) <= e.generation) continue;
+        const u32 a = std::max(e.phys, page * kPage), b = static_cast<u32>(std::min<u64>(static_cast<u64>(e.phys) + e.length, static_cast<u64>(page + 1) * kPage));
+        if (texture_content(a, b - a, 0) != e.page_hashes[i]) return false;
+    }
+    if (e.palette_phys && handles_.newest_write(e.palette_phys, 256 * 4) > e.generation && texture_content(e.palette_phys, 256 * 4, 0) != e.palette_hash) return false;
     e.generation = handles_.write_generation();
     handles_.watch_writes(e.phys, e.length);  // watched again: its next write is the one that matters
     if (e.palette_phys) handles_.watch_writes(e.palette_phys, 256 * 4);
@@ -2220,6 +2242,7 @@ const VulkanRenderer::TextureEntry* VulkanRenderer::texture(const KelvinState& s
     entry->generation = generation;
     entry->palette_phys = palette_phys;
     entry->content = texture_content(phys, length, palette_phys);
+    hash_pages(*entry);
     TextureEntry* raw = entry.get();
     textures_[key] = std::move(entry);
     sc = StageCache{regs, phys, length, raw};
