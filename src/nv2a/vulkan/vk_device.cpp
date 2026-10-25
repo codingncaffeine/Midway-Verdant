@@ -176,6 +176,30 @@ VkDevice Device::create_logical(const Functions& fn, VkPhysicalDevice gpu, u32& 
             }
         }
     }
+    // Pipelines made from the cache alone or not at all (VK_EXT_pipeline_creation_cache_control): with background
+    // compiles a pipeline the cache holds is made at once, and only one the driver has to compile goes to a worker
+    // (draws waiting for every new pipeline left a boot animation's last effect undrawn for two seconds).
+    VkPhysicalDevicePipelineCreationCacheControlFeaturesEXT cache_control{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_CREATION_CACHE_CONTROL_FEATURES_EXT};
+    {
+        u32 n_ext = 0;
+        fn.vkEnumerateDeviceExtensionProperties(gpu, nullptr, &n_ext, nullptr);
+        std::vector<VkExtensionProperties> props(n_ext);
+        fn.vkEnumerateDeviceExtensionProperties(gpu, nullptr, &n_ext, props.data());
+        const bool offered = std::ranges::any_of(props, [](const VkExtensionProperties& p) {
+            return std::string_view(p.extensionName) == VK_EXT_PIPELINE_CREATION_CACHE_CONTROL_EXTENSION_NAME;
+        });
+        if (offered && fn.vkGetPhysicalDeviceFeatures2) {
+            VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+            f2.pNext = &cache_control;
+            fn.vkGetPhysicalDeviceFeatures2(gpu, &f2);
+            if (cache_control.pipelineCreationCacheControl) {
+                extensions.push_back(VK_EXT_PIPELINE_CREATION_CACHE_CONTROL_EXTENSION_NAME);
+                cache_control.pNext = const_cast<void*>(dci.pNext);
+                dci.pNext = &cache_control;
+                enabled.cache_control = true;
+            }
+        }
+    }
     dci.enabledExtensionCount = static_cast<u32>(extensions.size());
     dci.ppEnabledExtensionNames = extensions.data();
     const VkDevice device = create(dci);

@@ -165,6 +165,7 @@ public:
         u64 gpu_copies{0};  // 2D-engine copies made between target images (copy_rect)
         u64 shaders_from_disk{0};  // shader compiles the disk cache answered
         u64 compiles_queued{0}, pipelines_queued{0}, pending_skips{0};  // background compiles started; draws skipped waiting
+        u64 pipeline_cache_hits{0};  // pipelines the cache held, made at once with background compiles on
         u64 textures_unchanged{0};
         u64 surface_reloads{0};  // render targets reloaded from RAM after another engine wrote them  // textures whose pages were written but whose bytes hashed the same: kept
         // Write-backs by cause: frame end, a texture sampling the target, the scanout at vblank, a 2D or CPU range,

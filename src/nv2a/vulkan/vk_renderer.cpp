@@ -1979,6 +1979,22 @@ VkPipeline VulkanRenderer::pipeline(const KelvinState& s, VkShaderModule vs, VkS
     gpi.pDynamicState = &dyn;
     gpi.layout = pipeline_layout_;
     gpi.renderPass = t.pass;
+    if (async_compile_ && dev_.cache_control()) {
+        // The cache first: a pipeline it holds is made here at once and the draw goes ahead; only one the driver has
+        // to compile goes to a worker (the boot animation's last effect stood undrawn for two seconds, every new
+        // pipeline of it waiting its turn on a worker).
+        gpi.flags |= VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT_EXT;
+        VkPipeline p = VK_NULL_HANDLE;
+        const VkResult r = fn_->vkCreateGraphicsPipelines(dev_.device(), pipeline_cache_, 1, &gpi, nullptr, &p);
+        gpi.flags &= ~static_cast<VkPipelineCreateFlags>(VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT_EXT);
+        if (r == VK_SUCCESS && p) {
+            ++stats_.pipelines;
+            ++stats_.pipeline_cache_hits;
+            pipelines_[key] = p;
+            return p;
+        }
+        if (p) fn_->vkDestroyPipeline(dev_.device(), p, nullptr);
+    }
     if (async_compile_) {
         pipelines_pending_.emplace(key, build);
         ++stats_.pipelines_queued;

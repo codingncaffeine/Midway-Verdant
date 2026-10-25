@@ -781,12 +781,12 @@ RETRO_API void retro_unload_game(void) {
         if (const auto* r = machine->nv2a().renderer()) {
             const auto& st = r->stats();
             const auto ms = [](mv::u64 ns) { return static_cast<double>(ns) / 1e6; };
-            log(RETRO_LOG_INFO, "gpu time: %llu draws %.0f ms (fetch %.0f, indices %.0f, textures %.0f, pipelines %.0f, shader compiles %.0f, uploads %.0f, descriptors %.0f, record %.0f); %llu submits + %llu waits %.0f ms; %llu write-backs %.0f ms (device copies %.0f); %llu textures decoded (%llu kept: pages written, bytes unchanged), %llu shaders from the disk cache; background compiles: %llu shaders + %llu pipelines, %llu draws skipped waiting",
+            log(RETRO_LOG_INFO, "gpu time: %llu draws %.0f ms (fetch %.0f, indices %.0f, textures %.0f, pipelines %.0f, shader compiles %.0f, uploads %.0f, descriptors %.0f, record %.0f); %llu submits + %llu waits %.0f ms; %llu write-backs %.0f ms (device copies %.0f); %llu textures decoded (%llu kept: pages written, bytes unchanged), %llu shaders from the disk cache; background compiles: %llu shaders + %llu pipelines, %llu draws skipped waiting; %llu pipelines made from the cache at once",
                 static_cast<unsigned long long>(st.draws), ms(st.ns_draw), ms(st.ns_fetch), ms(st.ns_indices), ms(st.ns_texture), ms(st.ns_pipeline), ms(st.ns_vs + st.ns_fs),
                 ms(st.ns_upload), ms(st.ns_descriptors), ms(st.ns_record), static_cast<unsigned long long>(st.flushes), static_cast<unsigned long long>(st.waits),
                 ms(st.ns_flush), static_cast<unsigned long long>(st.writebacks), ms(st.ns_write_back), ms(st.ns_write_back_gpu),
                 static_cast<unsigned long long>(st.textures_decoded), static_cast<unsigned long long>(st.textures_unchanged), static_cast<unsigned long long>(st.shaders_from_disk),
-                static_cast<unsigned long long>(st.compiles_queued), static_cast<unsigned long long>(st.pipelines_queued), static_cast<unsigned long long>(st.pending_skips));
+                static_cast<unsigned long long>(st.compiles_queued), static_cast<unsigned long long>(st.pipelines_queued), static_cast<unsigned long long>(st.pending_skips), static_cast<unsigned long long>(st.pipeline_cache_hits));
             // Draws the renderer could not draw, and why (the first of each distinct reason).
             if (st.skipped) log(RETRO_LOG_INFO, "gpu: %llu draws skipped", static_cast<unsigned long long>(st.skipped));
             log(RETRO_LOG_INFO, "gpu: write-backs by cause: frame end %llu, texture %llu, scanout %llu, 2D/range %llu, relayout %llu, idle vblank %llu; %llu targets sampled in place, %llu snapshots for draws sampling their own target, %llu depth buffers converted to colour, %llu targets the CPU wrote reloaded, %llu depth buffers handed between targets, %llu loaded from RAM; %llu targets evicted by an overlapping one, %llu retired unused, %llu rectangles of a region copied for a texture",
