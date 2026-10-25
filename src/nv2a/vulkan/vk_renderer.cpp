@@ -167,6 +167,13 @@ VulkanRenderer::VulkanRenderer(vk::Device& device, const HandleResolver& handles
         debug_vsh_dump_ = s.find("vshdump") != std::string::npos;
         if (debug_draw_id_) debug_flat_ = true;
     }
+    // MV_DRAWID_VBLANKS=FROM-TO: the drawid lines of those vblanks only, with the real shading (not flat).
+    if (const char* w = std::getenv("MV_DRAWID_VBLANKS"); w && *w) {
+        char* end = nullptr;
+        drawid_from_ = std::strtoull(w, &end, 10);
+        drawid_to_ = end && *end == '-' ? std::strtoull(end + 1, nullptr, 10) : drawid_from_;
+        debug_draw_id_ = true;
+    }
 }
 
 // A pipeline's create-info and everything it points at, kept together so a worker can create it after pipeline()
@@ -1950,7 +1957,7 @@ VkPipeline VulkanRenderer::pipeline(const KelvinState& s, VkShaderModule vs, VkS
     cb.srcColorBlendFactor = cb.srcAlphaBlendFactor = blend_factor(s.reg(mthd::kBlendSfactor));
     cb.dstColorBlendFactor = cb.dstAlphaBlendFactor = blend_factor(s.reg(mthd::kBlendDfactor));
     cb.colorBlendOp = cb.alphaBlendOp = blend_op(s.reg(mthd::kBlendEquation));
-    if (debug_draw_id_) {
+    if (drawid_on()) {
         cb.blendEnable = VK_TRUE;
         cb.srcColorBlendFactor = cb.srcAlphaBlendFactor = VK_BLEND_FACTOR_CONSTANT_COLOR;
         cb.dstColorBlendFactor = cb.dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
@@ -3020,7 +3027,7 @@ void VulkanRenderer::clear(const KelvinState& s, u32 bits) {
     ++t->draw_serial;
     VkClearAttachment att[2]{};
     u32 n = 0;
-    if (debug_draw_id_)
+    if (drawid_on())
         std::fprintf(stderr, "drawid clear: surface %08x bits %02x colour %08x zstencil %08x rect %u,%u..%u,%u of %ux%u (registers %08x %08x)\n", t->phys, bits, s.clear_color(),
                      s.clear_zstencil(), x0, y0, x1, y1, t->width, t->height, rect_h, rect_v);
     float color[4];
@@ -3162,7 +3169,7 @@ void VulkanRenderer::draw(const KelvinState& s, const DrawBatch& batch) {
     ++frame_draws_;
     // The renderer's draw number since it started (unique across frames: the replay's frames and the flips differ).
     const u32 draw_id = static_cast<u32>(stats_.draws);
-    if (debug_draw_id_)
+    if (drawid_on())
         std::fprintf(stderr,
                      "drawid %u: surface %08x, stages %05x, blend %u, %zu indices, %zu ranges, %zu inline words, %u immediate; program %u, depth test %u func %x write %u, "
                      "colour mask %08x, stencil %u, clip %g..%g, zeta %08x format %08x control0 %08x\n",
@@ -3192,7 +3199,7 @@ void VulkanRenderer::draw(const KelvinState& s, const DrawBatch& batch) {
         return;
     }
     if (debug_tex_log_) std::fprintf(stderr, "texlog: draw into %08x %s\n", t->phys, s.surface().swizzled() ? "swizzled" : "linear");
-    if (debug_draw_id_) {
+    if (drawid_on()) {
         // Has anything but this renderer written the target's RAM since the last draw into it?
         static std::unordered_map<u32, u32> seen;
         const u32 newest = handles_.newest_write(t->phys, t->bytes());
@@ -3222,7 +3229,7 @@ void VulkanRenderer::draw(const KelvinState& s, const DrawBatch& batch) {
         ++stats_.skipped;
         return;
     }
-    if (debug_draw_id_)
+    if (drawid_on())
         if (auto it = vs_debug_ids_.find(vs); it != vs_debug_ids_.end()) std::fprintf(stderr, "drawid %u: vertex shader vs-%u\n", draw_id, it->second);
     psh::Key pkey = psh::key_from_state(s);
     if (debug_shadow_pass_) pkey.shadow_compare_func = 7;  // every shadow lookup lit
@@ -3464,7 +3471,7 @@ void VulkanRenderer::draw(const KelvinState& s, const DrawBatch& batch) {
     const u32 bc = s.reg(mthd::kBlendColor);
     float constants[4] = {static_cast<float>((bc >> 16) & 0xFFu) / 255.0f, static_cast<float>((bc >> 8) & 0xFFu) / 255.0f,
                                 static_cast<float>(bc & 0xFFu) / 255.0f, static_cast<float>(bc >> 24) / 255.0f};
-    if (debug_draw_id_) {
+    if (drawid_on()) {
         constants[0] = static_cast<float>(draw_id & 0xFFu) / 255.0f;
         constants[1] = static_cast<float>((draw_id >> 8) & 0xFFu) / 255.0f;
         constants[2] = static_cast<float>((draw_id >> 16) & 0xFFu) / 255.0f;

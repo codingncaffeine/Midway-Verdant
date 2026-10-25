@@ -674,6 +674,8 @@ private:
     Stats stats_;
     // Debug overrides from MV_RENDER_DEBUG (comma separated): flat (white fragments), nodepth, nocull, noblend.
     bool debug_flat_{false}, debug_nodepth_{false}, debug_nocull_{false}, debug_noblend_{false}, debug_shadow_pass_{false}, debug_show_v0_{false}, debug_skip_blend_{false}, debug_draw_id_{false}, debug_flip_front_{false}, debug_ff_dump_{false}, debug_wb_all_{false};
+    u64 drawid_from_{0}, drawid_to_{~0ull};  // MV_DRAWID_VBLANKS: the drawid lines of these vblanks only
+    bool drawid_on() const { return debug_draw_id_ && vblank_index_ >= drawid_from_ && vblank_index_ <= drawid_to_; }
     u64 frame_index_{1};  // frames ended so far, plus one
     bool attachments_written_{false}, sampled_since_barrier_{false};  // hazards the next surface_barrier() covers
     bool depth16_sampled_{false}, depth24_sampled_{false};  // the device samples (and filters) these depth formats

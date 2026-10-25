@@ -263,8 +263,10 @@ void SetupEngine::frame() {
     for (u32 list = 0; list < kRegListTop.size(); ++list) walk(list);
     for (u32 b = 0; b < kBins; ++b)
         for (float s : mix_[b]) bin_energy_[b] += static_cast<double>(s) * static_cast<double>(s);
-    // Twice a second, under the APU trace: every voice on a list with its position, envelope level and V0/V1 volumes.
-    if (++frames_ % 750 == 0 && trace::on(trace::Cat::Apu)) {
+    // Twice a second, under the APU trace or into MV_VOICE_CENSUS=FILE alone (a census to leave on while playing): every
+    // voice on a list with its position, envelope level and V0/V1 volumes, and each bin's level.
+    static std::FILE* census = [] { const char* c = std::getenv("MV_VOICE_CENSUS"); return c && *c ? std::fopen(c, "w") : nullptr; }();
+    if (++frames_ % 750 == 0 && (census || trace::on(trace::Cat::Apu))) {
         std::string line;
         for (u32 list = 0; list < kRegListTop.size(); ++list)
             for (u32 h = host_.global_reg(kRegListTop[list]) & kHandleMask, guard = 0; h < kMaxVoices && guard < kMaxVoices; h = field(h, kFieldPitchLink) & kHandleMask, ++guard)
@@ -272,6 +274,7 @@ void SetupEngine::frame() {
                                     (field(h, kFieldVolA) >> 4) & 0xFFFu, field(h, kFieldVolA) >> 20, (field(h, kFieldMisc) >> 16) & 3u, field(h, kFieldFcA), field(h, kFieldFcB),
                                     (field(h, kFieldState) & kStatePaused) ? " paused" : "");
         trace::log(trace::Cat::Apu, "vp: frame {} voices:{}", frames_, line.empty() ? " none" : line);
+        if (census) std::fprintf(census, "%.1f s voices:%s\n", static_cast<double>(frames_) / 1500.0, line.empty() ? " none" : line.c_str());
         if (const u32 d = dump_handle(); d < kMaxVoices && (field(d, kFieldState) & kStateActive)) dump_voice(d);
         // And the RMS level of each bin that carried sound over the half second, in dB of full scale.
         std::string bins;
@@ -281,6 +284,10 @@ void SetupEngine::frame() {
         }
         bin_energy_.fill(0.0);
         trace::log(trace::Cat::Apu, "vp: frame {} bin rms dB:{}", frames_, bins.empty() ? " silent" : bins);
+        if (census) {
+            std::fprintf(census, "%.1f s bins:%s\n", static_cast<double>(frames_) / 1500.0, bins.empty() ? " silent" : bins.c_str());
+            std::fflush(census);
+        }
         if (stereo_samples_) trace::log(trace::Cat::Apu, "vp: frame {} stereo voices rendered {} samples, {} with L != R", frames_, stereo_samples_, stereo_differ_);
         stereo_samples_ = stereo_differ_ = 0;
     }
