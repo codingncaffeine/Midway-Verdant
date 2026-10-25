@@ -847,37 +847,42 @@ void VulkanRenderer::upload_depth_from_ram(Surface& t) {
         }
     }
     if (t.sc > 1) {
-        // A scaled target: each stored texel widened to sc x sc (depth cannot be blitted on every device), uploaded in
-        // bands that fit the staging ring. Row strides are kept to multiples of four bytes (depth and stencil copies).
-        const u32 sc = t.sc, rw = t.iw(), rh = t.ih(), dsz = z16 ? 2u : 4u;
+        // A scaled target: each stored row widened sc times on the CPU, and the copy reads it into sc image rows (depth
+        // cannot be blitted on every device; widening whole blocks on the CPU was 55 MB a load at 6x, ~1 a frame in the
+        // boot animation). Bands of stored rows fit the staging ring; row strides stay multiples of four bytes.
+        const u32 sc = t.sc, rw = t.iw(), dsz = z16 ? 2u : 4u;
         const VkDeviceSize drow = (static_cast<VkDeviceSize>(rw) * dsz + 3) / 4 * 4, srow = z16 ? 0 : (static_cast<VkDeviceSize>(rw) + 3) / 4 * 4;
         const u32 band = static_cast<u32>(std::max<VkDeviceSize>(1, (VkDeviceSize{4} << 20) / (drow + srow)));
-        for (u32 r0 = 0; r0 < rh; r0 += band) {
-            const u32 rows = std::min(band, rh - r0);
+        std::vector<VkBufferImageCopy> regions;
+        for (u32 r0 = 0; r0 < t.height; r0 += band) {
+            const u32 rows = std::min(band, t.height - r0);
             VkDeviceSize offset = 0;
             if (!staging_alloc(rows * (drow + srow), offset)) return;
             u8* dst = static_cast<u8*>(staging_.buffer.mapped) + offset;
+            regions.clear();
             for (u32 r = 0; r < rows; ++r) {
-                const std::size_t src_row = static_cast<std::size_t>((r0 + r) / sc) * t.width;
+                const std::size_t src_row = static_cast<std::size_t>(r0 + r) * t.width;
                 u8* drow_p = dst + r * drow;
                 u8* srow_p = dst + rows * drow + r * srow;
-                for (u32 x = 0; x < rw; ++x) {
-                    const std::size_t i = src_row + x / sc;
-                    std::memcpy(drow_p + static_cast<std::size_t>(x) * dsz, &pixels[i * dsz], dsz);
-                    if (!z16) srow_p[x] = pixels[n * 4 + i];
+                for (u32 x = 0; x < t.width; ++x) {
+                    const std::size_t i = src_row + x;
+                    for (u32 k = 0; k < sc; ++k) std::memcpy(drow_p + (static_cast<std::size_t>(x) * sc + k) * dsz, &pixels[i * dsz], dsz);
+                    if (!z16) std::memset(srow_p + static_cast<std::size_t>(x) * sc, pixels[n * 4 + i], sc);
+                }
+                for (u32 k = 0; k < sc; ++k) {
+                    VkBufferImageCopy c{};
+                    c.bufferOffset = offset + r * drow;
+                    c.imageSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1};
+                    c.imageOffset = {0, static_cast<i32>((r0 + r) * sc + k), 0};
+                    c.imageExtent = {rw, 1, 1};
+                    regions.push_back(c);
+                    if (z16) continue;
+                    c.bufferOffset = offset + rows * drow + r * srow;
+                    c.imageSubresource.aspectMask = VK_IMAGE_ASPECT_STENCIL_BIT;
+                    regions.push_back(c);
                 }
             }
-            VkBufferImageCopy regions[2]{};
-            regions[0].bufferOffset = offset;
-            regions[0].bufferRowLength = static_cast<u32>(drow / dsz);
-            regions[0].imageSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1};
-            regions[0].imageOffset = {0, static_cast<i32>(r0), 0};
-            regions[0].imageExtent = {rw, rows, 1};
-            regions[1] = regions[0];
-            regions[1].bufferOffset = offset + rows * drow;
-            regions[1].bufferRowLength = static_cast<u32>(srow);
-            regions[1].imageSubresource.aspectMask = VK_IMAGE_ASPECT_STENCIL_BIT;
-            fn_->vkCmdCopyBufferToImage(cb_, staging_.buffer.buffer, t.depth.image, VK_IMAGE_LAYOUT_GENERAL, z16 ? 1 : 2, regions);
+            fn_->vkCmdCopyBufferToImage(cb_, staging_.buffer.buffer, t.depth.image, VK_IMAGE_LAYOUT_GENERAL, static_cast<u32>(regions.size()), regions.data());
         }
         upload_barrier();
         ++stats_.depth_uploads;
