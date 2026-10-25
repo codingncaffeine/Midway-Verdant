@@ -256,6 +256,14 @@ bool Machine::init(std::string& error) {
         }
         if (const char* w = std::getenv("MV_DEBUG_NO_WRITE_TRACKING"); !(w && *w == '1')) nv2a_.set_write_tracking(cpu_.get());  // 1: a measurement control (stale textures)
         nv2a_.set_renderer(renderer_.get());
+        // Occlusion reports from real counts in the fast core, as the reference emulator makes them: one title's sun glare
+        // reads how much of the sun passed the depth test (the fixed count says the whole screen did, every time, so the
+        // sun glares through buildings). Opt-in with MV_ZPASS_REPORTS=1 until another title's lens-flare tests pass
+        // with them (its 2x2 test quads at a light fail the depth test against the hull: under investigation).
+        if (const char* z = std::getenv("MV_ZPASS_REPORTS"); config_.cpu == "kvm" && z && *z == '1') {
+            nv2a_.set_real_reports(true);
+            renderer_->set_count_zpass(true);
+        }
         // The pusher on its own thread (PLAN D21), in fast mode without a capture (which records RAM before each run);
         // MV_FIFO_THREAD=0 runs it inline (the control). It was opt-in while the GPU thread read and re-protected the
         // dirty-page log under the running guest (a title's CPU time doubled, the boot animation lost 4 % of its

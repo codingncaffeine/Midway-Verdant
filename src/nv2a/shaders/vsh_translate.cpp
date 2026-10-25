@@ -258,7 +258,10 @@ void append_head(std::string& g) {
     g += std::format("layout(location = {}) out vec4 vtx_b1;\n", kVaryingB1);
     for (u32 i = 0; i < 4; ++i) g += std::format("layout(location = {}) out vec4 vtx_t{};\n", kVaryingT0 + i, i);
     g += std::format("layout(location = {}) out float vtx_fog;\n", kVaryingFog);
-    g += std::format("layout(location = {}) out vec4 vtx_pos;\n\n", kVaryingPos);
+    g += std::format("layout(location = {}) out vec4 vtx_pos;\n", kVaryingPos);
+    // The screen-space depth (depth units), interpolated linearly across the screen as the console does: the pixel side
+    // computes the depth it stores from it (the host's FragCoord.z arrives already rounded to the buffer's step).
+    g += std::format("layout(location = {}) noperspective out float vtx_z;\n\n", kVaryingZ);
     g +=
         "// The hardware's rules: a product with a zero factor is zero whatever the other factor is; the reciprocal\n"
         "// ops take a scalar and replicate it; RCC clamps the magnitude to [2^-64, 2^64]; LIT clamps the exponent.\n"
@@ -341,6 +344,7 @@ void append_tail(std::string& g, const Options& options) {
         "        oPos.xy = mix(oPos.xy, floor(oPos.xy) + 0.5 / surface_size.z, lessThan(abs(fract(oPos.xy) - 0.5), vec2(1.0 / 16.0)));\n"
         "    oPos.w = vp_clamp_away(oPos.w);\n"
         "    vtx_pos = oPos;\n"
+        "    vtx_z = oPos.z;\n"
         "    vec2 ndc = (2.0 * oPos.xy - surface_size.xy) / surface_size.xy;\n"
         "    float zndc = oPos.z / clip_range.y;\n"
         "    // Multiplied back by the SIGNED w: a triangle with vertices behind the eye is then clipped at w = 0 as the\n"

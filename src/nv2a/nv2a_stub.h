@@ -117,6 +117,10 @@ public:
     // has reached in the guest's present, PGRAPH_STATUS reads busy while the GPU clock is ahead. Deterministic: the
     // costs come from the method stream (gpu_timing.h). Off: the pusher takes no time (the fast mode, MV_GPU_TIMING=0).
     void set_timed(bool on) { timed_ = on; }
+    // Occlusion reports from the renderer's counts of z-pass-counted draws in the fast core (the reference emulator's
+    // model): GET_REPORT queues the draws counted since the last report; the queue is written to RAM when a pusher run
+    // ends, one wait for the GPU a run. Off: every report says the whole screen passed.
+    void set_real_reports(bool on) { real_reports_ = on; }
     bool timed() const { return timed_; }
     u64 gpu_clocks() const { return gpu_clock_; }  // instrument: GPU clocks charged so far
     // Stage B instruments: pixels counted, the clocks they cost, and how often the GPU's counts had to be waited for.
@@ -202,6 +206,8 @@ private:
     void advance_flip_field(unsigned shift);
     bool flip_released() const { return flip_field(24) != flip_field(20); }
     void write_report(u32 parameter);
+    void write_report_count(u32 parameter, u32 count);
+    void process_reports();
     void update_irq();
     void schedule_vblank();
     void schedule_alarm();
@@ -272,6 +278,17 @@ private:
     };
     u64 zpass_count_{0};  // samples passed since CLEAR_REPORT_VALUE, for GET_REPORT (timed, with a renderer)
     std::deque<PendingDraw> pending_draws_;
+    // The fast core's reports (set_real_reports): draws counted since the last report or clear, and the queue in stream
+    // order (a clear drops what came before it).
+    struct QueuedReport {
+        bool clear;
+        u32 parameter, handle;  // GET_REPORT's word and the report object then
+        std::vector<u64> tickets;
+    };
+    bool real_reports_{false};
+    std::vector<u64> zpass_tickets_;
+    std::vector<QueuedReport> report_queue_;
+    u64 fast_zpass_count_{0};
     u64 timed_pixels_{0}, pixel_clocks_{0}, pixel_resolves_{0};
     u32 get_visible_{0};
     u32 methods_since_mark_{0};

@@ -110,6 +110,9 @@ public:
     // draw's ticket (0: it drew nothing) is read after the draw, and draw_counts gives its counts in the target's
     // logical pixels (divided by its anti-aliasing scale), submitting and waiting for the GPU only if they are not in.
     void set_count_draws(bool on) { count_draws_ = on; }
+    // Z-pass counting alone (the fast core's occlusion reports): only draws made with SET_ZPASS_PIXEL_COUNT_ENABLE on are
+    // wrapped in a query and given a ticket, as the reference emulator counts them.
+    void set_count_zpass(bool on) { count_zpass_ = on; }
     u64 last_draw_ticket() const { return last_ticket_; }
     struct DrawCounts {
         u64 fragments{0};  // pixels written: the passed samples in the target's logical pixels
@@ -491,7 +494,7 @@ private:
     };
     static constexpr u32 kQueriesPerFrame = 4096;
     static constexpr u32 kSubmitDraws = 32;  // counted draws a submission carries at most (<= kQueriesPerFrame)
-    bool count_draws_{false};
+    bool count_draws_{false}, count_zpass_{false};
     u64 next_ticket_{1}, last_ticket_{0};
     std::unordered_map<u64, DrawCounts> counts_;
     void harvest(Frame& fr);

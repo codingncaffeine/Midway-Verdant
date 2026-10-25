@@ -27,6 +27,8 @@ u32 bits(float f) {
     return v;
 }
 
+constexpr u32 kZminMaxControlForTest = 0x1D78;  // Kelvin SET_ZMIN_MAX_CONTROL: ZCLAMP_EN in bits 7:4 (0 cull, 1 clamp)
+
 struct RamResolver : HandleResolver {
     u32 size{0};
     DmaObject resolve(u32) const override { return {0, size - 1, 0x3D, true}; }
@@ -52,6 +54,10 @@ void load_passthrough_program(Kelvin& k) {
         for (u32 w = 0; w < 4; ++w) k.method(mthd::kTransformProgram + 4 * w, t[w]);
     k.method(mthd::kTransformProgramStart, 0);
     k.method(mthd::kTransformExecutionMode, 2);
+    // The depth clip range as the runtime sets it with the program (the pixel shader clamps or culls depth to it; the
+    // registers are zero at power-on).
+    k.method(mthd::kClipMin, std::bit_cast<u32>(0.0f));
+    k.method(mthd::kClipMax, std::bit_cast<u32>(16777215.0f));
 }
 
 // Combiners: final colour = v0 (diffuse), alpha = v0.a.
@@ -568,6 +574,67 @@ TEST(Vulkan, ThePolygonOffsetMovesACoplanarTriangleInFrontOnlyWhenEnabled) {
     renderer.end_frame();
     for (const auto& e : renderer.stats().errors) ADD_FAILURE() << "renderer: " << e;
     EXPECT_EQ(pixel_at(ram, 8, 8) & 0x00FFFFFFu, 0xFF0000u) << "pulled in front by 16 depth units";
+}
+
+TEST(Vulkan, TheDepthWrittenIsTheConsolesClampedOrCulledToTheClipRangeAndTruncated) {
+    // The console's depth, not the host's: culled outside the clip range (SET_ZMIN_MAX_CONTROL ZCLAMP_EN = cull) or
+    // clamped to it (= clamp), and stored truncated to the buffer's integer step. A shadow map's compare and an
+    // occlusion test quad at a light's depth depend on the exact step.
+    vk::Device device;
+    std::string error;
+    if (!device.init(error)) GTEST_SKIP() << "no Vulkan device: " << error;
+    std::vector<u8> ram(4u << 20, 0);
+    RamResolver handles;
+    handles.size = static_cast<u32>(ram.size());
+    VulkanRenderer renderer(device, handles, ram.data(), static_cast<u32>(ram.size()));
+    ASSERT_TRUE(renderer.init(error)) << error;
+    if (!device.depth_clamp()) GTEST_SKIP() << "the device cannot clamp depth";
+    Kelvin k;
+    k.set_sink(&renderer);
+    setup_target(k);
+    k.method(mthd::kDepthTestEnable, 1);
+    k.method(mthd::kDepthFunc, 0x207);  // ALWAYS: every fragment writes its depth
+    k.method(mthd::kDepthMask, 1);
+    k.method(mthd::kClipMax, bits(8000000.0f));
+    auto clear = [&] {
+        k.method(mthd::kColorClear, 0xFF000080);
+        k.method(mthd::kZstencilClear, 0xFFFFFF00);
+        k.method(mthd::kClearRectH, 63u << 16);
+        k.method(mthd::kClearRectV, 63u << 16);
+        k.method(mthd::kClearSurface, 0xF3);
+    };
+    auto triangle = [&](float depth_units) {  // green, over the whole target, at one depth in depth units
+        k.method(mthd::kBeginEnd, 5);
+        k.method(mthd::kDiffuse4ub, 0xFF00FF00);
+        for (const auto& p : {std::array<float, 2>{0.0f, 0.0f}, std::array<float, 2>{128.0f, 0.0f}, std::array<float, 2>{0.0f, 128.0f}}) {
+            k.method(mthd::kVertexData4fM + 0, bits(p[0]));
+            k.method(mthd::kVertexData4fM + 4, bits(p[1]));
+            k.method(mthd::kVertexData4fM + 8, bits(depth_units));
+            k.method(mthd::kVertexData4fM + 12, bits(1.0f));
+        }
+        k.method(mthd::kBeginEnd, 0);
+    };
+    auto stored_depth = [&] {
+        renderer.end_frame();
+        renderer.write_back_all();
+        u32 word;
+        std::memcpy(&word, &ram[0x20000 + 8 * 256 + 8 * 4], 4);
+        return word >> 8;
+    };
+    k.method(kZminMaxControlForTest, 0x01);  // cull
+    clear();
+    triangle(12000000.0f);
+    EXPECT_EQ(stored_depth(), 0xFFFFFFu) << "beyond the clip range and culled: the clear's depth stays";
+    EXPECT_EQ(pixel_at(ram, 8, 8) & 0x00FFFFFFu, 0x000080u) << "and the colour too";
+    k.method(kZminMaxControlForTest, 0x11);  // clamp
+    clear();
+    triangle(12000000.0f);
+    EXPECT_EQ(stored_depth(), 8000000u) << "clamped to the clip range's top";
+    EXPECT_EQ(pixel_at(ram, 8, 8) & 0x00FFFFFFu, 0x00FF00u);
+    clear();
+    triangle(4000000.75f);
+    EXPECT_EQ(stored_depth(), 4000000u) << "truncated to the step below, as the console stores it (the host rounds up)";
+    for (const auto& e : renderer.stats().errors) ADD_FAILURE() << "renderer: " << e;
 }
 
 TEST(Vulkan, ATargetWhoseMemoryAnotherEngineRewroteIsReloadedBeforeItIsDrawnIntoAgain) {

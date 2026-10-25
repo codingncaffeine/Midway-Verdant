@@ -11,6 +11,7 @@
 
 #include "debug/png.h"
 #include "nv2a/shaders/glsl_compiler.h"
+#include "nv2a/shaders/vsh_interpreter.h"
 #include "nv2a/scanout.h"
 
 namespace mv::pgraph {
@@ -19,6 +20,8 @@ namespace {
 
 constexpr VkDeviceSize kVertexRingBytes = 32u << 20, kIndexRingBytes = 8u << 20, kUniformRingBytes = 8u << 20, kStagingBytes = 16u << 20;
 constexpr u32 kMaxDescriptorSets = 4096;
+constexpr u32 kZpassEnable = 0x17CC;  // Kelvin SET_ZPASS_PIXEL_COUNT_ENABLE
+constexpr u32 kZminMaxControl = 0x1D78;  // Kelvin SET_ZMIN_MAX_CONTROL
 
 VkFormat color_vk_format(u32 nv_format) {
     switch (nv_format) {
@@ -552,8 +555,8 @@ void VulkanRenderer::submit(bool rotate) {
     dev_.submit(1, &si, fr.last);
     fr.serial = ++submitted_;
     ++stats_.flushes;
-    // Draw counting reads a frame's queries once its fence signals, all of them at once: every submit moves on.
-    if (rotate || rotate_pending_ || count_draws_) {
+    // Draw counting reads a frame's queries once its fence signals, all of them at once: a submit with queries moves on.
+    if (rotate || rotate_pending_ || count_draws_ || fr.queries > 0) {
         rotate_pending_ = false;
         begin_frame((slot_ + 1) % kFramesInFlight);
     } else {
@@ -1588,6 +1591,7 @@ void VulkanRenderer::write_back_range(u32 phys, u32 len) {
 
 bool VulkanRenderer::copy_rect(u32 src_phys, u32 src_pitch, u32 dst_phys, u32 dst_pitch, u32 w, u32 h, u32 bpp) {
     if (debug_roundtrip_) return false;
+    if (drawid_on()) std::fprintf(stderr, "drawid 2d: copy %08x pitch %u -> %08x pitch %u, %ux%u, %u B/px\n", src_phys, src_pitch, dst_phys, dst_pitch, w, h, bpp);
     // The pitch-linear target whose image holds the rectangle at `phys` (its pixel there, as x, y), current with RAM or newer.
     auto holder = [&](u32 phys, u32 pitch, u32& x, u32& y) -> Surface* {
         for (auto& [k, sp] : surfaces_) {
@@ -1604,7 +1608,10 @@ bool VulkanRenderer::copy_rect(u32 src_phys, u32 src_pitch, u32 dst_phys, u32 ds
     u32 sx = 0, sy = 0, dx = 0, dy = 0;
     Surface* src = holder(src_phys, src_pitch, sx, sy);
     Surface* dst = src ? holder(dst_phys, dst_pitch, dx, dy) : nullptr;
-    if (!dst || src->color.format != dst->color.format) return false;
+    if (!dst || src->color.format != dst->color.format) {
+        if (drawid_on()) std::fprintf(stderr, "drawid 2d: through RAM (source target %08x, destination target %08x)\n", src ? src->phys : 0u, dst ? dst->phys : 0u);
+        return false;
+    }
     if (src == dst && sx < dx + w && dx < sx + w && sy < dy + h && dy < sy + h) return false;  // overlapping within one image
     // Another target over the destination's memory would not see the copy (RAM would have shown it to it): through RAM.
     const u64 d0 = dst_phys, d1 = static_cast<u64>(dst_phys) + static_cast<u64>(h - 1) * dst_pitch + static_cast<u64>(w) * bpp;
@@ -1648,6 +1655,7 @@ bool VulkanRenderer::copy_rect(u32 src_phys, u32 src_pitch, u32 dst_phys, u32 ds
 // A GPU-side write to guest memory (a blit): decoded textures over it are stale, and so is any target's image
 // the guest has not drawn into since.
 void VulkanRenderer::invalidate(u32 phys, u32 len) {
+    if (drawid_on()) std::fprintf(stderr, "drawid 2d: RAM written %08x..%08x (targets there reload)\n", phys, phys + len);
     invalidate_textures(phys, len);
     const u64 b0 = phys, b1 = static_cast<u64>(phys) + len;
     for (auto& [k, s] : surfaces_) {
@@ -1974,7 +1982,10 @@ VkPipeline VulkanRenderer::pipeline(const KelvinState& s, VkShaderModule vs, VkS
         rs.cullMode = face == 0x404 ? VK_CULL_MODE_FRONT_BIT : (face == 0x408 ? VK_CULL_MODE_FRONT_AND_BACK : VK_CULL_MODE_BACK_BIT);
     }
     rs.frontFace = (s.reg(mthd::kFrontFace) == 0x900) != debug_flip_front_ ? VK_FRONT_FACE_CLOCKWISE : VK_FRONT_FACE_COUNTER_CLOCKWISE;
-    rs.depthBiasEnable = VK_TRUE;  // the polygon offset, set per draw (zero when the draw has none)
+    // The polygon offset and the near and far clip are the pixel shader's (it writes the console's depth): the host
+    // neither clips on z (where the device can clamp instead) nor biases.
+    rs.depthClampEnable = dev_.depth_clamp() ? VK_TRUE : VK_FALSE;
+    rs.depthBiasEnable = VK_FALSE;
     auto& ms = build->ms;
     ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
     auto& ds = build->ds;
@@ -3246,7 +3257,9 @@ void VulkanRenderer::draw(const KelvinState& s, const DrawBatch& batch) {
     // A frame whose queries are used up goes to the GPU before this draw (its pass reopens below); and with counting
     // on, every few hundred draws: the GPU works on them while the CPU goes on, so a count asked for later is usually
     // in already instead of a submit and a wait for the whole batch (5.6 % of a title's CPU thread waited there).
-    if (count_draws_ && frames_[slot_].queries >= kSubmitDraws) submit();
+    // Counted: every draw for the timed pusher, or only the z-pass-counted ones for the occlusion reports.
+    const bool counting = count_draws_ || (count_zpass_ && (s.reg(kZpassEnable) & 1u) != 0);
+    if (counting && frames_[slot_].queries >= kSubmitDraws) submit();
     LapClock clock(stats_.ns_draw);
     ++stats_.draws;
     ++frame_draws_;
@@ -3456,6 +3469,23 @@ void VulkanRenderer::draw(const KelvinState& s, const DrawBatch& batch) {
         vsh::fixed_function_uniforms(s, u + kConstants * 4 + 8);
         psh::Uniforms pu{};
         psh::uniforms_from_state(s, scales, pu);
+        {
+            // The depth the pixel shader writes as the console does: the format's range (the vertex side's z scale), the
+            // clip range, the polygon offset for triangle-class primitives with the front mode's enable (its slope term
+            // per image pixel: sc times larger at the internal resolution), and SET_ZMIN_MAX_CONTROL's cull or clamp.
+            const u32 mode = s.reg(mthd::kFrontPolygonMode);
+            const u32 enable = mode == 0x1B00 ? mthd::kPolyOffsetPointEnable : mode == 0x1B01 ? mthd::kPolyOffsetLineEnable : mthd::kPolyOffsetFillEnable;
+            const bool offset_on = v.primitive >= Primitive::Triangles && s.reg(enable) != 0;
+            const bool float_depth = (s.reg(mthd::kControl0) & (1u << 12)) != 0;  // SET_CONTROL0 Z_FORMAT
+            pu.depth[0][0] = t->zeta_format == 1 ? 65535.0f : 16777215.0f;
+            pu.depth[0][1] = s.regf(mthd::kClipMin);
+            pu.depth[0][2] = s.regf(mthd::kClipMax);
+            pu.depth[0][3] = offset_on ? std::bit_cast<float>(s.reg(mthd::kPolygonOffsetBias)) : 0.0f;
+            pu.depth[1][0] = offset_on ? std::bit_cast<float>(s.reg(mthd::kPolygonOffsetFactor)) * static_cast<float>(t->sc) : 0.0f;
+            pu.depth[1][1] = float_depth ? 2.0f : (t->zeta_format == 1 ? 0.0f : 1.0f);
+            pu.depth[1][2] = ((s.reg(kZminMaxControl) >> 4) & 0xFu) == 0 ? 1.0f : 0.0f;  // ZCLAMP_EN: 0 cull, 1 clamp
+            pu.depth[1][3] = 0.0f;
+        }
         const VkDeviceSize ualign = std::max<VkDeviceSize>(dev_.limits().minUniformBufferOffsetAlignment, 16);
         auto upload = [&](UniformUpload& last, const void* block, std::size_t bytes, VkDeviceSize& offset) {
             if (last.valid && std::memcmp(last.bytes.data(), block, bytes) == 0) {
@@ -3567,25 +3597,13 @@ void VulkanRenderer::draw(const KelvinState& s, const DrawBatch& batch) {
     }
     fn_->vkCmdSetBlendConstants(cb_, constants);
     fn_->vkCmdSetStencilReference(cb_, VK_STENCIL_FACE_FRONT_AND_BACK, s.reg(mthd::kStencilRef) & 0xFFu);
-    {
-        // The polygon offset: bias + factor x the depth slope, in depth-buffer units, which are the attachment's own steps
-        // (depth reaches the host as z / the zeta format's maximum). It applies to triangle-class primitives, with the
-        // enable of the front polygon mode (we fill every mode). Per the method definitions and the reference emulator.
-        const u32 mode = s.reg(mthd::kFrontPolygonMode);
-        const u32 enable = mode == 0x1B00 ? mthd::kPolyOffsetPointEnable : mode == 0x1B01 ? mthd::kPolyOffsetLineEnable : mthd::kPolyOffsetFillEnable;
-        const bool triangles = v.primitive >= Primitive::Triangles;
-        const bool on = triangles && s.reg(enable) != 0;
-        // The slope is per image pixel: at the internal resolution's scale it is sc times smaller, so the factor is
-        // sc times larger for the same offset.
-        fn_->vkCmdSetDepthBias(cb_, on ? std::bit_cast<float>(s.reg(mthd::kPolygonOffsetBias)) : 0.0f, 0.0f,
-                               on ? std::bit_cast<float>(s.reg(mthd::kPolygonOffsetFactor)) * static_cast<float>(sc) : 0.0f);
-    }
+    // The polygon offset is the pixel shader's (it writes the console's depth; the pipeline's depth bias is off).
     const VkDeviceSize vb_offsets[2] = {voffset, voffset + vertex_bytes};
     const VkBuffer vbs[2] = {vertex_ring_.buffer.buffer, vertex_ring_.buffer.buffer};
     fn_->vkCmdBindVertexBuffers(cb_, 0, 2, vbs, vb_offsets);
     Frame& qf = frames_[slot_];
     const u32 query = qf.queries;
-    if (count_draws_) {
+    if (counting) {
         fn_->vkCmdBeginQuery(cb_, qf.occlusion, query, dev_.occlusion_precise() ? VK_QUERY_CONTROL_PRECISE_BIT : 0);
     }
     if (!index_list->empty()) {
@@ -3594,12 +3612,28 @@ void VulkanRenderer::draw(const KelvinState& s, const DrawBatch& batch) {
     } else {
         fn_->vkCmdDraw(cb_, v.count, 1, 0, 0);
     }
-    if (count_draws_) {
+    if (counting) {
         fn_->vkCmdEndQuery(cb_, qf.occlusion, query);
         qf.aa_scale[query] = t->aa_x * t->aa_y;
         qf.res_scale[query] = sc * sc;
         ++qf.queries;
         last_ticket_ = qf.first_ticket + query;
+        if (drawid_on()) std::fprintf(stderr, "drawid %u: counted, ticket %llu, %u vertices, %zu indices, viewport %g,%g %gx%g scissor %d,%d %ux%u\n", draw_id, static_cast<unsigned long long>(last_ticket_), v.count, index_list->size(), static_cast<double>(viewport.x), static_cast<double>(viewport.y), static_cast<double>(viewport.width), static_cast<double>(viewport.height), scissor.offset.x, scissor.offset.y, scissor.extent.width, scissor.extent.height);
+        // Instrument (drawid window, counted draws): each vertex as the program leaves it (screen x, y, depth units, w),
+        // from the CPU interpreter, with the clip range: where an occlusion test quad lands.
+        if (drawid_on() && s.vertex_program_mode()) {
+            const vsh::Program prog = vsh::extract_program(s);
+            std::string line;
+            for (u32 n = 0; n < std::min<u32>(v.count, 8); ++n) {
+                std::array<vsh::Vec4, kAttributes> in{};
+                for (u32 a = 0; a < kAttributes; ++a)
+                    for (u32 c = 0; c < 4; ++c) in[a][c] = (v.enabled & (1u << a)) ? v.attribute[a][static_cast<std::size_t>(n) * 4 + c] : v.constant[a][c];
+                const vsh::Outputs o = vsh::run(prog, in, s.constants);
+                line += std::format(" ({:.2f}, {:.2f}, {:.1f}, {:.3f})", o.pos[0], o.pos[1], o.pos[2], o.pos[3]);
+            }
+            std::fprintf(stderr, "drawid %u: positions%s; clip %g..%g, zmin/max control %08x\n", draw_id, line.c_str(), static_cast<double>(s.regf(mthd::kClipMin)),
+                         static_cast<double>(s.regf(mthd::kClipMax)), s.reg(kZminMaxControl));
+        }
         next_ticket_ = last_ticket_ + 1;
     }
     clock.lap(stats_.ns_record);

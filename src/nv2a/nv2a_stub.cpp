@@ -150,6 +150,9 @@ void Nv2aStub::reset() {
     marks_pushed_ = 0;
     pending_draws_.clear();
     zpass_count_ = 0;
+    zpass_tickets_.clear();
+    report_queue_.clear();
+    fast_zpass_count_ = 0;
     kelvin_ = pgraph::Kelvin();
     kelvin_.set_sink(renderer_);
     kelvin_.set_vertex_memory(this, {bus_.ram(), static_cast<u32>(bus_.ram_size())});
@@ -193,6 +196,46 @@ void Nv2aStub::advance_flip_field(unsigned shift) {
 // tests (a 4-vertex fan, depth LEQUAL, writes off, z cull mode) pass no sample in our renderer even with the depth
 // test and culling off, so every flare vanished (session 18; the transformed vertices are the next thing to look at).
 void Nv2aStub::write_report(u32 parameter) {
+    // The fast core with real reports: queued with the draws counted since the last report, written when the run ends.
+    if (real_reports_ && !timed_ && renderer_) {
+        report_queue_.push_back({false, parameter, report_handle_, std::move(zpass_tickets_)});
+        zpass_tickets_.clear();
+        return;
+    }
+    static const bool real_counts = [] {
+        const char* z = std::getenv("MV_ZPASS_REPORTS");
+        return z && *z == '1';
+    }();
+    const u32 count = (real_counts && timed_ && renderer_) ? static_cast<u32>(std::min<u64>(zpass_count_, 0xFFFFFFFFu))
+                                            : (scanout_programmed() ? scanout_width() * scanout_height() : 640u * 480u);
+    write_report_count(parameter, count);
+}
+
+// The queued reports in stream order: each adds its draws' passed samples (in the console's pixels: the renderer divides
+// by the internal resolution's scale) to the running count and writes it; a clear restarts the count. Reading the counts
+// waits for the GPU once for the lot (the reference emulator writes its reports when a pusher run ends too).
+void Nv2aStub::process_reports() {
+    if (report_queue_.empty()) return;
+    const u32 handle_now = report_handle_;
+    for (QueuedReport& r : report_queue_) {
+        for (const u64 t : r.tickets) {
+            const u64 samples = renderer_ ? renderer_->draw_counts(t).samples : 0;
+            if (debug_zpass()) std::fprintf(stderr, "zpass: draw %llu samples %llu%s\n", static_cast<unsigned long long>(t), static_cast<unsigned long long>(samples), r.clear ? " (cleared)" : "");
+            fast_zpass_count_ += samples;
+        }
+        if (debug_zpass() && !r.clear) std::fprintf(stderr, "zpass: GET_REPORT %08x -> %llu\n", r.parameter, static_cast<unsigned long long>(fast_zpass_count_));
+        if (r.clear) {
+            fast_zpass_count_ = 0;
+            continue;
+        }
+        report_handle_ = r.handle;
+        write_report_count(r.parameter, static_cast<u32>(std::min<u64>(fast_zpass_count_, 0xFFFFFFFFu)));
+    }
+    report_handle_ = handle_now;
+    report_queue_.clear();
+}
+
+void Nv2aStub::write_report_count(u32 parameter, u32 count) {
     const auto dma = dma_object(lookup_handle(report_handle_) & 0xFFFFu);
     const u32 offset = parameter & 0x00FFFFFFu;
     if (!dma.valid || offset + 16 > dma.limit + 1) {
@@ -202,12 +245,6 @@ void Nv2aStub::write_report(u32 parameter) {
     u8 report[16]{};
     const u64 t = ptimer_ticks();
     for (int i = 0; i < 8; ++i) report[i] = static_cast<u8>(t >> (8 * i));
-    static const bool real_counts = [] {
-        const char* z = std::getenv("MV_ZPASS_REPORTS");
-        return z && *z == '1';
-    }();
-    const u32 count = (real_counts && timed_ && renderer_) ? static_cast<u32>(std::min<u64>(zpass_count_, 0xFFFFFFFFu))
-                                            : (scanout_programmed() ? scanout_width() * scanout_height() : 640u * 480u);
     for (int i = 0; i < 4; ++i) report[8 + i] = static_cast<u8>(count >> (8 * i));
     if (debug_zpass()) std::fprintf(stderr, "zpass: GET_REPORT %08x -> %u\n", parameter, count);
     bus_.write_ram(dma.base + offset, report, 16);
@@ -553,6 +590,15 @@ void Nv2aStub::execute_method(const PushbufferMethod& m) {
             }
         }
         if (debug_zpass() && (m.method == kMethodClearReport || m.method == kMethodZpassEnable)) std::fprintf(stderr, "zpass: method %04x <- %08x\n", m.method, m.value);
+        // The fast core's real reports: the renderer gives a ticket only to a z-pass-counted draw; CLEAR_REPORT_VALUE
+        // drops the count so far (in stream order, through the queue; its draws' results are read and discarded).
+        if (real_reports_ && !timed_) {
+            if (const u64 ticket = renderer_->last_draw_ticket(); ticket && ticket != ticket_before) zpass_tickets_.push_back(ticket);
+            if (m.method == kMethodClearReport) {
+                report_queue_.push_back({true, 0, 0, std::move(zpass_tickets_)});
+                zpass_tickets_.clear();
+            }
+        }
         if (timed_ && m.method == kMethodClearReport && m.value == 1) {
             if (pending_draws_.empty()) zpass_count_ = 0;
             else pending_draws_.push_back({0, 0, 0, marks_pushed_, false});
@@ -736,6 +782,7 @@ void Nv2aStub::run_pusher_inline() {
     last_run_end_ = t1;
     run_open_ = true;
     regs_[kCache1DmaGet] = get;
+    process_reports();  // the occlusion reports this run asked for (fast core, real reports)
     // A walk that moved nothing (a fetch outside its object, an unknown header) would be retried for ever by the FIFO
     // thread; it waits for the next kick instead, as the inline pusher does.
     if (get == get_before && walker_.methods_seen() == methods_before) stuck_ = true;

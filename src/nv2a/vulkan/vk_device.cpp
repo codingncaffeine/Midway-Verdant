@@ -144,6 +144,8 @@ VkDevice Device::create_logical(const Functions& fn, VkPhysicalDevice gpu, u32& 
     features.fillModeNonSolid = available.fillModeNonSolid;
     features.samplerAnisotropy = available.samplerAnisotropy;
     enabled.anisotropy = available.samplerAnisotropy;
+    features.depthClamp = available.depthClamp;
+    enabled.depth_clamp = available.depthClamp;
     features.independentBlend = available.independentBlend;
     features.largePoints = available.largePoints;
     features.occlusionQueryPrecise = available.occlusionQueryPrecise;

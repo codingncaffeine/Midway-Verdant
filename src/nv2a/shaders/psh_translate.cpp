@@ -349,7 +349,8 @@ Translation translate(const Key& key) {
     g += std::format("layout(location = {}) {}in vec4 vtx_b1;\n", kVaryingB1, flat);
     for (u32 i = 0; i < 4; ++i) g += std::format("layout(location = {}) in vec4 vtx_t{};\n", kVaryingT0 + i, i);
     g += std::format("layout(location = {}) in float vtx_fog;\n", kVaryingFog);
-    g += std::format("layout(location = {}) in vec4 vtx_pos;\n\n", kVaryingPos);
+    g += std::format("layout(location = {}) in vec4 vtx_pos;\n", kVaryingPos);
+    g += std::format("layout(location = {}) noperspective in float vtx_z;\n\n", kVaryingZ);
     g +=
         "layout(std140, set = 0, binding = 1) uniform PshUniforms {\n"
         "    vec4 c0[9];\n"
@@ -360,6 +361,7 @@ Translation translate(const Key& key) {
         "    vec4 eye;\n"
         "    vec4 bump_mat[4];\n"
         "    vec4 bump_lum[4];\n"
+        "    vec4 depth[2];\n"
         "};\n";
     // Texture stages: which sampler each needs.
     for (u32 i = 0; i < 4; ++i) {
@@ -368,16 +370,22 @@ Translation translate(const Key& key) {
         const char* type = kind == SamplerKind::SamplerCube ? "samplerCube" : (kind == SamplerKind::Sampler3D ? "sampler3D" : "sampler2D");
         if (kind != SamplerKind::None) g += std::format("layout(set = 0, binding = {}) uniform {} tex{};\n", kSamplerBindingBase + i, type, i);
     }
-    bool dots = false, bumps = false;
+    bool dots = false, bumps = false, depth_replaced = false;
     for (u32 i = 0; i < 4; ++i) {
         const u32 mode = stage_mode(key, i);
         if (!mode_valid_at(mode, i)) continue;
         dots |= dot_mode(mode);
         bumps |= mode == kModeBumpEnv || mode == kModeBumpEnvLuminance;
+        depth_replaced |= mode == kModeDotZW;
     }
     if (dots || bumps) g += kDotMapFunctions;
     g += "\nlayout(location = 0) out vec4 frag_color;\n\n";
     g += "void main() {\n";
+    // The depth in the console's units and its slope, taken before anything can discard (derivatives need every pixel
+    // of the quad), from the screen-space z the vertex side passes (interpolated linearly across the screen).
+    if (!depth_replaced)
+        g += "    float nv_z = vtx_z;\n"
+             "    float nv_slope = max(abs(dFdx(nv_z)), abs(dFdy(nv_z)));\n";
     g += "    vec4 v0 = vtx_d0;\n    vec4 v1 = vtx_d1;\n";
     g += std::format("    vec4 fog = vec4(fog_color.rgb, {});\n", key.fog_enable ? "clamp(vtx_fog, 0.0, 1.0)" : "1.0");
     // A stage without a result (mode none, a disabled texture) reads (0, 0, 0, 0), as NV_texture_shader's NONE does.
@@ -632,6 +640,21 @@ Translation translate(const Key& key) {
     g += "    frag_color = clamp(final_color, 0.0, 1.0);\n";
     if (g.find("vec4 debug_show") != std::string::npos) g += "    frag_color = debug_show;\n";
     if (key.swap_rb) g += "    frag_color = frag_color.bgra;\n";  // a B8 or G8B8 target: its first channel is blue
+    // The depth the console writes, as the reference emulator computes it: the polygon offset (bias + factor x slope, in
+    // depth units), then culled outside the clip range or clamped to it (SET_ZMIN_MAX_CONTROL), then truncated to the
+    // buffer's integer step (the host would round). A shadow map's compare, an occlusion test quad at a light's depth
+    // and a decal over its surface depend on the exact step. A 24-bit value is written one float step above n / 2^24 so
+    // the attachment's conversion lands on n.
+    if (!depth_replaced)
+        g += "    nv_z += depth[0].w + depth[1].x * nv_slope;\n"
+             "    if (depth[1].z > 0.5) {\n"
+             "        if (nv_z < depth[0].y || nv_z > depth[0].z) discard;\n"
+             "    } else {\n"
+             "        nv_z = clamp(nv_z, depth[0].y, depth[0].z);\n"
+             "    }\n"
+             "    if (depth[1].y < 0.5) gl_FragDepth = floor(nv_z) / 65535.0;\n"
+             "    else if (depth[1].y < 1.5) gl_FragDepth = uintBitsToFloat(floatBitsToUint(floor(nv_z) / 16777216.0) + 1u);\n"
+             "    else gl_FragDepth = nv_z / depth[0].x;\n";
     g += "}\n";
     t.glsl = std::move(g);
     return t;
