@@ -52,6 +52,13 @@ public:
     // x w by `scale` x h XRGB8888 pixels (alpha clear, rows tightly packed). False at 1x, or when RAM holds the
     // picture (no target there, or another engine wrote it since): the caller widens the RAM picture instead.
     bool scaled_scanout(u32 phys, u32 pitch, u32 bpp, bool rgb565, u32 w, u32 h, std::vector<u32>& xrgb, u32& scale) const;
+    // The same picture where it lies (no copy): the rectangle's first pixel, its row pitch and its scale, in the frame
+    // buffer's format. It stays valid until the next vblank (the CPU holds at that one while the frontend takes it).
+    struct ScaledPicture {
+        const u8* pixels{nullptr};
+        u32 pitch{0}, sc{1};
+    };
+    bool scaled_picture(u32 phys, u32 pitch, u32 bpp, u32 w, u32 h, ScaledPicture& out) const;
 
     void clear(const KelvinState& state, u32 clear_bits) override;
     void draw(const KelvinState& state, const DrawBatch& batch) override;

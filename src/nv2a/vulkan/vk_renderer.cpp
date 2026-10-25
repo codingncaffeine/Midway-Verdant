@@ -3086,7 +3086,7 @@ void VulkanRenderer::store_display(Surface& s) {
     shown_ = s.phys;
 }
 
-bool VulkanRenderer::scaled_scanout(u32 phys, u32 pitch, u32 bpp, bool rgb565, u32 w, u32 h, std::vector<u32>& xrgb, u32& scale) const {
+bool VulkanRenderer::scaled_picture(u32 phys, u32 pitch, u32 bpp, u32 w, u32 h, ScaledPicture& out) const {
     std::lock_guard g(display_mutex_);
     if (!shown_) return false;
     for (const Capture& c : captures_) {
@@ -3095,24 +3095,23 @@ bool VulkanRenderer::scaled_scanout(u32 phys, u32 pitch, u32 bpp, bool rgb565, u
         if ((off % pitch) % bpp) return false;
         const u32 x0 = (off % pitch) / bpp, y0 = off / pitch;
         if (x0 + w > c.width || y0 + h > c.height) return false;
-        const u32 sc = c.sc, fw = w * sc, fh = h * sc;
-        const u32 src_pitch = c.width * sc * bpp;
-        const u8* src = static_cast<const u8*>(c.buffer.mapped) + static_cast<std::size_t>(y0) * sc * src_pitch + static_cast<std::size_t>(x0) * sc * bpp;
-        xrgb.resize(static_cast<std::size_t>(fw) * fh);
-        if (bpp == 4) {
-            // One pass: the rectangle out of the read-back buffer, the scanout's ignored alpha byte cleared.
-            for (u32 y = 0; y < fh; ++y) {
-                const u32* row = reinterpret_cast<const u32*>(src + static_cast<std::size_t>(y) * src_pitch);
-                u32* out = xrgb.data() + static_cast<std::size_t>(y) * fw;
-                for (u32 x = 0; x < fw; ++x) out[x] = row[x] & 0x00FFFFFFu;
-            }
-        } else {
-            scanout_to_xrgb(src, src_pitch, bpp, rgb565, fw, fh, reinterpret_cast<u8*>(xrgb.data()));
-        }
-        scale = sc;
+        out.sc = c.sc;
+        out.pitch = c.width * c.sc * bpp;
+        out.pixels = static_cast<const u8*>(c.buffer.mapped) + static_cast<std::size_t>(y0) * c.sc * out.pitch + static_cast<std::size_t>(x0) * c.sc * bpp;
         return true;
     }
     return false;
+}
+
+bool VulkanRenderer::scaled_scanout(u32 phys, u32 pitch, u32 bpp, bool rgb565, u32 w, u32 h, std::vector<u32>& xrgb, u32& scale) const {
+    ScaledPicture p;
+    if (!scaled_picture(phys, pitch, bpp, w, h, p)) return false;
+    const u32 fw = w * p.sc, fh = h * p.sc;
+    xrgb.resize(static_cast<std::size_t>(fw) * fh);
+    scanout_to_xrgb(p.pixels, p.pitch, bpp, rgb565, fw, fh, reinterpret_cast<u8*>(xrgb.data()));
+    for (u32& px : xrgb) px &= 0x00FFFFFFu;
+    scale = p.sc;
+    return true;
 }
 
 std::vector<VulkanRenderer::SurfaceInfo> VulkanRenderer::surfaces() const {

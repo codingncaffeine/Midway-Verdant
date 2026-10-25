@@ -4,6 +4,7 @@
 // in that frame, and the pads' state from the RetroPads. The console's own files (the MCPX boot ROM, the flash
 // image, the EEPROM and the hard-disk image) come from <system>/midway-verdant/.
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cctype>
 #include <chrono>
@@ -17,6 +18,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "core/machine.h"
@@ -187,6 +189,17 @@ bool find_console_files(const std::filesystem::path& dir, ConsoleFiles& out, std
     return error.empty();
 }
 
+// Rows [0, rows) split into bands on up to four threads: a picture at a high internal resolution is tens of MB a frame.
+template <typename F>
+void parallel_rows(mv::u32 rows, F&& f) {
+    const mv::u32 n = rows >= 1024 ? 4u : 1u, step = (rows + n - 1) / n;
+    std::vector<std::thread> helpers;
+    for (mv::u32 i = 1; i < n; ++i)
+        if (const mv::u32 a = i * step; a < rows) helpers.emplace_back([&f, a, b = std::min(rows, a + step)] { f(a, b); });
+    f(0u, std::min(rows, step));
+    for (std::thread& t : helpers) t.join();
+}
+
 // The scanout as the display shows it, with the video overlay, into `frame`.
 void grab_frame() {
     std::lock_guard g(machine->lock());
@@ -207,16 +220,46 @@ void grab_frame() {
     // holds (the CPU or a blit wrote it, nothing drew it) is widened, each pixel to a block.
     mv::u32 sc = 1;
     const mv::pgraph::VulkanRenderer* renderer = machine->renderer();
-    // The rendered picture goes straight into the frame (at 8x it is 78 MB: one pass, alpha cleared on the way).
-    const bool rendered = res_scale > 1 && renderer && renderer->scaled_scanout(start, pitch, bpp, gpu.scanout_rgb565(), w, h, frame, sc);
-    if (!rendered) sc = res_scale;
+    mv::pgraph::VulkanRenderer::ScaledPicture pic;
+    const bool rendered = res_scale > 1 && renderer && renderer->scaled_picture(start, pitch, bpp, w, h, pic);
+    sc = rendered ? pic.sc : res_scale;
     const mv::u32 fw = w * sc, fh = h * sc;
     frame_w = fw;
     frame_h = fh;
     frame.resize(static_cast<std::size_t>(fw) * fh);
     mv::u8* out = reinterpret_cast<mv::u8*>(frame.data());
+    const auto lut = gpu.gamma_lut();
+    const bool rgb565 = gpu.scanout_rgb565();
+    // The colour table as three tables of finished channel bits: a pixel is three lookups OR-ed.
+    std::array<mv::u32, 256> lut_b{}, lut_g{}, lut_r{};
+    if (lut)
+        for (mv::u32 i = 0; i < 256; ++i) {
+            lut_b[i] = (*lut)[i * 3u + 2];
+            lut_g[i] = static_cast<mv::u32>((*lut)[i * 3u + 1]) << 8;
+            lut_r[i] = static_cast<mv::u32>((*lut)[i * 3u]) << 16;
+        }
     if (rendered) {
-        // In the frame already.
+        // The rendered picture into the frame where it lies, in bands on a few threads, the colour table applied and the
+        // alpha byte cleared in the same pass (at 6x a frame is 44 MB; three passes on one thread took 8 ms).
+        parallel_rows(fh, [&](mv::u32 y0, mv::u32 y1) {
+            for (mv::u32 y = y0; y < y1; ++y) {
+                const mv::u8* src = pic.pixels + static_cast<std::size_t>(y) * pic.pitch;
+                mv::u32* dst = frame.data() + static_cast<std::size_t>(y) * fw;
+                if (bpp != 4) {
+                    mv::scanout_to_xrgb(src, pic.pitch, bpp, rgb565, fw, 1, reinterpret_cast<mv::u8*>(dst));
+                    if (lut) mv::apply_gamma(*lut, reinterpret_cast<mv::u8*>(dst), fw * 4, fw, 1);
+                } else if (lut) {
+                    const mv::u32* row = reinterpret_cast<const mv::u32*>(src);
+                    for (mv::u32 x = 0; x < fw; ++x) {
+                        const mv::u32 p = row[x];
+                        dst[x] = lut_b[p & 0xFFu] | lut_g[(p >> 8) & 0xFFu] | lut_r[(p >> 16) & 0xFFu];
+                    }
+                } else {
+                    const mv::u32* row = reinterpret_cast<const mv::u32*>(src);
+                    for (mv::u32 x = 0; x < fw; ++x) dst[x] = row[x] & 0x00FFFFFFu;
+                }
+            }
+        });
     } else if (sc > 1) {
         composed.resize(static_cast<std::size_t>(w) * h * 4);
         mv::scanout_to_xrgb(fb, pitch, bpp, gpu.scanout_rgb565(), w, h, composed.data());
@@ -229,7 +272,7 @@ void grab_frame() {
     } else {
         mv::scanout_to_xrgb(fb, pitch, bpp, gpu.scanout_rgb565(), w, h, out);
     }
-    if (const auto lut = gpu.gamma_lut()) mv::apply_gamma(*lut, out, fw * 4, fw, fh);
+    if (lut && !rendered) mv::apply_gamma(*lut, out, fw * 4, fw, fh);
     const auto ov = gpu.overlay();
     if (ov) {
         // The overlay's rectangle and steps are in scanout pixels: sc times as many at the internal resolution.
@@ -244,7 +287,7 @@ void grab_frame() {
     }
     // The scanout ignores the alpha byte; the frontend's XRGB8888 wants it clear of meaning too (a rendered 32-bit
     // picture came with it cleared).
-    if (!(rendered && bpp == 4) || ov)
+    if (!rendered || ov)
         for (auto& px : frame) px &= 0x00FFFFFFu;
 }
 
