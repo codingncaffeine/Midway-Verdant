@@ -85,6 +85,8 @@ Machine::Machine(const MachineConfig& config)
     smbus_.attach(0x4C, adm1032_);
     smbus_.attach(0x45, encoder_);
     lpc_.attach_pm_block(&pm_, PmBlock::kSize);
+    // Fields alternate at every vblank (480i, the only mode the EEPROM offers), as the encoder's field pin does.
+    pm_.set_field_source([this] { return (nv2a_.vblanks() & 1u) != 0; });
     bus_.map_mmio(Flash::kBase, Flash::kWindow, &flash_);
 
     smc_.set_on_reset_request([this](u8 bits) {

@@ -312,3 +312,21 @@ TEST(PmTimer, CountsAt3375MHzWithAll32Bits) {
     sched.advance_to(cycles_from_ns_ceil(10'000'000'000));  // past 2^24 ticks (4.97 s)
     EXPECT_EQ(pm.pio_read(0x8008, 4), 33'750'000u) << "no 24-bit wrap";
 }
+
+// GPIO 0's bit 5 is the encoder's field pin: it follows the field (D3D reads it at each vblank; XMV movies start on an
+// even field and waited for ever while it read a constant 0), the bits software wrote stay as written.
+TEST(PmGpio, TheFieldPinFollowsTheFieldAndTheWrittenBitsStay) {
+    Scheduler sched;
+    PmBlock pm(sched, [](u16) {});
+    pm.pio_write(0x80C0, 1, 0x01);
+    EXPECT_EQ(pm.pio_read(0x80C0, 1), 0x01u) << "no source: the register as written";
+    bool even = false;
+    pm.set_field_source([&] { return even; });
+    EXPECT_EQ(pm.pio_read(0x80C0, 1), 0x01u);
+    even = true;
+    EXPECT_EQ(pm.pio_read(0x80C0, 1), 0x21u);
+    EXPECT_EQ(pm.pio_read(0x80C0, 4) & 0xFFu, 0x21u) << "a wider read covers it too";
+    EXPECT_EQ(pm.pio_read(0x80BE, 4) & 0xFF0000u, 0x210000u) << "and one that starts below it";
+    even = false;
+    EXPECT_EQ(pm.pio_read(0x80C0, 1), 0x01u);
+}

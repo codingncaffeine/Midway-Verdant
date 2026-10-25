@@ -77,6 +77,10 @@ u32 PmBlock::pio_read(u16 port, unsigned size) {
     if (off >= kSize) return 0xFFFFFFFFu;
     u32 v = 0;
     for (unsigned i = 0; i < size && off + i < kSize; ++i) v |= static_cast<u32>(regs_[off + i]) << (8 * i);
+    if (field_pin_ && off <= kGpioField && off + size > kGpioField) {
+        const unsigned shift = 8u * (kGpioField - off);
+        v = (v & ~(static_cast<u32>(kGpioFieldBit) << shift)) | (field_pin_() ? static_cast<u32>(kGpioFieldBit) << shift : 0u);
+    }
     if (off != 0x00 && off != 0x02 && off != 0x04 && off != 0x08) {
         trace::log(trace::Cat::Pio, "pm read  +{:02x} size {} -> {:0{}x}", off, size, v, size * 2);
     }

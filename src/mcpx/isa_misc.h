@@ -62,10 +62,16 @@ public:
     void pio_write(u16 port, unsigned size, u32 value) override;
     u32 timer_value() const;
     void set_base(u16 base) { base_ = base; }
+    // GPIO 0 (+0xC0) bit 5 is the TV encoder's field signal: D3D reads it at every vblank for the field it reports,
+    // and a movie player that starts on a given field waits for it. The source gives the pin's level (high = even field).
+    static constexpr u16 kGpioField = 0xC0;
+    static constexpr u8 kGpioFieldBit = 0x20;
+    void set_field_source(std::function<bool()> level) { field_pin_ = std::move(level); }
 
 private:
     Scheduler& sched_;
     std::function<void(u16)> on_sleep_;
+    std::function<bool()> field_pin_;
     u16 base_{0x8000};
     std::array<u8, kSize> regs_{};
 };
