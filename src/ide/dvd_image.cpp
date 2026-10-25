@@ -1,5 +1,7 @@
 #include "ide/dvd_image.h"
 
+#include "ide/disk_image.h"  // note_slow_io
+
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
@@ -82,7 +84,9 @@ bool DvdImage::read(u64 lba, u32 count, u8* out) const {
     if (!file_ || lba + count > sectors_) return false;
     const auto t0 = std::chrono::steady_clock::now();
     const bool ok = read_at(base_ + lba * kSectorSize, count * kSectorSize, out);
-    host_read_ns_.fetch_add(static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count()), std::memory_order_relaxed);
+    const auto ns = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
+    host_read_ns_.fetch_add(ns, std::memory_order_relaxed);
+    note_slow_io("dvd read", lba, count, ns);
     return ok;
 }
 
@@ -108,7 +112,9 @@ bool DvdImage::end_read(std::vector<u8>& out) {
     done_.wait(lock, [this] { return finished_; });
     out = std::move(result_);
     result_.clear();
-    host_read_ns_.fetch_add(static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count()), std::memory_order_relaxed);
+    const auto ns = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
+    host_read_ns_.fetch_add(ns, std::memory_order_relaxed);
+    note_slow_io("dvd wait", req_lba_, req_count_, ns);
     return ok_;
 }
 

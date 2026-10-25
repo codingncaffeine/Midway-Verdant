@@ -5,6 +5,7 @@
 #include <cstring>
 #include <filesystem>
 #include <memory>
+#include <vector>
 
 #include "core/bus.h"
 #include "core/scheduler.h"
@@ -400,4 +401,54 @@ TEST(Ide, TaskFileWritesReachBothDevices) {
     r.bus.pio_write(0x1F6, 1, 0xA0);  // the master
     EXPECT_EQ(r.bus.pio_read(0x1F3, 1), 0x5Au);
     EXPECT_EQ(r.bus.pio_read(0x1F2, 1), 0x07u);
+}
+
+// Writes land in the image's write cache and a writer thread puts them in the file: every read sees the latest write
+// at once (from the cache or the file, never an older sector), and everything is in the file once the image is gone.
+TEST(DiskImage, WritesAreReadBackAtOnceAndReachTheFile) {
+    const auto path = std::filesystem::temp_directory_path() / "mv-test-write-cache.raw";
+    constexpr u64 kSectors = 80 * 2048;  // 80 MiB: more than the cache holds
+    {
+        std::FILE* f = std::fopen(path.string().c_str(), "wb");
+        ASSERT_NE(f, nullptr);
+        std::fseek(f, static_cast<long>(kSectors * 512 - 1), SEEK_SET);
+        std::fputc(0, f);
+        std::fclose(f);
+    }
+    std::string error;
+    std::vector<u8> big(static_cast<std::size_t>(kSectors) * 512);
+    for (std::size_t i = 0; i < big.size(); i += 512) std::memset(&big[i], static_cast<int>(1 + i / 512 % 250), 512);
+    {
+        DiskImage disk;
+        ASSERT_TRUE(disk.open(path, false, error)) << error;
+        // One sector rewritten many times, each read straight after.
+        u8 s[512];
+        for (u32 v = 0; v < 2000; ++v) {
+            std::memset(s, static_cast<int>(v & 0xFF), sizeof s);
+            ASSERT_TRUE(disk.write(5, 1, s));
+            u8 r[512];
+            ASSERT_TRUE(disk.read(5, 1, r));
+            ASSERT_EQ(r[0], static_cast<u8>(v)) << "write " << v;
+        }
+        // A large copy (the cache fills and drains), its far end read at once, in one read and on the reader thread.
+        for (u64 at = 0; at < kSectors - 64; at += 2048) ASSERT_TRUE(disk.write(64 + at, static_cast<u32>(std::min<u64>(2048, kSectors - 64 - at)), &big[(64 + at) * 512]));
+        std::vector<u8> tail(16 * 512);
+        ASSERT_TRUE(disk.read(kSectors - 16, 16, tail.data()));
+        EXPECT_EQ(std::memcmp(tail.data(), &big[(kSectors - 16) * 512], tail.size()), 0) << "the last sectors written";
+        disk.begin_read(kSectors - 8, 8);
+        std::vector<u8> got;
+        ASSERT_TRUE(disk.end_read(got));
+        EXPECT_EQ(std::memcmp(got.data(), &big[(kSectors - 8) * 512], got.size()), 0) << "the reader thread sees the cache too";
+    }
+    {
+        DiskImage disk;
+        ASSERT_TRUE(disk.open(path, true, error)) << error;
+        u8 r[512];
+        ASSERT_TRUE(disk.read(5, 1, r));
+        EXPECT_EQ(r[0], static_cast<u8>(1999 & 0xFF)) << "the last write is in the file";
+        std::vector<u8> all(static_cast<std::size_t>(kSectors - 64) * 512);
+        ASSERT_TRUE(disk.read(64, static_cast<u32>(kSectors - 64), all.data()));
+        EXPECT_EQ(std::memcmp(all.data(), &big[64 * 512], all.size()), 0) << "the whole copy is in the file";
+    }
+    std::filesystem::remove(path);
 }

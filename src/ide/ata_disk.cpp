@@ -65,6 +65,7 @@ std::array<u8, 32> AtaDisk::password_for(std::span<const u8, 16> hdd_key, const 
 }
 
 void AtaDisk::reset() {
+    drop_read();
     tf_.error = 0x01;
     tf_.sector_count = 1;
     tf_.lba_low = 1;
@@ -114,6 +115,13 @@ void AtaDisk::set_lba(u64 v) {
 Cycles AtaDisk::transfer_time(u32 sectors) const {
     // Ultra DMA mode 2 (33 MB/s) plus command overhead; rotational and seek time are not modelled yet [plan: Phase 11].
     return kCommandLatency + cycles_from_ns(static_cast<u64>(sectors) * 512u * 1000u / 33u);
+}
+
+void AtaDisk::drop_read() {
+    if (!read_in_flight_) return;
+    read_in_flight_ = false;
+    std::vector<u8> unused;
+    image_.end_read(unused);
 }
 
 void AtaDisk::finish_ok() {
@@ -245,6 +253,9 @@ Cycles AtaDisk::start_command(u8 command) {
             sectors_left_ = count();
             trace::log(trace::Cat::Pio, "hdd read dma {} sectors at lba {}", sectors_left_, current_lba_);
             pending_ = Pending::DmaRead;
+            drop_read();
+            image_.begin_read(current_lba_, sectors_left_);  // the host reads while the drive's modelled time runs
+            read_in_flight_ = true;
             return transfer_time(sectors_left_);
         case 0xCA:
         case 0xCB:  // WRITE DMA
@@ -347,8 +358,21 @@ void AtaDisk::continue_command() {
             break;
         case Pending::DmaRead: {
             if (!channel_->dma_active()) return;  // the engine starts us again
-            std::vector<u8> data(static_cast<std::size_t>(sectors_left_) * 512);
-            if (!image_.read(current_lba_, sectors_left_, data.data())) {
+            if (read_in_flight_ && host_paced_reads_ && !image_.ready()) {
+                // The host is still reading: the drive is still busy, due again half a millisecond on.
+                channel_->schedule(*this, cycles_from_ns(500'000));
+                return;
+            }
+            std::vector<u8> data;
+            bool read_ok;
+            if (read_in_flight_) {
+                read_in_flight_ = false;
+                read_ok = image_.end_read(data);
+            } else {
+                data.resize(static_cast<std::size_t>(sectors_left_) * 512);
+                read_ok = image_.read(current_lba_, sectors_left_, data.data());
+            }
+            if (!read_ok) {
                 channel_->dma_complete(false);
                 finish_error(ata::kErrorIdnf);
                 return;

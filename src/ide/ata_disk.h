@@ -50,6 +50,9 @@ public:
 
     u64 unlock_attempts() const { return unlock_attempts_; }
     bool ever_unlocked() const { return ever_unlocked_; }
+    // The fast core: a DMA read the host has not delivered by its completion time comes due again later instead of
+    // holding the CPU thread (as the disc drive's, AtapiCdrom::set_host_paced_reads). The accurate core waits for it.
+    void set_host_paced_reads(bool on) { host_paced_reads_ = on; }
 
 private:
     enum class Pending { None, IdentifyReady, ReadReady, WriteDone, Complete, DmaRead, DmaWrite, SecurityData };
@@ -63,8 +66,11 @@ private:
     u32 count() const { return tf_.sector_count == 0 ? 256u : tf_.sector_count; }
     Cycles transfer_time(u32 sectors) const;
     void handle_security_data();
+    void drop_read();  // a DMA read begun on the image's thread whose data phase never came: collected and dropped
 
     DiskImage& image_;
+    bool host_paced_reads_{false};
+    bool read_in_flight_{false};  // the DMA read's sectors are being read on the image's thread
     std::string model_{"MIDWAY VERDANT HD 8GB"}, serial_{"MV0000000001"}, firmware_{"MV01"};
     PasswordOracle oracle_;
     bool security_enabled_{true}, locked_{true}, frozen_{false};
