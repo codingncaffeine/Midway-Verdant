@@ -82,6 +82,10 @@ public:
     bool write_back_at(u32 phys);
     // Every render target overlapping [phys, phys + len) reaches RAM (colour and depth): the 2D engine reads there.
     void write_back_range(u32 phys, u32 len);
+    // The 2D engine's copy of a rectangle (w x h pixels of bpp bytes, rows src_pitch / dst_pitch bytes apart) when both
+    // sides lie inside render targets whose images are current: an image copy on the GPU, the destination left newer than
+    // RAM. False (nothing done) when RAM has to carry it: the caller copies there.
+    bool copy_rect(u32 src_phys, u32 src_pitch, u32 dst_phys, u32 dst_pitch, u32 w, u32 h, u32 bpp);
     // Every dirty render target reaches RAM (colour and depth). The live machine calls it when the GPU has been idle
     // for a whole frame: the hardware wrote those pixels when it drew them, and RAM a program reuses later must not
     // receive them then (a title launched after the boot animation got the animation's targets over its own data).
@@ -105,6 +109,7 @@ public:
     struct Stats {
         u64 draws{0}, clears{0}, skipped{0}, pipelines{0}, shaders{0}, textures_decoded{0}, writebacks{0}, flushes{0};
         u64 batch_flushes{0};  // batches submitted mid-frame because the rings or the descriptor pool were full
+        u64 staging_flushes{0};  // batches submitted mid-frame because the upload staging ring was full
         u64 waits{0};          // times the CPU stopped for the GPU (a fence wait)
         u64 uniform_reuses{0};  // uniform blocks equal to the frame's last upload, bound where that lies
         u64 descriptor_reuses{0};  // draws that kept the previous draw's descriptor set
@@ -115,6 +120,8 @@ public:
         u64 depth_handovers{0}, depth_uploads{0};  // depth buffers moved between targets sharing an address; loaded from RAM
         u64 evicted{0}, retired_unused{0};  // targets another target overlapped; targets nothing used for 10 s
         u64 subrect_copies{0};  // rectangles of a pitch-linear region copied for a texture
+        u64 cube_assemblies{0};  // cube maps put together on the GPU from six render targets (cube_texture)
+        u64 gpu_copies{0};  // 2D-engine copies made between target images (copy_rect)
         u64 shaders_from_disk{0};  // shader compiles the disk cache answered
         u64 compiles_queued{0}, pipelines_queued{0}, pending_skips{0};  // background compiles started; draws skipped waiting
         u64 textures_unchanged{0};
@@ -213,9 +220,13 @@ private:
         u32 zeta_bytes() const { return swizzled ? (zeta_format == 1 ? 2u : 4u) * width * height : zeta_pitch * height; }
     };
     void note(const std::string& message);
-    // Ends the pass and submits the recording frame without waiting for it, then starts the next frame in flight
-    // (waiting only if that frame's previous submission has not finished).
-    void submit();
+    // Ends the pass and submits what the recording frame has recorded without waiting for it, then records on into a new
+    // command buffer of the same frame. `rotate` (the draw rings or the staging ring are full; the vblank asked for it;
+    // every submit while draws are counted) starts the next frame in flight instead
+    // (waiting only if that frame's last submission has not finished).
+    void submit(bool rotate = false);
+    void begin_commands();  // the recording frame's next command buffer, begun
+    bool rotate_pending_{false};  // set at the vblank: the next submit starts the next frame in flight
     // Submits, then waits until the GPU has executed everything submitted so far.
     void finish();
     // Makes a frame the recording one: waits for its last submission, frees what it retired, resets its descriptor
@@ -263,6 +274,18 @@ private:
     TextureEntry* surface_texture(const TextureStage& ts, u32 phys);
     TextureEntry* snapshot_texture(Surface& s, const TextureStage& ts, u32 phys, u32 w, u32 h, bool linear, bool x8);
     TextureEntry* subrect_texture(Surface& s, const TextureStage& ts, u32 phys, u32 x0, u32 y0, u32 w, u32 h, bool x8);
+    // A cube map whose six faces are render targets drawn this frame or the last: the faces copied into a cube image on
+    // the GPU (at their internal resolution), retaken when any face was drawn into since; or null.
+    TextureEntry* cube_texture(const TextureStage& ts, u32 phys);
+    struct CubeEntry {
+        vk::Image image;
+        VkImageView x8_view{VK_NULL_HANDLE};
+        TextureEntry tex, x8_tex;
+        std::array<u64, 6> serials{};
+        std::array<const void*, 6> faces{};  // the targets the copies came from
+    };
+    std::unordered_map<u32, CubeEntry> cubes_;
+    void retire_cubes();
     void retire_subs(Surface& s);
     Surface* draw_target_{nullptr};  // the target of the draw whose textures are being looked up
     // The depth buffer at each zeta address lives in one target's depth image at a time: the target that last drew with
@@ -277,7 +300,7 @@ private:
     u64 vblank_index_{0};  // vblanks seen (write_back_at), for retiring targets nothing uses
     TextureEntry* zeta_color_texture(Surface& s, const TextureStage& ts, u32 phys, u32 w, u32 h, bool linear, bool x8);
     bool init_zeta_convert();
-    bool zc_buffers();
+    bool zc_buffers(u32 texels = 0);
     // The depth-to-colour conversion: a compute pass over two device buffers (the copied depth words and stencil
     // bytes in, the Z24S8 words out), made on first use.
     static constexpr u32 kZetaConvertMaxTexels = 1024 * 1024;
@@ -323,12 +346,17 @@ private:
     u32 ram_size_;
     const vk::Functions* fn_{nullptr};
 
-    // The frames in flight. Each owns a command buffer, the fence its submission signals, a descriptor pool and a
+    // The frames in flight. Each owns command buffers and the fences their submissions signal, a descriptor pool and a
     // region of every ring, so a submit does not wait: a frame's resources are reused only once its fence signals.
     static constexpr u32 kFramesInFlight = 3;
     struct Frame {
-        VkCommandBuffer cb{VK_NULL_HANDLE};
-        VkFence fence{VK_NULL_HANDLE};
+        // Its submissions: each has a command buffer and a fence of its own, so the frame goes on recording into the next
+        // while the GPU runs the last (a submit no longer moves to another frame in flight and waits for it); `used` of
+        // them so far, and the fence of the last, which signals once everything submitted before it has run too.
+        std::vector<VkCommandBuffer> cbs;
+        std::vector<VkFence> fences;
+        u32 used{0};
+        VkFence last{VK_NULL_HANDLE};
         VkDescriptorPool pool{VK_NULL_HANDLE};
         u64 serial{0};  // the submission that last used it (0: never submitted)
         // Objects retired while this frame recorded: commands already recorded (here or earlier) may use them.

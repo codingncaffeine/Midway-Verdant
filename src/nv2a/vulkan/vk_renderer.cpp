@@ -232,6 +232,10 @@ VulkanRenderer::~VulkanRenderer() {
     if (clear_vs_) f.vkDestroyShaderModule(dev_.device(), clear_vs_, nullptr);
     if (clear_fs_) f.vkDestroyShaderModule(dev_.device(), clear_fs_, nullptr);
     for (auto& [k, t] : textures_) dev_.destroy_image(t->image);
+    for (auto& [k, c] : cubes_) {
+        if (c.x8_view) f.vkDestroyImageView(dev_.device(), c.x8_view, nullptr);
+        dev_.destroy_image(c.image);
+    }
     for (auto& [k, s] : samplers_) f.vkDestroySampler(dev_.device(), s, nullptr);
     for (auto& [k, s] : border_samplers_) f.vkDestroySampler(dev_.device(), s, nullptr);
     if (dummy_sampler_) f.vkDestroySampler(dev_.device(), dummy_sampler_, nullptr);
@@ -255,9 +259,9 @@ VulkanRenderer::~VulkanRenderer() {
     for (Capture& c : captures_) dev_.destroy_buffer(c.buffer);
     for (Frame& fr : frames_) {
         if (fr.pool) f.vkDestroyDescriptorPool(dev_.device(), fr.pool, nullptr);
-        if (fr.fence) f.vkDestroyFence(dev_.device(), fr.fence, nullptr);
+        for (VkFence fence : fr.fences) f.vkDestroyFence(dev_.device(), fence, nullptr);
         if (fr.occlusion) f.vkDestroyQueryPool(dev_.device(), fr.occlusion, nullptr);
-        if (fr.cb) f.vkFreeCommandBuffers(dev_.device(), dev_.pool(), 1, &fr.cb);
+        if (!fr.cbs.empty()) f.vkFreeCommandBuffers(dev_.device(), dev_.pool(), static_cast<u32>(fr.cbs.size()), fr.cbs.data());
     }
 }
 
@@ -308,15 +312,9 @@ bool VulkanRenderer::init(std::string& error) {
     dpi.maxSets = kMaxDescriptorSets;
     dpi.poolSizeCount = 2;
     dpi.pPoolSizes = sizes;
-    VkCommandBufferAllocateInfo cai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-    cai.commandPool = dev_.pool();
-    cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    cai.commandBufferCount = 1;
-    VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
     for (Frame& fr : frames_) {
-        if (f.vkCreateDescriptorPool(dev_.device(), &dpi, nullptr, &fr.pool) != VK_SUCCESS || f.vkAllocateCommandBuffers(dev_.device(), &cai, &fr.cb) != VK_SUCCESS ||
-            f.vkCreateFence(dev_.device(), &fci, nullptr, &fr.fence) != VK_SUCCESS) {
-            error = "frame in flight: descriptor pool, command buffer or fence creation failed";
+        if (f.vkCreateDescriptorPool(dev_.device(), &dpi, nullptr, &fr.pool) != VK_SUCCESS) {
+            error = "frame in flight: descriptor pool creation failed";
             return false;
         }
         VkQueryPoolCreateInfo qpi{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
@@ -369,7 +367,7 @@ void VulkanRenderer::begin_frame(u32 slot) {
     Frame& fr = frames_[slot];
     if (fr.serial > completed_) {
         // The GPU may still be executing this frame's last submission (its rings and descriptor sets are in use).
-        f.vkWaitForFences(dev_.device(), 1, &fr.fence, VK_TRUE, ~0ull);
+        f.vkWaitForFences(dev_.device(), 1, &fr.last, VK_TRUE, ~0ull);
         completed_ = fr.serial;
         ++stats_.waits;
     }
@@ -379,24 +377,46 @@ void VulkanRenderer::begin_frame(u32 slot) {
     fr.dead_images.clear();
     fr.dead_views.clear();
     fr.dead_framebuffers.clear();
+    if (fr.used) f.vkResetFences(dev_.device(), fr.used, fr.fences.data());  // all signalled: the last covers the rest
+    fr.used = 0;
     f.vkResetDescriptorPool(dev_.device(), fr.pool, 0);
     descriptor_sets_used_ = 0;
     for (Ring* r : {&vertex_ring_, &index_ring_, &uniform_ring_, &staging_}) r->begin = r->cursor = r->region * slot;
     last_vs_upload_.valid = last_ps_upload_.valid = false;  // they lie in another frame's region
-    last_set_ = bound_set_ = VK_NULL_HANDLE;                // the pool was reset, and binding is per command buffer
+    last_set_ = VK_NULL_HANDLE;                             // the pool was reset
     slot_ = slot;
-    cb_ = fr.cb;
-    f.vkResetCommandBuffer(cb_, 0);
-    VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    f.vkBeginCommandBuffer(cb_, &bi);
-    recording_ = true;
+    begin_commands();
     // The frame's queries: what its last use counted is read first (its fence has signalled), then the pools reset.
     harvest(fr);
     f.vkCmdResetQueryPool(cb_, fr.occlusion, 0, kQueriesPerFrame);  // always: counting may be switched on mid-frame
     fr.queries = 0;
     fr.first_ticket = next_ticket_;
     fr.harvested = false;
+}
+
+void VulkanRenderer::begin_commands() {
+    const auto& f = *fn_;
+    Frame& fr = frames_[slot_];
+    if (fr.used == fr.cbs.size()) {
+        VkCommandBufferAllocateInfo cai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+        cai.commandPool = dev_.pool();
+        cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        cai.commandBufferCount = 1;
+        VkCommandBuffer cb = VK_NULL_HANDLE;
+        VkFence fence = VK_NULL_HANDLE;
+        VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+        f.vkAllocateCommandBuffers(dev_.device(), &cai, &cb);
+        f.vkCreateFence(dev_.device(), &fci, nullptr, &fence);
+        fr.cbs.push_back(cb);
+        fr.fences.push_back(fence);
+    }
+    cb_ = fr.cbs[fr.used];
+    f.vkResetCommandBuffer(cb_, 0);
+    VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    f.vkBeginCommandBuffer(cb_, &bi);
+    bound_set_ = VK_NULL_HANDLE;  // binding is per command buffer
+    recording_ = true;
 }
 
 // A finished frame's query results into counts_, by ticket (once).
@@ -428,7 +448,7 @@ VulkanRenderer::DrawCounts VulkanRenderer::draw_counts(u64 ticket) {
         if (fr.harvested || ticket < fr.first_ticket || ticket >= fr.first_ticket + fr.queries) continue;
         if (i == slot_ && recording_) submit();  // still being recorded: it goes to the GPU now
         if (fr.serial > completed_) {
-            fn_->vkWaitForFences(dev_.device(), 1, &fr.fence, VK_TRUE, ~0ull);
+            fn_->vkWaitForFences(dev_.device(), 1, &fr.last, VK_TRUE, ~0ull);
             completed_ = std::max(completed_, fr.serial);
             ++stats_.waits;
         }
@@ -474,7 +494,7 @@ u64 ns_since(std::chrono::steady_clock::time_point t0) {
 }
 }  // namespace
 
-void VulkanRenderer::submit() {
+void VulkanRenderer::submit(bool rotate) {
     const auto& f = *fn_;
     if (!recording_) return;
     Timed timed(stats_.ns_flush);
@@ -485,11 +505,17 @@ void VulkanRenderer::submit() {
     VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
     si.commandBufferCount = 1;
     si.pCommandBuffers = &cb_;
-    f.vkResetFences(dev_.device(), 1, &fr.fence);
-    f.vkQueueSubmit(dev_.queue(), 1, &si, fr.fence);
+    fr.last = fr.fences[fr.used++];
+    f.vkQueueSubmit(dev_.queue(), 1, &si, fr.last);
     fr.serial = ++submitted_;
     ++stats_.flushes;
-    begin_frame((slot_ + 1) % kFramesInFlight);
+    // Draw counting reads a frame's queries once its fence signals, all of them at once: every submit moves on.
+    if (rotate || rotate_pending_ || count_draws_) {
+        rotate_pending_ = false;
+        begin_frame((slot_ + 1) % kFramesInFlight);
+    } else {
+        begin_commands();
+    }
 }
 
 void VulkanRenderer::finish() {
@@ -499,7 +525,7 @@ void VulkanRenderer::finish() {
     // A fence's signal covers every submission before its own on the queue, so the latest one is all it takes.
     Frame& fr = frames_[last];
     if (fr.serial > completed_) {
-        fn_->vkWaitForFences(dev_.device(), 1, &fr.fence, VK_TRUE, ~0ull);
+        fn_->vkWaitForFences(dev_.device(), 1, &fr.last, VK_TRUE, ~0ull);
         completed_ = fr.serial;
         ++stats_.waits;
     }
@@ -942,6 +968,9 @@ std::unordered_map<u32, std::unique_ptr<VulkanRenderer::Surface>>::iterator Vulk
     retire(s0.zcolor);
     retire(s0.lo);
     retire_subs(s0);
+    for (auto& [k, c] : cubes_)  // a later target at the same place is not the face these copies came from
+        for (const void*& face : c.faces)
+            if (face == &s0) face = nullptr;
     stage_cache_.fill({});  // a stage may point at the erased target's entries
     return surfaces_.erase(it);
 }
@@ -1179,6 +1208,65 @@ void VulkanRenderer::write_back_range(u32 phys, u32 len) {
     }
     finish_write_backs();
     wb_why_ = Stats::kWbAll;
+}
+
+bool VulkanRenderer::copy_rect(u32 src_phys, u32 src_pitch, u32 dst_phys, u32 dst_pitch, u32 w, u32 h, u32 bpp) {
+    if (debug_roundtrip_) return false;
+    // The pitch-linear target whose image holds the rectangle at `phys` (its pixel there, as x, y), current with RAM or newer.
+    auto holder = [&](u32 phys, u32 pitch, u32& x, u32& y) -> Surface* {
+        for (auto& [k, sp] : surfaces_) {
+            Surface& s = *sp;
+            if (s.swizzled || s.pitch != pitch || s.color_bytes() != bpp || s.color_ram_newer || phys < s.phys || phys >= static_cast<u64>(s.phys) + s.bytes()) continue;
+            const u32 off = phys - s.phys;
+            if ((off % pitch) % bpp) continue;
+            x = (off % pitch) / bpp;
+            y = off / pitch;
+            if (x + w <= s.width && y + h <= s.height) return &s;
+        }
+        return nullptr;
+    };
+    u32 sx = 0, sy = 0, dx = 0, dy = 0;
+    Surface* src = holder(src_phys, src_pitch, sx, sy);
+    Surface* dst = src ? holder(dst_phys, dst_pitch, dx, dy) : nullptr;
+    if (!dst || src->color.format != dst->color.format) return false;
+    if (src == dst && sx < dx + w && dx < sx + w && sy < dy + h && dy < sy + h) return false;  // overlapping within one image
+    // Another target over the destination's memory would not see the copy (RAM would have shown it to it): through RAM.
+    const u64 d0 = dst_phys, d1 = static_cast<u64>(dst_phys) + static_cast<u64>(h - 1) * dst_pitch + static_cast<u64>(w) * bpp;
+    for (auto& [k, sp] : surfaces_)
+        if (sp.get() != dst && sp->phys < d1 && d0 < static_cast<u64>(sp->phys) + sp->bytes()) return false;
+    end_pass();
+    VkMemoryBarrier before{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    before.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+    before.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+    fn_->vkCmdPipelineBarrier(cb_, VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &before, 0, nullptr, 0, nullptr);
+    if (src->sc == dst->sc) {
+        VkImageCopy region{};
+        region.srcSubresource = region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        region.srcOffset = {static_cast<i32>(sx * src->sc), static_cast<i32>(sy * src->sc), 0};
+        region.dstOffset = {static_cast<i32>(dx * dst->sc), static_cast<i32>(dy * dst->sc), 0};
+        region.extent = {w * src->sc, h * src->sc, 1};
+        fn_->vkCmdCopyImage(cb_, src->color.image, VK_IMAGE_LAYOUT_GENERAL, dst->color.image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+    } else {
+        VkImageBlit b{};
+        b.srcSubresource = b.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        b.srcOffsets[0] = {static_cast<i32>(sx * src->sc), static_cast<i32>(sy * src->sc), 0};
+        b.srcOffsets[1] = {static_cast<i32>((sx + w) * src->sc), static_cast<i32>((sy + h) * src->sc), 1};
+        b.dstOffsets[0] = {static_cast<i32>(dx * dst->sc), static_cast<i32>(dy * dst->sc), 0};
+        b.dstOffsets[1] = {static_cast<i32>((dx + w) * dst->sc), static_cast<i32>((dy + h) * dst->sc), 1};
+        fn_->vkCmdBlitImage(cb_, src->color.image, VK_IMAGE_LAYOUT_GENERAL, dst->color.image, VK_IMAGE_LAYOUT_GENERAL, 1, &b, VK_FILTER_NEAREST);
+    }
+    VkMemoryBarrier after{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    after.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT;
+    after.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT;
+    fn_->vkCmdPipelineBarrier(cb_, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &after, 0, nullptr, 0, nullptr);
+    // The destination's image now holds what RAM would after the blit: newer than RAM, as after a draw.
+    dst->dirty = true;
+    ++dst->draw_serial;
+    dst->last_rendered_frame = frame_index_;
+    dst->last_used_vblank = src->last_used_vblank = vblank_index_;
+    dst->rendered_this_frame = true;
+    ++stats_.gpu_copies;
+    return true;
 }
 
 // A GPU-side write to guest memory (a blit): decoded textures over it are stale, and so is any target's image
@@ -1625,7 +1713,7 @@ const VulkanRenderer::TextureEntry* VulkanRenderer::texture(const KelvinState& s
             return nullptr;
         }
     }
-    if (TextureEntry* e = surface_texture(ts, phys)) {
+    if (TextureEntry* e = ts.cubemap() ? cube_texture(ts, phys) : surface_texture(ts, phys)) {
         sc = StageCache{regs, phys, length, e};
         return e;
     }
@@ -1924,7 +2012,7 @@ bool VulkanRenderer::init_zeta_convert() {
                                            "layout(std430, binding = 1) writeonly buffer Out { uint words[]; } dst;\n"
                                            "layout(push_constant) uniform P { uint count; uint stencil_word; } pc;\n"
                                            "void main() {\n"
-                                           "    uint i = gl_GlobalInvocationID.x;\n"
+                                           "    uint i = gl_GlobalInvocationID.y * gl_NumWorkGroups.x * 64u + gl_GlobalInvocationID.x;  // rows of groups: past 65535 of them\n"
                                            "    if (i >= pc.count) return;\n"
                                            "    uint s = (src.words[pc.stencil_word + (i >> 2)] >> ((i & 3u) * 8u)) & 0xFFu;\n"
                                            "    dst.words[i] = ((src.words[i] & 0xFFFFFFu) << 8) | s;\n"
@@ -1985,13 +2073,12 @@ bool VulkanRenderer::init_zeta_convert() {
     return true;
 }
 
-// The conversion's buffers, for kZetaConvertMaxTexels stored texels at the internal resolution's scale, and the
-// descriptor set pointed at them (apply_scale drops them once the GPU is idle).
-bool VulkanRenderer::zc_buffers() {
+// The conversion's buffers, for at least `texels` texels (kZetaConvertMaxTexels at the least), and the descriptor set
+// pointed at them. They grow when a larger target needs them (once the GPU is idle) and go when the internal
+// resolution changes (apply_scale).
+bool VulkanRenderer::zc_buffers(u32 texels) {
     std::string error;
-    // Up to 4x the scale's texels (beyond that, a buffer of hundreds of MB for a rare path: larger targets go through RAM).
-    const u32 s = std::min(scale_, 4u);
-    const VkDeviceSize n = static_cast<VkDeviceSize>(kZetaConvertMaxTexels) * s * s;
+    const VkDeviceSize n = std::max<VkDeviceSize>(kZetaConvertMaxTexels, texels);
     if (!dev_.create_buffer(n * 5, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, vk::BufferMemory::Device, zc_in_, error) ||
         !dev_.create_buffer(n * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, vk::BufferMemory::Device, zc_out_, error)) {
         note("depth conversion buffers: " + error);
@@ -2019,7 +2106,15 @@ bool VulkanRenderer::zc_buffers() {
 // before each read wrote the whole depth buffer back to RAM, waited for the GPU and decoded it again.
 VulkanRenderer::TextureEntry* VulkanRenderer::zeta_color_texture(Surface& s, const TextureStage& ts, u32 phys, u32 w, u32 h, bool linear, bool x8) {
     const u32 n = s.iw() * s.ih();  // the image's texels (the internal resolution's)
-    if (!init_zeta_convert() || n > zc_capacity_) return nullptr;
+    if (!init_zeta_convert()) return nullptr;
+    if (n > zc_capacity_) {
+        // A larger target than the buffers hold (a high internal resolution): made again once nothing in flight uses them.
+        finish();
+        dev_.destroy_buffer(zc_in_);
+        dev_.destroy_buffer(zc_out_);
+        zc_capacity_ = 0;
+        if (!zc_buffers(n)) return nullptr;
+    }
     if (!s.zcolor.image) {
         std::string error;
         if (!dev_.create_image(VK_FORMAT_B8G8R8A8_UNORM, s.iw(), s.ih(), 1, 1, 1, VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
@@ -2056,7 +2151,9 @@ VulkanRenderer::TextureEntry* VulkanRenderer::zeta_color_texture(Surface& s, con
         fn_->vkCmdBindDescriptorSets(cb_, VK_PIPELINE_BIND_POINT_COMPUTE, zc_layout_, 0, 1, &zc_set_, 0, nullptr);
         const u32 push[2] = {n, n};
         fn_->vkCmdPushConstants(cb_, zc_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof push, push);
-        fn_->vkCmdDispatch(cb_, (n + 63) / 64, 1, 1);
+        // Groups in rows of at most 65535 (the least every device takes in one dimension; 6x already needs more).
+        const u32 groups = (n + 63) / 64, gx = std::min(groups, 65535u);
+        fn_->vkCmdDispatch(cb_, gx, (groups + gx - 1) / gx, 1);
         barrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
         VkBufferImageCopy out{};
         out.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
@@ -2158,6 +2255,104 @@ VulkanRenderer::TextureEntry* VulkanRenderer::subrect_texture(Surface& s, const 
     e.length = texture_size_in_memory(ts);
     s.last_used_vblank = vblank_index_;
     return &e;
+}
+
+// An environment map rendered each frame: the guest draws the six faces of a cube map as six render targets, then samples
+// them as one cube texture. The texture unit reads RAM, so before, all six were written back, waited for and decoded again
+// every frame (six of OutRun 2's ~7.5 write-backs a frame in a race). Here the six target images are copied into the
+// layers of a cube image on the GPU, at the targets' internal resolution, and retaken only when a face was drawn since.
+VulkanRenderer::TextureEntry* VulkanRenderer::cube_texture(const TextureStage& ts, u32 phys) {
+    if (debug_roundtrip_ || !ts.cubemap() || ts.mip_levels() > 1 || ts.log_width() != ts.log_height()) return nullptr;
+    const u32 fmt = ts.color_format();
+    if (fmt != 0x06 && fmt != 0x07) return nullptr;  // A8R8G8B8 and X8R8G8B8, swizzled: a target's B8G8R8A8 bytes
+    const bool x8 = fmt == 0x07;
+    const u32 size = 1u << ts.log_width(), face_bytes = texture_size_in_memory(ts) / 6;
+    std::array<Surface*, 6> faces{};
+    for (u32 f = 0; f < 6; ++f) {
+        const auto it = surfaces_.find(phys + f * face_bytes);
+        if (it == surfaces_.end()) return nullptr;
+        Surface& s = *it->second;
+        const bool recent = !s.ram_newer && s.last_rendered_frame + 1 >= frame_index_;
+        if (s.width != size || s.height != size || s.color_bytes() != 4 || color_vk_format(s.color_format) != VK_FORMAT_B8G8R8A8_UNORM || !(s.dirty || recent) ||
+            s.color_ram_newer || (f && s.sc != faces[0]->sc))
+            return nullptr;
+        faces[f] = &s;
+    }
+    const u32 isz = size * faces[0]->sc;
+    CubeEntry& c = cubes_[phys];
+    if (!c.image.image || c.image.width != isz) {
+        retire(c.x8_view);
+        retire(c.image);
+        c = CubeEntry{};
+        std::string error;
+        if (!dev_.create_image(VK_FORMAT_B8G8R8A8_UNORM, isz, isz, 1, 1, 6, VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, VK_IMAGE_ASPECT_COLOR_BIT, true, c.image,
+                               error)) {
+            note("cube image: " + error);
+            cubes_.erase(phys);
+            return nullptr;
+        }
+        end_pass();
+        fresh_image(c.image);
+        stage_cache_.fill({});  // a stage may point at the old entry
+    }
+    bool stale = false;
+    for (u32 f = 0; f < 6; ++f) stale = stale || c.faces[f] != faces[f] || c.serials[f] != faces[f]->draw_serial;
+    if (stale) {
+        end_pass();
+        VkMemoryBarrier before{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        before.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+        before.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+        fn_->vkCmdPipelineBarrier(cb_, VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &before, 0, nullptr, 0, nullptr);
+        std::array<VkImageCopy, 6> regions{};
+        for (u32 f = 0; f < 6; ++f) {
+            regions[f].srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            regions[f].dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, f, 1};
+            regions[f].extent = {isz, isz, 1};
+            fn_->vkCmdCopyImage(cb_, faces[f]->color.image, VK_IMAGE_LAYOUT_GENERAL, c.image.image, VK_IMAGE_LAYOUT_GENERAL, 1, &regions[f]);
+            c.faces[f] = faces[f];
+            c.serials[f] = faces[f]->draw_serial;
+        }
+        VkMemoryBarrier after{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        after.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT;
+        after.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        fn_->vkCmdPipelineBarrier(cb_, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT, 0, 1, &after, 0, nullptr, 0, nullptr);
+        ++stats_.cube_assemblies;
+    }
+    TextureEntry& e = x8 ? c.x8_tex : c.tex;
+    if (!e.valid) {
+        VkImageView view = c.image.view;
+        if (x8) {
+            VkImageViewCreateInfo vci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+            vci.viewType = VK_IMAGE_VIEW_TYPE_CUBE;
+            vci.image = c.image.image;
+            vci.format = c.image.format;
+            vci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 6};
+            vci.components.a = VK_COMPONENT_SWIZZLE_ONE;
+            if (fn_->vkCreateImageView(dev_.device(), &vci, nullptr, &view) != VK_SUCCESS) return nullptr;
+            c.x8_view = view;
+        }
+        e.image = c.image;
+        e.image.view = view;
+        e.image.levels = 1;
+        e.phys = phys;
+        e.width = e.height = size;
+        e.linear = false;
+        e.surface = true;
+        e.valid = true;
+    }
+    e.length = texture_size_in_memory(ts);
+    for (Surface* s : faces) s->last_used_vblank = vblank_index_;
+    ++stats_.surface_samples;
+    return &e;
+}
+
+void VulkanRenderer::retire_cubes() {
+    for (auto& [k, c] : cubes_) {
+        retire(c.x8_view);
+        retire(c.image);
+    }
+    cubes_.clear();
+    stage_cache_.fill({});
 }
 
 void VulkanRenderer::retire_subs(Surface& s) {
@@ -2276,9 +2471,10 @@ bool VulkanRenderer::staging_alloc(VkDeviceSize bytes, VkDeviceSize& offset) {
     // Sixteen bytes keep every copy's buffer offset a multiple of its texel size.
     if (bytes > staging_.region) return false;
     if (ring_alloc(staging_, bytes, 16, offset)) return true;
+    ++stats_.staging_flushes;
     // The frame's region is full: the copies so far go with its submission (still ahead, in queue order, of the
     // draws recorded after them), and the next frame's region is free once its last submission has run.
-    submit();
+    submit(true);
     return ring_alloc(staging_, bytes, 16, offset);
 }
 
@@ -2628,7 +2824,7 @@ void VulkanRenderer::draw(const KelvinState& s, const DrawBatch& batch) {
     // and moves to the next frame in flight's regions, so a frame can hold any number of draws (only a single draw
     // larger than a ring region is refused below).
     if (!fits_in_batch(vbytes, indices.size() * 4)) {
-        submit();
+        submit(true);
         ++stats_.batch_flushes;
     }
     if (!ring_alloc(vertex_ring_, vbytes, 16, voffset)) {
@@ -2840,6 +3036,8 @@ void VulkanRenderer::flush_frame() { submit(); }
 
 bool VulkanRenderer::write_back_at(u32 phys) {
     if (requested_scale_.load(std::memory_order_relaxed) != scale_) apply_scale();
+    // A frame boundary: the next submit moves to the next frame in flight, so what the frame retired is freed in time.
+    rotate_pending_ = true;
     // Targets nothing has drawn into or sampled for ten seconds, and that hold nothing newer than RAM, retire.
     if (++vblank_index_ % 60 == 0)
         for (auto it = surfaces_.begin(); it != surfaces_.end();) {
@@ -2889,6 +3087,7 @@ void VulkanRenderer::apply_scale() {
     end_pass();
     write_back_all();
     for (auto it = surfaces_.begin(); it != surfaces_.end();) it = erase_surface(it);
+    retire_cubes();
     depth_owner_.clear();
     finish();
     dev_.destroy_buffer(zc_in_);

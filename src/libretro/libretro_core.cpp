@@ -566,6 +566,8 @@ RETRO_API void retro_unload_game(void) {
                 static_cast<unsigned long long>(st.surface_samples), static_cast<unsigned long long>(st.snapshots), static_cast<unsigned long long>(st.zeta_conversions), static_cast<unsigned long long>(st.cpu_written_targets),
                 static_cast<unsigned long long>(st.depth_handovers), static_cast<unsigned long long>(st.depth_uploads), static_cast<unsigned long long>(st.evicted), static_cast<unsigned long long>(st.retired_unused), static_cast<unsigned long long>(st.subrect_copies));
             if (st.surface_reloads) log(RETRO_LOG_INFO, "gpu: %llu render targets reloaded from RAM after a 2D write", static_cast<unsigned long long>(st.surface_reloads));
+            if (st.cube_assemblies) log(RETRO_LOG_INFO, "gpu: %llu cube maps put together on the GPU from their face targets", static_cast<unsigned long long>(st.cube_assemblies));
+            log(RETRO_LOG_INFO, "gpu: submits mid-frame: %llu with the draw rings full, %llu with the upload staging full; %llu 2D copies made on the GPU", static_cast<unsigned long long>(st.batch_flushes), static_cast<unsigned long long>(st.staging_flushes), static_cast<unsigned long long>(st.gpu_copies));
             for (const auto& e : st.errors) log(RETRO_LOG_INFO, "gpu: renderer note: %s", e.c_str());
         }
         log(RETRO_LOG_INFO, "device time: the frontend's thread fired events for %.3f s; the gpu pusher took %.3f s on the CPU thread",

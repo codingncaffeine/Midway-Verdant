@@ -999,3 +999,88 @@ TEST(Vulkan, AScaledDepthBufferLargerThanTheReadBackReachesRamInBands) {
     std::memcpy(&z, &f.ram[kZeta + 2 * kPitch + 2 * 4], 4);
     EXPECT_NEAR(static_cast<double>(z >> 8), 0x400000, 2.0) << "the triangle's depth";
 }
+
+// An environment map drawn each frame: six swizzled targets, then a cube texture over them. The faces are copied into a
+// cube image on the GPU (at any internal resolution); nothing goes through RAM.
+TEST(Vulkan, ACubeMapOfSixRenderTargetsIsPutTogetherOnTheGpu) {
+    for (u32 scale : {1u, 2u}) {
+        SCOPED_TRACE(std::format("scale {}", scale));
+        TextureShaderFixture f;
+        std::string error;
+        if (!f.init(error)) GTEST_SKIP() << "no Vulkan device: " << error;
+        f.renderer->set_resolution_scale(scale);
+        Kelvin& k = f.k;
+        constexpr u32 kCube = 0x200000, kFace = 16 * 16 * 4;
+        const u32 colours[6] = {0xFFFF0000u, 0xFF00FF00u, 0xFF0000FFu, 0xFFFFFF00u, 0xFF00FFFFu, 0xFFFF00FFu};
+        for (u32 face = 0; face < 6; ++face) {
+            k.method(mthd::kSurfaceFormat, (4u << 24) | (4u << 16) | 0x200u | 0x8u);  // swizzled 16x16 A8R8G8B8, no depth
+            k.method(mthd::kSurfaceClipH, 16u << 16);
+            k.method(mthd::kSurfaceClipV, 16u << 16);
+            k.method(mthd::kSurfaceColorOffset, kCube + face * kFace);
+            k.method(mthd::kColorClear, colours[face]);
+            k.method(mthd::kClearRectH, 15u << 16);
+            k.method(mthd::kClearRectV, 15u << 16);
+            k.method(mthd::kClearSurface, 0xF0);
+        }
+        setup_target(k);
+        load_texcoord_program(k);
+        const u32 b = mthd::kTextureBase;
+        k.method(b + 0x0, kCube);
+        k.method(b + 0x4, (4u << 24) | (4u << 20) | (1u << 16) | (0x06u << 8) | (2u << 4) | (1u << 2) | 1u);  // a 16x16 cube map
+        k.method(b + 0x8, 0x00030303);
+        k.method(b + 0xC, 0x40000000);
+        k.method(b + 0x14, (1u << 24) | (1u << 16));
+        k.method(mthd::kShaderStageProgram, 3u);  // stage 0: cube map
+        output_texture_stage(k, 0);
+        const float dirs[6][3] = {{1, 0, 0}, {-1, 0, 0}, {0, 1, 0}, {0, -1, 0}, {0, 0, 1}, {0, 0, -1}};
+        for (u32 face = 0; face < 6; ++face) {
+            texcoord(k, 0, dirs[face][0], dirs[face][1], dirs[face][2], 1.0f);
+            draw_full_triangle(k, f.ram);
+            f.renderer->end_frame();
+            EXPECT_EQ(pixel_at(f.ram, 8, 8), colours[face]) << "face " << face;
+        }
+        for (const auto& e : f.renderer->stats().errors) ADD_FAILURE() << "renderer: " << e;
+        EXPECT_GE(f.renderer->stats().cube_assemblies, 1u);
+        EXPECT_EQ(f.renderer->stats().writebacks_by[VulkanRenderer::Stats::kWbTexture], 0u) << "no face went through RAM";
+    }
+}
+
+// The 2D engine copying a rectangle between two render targets: an image copy on the GPU (no write-back, no reload),
+// and RAM shows the same result once the destination is written back.
+TEST(Vulkan, A2DCopyBetweenTwoTargetsStaysOnTheGpu) {
+    for (u32 scale : {1u, 2u}) {
+        SCOPED_TRACE(std::format("scale {}", scale));
+        ScaledFixture f;
+        std::string error;
+        if (!f.init(scale, error)) GTEST_SKIP() << "no Vulkan device: " << error;
+        Kelvin& k = f.k;
+        auto fill = [&](u32 offset, u32 colour) {
+            setup_target(k, 8, offset);
+            k.method(mthd::kColorClear, colour);
+            k.method(mthd::kClearRectH, 63u << 16);
+            k.method(mthd::kClearRectV, 63u << 16);
+            k.method(mthd::kClearSurface, 0xF0);
+        };
+        fill(0x10000, 0xFFFF0000u);  // red
+        fill(0x40000, 0xFF0000FFu);  // blue
+        // 16x8 pixels from (4, 2) of the red target to (40, 30) of the blue one.
+        ASSERT_TRUE(f.renderer->copy_rect(0x10000 + 2 * 256 + 4 * 4, 256, 0x40000 + 30 * 256 + 40 * 4, 256, 16, 8, 4));
+        f.renderer->end_frame();
+        for (const auto& e : f.renderer->stats().errors) ADD_FAILURE() << "renderer: " << e;
+        auto px = [&](u32 x, u32 y) {
+            u32 v;
+            std::memcpy(&v, &f.ram[0x40000 + y * 256 + x * 4], 4);
+            return v;
+        };
+        EXPECT_EQ(px(40, 30), 0xFFFF0000u);
+        EXPECT_EQ(px(55, 37), 0xFFFF0000u) << "the rectangle's last pixel";
+        EXPECT_EQ(px(56, 37), 0xFF0000FFu) << "right of it";
+        EXPECT_EQ(px(40, 38), 0xFF0000FFu) << "below it";
+        EXPECT_EQ(px(39, 30), 0xFF0000FFu) << "left of it";
+        EXPECT_EQ(f.renderer->stats().gpu_copies, 1u);
+        EXPECT_EQ(f.renderer->stats().writebacks_by[VulkanRenderer::Stats::kWbRange], 0u);
+        // A source the CPU has written since: RAM has to carry the copy.
+        f.renderer->invalidate(0x10000, 64 * 256);
+        EXPECT_FALSE(f.renderer->copy_rect(0x10000, 256, 0x40000, 256, 16, 8, 4));
+    }
+}

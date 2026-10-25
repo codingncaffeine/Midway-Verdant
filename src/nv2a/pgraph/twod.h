@@ -26,6 +26,10 @@ public:
     // Around a blit the host hears which RAM it reads (a render target there must be in RAM first) and writes
     // (textures decoded from there are stale).
     TwoD(u8* ram, u64 ram_size, const HandleResolver& resolver) : ram_(ram), ram_size_(ram_size), resolver_(resolver) {}
+    // A copy the host can make between images it holds (render targets on the GPU): true when it did, and RAM is left
+    // alone (the destination image is then newer than RAM, as after a draw).
+    using GpuCopy = std::function<bool(u32 src_phys, u32 src_pitch, u32 dst_phys, u32 dst_pitch, u32 w, u32 h, u32 bpp)>;
+    void set_gpu_copy(GpuCopy copy) { gpu_copy_ = std::move(copy); }
     void set_hooks(std::function<void(u32 phys, u32 len)> before_read, std::function<void(u32 phys, u32 len)> after_write) {
         before_read_ = std::move(before_read);
         after_write_ = std::move(after_write);
@@ -37,6 +41,7 @@ public:
     static u32 bytes_per_pixel(u32 format);
 
     u64 blits() const { return blits_; }
+    u64 gpu_blits() const { return gpu_blits_; }  // of them, made between images on the GPU
     const std::string& last_error() const { return error_; }
 
 private:
@@ -46,6 +51,8 @@ private:
     u64 ram_size_;
     const HandleResolver& resolver_;
     std::function<void(u32, u32)> before_read_, after_write_;
+    GpuCopy gpu_copy_;
+    u64 gpu_blits_{0};
     u32 dma_source_{0}, dma_destination_{0}, format_{0}, pitch_{0}, offset_source_{0}, offset_destination_{0};
     u32 operation_{kOperationSrcCopy}, point_in_{0}, point_out_{0}, size_{0};
     u64 blits_{0};

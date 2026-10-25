@@ -108,6 +108,8 @@ Nv2aStub::Nv2aStub(Bus& bus, Scheduler& sched, std::function<void(bool)> irq)
     twod_ = std::make_unique<pgraph::TwoD>(bus_.ram(), bus_.ram_size(), *this);
     twod_->set_hooks([this](u32 phys, u32 len) { if (renderer_) renderer_->write_back_range(phys, len); },
                      [this](u32 phys, u32 len) { if (renderer_) renderer_->invalidate(phys, len); });
+    // Between two render targets the copy stays on the GPU: no write-back, wait and reload of the destination.
+    twod_->set_gpu_copy([this](u32 sp, u32 spitch, u32 dp, u32 dpitch, u32 w, u32 h, u32 bpp) { return renderer_ && renderer_->copy_rect(sp, spitch, dp, dpitch, w, h, bpp); });
 }
 
 void Nv2aStub::reset() {

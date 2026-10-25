@@ -77,6 +77,12 @@ bool TwoD::blit() {
         error_ = "rectangle outside RAM";
         return false;
     }
+    if (gpu_copy_ && gpu_copy_(static_cast<u32>(ps), static_cast<u32>(src_pitch), static_cast<u32>(pd), static_cast<u32>(dst_pitch), w, h, bpp)) {
+        ++blits_;
+        ++gpu_blits_;
+        trace::log(trace::Cat::Gpu, "2d: blit {}x{} ({} B/px) {:08x} -> {:08x} on the GPU", w, h, bpp, ps, pd);
+        return true;
+    }
     // The source must be in RAM, and so must whatever was rendered into the destination: the blit may cover only
     // part of it, and the rest has to survive into the reloaded picture.
     if (before_read_) {
