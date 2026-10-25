@@ -256,7 +256,8 @@ void BlockEngine::kill_range(u32 ram_page, unsigned off, unsigned len) {
     std::size_t kept = 0;
     bool any = false;
     for (Block* b : list) {
-        if (off < b->page_off + b->bytes && off + len > b->page_off) {
+        const unsigned first = b->page_off, end = first + b->bytes;  // u16 fields: unsigned before the compares
+        if (off < end && off + len > first) {
             kill_block(b);
             any = true;
         } else {
