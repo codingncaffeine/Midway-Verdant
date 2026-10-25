@@ -28,6 +28,7 @@
 #include "ide/hdd_format.h"
 #include "mv/version.h"
 #include "libretro/libretro.h"
+#include "libretro/libretro_vulkan.h"
 #include "libretro/retropad_map.h"
 #include "nv2a/overlay.h"
 #include "nv2a/scanout.h"
@@ -65,6 +66,8 @@ std::vector<mv::i16> audio;  // interleaved stereo at 48 kHz, filled on the mach
 std::atomic<bool> direct_audio{false};
 // The internal resolution option (PLAN D34): the frame is res_scale times the scanout each way. The fast core only.
 unsigned res_scale = 1;
+// The frontend took the Vulkan hardware-render interface (PLAN D38): frames go to it as images on its device.
+bool hw_video = false;
 bool fast_core = true;
 constexpr unsigned kPads = 4;
 unsigned pads_plugged = 1;
@@ -230,7 +233,13 @@ void grab_frame() {
     mv::u32 sc = 1;
     const mv::pgraph::VulkanRenderer* renderer = machine->renderer();
     mv::pgraph::VulkanRenderer::ScaledPicture pic;
-    const bool rendered = res_scale > 1 && renderer && renderer->scaled_picture(start, pitch, bpp, w, h, pic);
+    bool rendered = res_scale > 1 && renderer && renderer->scaled_picture(start, pitch, bpp, w, h, pic);
+    if (rendered && hw_video && !(pic.xrgb && (!gpu.overlay() || pic.overlaid))) {
+        // On the frontend's device the picture is in device memory: one the GPU did not finish (an overlay too
+        // large for its pass) is taken from RAM instead.
+        renderer->picture_done();
+        rendered = false;
+    }
     sc = rendered ? pic.sc : res_scale;
     // Instrument: MV_DEBUG_GRAB=1 prints each frame's path (the GPU's picture in place, copied, or RAM's widened).
     static const bool debug_grab = [] { const char* d = std::getenv("MV_DEBUG_GRAB"); return d && *d == '1'; }();
@@ -365,6 +374,202 @@ void apply_visual_options() {
     av.timing.sample_rate = kSampleRate;
     env_cb(RETRO_ENVIRONMENT_SET_SYSTEM_AV_INFO, &av);
     log(RETRO_LOG_INFO, "internal resolution: %ux", s);
+}
+
+// ── The frontend's Vulkan device (the libretro hardware-render interface, PLAN D38) ─────────────────────────────────
+// A frontend that takes SET_HW_RENDER for Vulkan makes the device (through our negotiation callbacks when it has
+// them, so the renderer's features and extensions are on it), and each frame goes to it as an image on the GPU
+// instead of being read back and copied (a 6x frame is 44 MB). The console is built once the device exists.
+constexpr mv::u32 kVulkan11 = (1u << 22) | (1u << 12);  // VK_API_VERSION_1_1 (its macro's casts trip -Wold-style-cast)
+retro_hw_render_callback hw_render{};
+const retro_hw_render_interface_vulkan* vk_iface = nullptr;
+std::optional<mv::MachineConfig> pending_cfg;  // the console to build at the next context_reset
+mv::vk::Enabled negotiated_enabled;  // what create_logical enabled on the frontend's device
+bool negotiated = false;
+
+const VkApplicationInfo* hw_application_info() {
+    static VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO, nullptr, "Midway Verdant", 0, "Midway Verdant", 0, kVulkan11};
+    return &app;
+}
+
+// The GPU the frontend leaves to us: a discrete one first.
+VkPhysicalDevice pick_gpu(const mv::vk::Functions& fn, VkInstance instance) {
+    mv::u32 n = 0;
+    fn.vkEnumeratePhysicalDevices(instance, &n, nullptr);
+    std::vector<VkPhysicalDevice> gpus(n);
+    fn.vkEnumeratePhysicalDevices(instance, &n, gpus.data());
+    VkPhysicalDevice best = VK_NULL_HANDLE;
+    int best_score = -1;
+    for (VkPhysicalDevice g : gpus) {
+        VkPhysicalDeviceProperties p{};
+        fn.vkGetPhysicalDeviceProperties(g, &p);
+        const int score = p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU ? 3 : p.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ? 2 : 1;
+        if (score > best_score) {
+            best_score = score;
+            best = g;
+        }
+    }
+    return best;
+}
+
+// The device the renderer wants, made by `create` (the frontend's wrapper, or vkCreateDevice with the frontend's
+// required extensions added), with its queue handed to the frontend for presenting too.
+bool make_frontend_device(retro_vulkan_context* ctx, VkInstance instance, VkPhysicalDevice gpu, PFN_vkGetInstanceProcAddr gipa,
+                          const std::function<VkDevice(VkPhysicalDevice, const VkDeviceCreateInfo&)>& create) {
+    mv::vk::Functions fn{};
+    fn.vkGetInstanceProcAddr = gipa;
+    mv::vk::load_instance(fn, instance);
+    if (!gpu) gpu = pick_gpu(fn, instance);
+    if (!gpu) {
+        log(RETRO_LOG_ERROR, "Vulkan: the frontend's instance has no GPU");
+        return false;
+    }
+    mv::u32 family = 0;
+    std::string error;
+    const VkDevice device = mv::vk::Device::create_logical(fn, gpu, family, negotiated_enabled, [&](const VkDeviceCreateInfo& ci) { return create(gpu, ci); }, error);
+    if (!device) {
+        log(RETRO_LOG_ERROR, "Vulkan: %s", error.c_str());
+        return false;
+    }
+    const auto get_queue = reinterpret_cast<PFN_vkGetDeviceQueue>(fn.vkGetDeviceProcAddr(device, "vkGetDeviceQueue"));
+    ctx->gpu = gpu;
+    ctx->device = device;
+    ctx->queue_family_index = family;
+    get_queue(device, family, 0, &ctx->queue);
+    ctx->presentation_queue = ctx->queue;  // the graphics queue presents on every desktop driver we know
+    ctx->presentation_queue_family_index = family;
+    negotiated = true;
+    return true;
+}
+
+bool hw_create_device2(retro_vulkan_context* ctx, VkInstance instance, VkPhysicalDevice gpu, VkSurfaceKHR, PFN_vkGetInstanceProcAddr gipa,
+                       retro_vulkan_create_device_wrapper_t wrapper, void* opaque) {
+    return make_frontend_device(ctx, instance, gpu, gipa, [&](VkPhysicalDevice g, const VkDeviceCreateInfo& ci) { return wrapper(g, opaque, &ci); });
+}
+
+// v1: the frontend's required extensions and layers go in with ours.
+bool hw_create_device(retro_vulkan_context* ctx, VkInstance instance, VkPhysicalDevice gpu, VkSurfaceKHR, PFN_vkGetInstanceProcAddr gipa,
+                      const char** required_extensions, unsigned n_extensions, const char** required_layers, unsigned n_layers, const VkPhysicalDeviceFeatures*) {
+    const auto create_device = reinterpret_cast<PFN_vkCreateDevice>(gipa(instance, "vkCreateDevice"));
+    return make_frontend_device(ctx, instance, gpu, gipa, [&](VkPhysicalDevice g, const VkDeviceCreateInfo& ci) {
+        std::vector<const char*> ext(ci.ppEnabledExtensionNames, ci.ppEnabledExtensionNames + ci.enabledExtensionCount);
+        for (unsigned i = 0; i < n_extensions; ++i)
+            if (std::ranges::none_of(ext, [&](const char* e) { return std::strcmp(e, required_extensions[i]) == 0; })) ext.push_back(required_extensions[i]);
+        VkDeviceCreateInfo with = ci;
+        with.enabledExtensionCount = static_cast<mv::u32>(ext.size());
+        with.ppEnabledExtensionNames = ext.data();
+        with.enabledLayerCount = n_layers;
+        with.ppEnabledLayerNames = required_layers;
+        VkDevice d = VK_NULL_HANDLE;
+        return create_device(g, &with, nullptr, &d) == VK_SUCCESS ? d : VK_NULL_HANDLE;
+    });
+}
+
+void hw_destroy_device() {}  // nothing of ours lives outside the renderer, which goes with the console
+
+bool start_machine(const mv::MachineConfig& cfg);
+
+void hw_context_reset() {
+    vk_iface = nullptr;
+    if (!env_cb(RETRO_ENVIRONMENT_GET_HW_RENDER_INTERFACE, &vk_iface) || !vk_iface || vk_iface->interface_type != RETRO_HW_RENDER_INTERFACE_VULKAN || !vk_iface->set_image) {
+        message("Midway Verdant: the frontend gave no Vulkan interface");
+        vk_iface = nullptr;
+        return;
+    }
+    if (!pending_cfg) return;  // the console runs already
+    mv::MachineConfig cfg = *pending_cfg;
+    mv::vk::External e;
+    e.instance = vk_iface->instance;
+    e.gpu = vk_iface->gpu;
+    e.device = vk_iface->device;
+    e.queue = vk_iface->queue;
+    e.queue_family = vk_iface->queue_index;
+    e.get_instance_proc_addr = vk_iface->get_instance_proc_addr;
+    e.lock_queue = vk_iface->lock_queue;
+    e.unlock_queue = vk_iface->unlock_queue;
+    e.handle = vk_iface->handle;
+    e.negotiated = negotiated;
+    e.enabled = negotiated_enabled;
+    cfg.gpu_external = e;
+    if (!negotiated) log(RETRO_LOG_WARN, "Vulkan: the frontend made the device without our negotiation; optional features (border colours, anisotropy) are off");
+    if (start_machine(cfg)) pending_cfg.reset();
+}
+
+// The frontend takes its device away (it is going, or remaking its video): the console cannot outlive the renderer on
+// it, so it stops; the next context_reset builds it again from the start.
+void hw_context_destroy() {
+    if (machine) {
+        log(RETRO_LOG_WARN, "Vulkan: the frontend took its device away while the console ran; it starts again with the next one");
+        std::lock_guard g(audio_lock);
+        audio.clear();
+    }
+    if (machine) {
+        pending_cfg = machine->config();
+        machine.reset();  // its CPU stops and its renderer goes before the device does
+    }
+    vk_iface = nullptr;
+}
+
+// Asks the frontend for Vulkan hardware rendering and offers our device negotiation; false (software frames, as
+// before) when it has no Vulkan or MV_VIDEO=software asks for that.
+bool offer_hw_render() {
+    hw_video = false;
+    negotiated = false;
+    if (const char* v = std::getenv("MV_VIDEO"); v && std::strcmp(v, "software") == 0) return false;
+    hw_render = {};
+    hw_render.context_type = RETRO_HW_CONTEXT_VULKAN;
+    hw_render.version_major = kVulkan11;
+    hw_render.context_reset = hw_context_reset;
+    hw_render.context_destroy = hw_context_destroy;
+    if (!env_cb(RETRO_ENVIRONMENT_SET_HW_RENDER, &hw_render)) return false;
+    static retro_hw_render_context_negotiation_interface_vulkan iface{};
+    iface.interface_type = RETRO_HW_RENDER_CONTEXT_NEGOTIATION_INTERFACE_VULKAN;
+    iface.interface_version = RETRO_HW_RENDER_CONTEXT_NEGOTIATION_INTERFACE_VULKAN_VERSION;
+    iface.get_application_info = hw_application_info;
+    iface.create_device = hw_create_device;
+    iface.destroy_device = hw_destroy_device;
+    iface.create_instance = nullptr;  // the frontend's instance is fine: we need nothing of it
+    iface.create_device2 = hw_create_device2;
+    env_cb(RETRO_ENVIRONMENT_SET_HW_RENDER_CONTEXT_NEGOTIATION_INTERFACE, &iface);  // optional: without it the frontend makes the device alone
+    hw_video = true;
+    return true;
+}
+
+// Builds the console and lets it run: at load, or once the frontend made its Vulkan device (hw_context_reset).
+bool start_machine(const mv::MachineConfig& cfg) {
+    std::string error;
+    machine = std::make_unique<mv::Machine>(cfg);
+    if (!machine->init(error)) {
+        message(("Midway Verdant: " + error).c_str());
+        machine.reset();
+        return false;
+    }
+    direct_audio = direct_mix_option();
+    machine->apu().set_direct_mix(direct_audio);
+    machine->apu().set_direct_sink([](const mv::i16* stereo, mv::u32 frames) {
+        if (direct_audio) queue_audio(stereo, frames * 2);
+    });
+    machine->aci().set_sample_sink([](mv::Aci::Channel c, const mv::u8* data, mv::u32 bytes) {
+        if (c != mv::Aci::PcmOut || direct_audio) return;
+        queue_audio(data, bytes / 2);
+    });
+    if (have_rumble) {
+        for (unsigned p = 0; p < pads_plugged; ++p)
+            machine->pad(p).set_rumble([p](mv::u16 left, mv::u16 right) {
+                rumble.set_rumble_state(p, RETRO_RUMBLE_STRONG, left);
+                rumble.set_rumble_state(p, RETRO_RUMBLE_WEAK, right);
+            });
+    }
+    log(RETRO_LOG_INFO, "booting %s with %u pad(s); files from %s", cfg.dvd_image ? cfg.dvd_image->string().c_str() : "no disc", pads_plugged,
+        cfg.mcpx_rom.parent_path().string().c_str());
+    log(RETRO_LOG_INFO, "timeline: %s; one console frame per retro_run", machine->cpu()->clock_name().c_str());
+    log(RETRO_LOG_INFO, "audio: %s", direct_audio ? "direct mix" : "console");
+    if (hw_video && machine->renderer()) machine->renderer()->set_handoff(true);  // captures stay on the device (D38)
+    frames_run = frames_capped = 0;
+    frame_ms_sum = frame_ms_max = 0;
+    hold_wake_ms_sum = hold_grab_ms_sum = hold_wake_ms_max = 0;
+    machine->start();
+    return true;
 }
 
 }  // namespace
@@ -517,42 +722,18 @@ RETRO_API bool retro_load_game(const retro_game_info* game) {
     }
     cfg.pads = pads_plugged;
     if (game && game->path && *game->path) cfg.dvd_image = game->path;
-    machine = std::make_unique<mv::Machine>(cfg);
-    if (!machine->init(error)) {
-        message(("Midway Verdant: " + error).c_str());
-        machine.reset();
-        return false;
+    if (offer_hw_render()) {
+        pending_cfg = cfg;  // started on the frontend's device (hw_context_reset)
+        log(RETRO_LOG_INFO, "video: the frontend's Vulkan device, frames handed over as images");
+        return true;
     }
-    direct_audio = direct_mix_option();
-    machine->apu().set_direct_mix(direct_audio);
-    machine->apu().set_direct_sink([](const mv::i16* stereo, mv::u32 frames) {
-        if (direct_audio) queue_audio(stereo, frames * 2);
-    });
-    machine->aci().set_sample_sink([](mv::Aci::Channel c, const mv::u8* data, mv::u32 bytes) {
-        if (c != mv::Aci::PcmOut || direct_audio) return;
-        queue_audio(data, bytes / 2);
-    });
-    if (have_rumble) {
-        for (unsigned p = 0; p < pads_plugged; ++p)
-            machine->pad(p).set_rumble([p](mv::u16 left, mv::u16 right) {
-                rumble.set_rumble_state(p, RETRO_RUMBLE_STRONG, left);
-                rumble.set_rumble_state(p, RETRO_RUMBLE_WEAK, right);
-            });
-    }
-    log(RETRO_LOG_INFO, "booting %s with %u pad(s); files from %s", cfg.dvd_image ? cfg.dvd_image->string().c_str() : "no disc", pads_plugged,
-        files.mcpx.parent_path().string().c_str());
-    log(RETRO_LOG_INFO, "timeline: %s; one console frame per retro_run", machine->cpu()->clock_name().c_str());
-    log(RETRO_LOG_INFO, "audio: %s", direct_audio ? "direct mix" : "console");
-    frames_run = frames_capped = 0;
-    frame_ms_sum = frame_ms_max = 0;
-    hold_wake_ms_sum = hold_grab_ms_sum = hold_wake_ms_max = 0;
-    machine->start();
-    return true;
+    return start_machine(cfg);
 }
 
 RETRO_API bool retro_load_game_special(unsigned, const retro_game_info*, size_t) { return false; }
 
 RETRO_API void retro_unload_game(void) {
+    pending_cfg.reset();  // a console the frontend's device never came for
     if (!machine) return;
     // What the game did with the pads: polls of the report endpoint, reports delivered, class requests.
     for (unsigned p = 0; p < pads_plugged; ++p)
@@ -806,9 +987,29 @@ RETRO_API void retro_run(void) {
     };
     const bool in_place = frame_ptr != frame.data();
     if (pipeline) release();
-    if (in_place) machine->renderer()->picture_ready(frame_pic);
-    video_cb(frame_ptr, frame_w, frame_h, frame_pitch);
-    if (in_place) machine->renderer()->picture_done();
+    if (hw_video && vk_iface) {
+        // The frame into the image of the frontend's sync index, on the GPU (D38): the GPU's picture where it lies, or
+        // the CPU's through a staging copy. The index's last image is the frontend's until wait_sync_index returns.
+        const mv::u32 index = vk_iface->get_sync_index(vk_iface->handle);
+        vk_iface->wait_sync_index(vk_iface->handle);
+        mv::pgraph::VulkanRenderer::HandedOver h;
+        const bool ok = machine->renderer()->hand_over(index, in_place ? &frame_pic : nullptr, frame_w, frame_h, in_place ? nullptr : frame.data(), frame_pitch, h);
+        if (in_place) machine->renderer()->picture_done();
+        if (ok) {
+            static retro_vulkan_image image;  // the frontend reads it until video_cb returns
+            image.image_view = h.view;
+            image.image_layout = VK_IMAGE_LAYOUT_GENERAL;
+            image.create_info = *h.info;
+            vk_iface->set_image(vk_iface->handle, &image, 0, nullptr, VK_QUEUE_FAMILY_IGNORED);
+            video_cb(RETRO_HW_FRAME_BUFFER_VALID, h.width, h.height, 0);
+        } else {
+            video_cb(nullptr, frame_w, frame_h, 0);  // the last picture again
+        }
+    } else {
+        if (in_place) machine->renderer()->picture_ready(frame_pic);
+        video_cb(frame_ptr, frame_w, frame_h, frame_pitch);
+        if (in_place) machine->renderer()->picture_done();
+    }
     // The audio the console played since the last frame, as it played it: the AC'97 output runs on the console's
     // own clock, so a frame carries about 800 stereo samples, a few more or fewer as the reads fall. Padding a short
     // frame with silence would put a click in the sound, so the frontend's queue absorbs the jitter instead. While

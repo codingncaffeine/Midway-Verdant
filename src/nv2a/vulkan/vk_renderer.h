@@ -74,10 +74,28 @@ public:
         bool xrgb{false};  // finished XRGB8888 (the colour table applied, alpha clear), not the frame buffer's format
         bool overlaid{false};  // the video overlay drawn in on the GPU (set_display_overlay)
         VkFence ready{VK_NULL_HANDLE};
+        // Where it lies on the device (with set_handoff the buffer is device memory and `pixels` is null): the
+        // rectangle's first byte and the buffer's row length in pixels.
+        VkBuffer buffer{VK_NULL_HANDLE};
+        VkDeviceSize offset{0};
+        u32 row_pixels{0};
     };
     bool scaled_picture(u32 phys, u32 pitch, u32 bpp, u32 w, u32 h, ScaledPicture& out) const;
     void picture_ready(const ScaledPicture& p) const;
     void picture_done() const;
+
+    // The picture handed to a frontend on the GPU (the libretro Vulkan interface, PLAN D38): with set_handoff the
+    // captures stay in device memory (nothing read back), and hand_over copies the frame on the GPU into the image of
+    // the frontend's sync index: the GPU's picture (`pic`, from scaled_picture), or the CPU's (`cpu`, XRGB8888 rows
+    // `cpu_pitch` bytes apart). B8G8R8A8 with the view's alpha one, kept in GENERAL (the frontend does no
+    // transitions); the caller waited for the frontend to be done with the index (wait_sync_index). Any thread.
+    void set_handoff(bool on) { handoff_on_ = on; }
+    struct HandedOver {
+        VkImageView view{VK_NULL_HANDLE};
+        const VkImageViewCreateInfo* info{nullptr};
+        u32 width{0}, height{0};
+    };
+    bool hand_over(u32 sync_index, const ScaledPicture* pic, u32 width, u32 height, const u32* cpu, std::size_t cpu_pitch, HandedOver& out);
 
     void clear(const KelvinState& state, u32 clear_bits) override;
     void draw(const KelvinState& state, const DrawBatch& batch) override;
@@ -624,6 +642,21 @@ private:
     // (false: grab_frame draws it on the CPU, as when the steps would not fit the shader's 32-bit arithmetic).
     bool overlay_push(const Surface& s, DisplayConvertPush& push);
     std::optional<Overlay> display_ov_;
+    // The frontend's images (hand_over), one per sync index, each with its own staging buffer, command buffer and fence.
+    bool handoff_on_{false};
+    struct Handoff {
+        vk::Image image;
+        VkImageView view{VK_NULL_HANDLE};
+        VkImageViewCreateInfo info{};
+        vk::Buffer staging;
+        VkCommandBuffer cb{VK_NULL_HANDLE};
+        VkFence fence{VK_NULL_HANDLE};
+        bool pending{false};  // its fence was submitted
+        bool fresh{false};    // still UNDEFINED: the next copy moves it to GENERAL first
+    };
+    std::vector<Handoff> handoffs_;
+    VkCommandPool handoff_pool_{VK_NULL_HANDLE};
+    void destroy_handoff(Handoff& h);
     vk::Buffer dc_ov_;        // the overlay's source bytes, copied from RAM for the pass
     u32 scan_phys_{0};        // the scanout's start (write_back_at): the overlay's rectangle is relative to it
     bool display_lut_on_{false};

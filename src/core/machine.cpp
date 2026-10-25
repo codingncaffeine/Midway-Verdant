@@ -241,7 +241,7 @@ bool Machine::init(std::string& error) {
     if (capture_) nv2a_.set_capture(capture_.get(), cpu_.get());
     if (config_.gpu) {
         gpu_device_ = std::make_unique<vk::Device>();
-        if (!gpu_device_->init(error)) return false;
+        if (!(config_.gpu_external ? gpu_device_->adopt(*config_.gpu_external, error) : gpu_device_->init(error))) return false;
         renderer_ = std::make_unique<pgraph::VulkanRenderer>(*gpu_device_, nv2a_, bus_.ram(), static_cast<u32>(bus_.ram_size()));
         if (!renderer_->init(error)) return false;
         if (config_.shader_cache_dir) renderer_->open_disk_cache(*config_.shader_cache_dir);

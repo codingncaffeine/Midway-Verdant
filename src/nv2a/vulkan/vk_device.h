@@ -1,4 +1,5 @@
 #pragma once
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -29,8 +30,32 @@ struct Image {
     bool cube{false};
 };
 
+// What the device was created with, of the optional things the renderer uses.
+struct Enabled {
+    bool occlusion_precise{false};
+    bool custom_border{false}, custom_border_unformatted{false};
+    bool anisotropy{false};
+};
+
+// A device a libretro frontend owns (the Vulkan hardware-render interface, PLAN D38): its handles, the lock it
+// wants around every use of its queue, and what was enabled on it (`negotiated`: create_logical made it through the
+// frontend's wrapper; otherwise the frontend made it alone and none of the optional features are assumed).
+struct External {
+    VkInstance instance{VK_NULL_HANDLE};
+    VkPhysicalDevice gpu{VK_NULL_HANDLE};
+    VkDevice device{VK_NULL_HANDLE};
+    VkQueue queue{VK_NULL_HANDLE};
+    u32 queue_family{0};
+    PFN_vkGetInstanceProcAddr get_instance_proc_addr{nullptr};
+    void (*lock_queue)(void* handle){nullptr};
+    void (*unlock_queue)(void* handle){nullptr};
+    void* handle{nullptr};
+    bool negotiated{false};
+    Enabled enabled;
+};
+
 // One Vulkan instance, physical device, logical device and graphics queue, with the memory and command helpers
-// the renderer needs. Headless: no surface, no swapchain.
+// the renderer needs. Headless: no surface, no swapchain. Its own (init), or a frontend's (adopt).
 class Device {
 public:
     Device() = default;
@@ -41,14 +66,24 @@ public:
     // `software` prefers a CPU implementation (lavapipe) when one is present; validation layers come from
     // the MV_VK_VALIDATE environment variable.
     bool init(std::string& error, bool software = false);
+    // The frontend's device: nothing of it is destroyed here, and every submit takes the frontend's queue lock.
+    bool adopt(const External& e, std::string& error);
+    // The logical device on `gpu` with the queue family, features and extensions the renderer uses, made through
+    // `create` (vkCreateDevice, or a frontend's wrapper that may add its own). `fn` holds the instance's functions.
+    static VkDevice create_logical(const Functions& fn, VkPhysicalDevice gpu, u32& queue_family, Enabled& enabled,
+                                   const std::function<VkDevice(const VkDeviceCreateInfo&)>& create, std::string& error);
+    // Submits under the frontend's queue lock (when there is one).
+    VkResult submit(u32 count, const VkSubmitInfo* infos, VkFence fence);
+    void wait_queue_idle();
     bool ready() const { return device_ != VK_NULL_HANDLE; }
     // Exact occlusion counts, enabled when the device has them.
-    bool occlusion_precise() const { return occlusion_precise_; }
+    bool occlusion_precise() const { return enabled_.occlusion_precise; }
     // Sampler border colours of our own (VK_EXT_custom_border_color): the NV2A's per-stage BORDER_COLOR. Without it a
     // sampler takes the nearest of Vulkan's three built-in borders; `_unformatted` = no image format needed.
-    bool custom_border() const { return custom_border_; }
-    bool custom_border_unformatted() const { return custom_border_unformatted_; }
-    bool anisotropy() const { return anisotropy_; }  // samplerAnisotropy enabled
+    bool custom_border() const { return enabled_.custom_border; }
+    bool custom_border_unformatted() const { return enabled_.custom_border_unformatted; }
+    bool anisotropy() const { return enabled_.anisotropy; }  // samplerAnisotropy enabled
+    bool external() const { return external_; }  // a frontend's device (adopt)
 
     const Functions& fn() const { return fn_; }
     VkDevice device() const { return device_; }
@@ -63,7 +98,7 @@ public:
     bool create_buffer(VkDeviceSize size, VkBufferUsageFlags usage, BufferMemory where, Buffer& out, std::string& error);
     void destroy_buffer(Buffer& b);
     bool create_image(VkFormat format, u32 width, u32 height, u32 depth, u32 levels, u32 layers, VkImageUsageFlags usage,
-                      VkImageAspectFlags aspect, bool cube, Image& out, std::string& error);
+                      VkImageAspectFlags aspect, bool cube, Image& out, std::string& error, VkImageCreateFlags flags = 0);
     void destroy_image(Image& i);
     bool format_supports(VkFormat format, VkFormatFeatureFlags features) const;
 
@@ -78,9 +113,12 @@ private:
     VkInstance instance_{VK_NULL_HANDLE};
     VkPhysicalDevice physical_{VK_NULL_HANDLE};
     VkDevice device_{VK_NULL_HANDLE};
-    bool occlusion_precise_{false};
-    bool custom_border_{false}, custom_border_unformatted_{false};
-    bool anisotropy_{false};
+    Enabled enabled_;
+    bool external_{false};
+    void (*lock_queue_)(void*){nullptr};
+    void (*unlock_queue_)(void*){nullptr};
+    void* queue_handle_{nullptr};
+    bool finish_setup(std::string& error);  // the device's name, memory, limits and command pool
     VkQueue queue_{VK_NULL_HANDLE};
     u32 queue_family_{0};
     VkCommandPool pool_{VK_NULL_HANDLE};

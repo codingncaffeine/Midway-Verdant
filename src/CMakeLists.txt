@@ -84,7 +84,7 @@ target_compile_definitions(mvcore PUBLIC VK_NO_PROTOTYPES)
 if(NOT WIN32)
   target_link_libraries(mvcore PUBLIC ${CMAKE_DL_LIBS})
   # Vulkan structures are filled sType-first with the rest zeroed: the idiom the API documents.
-  set_source_files_properties(nv2a/vulkan/vk_device.cpp nv2a/vulkan/vk_renderer.cpp PROPERTIES COMPILE_OPTIONS "-Wno-missing-field-initializers;-Wno-old-style-cast")
+  set_source_files_properties(nv2a/vulkan/vk_device.cpp nv2a/vulkan/vk_renderer.cpp tools/mv-retro-host.cpp PROPERTIES COMPILE_OPTIONS "-Wno-missing-field-initializers;-Wno-old-style-cast")
 endif()
 # The x87 and SSE units run host floating point under the guest's rounding mode and read the exception flags back:
 # MSVC may move or fold float operations across those control-word changes unless the environment is honoured.

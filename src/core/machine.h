@@ -25,6 +25,7 @@
 #include "mcpx/rtc.h"
 #include "nv2a/capture.h"
 #include "nv2a/nv2a_stub.h"
+#include "nv2a/vulkan/vk_device.h"
 #include "aci/aci.h"
 #include "mcpx/nvnet.h"
 #include "apu/apu.h"
@@ -84,6 +85,8 @@ struct MachineConfig {
     std::optional<double> reset_at_seconds;
     // The live GPU: a Vulkan renderer fed by the pushbuffer, writing frames back into guest RAM.
     bool gpu{false};
+    // The Vulkan device a libretro frontend owns (its hardware-render interface, PLAN D38); else the renderer makes its own.
+    std::optional<vk::External> gpu_external;
     // The CPU: "kvm" (the fast mode) or "p6" (our interpreter, the accurate mode); with `oracle` the
     // interpreter is checked instruction by instruction against a KVM vCPU.
     std::string cpu{"kvm"};

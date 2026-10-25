@@ -9,13 +9,14 @@
 
 namespace mv::vk {
 
+
 Device::~Device() {
     if (device_) {
-        fn_.vkDeviceWaitIdle(device_);
+        wait_queue_idle();
         if (pool_) fn_.vkDestroyCommandPool(device_, pool_, nullptr);
-        fn_.vkDestroyDevice(device_, nullptr);
+        if (!external_) fn_.vkDestroyDevice(device_, nullptr);
     }
-    if (instance_) fn_.vkDestroyInstance(instance_, nullptr);
+    if (instance_ && !external_) fn_.vkDestroyInstance(instance_, nullptr);
 }
 
 bool Device::init(std::string& error, bool software) {
@@ -63,43 +64,90 @@ bool Device::init(std::string& error, bool software) {
         if (score > best_score) {
             best_score = score;
             physical_ = d;
-            name_ = p.deviceName;
-            limits_ = p.limits;
         }
     }
+    device_ = create_logical(fn_, physical_, queue_family_, enabled_, [&](const VkDeviceCreateInfo& dci) {
+        VkDevice d = VK_NULL_HANDLE;
+        if (VkResult r = fn_.vkCreateDevice(physical_, &dci, nullptr, &d); r != VK_SUCCESS) error = std::format("vkCreateDevice: {}", result_name(r));
+        return d;
+    }, error);
+    if (!device_) return false;
+    load_device(fn_, device_);
+    fn_.vkGetDeviceQueue(device_, queue_family_, 0, &queue_);
+    return finish_setup(error);
+}
+
+bool Device::adopt(const External& e, std::string& error) {
+    if (!e.instance || !e.gpu || !e.device || !e.queue || !e.get_instance_proc_addr) {
+        error = "the frontend's Vulkan context is incomplete";
+        return false;
+    }
+    external_ = true;
+    fn_.vkGetInstanceProcAddr = e.get_instance_proc_addr;
+    instance_ = e.instance;
+    load_instance(fn_, instance_);
+    physical_ = e.gpu;
+    device_ = e.device;
+    queue_ = e.queue;
+    queue_family_ = e.queue_family;
+    lock_queue_ = e.lock_queue;
+    unlock_queue_ = e.unlock_queue;
+    queue_handle_ = e.handle;
+    enabled_ = e.negotiated ? e.enabled : Enabled{};
+    load_device(fn_, device_);
+    return finish_setup(error);
+}
+
+bool Device::finish_setup(std::string& error) {
+    VkPhysicalDeviceProperties p{};
+    fn_.vkGetPhysicalDeviceProperties(physical_, &p);
+    name_ = p.deviceName;
+    limits_ = p.limits;
+    fn_.vkGetPhysicalDeviceMemoryProperties(physical_, &memory_);
+    VkCommandPoolCreateInfo pci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+    pci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+    pci.queueFamilyIndex = queue_family_;
+    if (VkResult r = fn_.vkCreateCommandPool(device_, &pci, nullptr, &pool_); r != VK_SUCCESS) {
+        error = std::format("vkCreateCommandPool: {}", result_name(r));
+        return false;
+    }
+    return true;
+}
+
+VkDevice Device::create_logical(const Functions& fn, VkPhysicalDevice gpu, u32& queue_family, Enabled& enabled,
+                                const std::function<VkDevice(const VkDeviceCreateInfo&)>& create, std::string& error) {
+    // One queue of a family that does graphics and compute (the libretro interface asks both of the frontend's queue).
     u32 families = 0;
-    fn_.vkGetPhysicalDeviceQueueFamilyProperties(physical_, &families, nullptr);
+    fn.vkGetPhysicalDeviceQueueFamilyProperties(gpu, &families, nullptr);
     std::vector<VkQueueFamilyProperties> qf(families);
-    fn_.vkGetPhysicalDeviceQueueFamilyProperties(physical_, &families, qf.data());
+    fn.vkGetPhysicalDeviceQueueFamilyProperties(gpu, &families, qf.data());
     bool found = false;
-    for (u32 i = 0; i < families; ++i) {
-        if (qf[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) {
-            queue_family_ = i;
+    for (u32 i = 0; i < families && !found; ++i) {
+        if ((qf[i].queueFlags & (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT)) == (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT)) {
+            queue_family = i;
             found = true;
-            break;
         }
     }
     if (!found) {
-        error = "the Vulkan device has no graphics queue";
-        return false;
+        error = "the Vulkan device has no queue that does graphics and compute";
+        return VK_NULL_HANDLE;
     }
-    fn_.vkGetPhysicalDeviceMemoryProperties(physical_, &memory_);
-
     const float priority = 1.0f;
     VkDeviceQueueCreateInfo qci{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
-    qci.queueFamilyIndex = queue_family_;
+    qci.queueFamilyIndex = queue_family;
     qci.queueCount = 1;
     qci.pQueuePriorities = &priority;
     VkPhysicalDeviceFeatures features{};
     VkPhysicalDeviceFeatures available{};
-    fn_.vkGetPhysicalDeviceFeatures(physical_, &available);
+    fn.vkGetPhysicalDeviceFeatures(gpu, &available);
+    enabled = Enabled{};
     features.fillModeNonSolid = available.fillModeNonSolid;
     features.samplerAnisotropy = available.samplerAnisotropy;
-    anisotropy_ = available.samplerAnisotropy;
+    enabled.anisotropy = available.samplerAnisotropy;
     features.independentBlend = available.independentBlend;
     features.largePoints = available.largePoints;
     features.occlusionQueryPrecise = available.occlusionQueryPrecise;
-    occlusion_precise_ = available.occlusionQueryPrecise;
+    enabled.occlusion_precise = available.occlusionQueryPrecise;
     VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
     dci.queueCreateInfoCount = 1;
     dci.pQueueCreateInfos = &qci;
@@ -109,41 +157,47 @@ bool Device::init(std::string& error, bool software) {
     VkPhysicalDeviceCustomBorderColorFeaturesEXT border{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_FEATURES_EXT};
     {
         u32 n_ext = 0;
-        fn_.vkEnumerateDeviceExtensionProperties(physical_, nullptr, &n_ext, nullptr);
+        fn.vkEnumerateDeviceExtensionProperties(gpu, nullptr, &n_ext, nullptr);
         std::vector<VkExtensionProperties> props(n_ext);
-        fn_.vkEnumerateDeviceExtensionProperties(physical_, nullptr, &n_ext, props.data());
+        fn.vkEnumerateDeviceExtensionProperties(gpu, nullptr, &n_ext, props.data());
         const bool offered = std::ranges::any_of(props, [](const VkExtensionProperties& p) {
             return std::string_view(p.extensionName) == VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME;
         });
-        if (offered && fn_.vkGetPhysicalDeviceFeatures2) {
+        if (offered && fn.vkGetPhysicalDeviceFeatures2) {
             VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
             f2.pNext = &border;
-            fn_.vkGetPhysicalDeviceFeatures2(physical_, &f2);
+            fn.vkGetPhysicalDeviceFeatures2(gpu, &f2);
             if (border.customBorderColors) {
                 extensions.push_back(VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME);
                 border.pNext = nullptr;
                 dci.pNext = &border;
-                custom_border_ = true;
-                custom_border_unformatted_ = border.customBorderColorWithoutFormat;
+                enabled.custom_border = true;
+                enabled.custom_border_unformatted = border.customBorderColorWithoutFormat;
             }
         }
     }
     dci.enabledExtensionCount = static_cast<u32>(extensions.size());
     dci.ppEnabledExtensionNames = extensions.data();
-    if (VkResult r = fn_.vkCreateDevice(physical_, &dci, nullptr, &device_); r != VK_SUCCESS) {
-        error = std::format("vkCreateDevice: {}", result_name(r));
-        return false;
+    const VkDevice device = create(dci);
+    if (!device) {
+        if (error.empty()) error = "the Vulkan device could not be created";
+        enabled = Enabled{};
     }
-    load_device(fn_, device_);
-    fn_.vkGetDeviceQueue(device_, queue_family_, 0, &queue_);
-    VkCommandPoolCreateInfo pci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
-    pci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
-    pci.queueFamilyIndex = queue_family_;
-    if (VkResult r = fn_.vkCreateCommandPool(device_, &pci, nullptr, &pool_); r != VK_SUCCESS) {
-        error = std::format("vkCreateCommandPool: {}", result_name(r));
-        return false;
-    }
-    return true;
+    return device;
+}
+
+VkResult Device::submit(u32 count, const VkSubmitInfo* infos, VkFence fence) {
+    if (lock_queue_) lock_queue_(queue_handle_);
+    const VkResult r = fn_.vkQueueSubmit(queue_, count, infos, fence);
+    if (unlock_queue_) unlock_queue_(queue_handle_);
+    return r;
+}
+
+void Device::wait_queue_idle() {
+    if (!queue_) return;
+    if (lock_queue_) lock_queue_(queue_handle_);
+    fn_.vkQueueWaitIdle(queue_);
+    if (unlock_queue_) unlock_queue_(queue_handle_);
 }
 
 u32 Device::memory_type(u32 type_bits, VkMemoryPropertyFlags flags, bool* found) const {
@@ -208,10 +262,10 @@ void Device::destroy_buffer(Buffer& b) {
 }
 
 bool Device::create_image(VkFormat format, u32 width, u32 height, u32 depth, u32 levels, u32 layers, VkImageUsageFlags usage,
-                          VkImageAspectFlags aspect, bool cube, Image& out, std::string& error) {
+                          VkImageAspectFlags aspect, bool cube, Image& out, std::string& error, VkImageCreateFlags flags) {
     out = Image{};
     VkImageCreateInfo ici{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
-    ici.flags = cube ? static_cast<u32>(VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT) : 0u;
+    ici.flags = flags | (cube ? static_cast<u32>(VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT) : 0u);
     ici.imageType = depth > 1 ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D;
     ici.format = format;
     ici.extent = {width, height, depth};
@@ -296,8 +350,8 @@ void Device::finish_once(VkCommandBuffer cb) {
     VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
     si.commandBufferCount = 1;
     si.pCommandBuffers = &cb;
-    fn_.vkQueueSubmit(queue_, 1, &si, VK_NULL_HANDLE);
-    fn_.vkQueueWaitIdle(queue_);
+    submit(1, &si, VK_NULL_HANDLE);
+    wait_queue_idle();
     fn_.vkFreeCommandBuffers(device_, pool_, 1, &cb);
 }
 

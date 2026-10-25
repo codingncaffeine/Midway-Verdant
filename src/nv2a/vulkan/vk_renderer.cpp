@@ -203,7 +203,12 @@ VulkanRenderer::~VulkanRenderer() {
         f.vkEndCommandBuffer(cb_);
         recording_ = false;
     }
-    f.vkDeviceWaitIdle(dev_.device());
+    dev_.wait_queue_idle();  // the one queue the renderer uses (a frontend's device: its lock, not a device-wide wait)
+    for (Handoff& h : handoffs_) {
+        destroy_handoff(h);
+        if (h.fence) f.vkDestroyFence(dev_.device(), h.fence, nullptr);
+    }
+    if (handoff_pool_) f.vkDestroyCommandPool(dev_.device(), handoff_pool_, nullptr);  // its command buffers with it
     save_pipeline_cache();
     if (pipeline_cache_) f.vkDestroyPipelineCache(dev_.device(), pipeline_cache_, nullptr);
     for (Frame& fr : frames_) {
@@ -518,7 +523,7 @@ void VulkanRenderer::submit(bool rotate) {
     si.commandBufferCount = 1;
     si.pCommandBuffers = &cb_;
     fr.last = fr.fences[fr.used++];
-    f.vkQueueSubmit(dev_.queue(), 1, &si, fr.last);
+    dev_.submit(1, &si, fr.last);
     fr.serial = ++submitted_;
     ++stats_.flushes;
     // Draw counting reads a frame's queries once its fence signals, all of them at once: every submit moves on.
@@ -3781,7 +3786,9 @@ void VulkanRenderer::capture_display(Surface& s) {
         if (c->buffer.size < bytes) {
             dev_.destroy_buffer(c->buffer);
             std::string error;
-            if (!dev_.create_buffer(bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, vk::BufferMemory::HostRead, c->buffer, error)) {
+            // Handed to a frontend on the GPU (D38) it stays in device memory; else the host reads it where it lies.
+            if (!dev_.create_buffer(bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                                    handoff_on_ ? vk::BufferMemory::Device : vk::BufferMemory::HostRead, c->buffer, error)) {
                 note("scaled picture buffer: " + error);
                 if (c == last_capture_) last_capture_ = nullptr;
                 destroy_capture(*c);
@@ -3842,7 +3849,7 @@ void VulkanRenderer::capture_display(Surface& s) {
     }
     // Submitted now, and an empty submission after it signals the capture's fence once everything before it is done.
     submit();
-    fn_->vkQueueSubmit(dev_.queue(), 0, nullptr, c->fence);
+    dev_.submit(0, nullptr, c->fence);
     last_capture_ = c;
     std::lock_guard g(display_mutex_);
     c->submitted = true;
@@ -3905,6 +3912,120 @@ bool VulkanRenderer::overlay_push(const Surface& s, DisplayConvertPush& push) {
     push.yuy2 = ov.yuy2 ? 1u : 0u;
     push.key_on = ov.color_key ? 1u : 0u;
     push.key = ov.key & 0xFFFFFFu;
+    return true;
+}
+
+
+// ── The picture handed to the frontend on the GPU (D38) ──────────────────────────────────────────────────────────
+
+void VulkanRenderer::destroy_handoff(Handoff& h) {
+    const auto& f = *fn_;
+    if (h.pending) f.vkWaitForFences(dev_.device(), 1, &h.fence, VK_TRUE, ~0ull);
+    h.pending = false;
+    if (h.view) f.vkDestroyImageView(dev_.device(), h.view, nullptr);
+    h.view = VK_NULL_HANDLE;
+    dev_.destroy_image(h.image);
+    dev_.destroy_buffer(h.staging);
+}
+
+bool VulkanRenderer::hand_over(u32 sync_index, const ScaledPicture* pic, u32 width, u32 height, const u32* cpu, std::size_t cpu_pitch, HandedOver& out) {
+    const auto& f = *fn_;
+    if (width == 0 || height == 0 || (!pic && !cpu) || (pic && !pic->buffer)) return false;
+    if (!handoff_pool_) {
+        VkCommandPoolCreateInfo pci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+        pci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+        pci.queueFamilyIndex = dev_.queue_family();
+        if (f.vkCreateCommandPool(dev_.device(), &pci, nullptr, &handoff_pool_) != VK_SUCCESS) return false;
+    }
+    if (handoffs_.size() <= sync_index) handoffs_.resize(sync_index + 1);
+    Handoff& h = handoffs_[sync_index];
+    if (!h.cb) {
+        VkCommandBufferAllocateInfo cai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+        cai.commandPool = handoff_pool_;
+        cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        cai.commandBufferCount = 1;
+        VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+        if (f.vkAllocateCommandBuffers(dev_.device(), &cai, &h.cb) != VK_SUCCESS || f.vkCreateFence(dev_.device(), &fci, nullptr, &h.fence) != VK_SUCCESS) return false;
+    }
+    if (h.pending) {
+        f.vkWaitForFences(dev_.device(), 1, &h.fence, VK_TRUE, ~0ull);
+        f.vkResetFences(dev_.device(), 1, &h.fence);
+        h.pending = false;
+    }
+    std::string error;
+    if (h.image.image && (h.image.width != width || h.image.height != height)) destroy_handoff(h);  // the frontend let go of it
+    if (!h.image.image) {
+        if (!dev_.create_image(VK_FORMAT_B8G8R8A8_UNORM, width, height, 1, 1, 1,
+                               VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, VK_IMAGE_ASPECT_COLOR_BIT, false, h.image, error,
+                               VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT)) {
+            note("picture for the frontend: " + error);
+            return false;
+        }
+        // XRGB8888 in memory is B, G, R and an unused byte: the view reads alpha as one.
+        h.info = VkImageViewCreateInfo{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        h.info.image = h.image.image;
+        h.info.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        h.info.format = VK_FORMAT_B8G8R8A8_UNORM;
+        h.info.components = {VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_ONE};
+        h.info.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        if (f.vkCreateImageView(dev_.device(), &h.info, nullptr, &h.view) != VK_SUCCESS) {
+            destroy_handoff(h);
+            return false;
+        }
+        h.fresh = true;
+    }
+    const VkDeviceSize bytes = static_cast<VkDeviceSize>(width) * height * 4;
+    if (!pic) {
+        if (h.staging.size < bytes) {
+            dev_.destroy_buffer(h.staging);
+            if (!dev_.create_buffer(bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, vk::BufferMemory::HostWrite, h.staging, error)) {
+                note("picture for the frontend: " + error);
+                return false;
+            }
+        }
+        for (u32 y = 0; y < height; ++y)
+            std::memcpy(static_cast<u8*>(h.staging.mapped) + static_cast<std::size_t>(y) * width * 4, reinterpret_cast<const u8*>(cpu) + y * cpu_pitch, static_cast<std::size_t>(width) * 4);
+    }
+    VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    f.vkBeginCommandBuffer(h.cb, &bi);
+    // The capture (submitted at the vblank, earlier on the same queue) has landed before the copy reads it; the
+    // frontend's earlier reads of this image are done (wait_sync_index).
+    VkImageMemoryBarrier to{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    to.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT;
+    to.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    to.oldLayout = h.fresh ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_GENERAL;
+    to.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    to.srcQueueFamilyIndex = to.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    to.image = h.image.image;
+    to.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    VkMemoryBarrier src{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    src.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT;
+    src.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    f.vkCmdPipelineBarrier(h.cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &src, 0, nullptr, 1, &to);
+    h.fresh = false;
+    VkBufferImageCopy r{};
+    r.bufferOffset = pic ? pic->offset : 0;
+    r.bufferRowLength = pic ? pic->row_pixels : width;
+    r.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    r.imageExtent = {width, height, 1};
+    f.vkCmdCopyBufferToImage(h.cb, pic ? pic->buffer : h.staging.buffer, h.image.image, VK_IMAGE_LAYOUT_GENERAL, 1, &r);
+    // Ready for whatever the frontend does with it next on the queue (sampling it, copying it).
+    VkImageMemoryBarrier done = to;
+    done.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    done.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT;
+    done.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+    f.vkCmdPipelineBarrier(h.cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &done);
+    f.vkEndCommandBuffer(h.cb);
+    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &h.cb;
+    if (dev_.submit(1, &si, h.fence) != VK_SUCCESS) return false;
+    h.pending = true;
+    out.view = h.view;
+    out.info = &h.info;
+    out.width = width;
+    out.height = height;
     return true;
 }
 
@@ -4044,7 +4165,10 @@ bool VulkanRenderer::scaled_picture(u32 phys, u32 pitch, u32 bpp, u32 w, u32 h, 
     out.xrgb = c->xrgb;
     out.overlaid = c->overlaid;
     out.pitch = c->width * c->sc * px;
-    out.pixels = static_cast<const u8*>(c->buffer.mapped) + static_cast<std::size_t>(y0) * c->sc * out.pitch + static_cast<std::size_t>(x0) * c->sc * px;
+    out.offset = static_cast<VkDeviceSize>(y0) * c->sc * out.pitch + static_cast<VkDeviceSize>(x0) * c->sc * px;
+    out.pixels = c->buffer.mapped ? static_cast<const u8*>(c->buffer.mapped) + out.offset : nullptr;
+    out.buffer = c->buffer.buffer;
+    out.row_pixels = c->width * c->sc;
     out.ready = c->submitted ? c->fence : VK_NULL_HANDLE;
     held_ = c;
     return true;

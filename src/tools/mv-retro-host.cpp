@@ -5,6 +5,7 @@
 //     [--reset@FRAME ...]: retro_reset before that frame, as a frontend's restart button does (Emutastic calls it on its loop).
 //     [--option@FRAME KEY=VALUE ...]: the option changes before that frame, as a frontend's live options menu does (the next
 //     GET_VARIABLE_UPDATE reports it).
+//     [--hw-video]: offer the Vulkan hardware-render interface; the core hands frames over as images (read back for pictures).
 // Buttons: a b x y l r l2 r2 start select up down left right.
 #include <dlfcn.h>
 #if defined(__linux__)
@@ -17,6 +18,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <algorithm>
+#include <array>
+#include <memory>
+#include <mutex>
 #include <filesystem>
 #include <format>
 #include <map>
@@ -26,6 +30,8 @@
 
 #include "debug/png.h"
 #include "libretro/libretro.h"
+#include "libretro/libretro_vulkan.h"
+#include "nv2a/vulkan/vk_device.h"
 
 namespace {
 
@@ -49,6 +55,185 @@ std::vector<Press> presses;
 std::vector<std::pair<std::string, std::string>> options;  // --option key=value
 bool options_changed = false;  // since the core last asked (GET_VARIABLE_UPDATE)
 unsigned current_frame = 0;
+
+// ── --hw-video: the frontend side of the libretro Vulkan hardware-render interface (PLAN D38) ─────────────────────
+// The core makes the device through the negotiation interface (create_device2 through our wrapper); each frame it
+// hands over arrives as an image, read back here only for the frames a picture is saved of. Two sync indices, one
+// fence each, as a frontend with a double-buffered swapchain has.
+bool hw_requested = false, hw_accepted = false, hw_ready = false;
+retro_hw_render_callback hw_cb{};
+const retro_hw_render_context_negotiation_interface_vulkan* negotiation = nullptr;
+mv::vk::Functions vkf{};
+VkInstance vk_instance = VK_NULL_HANDLE;
+VkDevice vk_device = VK_NULL_HANDLE;
+VkQueue vk_queue = VK_NULL_HANDLE;
+std::mutex queue_mutex;
+retro_hw_render_interface_vulkan vk_iface{};
+constexpr unsigned kSyncImages = 2;
+std::array<VkFence, kSyncImages> sync_fences{};
+std::array<bool, kSyncImages> sync_pending{};
+std::array<VkCommandBuffer, kSyncImages> sync_cbs{};
+unsigned sync_index = 0;
+VkCommandPool hw_pool = VK_NULL_HANDLE;
+VkImage handed_image = VK_NULL_HANDLE;  // set_image's, for this frame
+std::unique_ptr<mv::vk::Device> hw_dev;  // the same device adopted, for the read-back buffer
+mv::vk::Buffer readback;
+bool readback_this_frame = false;
+unsigned long long hw_frames = 0, hw_dupes = 0;
+
+void hw_lock(void*) { queue_mutex.lock(); }
+void hw_unlock(void*) { queue_mutex.unlock(); }
+void hw_wait_index(unsigned i) {
+    if (!sync_pending[i]) return;
+    vkf.vkWaitForFences(vk_device, 1, &sync_fences[i], VK_TRUE, ~0ull);
+    vkf.vkResetFences(vk_device, 1, &sync_fences[i]);
+    sync_pending[i] = false;
+}
+void hw_set_image(void*, const retro_vulkan_image* image, uint32_t, const VkSemaphore*, uint32_t) { handed_image = image ? image->create_info.image : VK_NULL_HANDLE; }
+uint32_t hw_get_sync_index(void*) { return sync_index; }
+uint32_t hw_get_sync_index_mask(void*) { return (1u << kSyncImages) - 1; }
+void hw_set_command_buffers(void*, uint32_t, const VkCommandBuffer*) {}
+void hw_wait_sync_index(void*) { hw_wait_index(sync_index); }
+void hw_set_signal_semaphore(void*, VkSemaphore) {}
+
+VkDevice hw_create_device_wrapper(VkPhysicalDevice gpu, void*, const VkDeviceCreateInfo* ci) {
+    VkDevice d = VK_NULL_HANDLE;
+    return vkf.vkCreateDevice(gpu, ci, nullptr, &d) == VK_SUCCESS ? d : VK_NULL_HANDLE;
+}
+
+bool hw_create(std::string& error) {
+    if (!mv::vk::load_global(vkf, error)) return false;
+    static const VkApplicationInfo fallback{VK_STRUCTURE_TYPE_APPLICATION_INFO, nullptr, "mv-retro-host", 0, "mv-retro-host", 0, (1u << 22) | (1u << 12)};
+    const VkApplicationInfo* app = negotiation && negotiation->get_application_info ? negotiation->get_application_info() : &fallback;
+    VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
+    ici.pApplicationInfo = app ? app : &fallback;
+    if (vkf.vkCreateInstance(&ici, nullptr, &vk_instance) != VK_SUCCESS) {
+        error = "vkCreateInstance failed";
+        return false;
+    }
+    mv::vk::load_instance(vkf, vk_instance);
+    retro_vulkan_context ctx{};
+    bool ok = false;
+    if (negotiation && negotiation->interface_version >= 2 && negotiation->create_device2)
+        ok = negotiation->create_device2(&ctx, vk_instance, VK_NULL_HANDLE, VK_NULL_HANDLE, vkf.vkGetInstanceProcAddr, hw_create_device_wrapper, nullptr);
+    else if (negotiation && negotiation->create_device)
+        ok = negotiation->create_device(&ctx, vk_instance, VK_NULL_HANDLE, VK_NULL_HANDLE, vkf.vkGetInstanceProcAddr, nullptr, 0, nullptr, 0, nullptr);
+    if (!ok) {
+        error = "the core made no device through the negotiation interface";
+        return false;
+    }
+    vk_device = ctx.device;
+    vk_queue = ctx.queue;
+    mv::vk::load_device(vkf, vk_device);
+    mv::vk::External e;
+    e.instance = vk_instance;
+    e.gpu = ctx.gpu;
+    e.device = vk_device;
+    e.queue = vk_queue;
+    e.queue_family = ctx.queue_family_index;
+    e.get_instance_proc_addr = vkf.vkGetInstanceProcAddr;
+    e.lock_queue = hw_lock;
+    e.unlock_queue = hw_unlock;
+    hw_dev = std::make_unique<mv::vk::Device>();
+    if (!hw_dev->adopt(e, error)) return false;
+    VkCommandPoolCreateInfo pci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+    pci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+    pci.queueFamilyIndex = ctx.queue_family_index;
+    vkf.vkCreateCommandPool(vk_device, &pci, nullptr, &hw_pool);
+    VkCommandBufferAllocateInfo cai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    cai.commandPool = hw_pool;
+    cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cai.commandBufferCount = kSyncImages;
+    vkf.vkAllocateCommandBuffers(vk_device, &cai, sync_cbs.data());
+    VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    for (VkFence& fence : sync_fences) vkf.vkCreateFence(vk_device, &fci, nullptr, &fence);
+    vk_iface = {};
+    vk_iface.interface_type = RETRO_HW_RENDER_INTERFACE_VULKAN;
+    vk_iface.interface_version = RETRO_HW_RENDER_INTERFACE_VULKAN_VERSION;
+    vk_iface.instance = vk_instance;
+    vk_iface.gpu = ctx.gpu;
+    vk_iface.device = vk_device;
+    vk_iface.get_device_proc_addr = vkf.vkGetDeviceProcAddr;
+    vk_iface.get_instance_proc_addr = vkf.vkGetInstanceProcAddr;
+    vk_iface.queue = vk_queue;
+    vk_iface.queue_index = ctx.queue_family_index;
+    vk_iface.set_image = hw_set_image;
+    vk_iface.get_sync_index = hw_get_sync_index;
+    vk_iface.get_sync_index_mask = hw_get_sync_index_mask;
+    vk_iface.set_command_buffers = hw_set_command_buffers;
+    vk_iface.wait_sync_index = hw_wait_sync_index;
+    vk_iface.lock_queue = hw_lock;
+    vk_iface.unlock_queue = hw_unlock;
+    vk_iface.set_signal_semaphore = hw_set_signal_semaphore;
+    hw_ready = true;
+    hw_cb.context_reset();
+    return true;
+}
+
+// A handed-over frame: what the frontend's own work would be (a submission after the core's, with this index's
+// fence), and the image read back into last_frame when a picture of this frame is saved.
+void hw_frame(unsigned w, unsigned h) {
+    ++hw_frames;
+    hw_wait_index(sync_index);
+    VkCommandBuffer cb = sync_cbs[sync_index];
+    VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkf.vkBeginCommandBuffer(cb, &bi);
+    const VkDeviceSize bytes = static_cast<VkDeviceSize>(w) * h * 4;
+    const bool read = readback_this_frame && handed_image;
+    if (read && readback.size < bytes) {
+        hw_dev->destroy_buffer(readback);
+        std::string error;
+        if (!hw_dev->create_buffer(bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, mv::vk::BufferMemory::HostRead, readback, error)) std::fprintf(stderr, "mv-retro-host: %s\n", error.c_str());
+    }
+    if (read && readback.buffer) {
+        VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        mb.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+        mb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        vkf.vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+        VkBufferImageCopy r{};
+        r.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        r.imageExtent = {w, h, 1};
+        vkf.vkCmdCopyImageToBuffer(cb, handed_image, VK_IMAGE_LAYOUT_GENERAL, readback.buffer, 1, &r);
+        mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        mb.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+        vkf.vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+    }
+    vkf.vkEndCommandBuffer(cb);
+    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &cb;
+    {
+        std::lock_guard g(queue_mutex);
+        vkf.vkQueueSubmit(vk_queue, 1, &si, sync_fences[sync_index]);
+    }
+    sync_pending[sync_index] = true;
+    if (read && readback.buffer) {
+        hw_wait_index(sync_index);
+        last_w = w;
+        last_h = h;
+        last_pitch = static_cast<std::size_t>(w) * 4;
+        const auto* p = static_cast<const unsigned char*>(readback.mapped);
+        last_frame.assign(p, p + bytes);
+    }
+}
+
+void hw_destroy() {
+    if (!hw_ready) return;
+    {
+        std::lock_guard g(queue_mutex);
+        vkf.vkQueueWaitIdle(vk_queue);
+    }
+    if (hw_cb.context_destroy) hw_cb.context_destroy();
+    if (negotiation && negotiation->destroy_device) negotiation->destroy_device();
+    hw_dev->destroy_buffer(readback);
+    hw_dev.reset();
+    for (VkFence f : sync_fences) vkf.vkDestroyFence(vk_device, f, nullptr);
+    vkf.vkDestroyCommandPool(vk_device, hw_pool, nullptr);
+    vkf.vkDestroyDevice(vk_device, nullptr);
+    vkf.vkDestroyInstance(vk_instance, nullptr);
+    hw_ready = false;
+}
 
 void core_log(retro_log_level, const char* fmt, ...) {
     va_list ap;
@@ -80,6 +265,26 @@ bool environment(unsigned cmd, void* data) {
             *static_cast<bool*>(data) = options_changed;
             options_changed = false;
             return true;
+        case RETRO_ENVIRONMENT_SET_HW_RENDER: {
+            auto* cb = static_cast<retro_hw_render_callback*>(data);
+            if (!hw_requested || cb->context_type != RETRO_HW_CONTEXT_VULKAN) return false;
+            hw_cb = *cb;
+            hw_accepted = true;
+            return true;
+        }
+        case RETRO_ENVIRONMENT_GET_HW_RENDER_CONTEXT_NEGOTIATION_INTERFACE_SUPPORT: {
+            if (!hw_requested) return false;
+            auto* n = static_cast<retro_hw_render_context_negotiation_interface*>(data);
+            n->interface_version = n->interface_type == RETRO_HW_RENDER_CONTEXT_NEGOTIATION_INTERFACE_VULKAN ? 2 : 0;
+            return true;
+        }
+        case RETRO_ENVIRONMENT_SET_HW_RENDER_CONTEXT_NEGOTIATION_INTERFACE:
+            negotiation = static_cast<const retro_hw_render_context_negotiation_interface_vulkan*>(data);
+            return hw_requested;
+        case RETRO_ENVIRONMENT_GET_HW_RENDER_INTERFACE:
+            if (!hw_ready) return false;
+            *static_cast<const retro_hw_render_interface**>(data) = reinterpret_cast<const retro_hw_render_interface*>(&vk_iface);
+            return true;
         case RETRO_ENVIRONMENT_GET_VARIABLE:
             for (const auto& [k, v] : options)
                 if (k == static_cast<retro_variable*>(data)->key) {
@@ -95,7 +300,14 @@ bool environment(unsigned cmd, void* data) {
 
 void video(const void* data, unsigned w, unsigned h, size_t pitch) {
     ++frames_seen;
-    if (!data) return;
+    if (data == RETRO_HW_FRAME_BUFFER_VALID) {
+        if (hw_ready) hw_frame(w, h);
+        return;
+    }
+    if (!data) {
+        ++hw_dupes;
+        return;
+    }
     last_w = w;
     last_h = h;
     last_pitch = pitch;
@@ -205,6 +417,8 @@ int main(int argc, char** argv) {
             frontend_ms = std::atof(argv[++i]);
         } else if (a == "--realtime") {
             realtime = true;
+        } else if (a == "--hw-video") {
+            hw_requested = true;  // offer the core the Vulkan hardware-render interface (PLAN D38)
         } else if (a == "--wav" && i + 1 < argc) {
             wav_out = std::fopen(argv[++i], "wb");
             if (!wav_out) {
@@ -242,6 +456,14 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "mv-retro-host: retro_load_game failed\n");
         return 1;
     }
+    if (hw_accepted) {
+        std::string error;
+        if (!hw_create(error)) {
+            std::fprintf(stderr, "mv-retro-host: --hw-video: %s\n", error.c_str());
+            return 1;
+        }
+        std::printf("hw video: the core's Vulkan device, frames handed over as images\n");
+    }
     retro_system_av_info av{};
     sym<void (*)(retro_system_av_info*)>(lib, "retro_get_system_av_info")(&av);
     std::printf("av: %ux%u base, %.3f fps, %.0f Hz\n", av.geometry.base_width, av.geometry.base_height, av.timing.fps, av.timing.sample_rate);
@@ -268,14 +490,17 @@ int main(int argc, char** argv) {
             std::printf("frame %u: option %s = %s\n", current_frame, key.c_str(), value.c_str());
         }
         audio_this_call = 0;
+        const bool save = png_every && ((current_frame + 1) % png_every == 0 || (png_from && current_frame + 1 >= png_from && current_frame + 1 <= png_to));
+        readback_this_frame = save;
         const auto c0 = std::chrono::steady_clock::now();
         run();
+        if (hw_ready) sync_index = (sync_index + 1) % kSyncImages;
         const double call_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - c0).count();
         call_ms_max = std::max(call_ms_max, call_ms);
         over17 += call_ms > 1000.0 / 60.0;
         over33 += call_ms > 2000.0 / 60.0;
         ++audio_per_call[audio_this_call];
-        if (png_every && ((current_frame + 1) % png_every == 0 || (png_from && current_frame + 1 >= png_from && current_frame + 1 <= png_to))) save_png(png_dir / std::format("frame-{:06}.png", current_frame + 1));
+        if (save) save_png(png_dir / std::format("frame-{:06}.png", current_frame + 1));
         if (frontend_ms > 0) std::this_thread::sleep_for(std::chrono::duration<double, std::milli>(frontend_ms));
         if (realtime) std::this_thread::sleep_until(t0 + std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>((current_frame + 1) / av.timing.fps)));
     }
@@ -306,6 +531,8 @@ int main(int argc, char** argv) {
         std::fclose(wav_out);
     }
     sym<void (*)()>(lib, "retro_unload_game")();
+    if (hw_ready) std::printf("hw video: %llu frames handed over, %llu repeated\n", hw_frames, hw_dupes);
+    hw_destroy();
     sym<void (*)()>(lib, "retro_deinit")();
     dlclose(lib);
     return 0;

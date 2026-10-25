@@ -1514,3 +1514,96 @@ TEST(Vulkan, TheVideoOverlayDrawnOnTheGpuIsTheOneTheCpuDraws) {
         }
     }
 }
+
+namespace {
+
+// The image a frontend was handed, read back (its bytes as they lie: B, G, R and the unused byte).
+std::vector<u32> read_handed_over(vk::Device& device, const VulkanRenderer::HandedOver& h) {
+    vk::Buffer buf;
+    std::string error;
+    std::vector<u32> out;
+    if (!device.create_buffer(static_cast<VkDeviceSize>(h.width) * h.height * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT, vk::BufferMemory::HostRead, buf, error)) return out;
+    VkCommandBuffer cb = device.begin_once();
+    VkMemoryBarrier mb{};
+    mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    mb.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+    mb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    device.fn().vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+    VkBufferImageCopy r{};
+    r.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    r.imageExtent = {h.width, h.height, 1};
+    device.fn().vkCmdCopyImageToBuffer(cb, h.info->image, VK_IMAGE_LAYOUT_GENERAL, buf.buffer, 1, &r);
+    device.finish_once(cb);
+    out.resize(static_cast<std::size_t>(h.width) * h.height);
+    std::memcpy(out.data(), buf.mapped, out.size() * 4);
+    device.destroy_buffer(buf);
+    return out;
+}
+
+void handoff_scene(Kelvin& k) {
+    setup_target(k);
+    k.method(mthd::kColorClear, 0xFF102030u);
+    k.method(mthd::kClearRectH, 63u << 16);
+    k.method(mthd::kClearRectV, 63u << 16);
+    k.method(mthd::kClearSurface, 0xF0);
+    k.method(mthd::kColorClear, 0xFFC08040u);
+    k.method(mthd::kClearRectH, (40u << 16) | 9u);
+    k.method(mthd::kClearRectV, (50u << 16) | 3u);
+    k.method(mthd::kClearSurface, 0xF0);
+}
+
+}  // namespace
+
+// The picture handed to a libretro frontend on the GPU (D38): with set_handoff the capture stays in device memory and
+// hand_over copies it into the frontend's image, which holds exactly what the host read-back holds (the colour table
+// applied); a CPU-made picture goes in through staging unchanged. The image's view reads alpha as one.
+TEST(Vulkan, AHandedOverPictureIsTheOneTheHostWouldHaveRead) {
+    std::array<u8, 768> lut{};
+    for (u32 i = 0; i < 768; ++i) lut[i] = static_cast<u8>(255 - i / 3);
+    std::vector<u32> want;
+    {
+        ScaledFixture f;
+        std::string error;
+        if (!f.init(3, error)) GTEST_SKIP() << "no Vulkan device: " << error;
+        handoff_scene(f.k);
+        f.renderer->set_display_lut(lut);
+        f.renderer->flush_frame();
+        ASSERT_TRUE(f.renderer->write_back_at(0x10000));
+        VulkanRenderer::ScaledPicture p;
+        ASSERT_TRUE(f.renderer->scaled_picture(0x10000, 256, 4, 64, 64, p));
+        f.renderer->picture_ready(p);
+        want.resize(192 * 192);
+        for (u32 y = 0; y < 192; ++y) std::memcpy(&want[static_cast<std::size_t>(y) * 192], p.pixels + static_cast<std::size_t>(y) * p.pitch, 192 * 4);
+        f.renderer->picture_done();
+    }
+    ScaledFixture f;
+    std::string error;
+    ASSERT_TRUE(f.init(3, error)) << error;
+    f.renderer->set_handoff(true);
+    handoff_scene(f.k);
+    f.renderer->set_display_lut(lut);
+    f.renderer->flush_frame();
+    ASSERT_TRUE(f.renderer->write_back_at(0x10000));
+    VulkanRenderer::ScaledPicture p;
+    ASSERT_TRUE(f.renderer->scaled_picture(0x10000, 256, 4, 64, 64, p));
+    EXPECT_EQ(p.pixels, nullptr) << "nothing read back to the host";
+    ASSERT_NE(p.buffer, VK_NULL_HANDLE);
+    VulkanRenderer::HandedOver h;
+    ASSERT_TRUE(f.renderer->hand_over(1, &p, 192, 192, nullptr, 0, h));
+    f.renderer->picture_done();
+    EXPECT_EQ(h.info->format, VK_FORMAT_B8G8R8A8_UNORM);
+    EXPECT_EQ(h.info->components.a, VK_COMPONENT_SWIZZLE_ONE);
+    const std::vector<u32> got = read_handed_over(f.device, h);
+    ASSERT_EQ(got.size(), want.size());
+    u32 differ = 0;
+    for (std::size_t i = 0; i < got.size(); ++i) differ += got[i] != want[i];
+    EXPECT_EQ(differ, 0u) << std::format("first pixels {:08x} vs {:08x}", got[0], want[0]);
+    EXPECT_NE(got[static_cast<std::size_t>(30 * 3) * 192 + 20 * 3], got[5]) << "the scene has two colours";
+    // A picture made on the CPU, into another sync index's image, at another size.
+    std::vector<u32> cpu(100 * 70);
+    for (std::size_t i = 0; i < cpu.size(); ++i) cpu[i] = static_cast<u32>(i * 2654435761u) & 0x00FFFFFFu;
+    VulkanRenderer::HandedOver c;
+    ASSERT_TRUE(f.renderer->hand_over(0, nullptr, 100, 70, cpu.data(), 100 * 4, c));
+    EXPECT_EQ(read_handed_over(f.device, c), cpu);
+    for (const auto& e : f.renderer->stats().errors) ADD_FAILURE() << "renderer: " << e;
+}
