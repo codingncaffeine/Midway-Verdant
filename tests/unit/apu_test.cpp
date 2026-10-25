@@ -613,7 +613,9 @@ TEST(ApuSynthesis, TheAmplitudeEnvelopeRampsInItsAttackAndTheVoiceEndsWithItsRel
     EXPECT_FALSE(r.field(SynthRig::kVoice, SE::kFieldState) & SE::kStateActive);
 }
 
-TEST(ApuSynthesis, AReleaseRateOfZeroHoldsTheVoiceUntilVoiceOff) {
+TEST(ApuSynthesis, AReleaseRateOfZeroHoldsTheVoiceUntilVoiceOffWhileItsFilterEnvelopeRuns) {
+    // The kernel's boot drones: amplitude in sustain, the filter envelope running (it bends their pitch); the
+    // recording carries them on after their zero-rate releases until the VOICE_OFF.
     using SE = apu::SetupEngine;
     SynthRig r;
     for (u32 i = 0; i < 64; ++i) {
@@ -622,8 +624,9 @@ TEST(ApuSynthesis, AReleaseRateOfZeroHoldsTheVoiceUntilVoiceOff) {
     }
     r.vp(SE::kMethodSetCurrentVoice, SynthRig::kVoice);
     r.vp(0x30C, 0x80000000u); // CFG_ENVA: sustain 128, no hold or decay
+    r.vp(0x314, 0xFF000000u); // CFG_ENVF: sustain 255 (pitch scale 0 in CFG_ENV0: no pitch change)
     r.vp(0x36C, 0);           // TAR_LFO_ENV: release rate 0
-    r.start(kPcm16Mono | SE::kFmtLoop, 63, 0, 0, 0, SE::kSustain << SE::kStateEaShift);
+    r.start(kPcm16Mono | SE::kFmtLoop, 63, 0, 0, 0, (SE::kSustain << SE::kStateEaShift) | (SE::kSustain << SE::kStateEfShift));
     r.sched.advance_to(Rig::frame(4));
     const float sustained = r.bin(0, 0);
     EXPECT_NEAR(sustained, 0.5f * 128.0f / 255.0f, 1e-6f) << "sustaining at level 128";
@@ -634,6 +637,29 @@ TEST(ApuSynthesis, AReleaseRateOfZeroHoldsTheVoiceUntilVoiceOff) {
     r.vp(SE::kMethodVoiceOff, SynthRig::kVoice);
     r.sched.advance_to(Rig::frame(402));
     EXPECT_EQ(r.apu.setup_engine().voices_retired(), 1u) << "VOICE_OFF ends it";
+}
+
+TEST(ApuSynthesis, AZeroRateReleaseOfASustainingVoiceWithoutAFilterEnvelopeEndsItAtOnce) {
+    // DirectSound's stop: a buffer sustaining at its level, the filter envelope off, released at rate 0. One racing
+    // title stops every sound this way and never sends VOICE_OFF; held, each voice stayed taken until its pool ran dry
+    // and its engine and tyre sounds faded out. (The test above, a running filter envelope, is the control: it holds.)
+    using SE = apu::SetupEngine;
+    SynthRig r;
+    for (u32 i = 0; i < 64; ++i) {
+        const u16 v = 16384;
+        ASSERT_TRUE(r.bus.write_ram(SynthRig::kPage + i * 2, &v, 2));
+    }
+    r.vp(SE::kMethodSetCurrentVoice, SynthRig::kVoice);
+    r.vp(0x30C, 0xFF000000u); // CFG_ENVA: sustain 255
+    r.vp(0x36C, 0);           // TAR_LFO_ENV: release rate 0
+    r.start(kPcm16Mono | SE::kFmtLoop, 63, 0, 0, 0, SE::kSustain << SE::kStateEaShift);
+    r.sched.advance_to(Rig::frame(4));
+    EXPECT_NEAR(r.bin(0, 0), 0.5f, 1e-6f) << "sustaining at full level";
+    r.vp(SE::kMethodVoiceRelease, SynthRig::kVoice);
+    r.sched.advance_to(Rig::frame(7));
+    EXPECT_EQ(r.apu.setup_engine().voices_retired(), 1u) << "the release ends it without a VOICE_OFF";
+    EXPECT_FALSE(r.field(SynthRig::kVoice, SE::kFieldState) & SE::kStateActive);
+    EXPECT_FLOAT_EQ(r.bin(0, 0), 0.0f);
 }
 
 TEST(ApuSynthesis, AZeroRateReleaseOfAVoiceWhoseEnvelopeNeverRanEndsItAtOnce) {

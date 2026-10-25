@@ -166,12 +166,15 @@ bool SetupEngine::method(u32 offset, u32 value) {
             trace::log(trace::Cat::Apu, "vp: voice {:x} release: amplitude rate {:x}, filter rate {:x}, envelope phases {:08x}, level {}", handle, ea / 16, ef / 16,
                        field(handle, kFieldState), field(handle, kFieldOffset) >> 24);
             set_field(handle, kFieldEcnt, (ef << 16) | (ea & 0xFFFFu));
-            // A zero-rate release of a voice whose amplitude envelope never ran (phase off: a buffer without an
-            // envelope) ends it at once, as both reference emulators do and as one title's recording shows (its
-            // looping ambience stops dead at the release); a running envelope's zero-rate release holds (below).
-            // [INFERRED from the two recordings; hw/apu.md]
+            // A zero-rate release ends the voice at once, as both reference emulators do, unless its filter envelope
+            // runs: a buffer without an envelope (one title's recording: its looping ambience stops dead at the
+            // release) and DirectSound's stop of a sustaining buffer (a racing title never follows it with VOICE_OFF:
+            // held, its voices stayed taken until the pool ran dry). The kernel's boot drones, whose filter envelope
+            // bends their pitch, hold until VOICE_OFF (below), as the console's recording carries them on.
+            // [INFERRED from the two recordings and the title's voice census; hw/apu.md]
             const u32 state = field(handle, kFieldState);
-            const u32 ea_phase = ((state >> kStateEaShift) & 0xFu) == kOff && ea == 0 ? kForceRelease : kRelease;
+            const bool ends = ea == 0 && (((state >> kStateEaShift) & 0xFu) == kOff || ((state >> kStateEfShift) & 0xFu) == kOff);
+            const u32 ea_phase = ends ? kForceRelease : kRelease;
             set_field(handle, kFieldState, (state & 0x00FFFFFFu) | (ea_phase << kStateEaShift) | (kRelease << kStateEfShift));
             return true;
         }
