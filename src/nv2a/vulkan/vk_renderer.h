@@ -134,6 +134,7 @@ public:
         u64 depth_handovers{0}, depth_uploads{0};  // depth buffers moved between targets sharing an address; loaded from RAM
         u64 depth_unparks{0}, parked_samples{0};  // parked depth images bound again; sampled in place
         u64 depth_loads_skipped{0};  // depth buffers bound for a clear of the whole buffer: nothing loaded
+        u64 depth_borrows{0};  // binds that drew with a bigger target's depth image of the same pitch (D37)
         u64 evicted{0}, retired_unused{0};  // targets another target overlapped; targets nothing used for 10 s
         u64 subrect_copies{0};  // rectangles of a pitch-linear region copied for a texture
         u64 cube_assemblies{0};  // cube maps put together on the GPU from six render targets (cube_texture)
@@ -242,6 +243,14 @@ private:
             u64 used{0};
         };
         std::vector<ParkedDepth> parked;
+        // Drawing with another target's depth image (D37): a pitch-linear depth buffer is memory, and a smaller target of
+        // the same zeta pitch binding it uses the top-left rectangle of the image that holds it, as on the hardware
+        // (Gauntlet Seven Sorrows' 720x480 frame buffers test the stencil of a 768x512 target's depth buffer each frame).
+        // borrow_fb pairs this colour image with that depth image; it holds while the lender's bound image is the same.
+        Surface* borrow{nullptr};
+        VkFramebuffer borrow_fb{VK_NULL_HANDLE};
+        VkImage borrow_image{VK_NULL_HANDLE};
+        Surface& depth_target() { return borrow ? *borrow : *this; }  // the target whose depth image the passes draw into
         u32 parked_bytes(const ParkedDepth& p) const { return swizzled ? (zeta_format == 1 ? 2u : 4u) * width * height : p.holds_pitch * height; }
         u32 held_bytes() const { return swizzled ? (zeta_format == 1 ? 2u : 4u) * width * height : (holds_pitch ? holds_pitch : zeta_pitch) * height; }
         // The frame the target was last drawn in, and whether a GPU-side copy (a blit) wrote its memory since: a clean
@@ -343,6 +352,9 @@ private:
     // cleared: the caller clears the whole depth buffer (and its stencil) before anything reads it, so what the address
     // held is not loaded (Half-Life 2's four targets of two shapes sharing one depth buffer, each through RAM).
     void bind_depth(Surface& t, bool cleared = false);
+    bool borrow_depth(Surface& t, Surface& owner);  // D37: t draws with owner's depth image; false when it cannot
+    void end_borrow(Surface& t);
+    void end_borrows_from(Surface& owner);  // the lender goes away: its borrowers draw with their own images again
     void write_back_held(Surface& s);  // the bound image to the address it holds, when newer there
     void upload_depth_from_ram(Surface& t);
     void release_depth(Surface& s);  // a target going away: its depth contents to RAM, its ownership dropped
@@ -450,6 +462,7 @@ private:
     bool recording_{false};
     bool pass_open_{false};
     Surface* pass_target_{nullptr};
+    VkFramebuffer pass_fb_{VK_NULL_HANDLE};  // the open pass's framebuffer (the target's own, or its borrow_fb)
 
     std::unordered_map<u32, std::unique_ptr<Surface>> surfaces_;
     std::unordered_map<u64, VkRenderPass> passes_;

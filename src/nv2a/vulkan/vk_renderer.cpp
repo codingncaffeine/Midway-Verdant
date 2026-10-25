@@ -488,6 +488,7 @@ void VulkanRenderer::end_pass() {
         fn_->vkCmdEndRenderPass(cb_);
         pass_open_ = false;
         pass_target_ = nullptr;
+        pass_fb_ = VK_NULL_HANDLE;
     }
 }
 
@@ -768,7 +769,9 @@ void VulkanRenderer::remember_pages(Surface& s) {
 }
 
 bool VulkanRenderer::ensure_pass(Surface& t, bool writes_color) {
-    if (pass_open_ && pass_target_ == &t && !(writes_color && t.color_ram_newer)) return true;
+    if (t.borrow && t.borrow->depth.image != t.borrow_image) end_borrow(t);  // the lender bound another image since
+    const VkFramebuffer fb = t.borrow ? t.borrow_fb : t.framebuffer;
+    if (pass_open_ && pass_target_ == &t && pass_fb_ == fb && !(writes_color && t.color_ram_newer)) return true;
     end_pass();
     if (t.color_ram_newer && writes_color) {
         upload_color_from_ram(t);
@@ -782,11 +785,13 @@ bool VulkanRenderer::ensure_pass(Surface& t, bool writes_color) {
     attachments_written_ = true;
     VkRenderPassBeginInfo rbi{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
     rbi.renderPass = t.pass;
-    rbi.framebuffer = t.framebuffer;
+    rbi.framebuffer = fb;
     rbi.renderArea = {{0, 0}, {t.iw(), t.ih()}};
     fn_->vkCmdBeginRenderPass(cb_, &rbi, VK_SUBPASS_CONTENTS_INLINE);
     pass_open_ = true;
     pass_target_ = &t;
+    pass_fb_ = fb;
+    if (t.borrow) t.borrow->last_used_vblank = vblank_index_;
     // Whether the pass writes colour or depth is the draw's or the clear's to say (the colour mask, the depth and stencil
     // state, the clear bits), so a pass that never touches one never lands it in guest RAM.
     t.rendered_this_frame = true;
@@ -803,6 +808,8 @@ void VulkanRenderer::bind_depth(Surface& t, bool cleared) {
     if (t.zeta_format == 0 || z == 0) return;
     const auto found = depth_owner_.find(z);
     Surface* owner = found == depth_owner_.end() ? nullptr : found->second;
+    if (owner && owner != &t && borrow_depth(t, *owner)) return;
+    if (t.borrow) end_borrow(t);
     if (owner == &t && t.depth_holds == z) return;
     end_pass();
     // Another target holds the address in a parked image: back to RAM with it, and this one loads it from there.
@@ -882,6 +889,48 @@ void VulkanRenderer::bind_depth(Surface& t, bool cleared) {
     t.depth_holds = z;
     t.holds_pitch = t.zeta_pitch;
     handles_.watch_writes(z, t.zeta_bytes());  // a CPU write to the depth buffer's memory reloads it
+}
+
+// D37: the owner's bound image holds t's zeta address at t's pitch, in the same format and scale, and is at least t's
+// size: t's passes draw into the image's top-left rectangle, which is the memory t's buffer covers. The owner keeps the
+// address (its write-backs, parking and sampling see t's depth writes); nothing is copied or loaded.
+bool VulkanRenderer::borrow_depth(Surface& t, Surface& owner) {
+    if (owner.depth_holds != t.zeta_phys || owner.swizzled || t.swizzled || owner.holds_pitch != t.zeta_pitch || owner.zeta_format != t.zeta_format || owner.sc != t.sc ||
+        owner.width < t.width || owner.height < t.height)
+        return false;
+    if (t.borrow == &owner && t.borrow_image == owner.depth.image) return true;
+    if (t.borrow) end_borrow(t);
+    VkImageView views[2] = {t.color.view, owner.depth.view};
+    VkFramebufferCreateInfo fbi{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
+    fbi.renderPass = t.pass;
+    fbi.attachmentCount = 2;
+    fbi.pAttachments = views;
+    fbi.width = t.iw();  // the depth image may be bigger: a framebuffer's attachments only have to cover it
+    fbi.height = t.ih();
+    fbi.layers = 1;
+    if (fn_->vkCreateFramebuffer(dev_.device(), &fbi, nullptr, &t.borrow_fb) != VK_SUCCESS) {
+        t.borrow_fb = VK_NULL_HANDLE;
+        return false;
+    }
+    if (debug_tex_log_)
+        std::fprintf(stderr, "texlog: depth %08x of target %08x %ux%u lent to target %08x %ux%u frame %llu\n", t.zeta_phys, owner.phys, owner.width, owner.height, t.phys, t.width, t.height,
+                     static_cast<unsigned long long>(frame_index_));
+    t.borrow = &owner;
+    t.borrow_image = owner.depth.image;
+    ++stats_.depth_borrows;
+    return true;
+}
+
+void VulkanRenderer::end_borrow(Surface& t) {
+    if (pass_open_ && pass_target_ == &t && pass_fb_ == t.borrow_fb) end_pass();
+    retire(t.borrow_fb);
+    t.borrow = nullptr;
+    t.borrow_image = VK_NULL_HANDLE;
+}
+
+void VulkanRenderer::end_borrows_from(Surface& owner) {
+    for (auto& [k, sp] : surfaces_)
+        if (sp->borrow == &owner) end_borrow(*sp);
 }
 
 // The bound depth image's contents to the address it holds, which the target may no longer bind, when newer there.
@@ -1168,6 +1217,8 @@ void VulkanRenderer::release_depth(Surface& s) {
 std::unordered_map<u32, std::unique_ptr<VulkanRenderer::Surface>>::iterator VulkanRenderer::erase_surface(std::unordered_map<u32, std::unique_ptr<Surface>>::iterator it) {
     Surface& s0 = *it->second;
     if (pass_target_ == &s0) end_pass();
+    end_borrows_from(s0);  // before its depth image retires
+    if (s0.borrow) end_borrow(s0);
     wb_why_ = Stats::kWbRelayout;
     if (s0.dirty) write_back(s0);
     release_depth(s0);
@@ -2938,7 +2989,10 @@ void VulkanRenderer::clear(const KelvinState& s, u32 bits) {
                      view_.h, t->width, t->height);
     if (bits & 3u) bind_depth(*t, whole && (bits & 1u) && (t->zeta_format == 1 || (bits & 2u)));
     ensure_pass(*t, (bits & 0xF0u) != 0);
-    if (bits & 3u) t->zeta_dirty = true;
+    if (bits & 3u) {
+        t->depth_target().zeta_dirty = true;
+        if (t->borrow) ++t->borrow->draw_serial;  // the lender's depth-as-colour conversion is stale
+    }
     if (bits & 0xF0u) t->dirty = true;
     ++t->clears_this_frame;
     ++t->draw_serial;
@@ -3357,7 +3411,10 @@ void VulkanRenderer::draw(const KelvinState& s, const DrawBatch& batch) {
                      s.reg(mthd::kStencilOpZpass));
     if (uses_depth) bind_depth(*t);  // only a draw that tests depth or stencil needs the buffer in place
     ensure_pass(*t, s.color_mask() != 0);
-    if ((s.depth_test() && s.depth_write()) || s.stencil_test()) t->zeta_dirty = true;
+    if ((s.depth_test() && s.depth_write()) || s.stencil_test()) {
+        t->depth_target().zeta_dirty = true;
+        if (t->borrow) ++t->borrow->draw_serial;  // the lender's depth-as-colour conversion is stale
+    }
     if (s.color_mask() != 0) t->dirty = true;
     ++t->draws_this_frame;
     ++t->draw_serial;
@@ -3483,6 +3540,7 @@ bool VulkanRenderer::write_back_at(u32 phys) {
         wb_why_ = Stats::kWbAll;
         return true;
     }
+    if (debug_tex_log_ && scale_ > 1) std::fprintf(stderr, "texlog: no target holds the scanout %08x\n", phys);
     wb_why_ = Stats::kWbAll;
     return false;
 }
@@ -3663,7 +3721,10 @@ void VulkanRenderer::write_back_zeta_banded(Surface& s) {
 // carries a fence of its own and the vblank does not wait for it (D36): the frontend does, while the CPU runs on, and
 // the next vblank writes the target's other buffer, never the one the frontend holds.
 void VulkanRenderer::capture_display(Surface& s) {
-    if (s.sc <= 1 || s.swizzled || s.color_ram_newer) return;
+    if (s.sc <= 1 || s.swizzled || s.color_ram_newer) {
+        if (debug_tex_log_) std::fprintf(stderr, "texlog: no capture of %08x: sc %u swizzled %d colour from RAM pending %d\n", s.phys, s.sc, s.swizzled ? 1 : 0, s.color_ram_newer ? 1 : 0);
+        return;
+    }
     const bool convert = init_display_convert();
     const VkDeviceSize bytes = static_cast<VkDeviceSize>(s.iw()) * s.ih() * (convert ? 4u : s.color_bytes());
     Capture* c = nullptr;

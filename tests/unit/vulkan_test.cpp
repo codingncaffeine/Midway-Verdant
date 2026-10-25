@@ -1368,3 +1368,47 @@ TEST(Vulkan, APartialDepthClearStillLoadsTheRestFromRam) {
         EXPECT_EQ(f.renderer->stats().depth_loads_skipped, 0u);
     }
 }
+
+// A smaller target of the same zeta pitch binding a depth buffer a bigger target holds draws into the top-left
+// rectangle of that target's depth image (D37), as on the hardware where the buffer is memory: nothing is copied or
+// loaded, the bigger target's next draw tests what the smaller one wrote, and RAM gets both at the write-back
+// (Gauntlet Seven Sorrows' 720x480 frame buffers on a 768x512 target's depth, each frame).
+TEST(Vulkan, ASmallerTargetDrawsIntoTheDepthImageOfABiggerOneOfTheSamePitch) {
+    for (u32 scale : {1u, 3u}) {
+        SCOPED_TRACE(std::format("scale {}", scale));
+        ScaledFixture f;
+        std::string error;
+        if (!f.init(scale, error)) GTEST_SKIP() << "no Vulkan device: " << error;
+        Kelvin& k = f.k;
+        setup_target(k);  // 64x64, zeta at 0x20000, pitch 256
+        k.method(mthd::kColorClear, 0xFF000080);
+        k.method(mthd::kClearRectH, 63u << 16);
+        k.method(mthd::kClearRectV, 63u << 16);
+        k.method(mthd::kClearSurface, 0xF0);
+        clear_depth(k, 0xBFFFFF00);  // 0.75
+        // The smaller target: 48x40 at 0x60000, the same depth buffer and pitch.
+        k.method(mthd::kSurfaceClipH, 48u << 16);
+        k.method(mthd::kSurfaceClipV, 40u << 16);
+        k.method(mthd::kSurfaceColorOffset, 0x60000);
+        depth_triangle(k, 0xFF00FF00, 0.5f);  // passes 0.75 and writes 0.5 over the top-left 48x40
+        k.method(mthd::kSurfaceClipH, 64u << 16);
+        k.method(mthd::kSurfaceClipV, 64u << 16);
+        k.method(mthd::kSurfaceColorOffset, 0x10000);
+        depth_triangle(k, 0xFFFF0000, 0.625f);  // blue: fails over the smaller target's 0.5, passes the 0.75 elsewhere
+        f.renderer->end_frame();
+        f.renderer->write_back_all();
+        for (const auto& e : f.renderer->stats().errors) ADD_FAILURE() << "renderer: " << e;
+        EXPECT_EQ(pixel_at(f.ram, 8, 8) & 0x00FFFFFFu, 0x000080u) << "tested against the smaller target's depth";
+        EXPECT_EQ(pixel_at(f.ram, 56, 8) & 0x00FFFFFFu, 0x0000FFu) << "right of it: the clear's depth";
+        EXPECT_EQ(pixel_at(f.ram, 8, 50) & 0x00FFFFFFu, 0x0000FFu) << "below it: the clear's depth";
+        u32 small;
+        std::memcpy(&small, &f.ram[0x60000 + 8 * 256 + 8 * 4], 4);
+        EXPECT_EQ(small & 0x00FFFFFFu, 0x00FF00u) << "the smaller target drew";
+        EXPECT_NEAR(static_cast<double>(zeta_word(f.ram, 0x20000, 8, 8) >> 8), 0x7FFFFF, 2) << "the smaller target's depth reached RAM";
+        EXPECT_NEAR(static_cast<double>(zeta_word(f.ram, 0x20000, 56, 50) >> 8), 0x9FFFFF, 2) << "the bigger target's own";
+        const auto& st = f.renderer->stats();
+        EXPECT_GE(st.depth_borrows, 1u);
+        EXPECT_EQ(st.depth_uploads, 0u) << "nothing loaded from RAM";
+        EXPECT_EQ(st.writebacks_by[VulkanRenderer::Stats::kWbRange], 0u) << "no depth sent to RAM at the switches";
+    }
+}

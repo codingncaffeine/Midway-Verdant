@@ -232,6 +232,11 @@ void grab_frame() {
     mv::pgraph::VulkanRenderer::ScaledPicture pic;
     const bool rendered = res_scale > 1 && renderer && renderer->scaled_picture(start, pitch, bpp, w, h, pic);
     sc = rendered ? pic.sc : res_scale;
+    // Instrument: MV_DEBUG_GRAB=1 prints each frame's path (the GPU's picture in place, copied, or RAM's widened).
+    static const bool debug_grab = [] { const char* d = std::getenv("MV_DEBUG_GRAB"); return d && *d == '1'; }();
+    if (debug_grab)
+        std::fprintf(stderr, "grab: frame %llu start %08x %ux%u bpp %u rendered %d xrgb %d overlay %d\n", static_cast<unsigned long long>(frames_run), start, w, h, bpp, rendered ? 1 : 0,
+                     rendered && pic.xrgb ? 1 : 0, gpu.overlay() ? 1 : 0);
     if (rendered && pic.xrgb && !gpu.overlay()) {
         // The GPU's finished picture goes to the frontend as it lies: no pass over it here at all.
         frame_w = w * sc;
@@ -610,9 +615,9 @@ RETRO_API void retro_unload_game(void) {
                 static_cast<unsigned long long>(st.depth_handovers), static_cast<unsigned long long>(st.depth_uploads), static_cast<unsigned long long>(st.evicted), static_cast<unsigned long long>(st.retired_unused), static_cast<unsigned long long>(st.subrect_copies));
             if (st.surface_reloads) log(RETRO_LOG_INFO, "gpu: %llu render targets reloaded from RAM after a 2D write", static_cast<unsigned long long>(st.surface_reloads));
             if (st.cube_assemblies) log(RETRO_LOG_INFO, "gpu: %llu cube maps put together on the GPU from their face targets", static_cast<unsigned long long>(st.cube_assemblies));
-            if (st.depth_unparks || st.parked_samples || st.depth_loads_skipped)
-                log(RETRO_LOG_INFO, "gpu: depth buffers: %llu parked images bound again, %llu sampled in place, %llu loads skipped for a whole clear",
-                    static_cast<unsigned long long>(st.depth_unparks), static_cast<unsigned long long>(st.parked_samples), static_cast<unsigned long long>(st.depth_loads_skipped));
+            if (st.depth_unparks || st.parked_samples || st.depth_loads_skipped || st.depth_borrows)
+                log(RETRO_LOG_INFO, "gpu: depth buffers: %llu parked images bound again, %llu sampled in place, %llu loads skipped for a whole clear, %llu drawn with a bigger target's image",
+                    static_cast<unsigned long long>(st.depth_unparks), static_cast<unsigned long long>(st.parked_samples), static_cast<unsigned long long>(st.depth_loads_skipped), static_cast<unsigned long long>(st.depth_borrows));
             if (st.mip_assemblies) log(RETRO_LOG_INFO, "gpu: %llu mip chains put together on the GPU from their level targets", static_cast<unsigned long long>(st.mip_assemblies));
             log(RETRO_LOG_INFO, "gpu: submits mid-frame: %llu with the draw rings full, %llu with the upload staging full; %llu 2D copies made on the GPU", static_cast<unsigned long long>(st.batch_flushes), static_cast<unsigned long long>(st.staging_flushes), static_cast<unsigned long long>(st.gpu_copies));
             for (const auto& e : st.errors) log(RETRO_LOG_INFO, "gpu: renderer note: %s", e.c_str());
