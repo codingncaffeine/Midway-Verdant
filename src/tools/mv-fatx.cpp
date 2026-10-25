@@ -55,6 +55,8 @@ public:
         return v;
     }
     bool end_of_chain(u32 c) const { return c == 0 || c >= 0xFFFFFFF0u || c > clusters_; }
+    u64 cluster_count() const { return clusters_; }
+    u32 cluster_size() const { return cluster_bytes_; }
     std::vector<u8> read_chain(u32 cluster, u64 limit) const {
         std::vector<u8> out, buf(cluster_bytes_);
         for (u32 guard = 0; !end_of_chain(cluster) && out.size() < limit && guard < clusters_; ++guard) {
@@ -146,7 +148,7 @@ bool copy_out(const Volume& v, const Entry& e, const std::filesystem::path& to) 
 
 int main(int argc, char** argv) {
     if (argc < 4) {
-        std::fprintf(stderr, "usage: mv-fatx ls IMAGE PARTITION [PATH]\n       mv-fatx get IMAGE PARTITION PATH OUT\n");
+        std::fprintf(stderr, "usage: mv-fatx ls IMAGE PARTITION [PATH]\n       mv-fatx get IMAGE PARTITION PATH OUT\n       mv-fatx chain IMAGE PARTITION PATH\n");
         return 2;
     }
     const std::string cmd = argv[1];
@@ -183,6 +185,19 @@ int main(int argc, char** argv) {
         return 0;
     }
     if (cmd == "get" && argc > 5) return copy_out(v, e, argv[5]) ? 0 : 1;
+    if (cmd == "chain") {
+        // The cluster chain of PATH as runs of consecutive clusters (first-last), to tell a broken chain from bad data.
+        u32 run_start = e.cluster, prev = e.cluster, n = 0;
+        for (u32 c = e.cluster; !v.end_of_chain(c) && n <= v.cluster_count(); c = v.next(c), ++n) {
+            if (c != e.cluster && c != prev + 1) {
+                std::printf("%u-%u\n", run_start, prev);
+                run_start = c;
+            }
+            prev = c;
+        }
+        std::printf("%u-%u (%u clusters of %u bytes)\n", run_start, prev, n, v.cluster_size());
+        return 0;
+    }
     std::fprintf(stderr, "mv-fatx: unknown command %s\n", cmd.c_str());
     return 2;
 }
