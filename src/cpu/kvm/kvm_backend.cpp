@@ -21,6 +21,7 @@
 #include <format>
 
 #include "core/clock.h"
+#include "cpu/kvm/coalesced_ring.h"
 
 #include "core/machine.h"
 #include "debug/guest_stack.h"
@@ -225,6 +226,28 @@ bool KvmBackend::init(Machine& machine, std::string& error) {
     run_ = static_cast<kvm_run*>(p);
     if (!setup_cpuid(error)) return false;
     arm_breakpoints();
+
+    // Device writes without an exit each where a device asks for it (Bus::coalesce_writes): KVM's coalesced MMIO
+    // ring, in the run area's page the capability names, taken whenever the machine advances time (either thread,
+    // under its lock: before the access an exit stopped for, and before any device event). MV_COALESCE=0 keeps an
+    // exit per write (the control).
+    if (const char* c = std::getenv("MV_COALESCE"); !(c && *c == '0')) {
+        const int page = ioctl(kvm_fd_, KVM_CHECK_EXTENSION, KVM_CAP_COALESCED_MMIO);
+        const auto page_size = static_cast<std::size_t>(sysconf(_SC_PAGESIZE));
+        if (page > 0 && (static_cast<std::size_t>(page) + 1) * page_size <= run_size_) {
+            coalesced_ = reinterpret_cast<kvm_coalesced_mmio_ring*>(reinterpret_cast<u8*>(run_) + static_cast<std::size_t>(page) * page_size);
+            coalesced_slots_ = static_cast<u32>((page_size - sizeof(kvm_coalesced_mmio_ring)) / sizeof(kvm_coalesced_mmio));
+            machine.set_before_events([this] { drain_coalesced_writes(); });
+            machine.bus().set_coalesce_hook([this](PhysAddr base, u32 size, bool on) {
+                if (!on) drain_coalesced_writes();  // what the zone took lands first
+                kvm_coalesced_mmio_zone zone{};
+                zone.addr = base;
+                zone.size = size;
+                if (ioctl(vm_fd_, on ? KVM_REGISTER_COALESCED_MMIO : KVM_UNREGISTER_COALESCED_MMIO, &zone) < 0) ++coalesce_failures_;
+                else coalesced_zones_ += on ? 1 : -1;
+            });
+        }
+    }
 
     // The timeline: the guest clock unless the configuration or MV_GUEST_CLOCK asks for the host clock.
     std::string mode = machine.config().guest_clock;
@@ -477,6 +500,8 @@ std::string KvmBackend::report() const {
     r += std::format("\nkvm: {} exits (mmio {}, pio {}, hlt {}, irq window {}, interrupted {}), {} kicks, {} interrupts injected",
                      stats_.exits, stats_.mmio_exits, stats_.pio_exits, stats_.hlt_exits, stats_.irq_window_exits, stats_.intr_exits, stats_.kicks,
                      stats_.irq_injections);
+    if (coalesced_ || coalesce_failures_)
+        r += std::format("\nkvm: {} device writes taken without an exit (coalesced MMIO, {} zones; {} zone changes refused)", coalesced_writes_, coalesced_zones_, coalesce_failures_);
     r += std::format("\nkvm: host time on the vCPU thread: firing device events {:.3f} s, exit handlers {:.3f} s, held by pacing {:.3f} s; backstop timer armed {} times",
                      sec(event_ns_), sec(handler_ns_), sec(pause_ns_), backstop_shots_);
     r += std::format("\nkvm: interrupt latency (guest us) <10 {}, <50 {}, <100 {}, <250 {}, <500 {}, <1000 {}, more {}; max {:.0f}", irq_latency_buckets_[0],
@@ -487,7 +512,7 @@ std::string KvmBackend::report() const {
         std::sort(top.begin(), top.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
         r += "\nkvm: busiest exits:";
         for (std::size_t i = 0; i < top.size() && i < 8; ++i)
-            r += (top[i].first & 0x10000u) ? std::format(" port {:04x} x{}", top[i].first & 0xFFFFu, top[i].second)
+            r += (top[i].first & 1u) ? std::format(" port {:04x} x{}", top[i].first >> 16, top[i].second)
                                            : std::format(" mmio {:08x} x{}", top[i].first, top[i].second);
     }
     if (!stopped_at_.empty()) r += "\nkvm: the guest stopped: " + stopped_at_;
@@ -672,6 +697,22 @@ void KvmBackend::handle_io() {
         }
     }
     ++stats_.pio_exits;
+}
+
+void KvmBackend::drain_coalesced_writes() {
+    if (!coalesced_) return;
+    Bus& bus = machine_->bus();
+    coalesced_writes_ += kvm::drain_coalesced(coalesced_, coalesced_slots_, [&](u64 phys, u32 len, const u8* data) {
+        if (len == 8) {
+            u64 v;
+            std::memcpy(&v, data, 8);
+            bus.write64(static_cast<PhysAddr>(phys), v);
+        } else {
+            u32 v = 0;
+            std::memcpy(&v, data, std::min<u32>(len, 4));
+            bus.write(static_cast<PhysAddr>(phys), len, v);
+        }
+    });
 }
 
 void KvmBackend::handle_mmio() {
@@ -876,7 +917,7 @@ void KvmBackend::thread_main() {
             ~HandlerTime() { acc += mono_ns() - t0; }
         } handler_time{handler_ns_, h1};
         if (run_->exit_reason < 64) ++stats_.by_reason[run_->exit_reason];
-        if (run_->exit_reason == KVM_EXIT_IO) ++exit_sources_[0x10000u | run_->io.port];
+        if (run_->exit_reason == KVM_EXIT_IO) ++exit_sources_[(u32{run_->io.port} << 16) | 1u];  // a port: bit 0 set (an MMIO key is a page)
         else if (run_->exit_reason == KVM_EXIT_MMIO) ++exit_sources_[static_cast<u32>(run_->mmio.phys_addr) & ~0xFFFu];
         switch (run_->exit_reason) {
             case KVM_EXIT_IO:

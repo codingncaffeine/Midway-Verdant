@@ -1,6 +1,7 @@
 #pragma once
 #include <atomic>
 #include <cstddef>
+#include <functional>
 #include <map>
 #include <memory>
 #include <string_view>
@@ -53,6 +54,13 @@ public:
     void map_mmio(PhysAddr base, u64 size, MmioHandler* handler);
     void unmap_mmio(PhysAddr base, u64 size);
     MmioHandler* mmio_at(PhysAddr addr) const;
+    // A device's hint: its writes to [base, base + size) may reach it later, in order, at the CPU's next exit or the
+    // io thread's next event pass (Machine::set_before_events), without an exit each (KVM's coalesced MMIO). Only for
+    // registers whose writes nothing observes before the guest's next access to the device: that access exits, and
+    // the writes before it land first. The CPU backend that can take writes so installs the hook.
+    using CoalesceHook = std::function<void(PhysAddr base, u32 size, bool on)>;
+    void coalesce_writes(PhysAddr base, u32 size, bool on);
+    void set_coalesce_hook(CoalesceHook hook);
 
     void map_pio(u16 base, u32 count, PioHandler* handler);
     void unmap_pio(u16 base, u32 count);
@@ -125,6 +133,8 @@ private:
     std::size_t ram_size_;
     std::vector<MmioHandler*> pages_;  // one entry per 4 KiB page of the 4 GiB space
     std::vector<PioHandler*> pio_;     // 65536 ports
+    std::vector<std::pair<PhysAddr, u32>> coalesced_;  // the zones devices asked for (coalesce_writes)
+    CoalesceHook coalesce_hook_;
     std::map<std::pair<PhysAddr, bool>, u64> unknown_mmio_;
     std::map<std::pair<u16, bool>, u64> unknown_pio_;
     bool dirty_tracking_{false};

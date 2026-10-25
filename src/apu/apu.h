@@ -86,7 +86,7 @@ public:
 
     // A register word as the kernel would read it (offset into the window, 4-byte aligned).
     u32 reg(u32 offset) {
-        if (!in_vp_window(offset)) dsp_sync();
+        if (processors_use(offset)) dsp_sync();
         return read_word(offset & ~3u);
     }
     // Raise interrupt status bits from a device-side event.
@@ -192,6 +192,13 @@ private:
     void run_processors(u64 frame, bool ep_start);
     void dsp_worker();
     static bool in_vp_window(u32 offset) { return offset >= kVpBlock && offset < kGpBlock; }
+    // The registers the processors' thread reads or writes: their memories and reset words, the scratch and FIFO tables
+    // and the FIFO registers (Memory). A CPU access to one waits for the frame running there (dsp_sync); the rest (the
+    // interrupt status a frame's interrupt handler reads, the front end, the voice methods) do not.
+    static bool processors_use(u32 offset) {
+        return offset >= kGpBlock || (offset >= kGpScratchTable && offset < kEpFifoTable + 4) || (offset >= kGpScratchMaxSge && offset < kEpFifoMaxSge + 4) ||
+               (offset >= kGpFifoRegs && offset < kGpFifoRegs + 0x100) || (offset >= kEpFifoRegs && offset < kEpFifoRegs + 0x100);
+    }
     void update_frame_clock();
     void on_frame(Cycles now);
     void update_irq();
@@ -234,6 +241,9 @@ private:
     u32 xgscnt_{0};            // the global sample count
     bool irq_level_{false};
     u64 reads_{0}, writes_{0};
+    // Instrument: MV_APU_CENSUS=1 counts the register accesses by offset and direction, printed when the APU goes.
+    bool census_{false};
+    std::unordered_map<u32, u64> census_counts_;  // key: offset | 1 for a write (offsets are word-aligned here)
     bool gp_problem_logged_{false}, ep_problem_logged_{false};
     u64 ep_releases_{0}, ep_runs_since_release_{0};  // instruments
 };

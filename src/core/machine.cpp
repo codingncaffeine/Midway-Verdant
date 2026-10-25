@@ -112,6 +112,8 @@ Machine::~Machine() {
         cpu_->stop();
         cpu_->join();
     }
+    before_events_ = {};  // the CPU backend's: it goes before these members do
+    bus_.set_coalesce_hook({});
     nv2a_.stop_fifo_thread();
     nv2a_.set_capture(nullptr, nullptr);
     nv2a_.set_renderer(nullptr);
@@ -298,6 +300,7 @@ Cycles Machine::wall_cycles() const {
 }
 
 void Machine::advance_time() {
+    if (before_events_) before_events_();
     // An interrupt the GPU's FIFO thread raised, applied here under the machine lock.
     if (nv2a_service_.load(std::memory_order_acquire) && nv2a_service_.exchange(false, std::memory_order_acq_rel)) nv2a_.service();
     if (cpu_ && cpu_->owns_timeline()) {

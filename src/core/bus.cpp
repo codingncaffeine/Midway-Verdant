@@ -1,5 +1,6 @@
 #include "core/bus.h"
 
+#include <algorithm>
 #include <bit>
 #include <cstdlib>
 #include <cstring>
@@ -22,6 +23,21 @@ void Bus::map_mmio(PhysAddr base, u64 size, MmioHandler* handler) {
 void Bus::unmap_mmio(PhysAddr base, u64 size) { map_mmio(base, size, nullptr); }
 
 MmioHandler* Bus::mmio_at(PhysAddr addr) const { return pages_[addr / kPageSize]; }
+
+void Bus::coalesce_writes(PhysAddr base, u32 size, bool on) {
+    const auto zone = std::pair{base, size};
+    const auto it = std::ranges::find(coalesced_, zone);
+    if (on == (it != coalesced_.end())) return;
+    if (on) coalesced_.push_back(zone);
+    else coalesced_.erase(it);
+    if (coalesce_hook_) coalesce_hook_(base, size, on);
+}
+
+void Bus::set_coalesce_hook(CoalesceHook hook) {
+    coalesce_hook_ = std::move(hook);
+    if (coalesce_hook_)
+        for (const auto& [base, size] : coalesced_) coalesce_hook_(base, size, true);
+}
 
 void Bus::map_pio(u16 base, u32 count, PioHandler* handler) {
     for (u32 p = base; p < static_cast<u32>(base) + count && p < pio_.size(); ++p) pio_[p] = handler;

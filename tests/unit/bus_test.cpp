@@ -1,6 +1,10 @@
 #include <gtest/gtest.h>
 
+#include <cstring>
+#include <vector>
+
 #include "core/bus.h"
+#include "cpu/kvm/coalesced_ring.h"
 #include "flash/flash.h"
 #include "pci/pci.h"
 
@@ -144,4 +148,50 @@ TEST(Flash, ImageIsMirroredAndTheRomOverlaysUntilHidden) {
     std::vector<u8> bad(1000);
     EXPECT_FALSE(flash.load_image(bad, error));
     EXPECT_NE(error.find("1000"), std::string::npos);
+}
+
+// A device's coalescing zones reach the CPU backend's hook: those asked for before it was installed, then each change.
+TEST(Bus, CoalescingZonesReachTheBackendsHook) {
+    Bus bus(64 * 1024);
+    bus.coalesce_writes(0xFE820000u, 0x1000, true);
+    std::vector<std::tuple<PhysAddr, u32, bool>> seen;
+    bus.set_coalesce_hook([&](PhysAddr base, u32 size, bool on) { seen.emplace_back(base, size, on); });
+    bus.coalesce_writes(0xFE820000u, 0x1000, true);  // already on: nothing
+    bus.coalesce_writes(0xFE820000u, 0x1000, false);
+    bus.coalesce_writes(0xFD820000u, 0x1000, true);
+    ASSERT_EQ(seen.size(), 3u);
+    EXPECT_EQ(seen[0], std::make_tuple(PhysAddr{0xFE820000u}, 0x1000u, true));
+    EXPECT_EQ(seen[1], std::make_tuple(PhysAddr{0xFE820000u}, 0x1000u, false));
+    EXPECT_EQ(seen[2], std::make_tuple(PhysAddr{0xFD820000u}, 0x1000u, true));
+}
+
+// The coalesced MMIO ring is taken in the guest's order from `first` to `last`, across the end of the ring, and every
+// slot is handed back.
+TEST(Bus, TheCoalescedRingIsTakenInOrderAcrossItsEnd) {
+    alignas(4096) static u8 page[4096];
+    std::memset(page, 0, sizeof page);
+    auto* ring = reinterpret_cast<kvm_coalesced_mmio_ring*>(page);
+    const u32 slots = static_cast<u32>((sizeof page - sizeof(kvm_coalesced_mmio_ring)) / sizeof(kvm_coalesced_mmio));
+    auto put = [&](u32 value) {  // the kernel's side
+        kvm_coalesced_mmio& e = *kvm::coalesced_entry(ring, ring->last);
+        e.phys_addr = 0xFE8202F8u;
+        e.len = 4;
+        std::memcpy(e.data, &value, 4);
+        ring->last = (ring->last + 1) % slots;
+    };
+    ring->first = ring->last = slots - 2;
+    for (u32 v = 1; v <= 5; ++v) put(v);
+    std::vector<u32> got;
+    const u32 n = kvm::drain_coalesced(ring, slots, [&](u64 phys, u32 len, const u8* data) {
+        EXPECT_EQ(phys, 0xFE8202F8u);
+        EXPECT_EQ(len, 4u);
+        u32 v;
+        std::memcpy(&v, data, 4);
+        got.push_back(v);
+    });
+    EXPECT_EQ(n, 5u);
+    EXPECT_EQ(got, (std::vector<u32>{1, 2, 3, 4, 5}));
+    EXPECT_EQ(ring->first, ring->last);
+    EXPECT_EQ(ring->first, 3u);
+    EXPECT_EQ(kvm::drain_coalesced(ring, slots, [](u64, u32, const u8*) { ADD_FAILURE() << "an empty ring gave a write"; }), 0u);
 }

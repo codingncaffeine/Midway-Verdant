@@ -44,6 +44,7 @@ Apu::Apu(Bus& bus, Scheduler& sched, std::function<void(bool)> irq)
     frame_.name = "apu.frame";
     frame_.fire = [this](Cycles now) { on_frame(now); };
     if (const char* t = std::getenv("MV_APU_THREAD"); t && *t == '0') dsp_threaded_ = false;
+    census_ = std::getenv("MV_APU_CENSUS") != nullptr;
     if (dsp_threaded_) dsp_thread_ = std::thread([this] { dsp_worker(); });
     if (const char* h = std::getenv("MV_DEBUG_DSP_PCHIST")) {
         if (std::strstr(h, "gp")) {
@@ -72,6 +73,18 @@ void Apu::run_processors_inline() {
 }
 
 Apu::~Apu() {
+    if (census_) {
+        std::vector<std::pair<u32, u64>> c(census_counts_.begin(), census_counts_.end());
+        std::ranges::sort(c, std::greater{}, &std::pair<u32, u64>::second);
+        // The 24 busiest accesses, then the 16 that waited for the processors' thread most (bit 1 of the key).
+        for (int waited = 0; waited < 2; ++waited)
+            for (std::size_t i = 0, n = 0; i < c.size() && n < (waited ? 16u : 24u); ++i) {
+                if (((c[i].first & 2) != 0) != (waited != 0)) continue;
+                ++n;
+                if (c[i].first == 0xFFFFFFF2u) std::fprintf(stderr, "apu census: the frame waited for the last frame x%llu\n", static_cast<unsigned long long>(c[i].second));
+                else std::fprintf(stderr, "apu census: %s%s +%05x x%llu\n", (c[i].first & 1) ? "write" : "read ", waited ? " that waited for the processors" : "", c[i].first & ~3u, static_cast<unsigned long long>(c[i].second));
+            }
+    }
     if (dsp_thread_.joinable()) {
         {
             std::lock_guard g(dsp_mutex_);
@@ -112,9 +125,18 @@ void Apu::dsp_worker() {
 void Apu::on_bar_changed(int index, u32 old_base, u32 new_base) {
     (void)old_base;
     if (index != 0) return;
-    if (mapped_at_) bus_.unmap_mmio(mapped_at_, kBarSize);
+    // The voice processor's method page takes its writes without an exit each where the CPU backend can (a race's
+    // engine sounds were hundreds of method writes a frame, each an exit): the hardware queues methods too, in a FIFO
+    // the guest reads the free count of (that read exits, and the writes before it land first).
+    if (mapped_at_) {
+        bus_.coalesce_writes(mapped_at_ + kVpBlock, 0x1000, false);  // what the zone took lands while still mapped
+        bus_.unmap_mmio(mapped_at_, kBarSize);
+    }
     mapped_at_ = new_base;
-    if (new_base) bus_.map_mmio(new_base, kBarSize, this);
+    if (new_base) {
+        bus_.map_mmio(new_base, kBarSize, this);
+        bus_.coalesce_writes(new_base + kVpBlock, 0x1000, true);
+    }
     trace::log(trace::Cat::Apu, "apu registers at {:08x}", new_base);
 }
 
@@ -237,19 +259,22 @@ void Apu::write_word(u32 offset, u32 value) {
 
 u32 Apu::mmio_read(PhysAddr addr, unsigned size) {
     const u32 off = addr - mapped_at_;
-    if (!in_vp_window(off)) dsp_sync();
+    if (census_ && processors_use(off) && dsp_busy_.load(std::memory_order_acquire)) ++census_counts_[(off & ~3u) | 2u];
+    if (processors_use(off)) dsp_sync();
     const u32 word = read_word(off & ~3u);
     const unsigned shift = 8u * (off & 3u);
     const u32 v = size == 4 ? word : (size == 2 ? ((word >> shift) & 0xFFFFu) : ((word >> shift) & 0xFFu));
     ++reads_;
+    if (census_) ++census_counts_[off & ~3u];
     trace::log(trace::Cat::Apu, "apu read  +{:05x} size {} -> {:08x}", off, size, v);
     return v;
 }
 
 void Apu::mmio_write(PhysAddr addr, unsigned size, u32 value) {
     const u32 off = addr - mapped_at_;
-    if (!in_vp_window(off)) dsp_sync();
     const u32 key = off & ~3u;
+    if (census_ && processors_use(off) && dsp_busy_.load(std::memory_order_acquire)) ++census_counts_[key | 3u];
+    if (processors_use(off)) dsp_sync();
     u32 word = value;
     if (size != 4) {
         const unsigned shift = 8u * (off & 3u);
@@ -259,6 +284,7 @@ void Apu::mmio_write(PhysAddr addr, unsigned size, u32 value) {
     }
     write_word(key, word);
     ++writes_;
+    if (census_) ++census_counts_[key | 1u];
     trace::log(trace::Cat::Apu, "apu write +{:05x} size {} <- {:08x}", off, size, value);
 }
 
@@ -334,6 +360,7 @@ void Apu::run_frame(apu::Processor& p, FrameStats& stats, std::string_view which
 
 void Apu::on_frame(Cycles now) {
     (void)now;
+    if (census_ && dsp_busy_.load(std::memory_order_acquire)) ++census_counts_[0xFFFFFFF2u];  // the frame itself waited
     dsp_sync();  // the last frame's processor run, before this frame touches their memories
     ++frames_;
     // The setup engine walks the voice lists first; its idle reports trap to the host once the front end is free.

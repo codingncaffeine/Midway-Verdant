@@ -15,6 +15,7 @@
 #include "cpu/backend.h"
 
 struct kvm_run;
+struct kvm_coalesced_mmio_ring;
 
 namespace mv {
 
@@ -69,6 +70,8 @@ private:
     bool setup_cpuid(std::string& error);
     void handle_io();
     void handle_mmio();
+    // The writes KVM's coalesced MMIO ring holds, to the bus in order (with the machine lock held).
+    void drain_coalesced_writes();
     void inject_interrupt_if_possible();
     void wait_for_interrupt();
     // The guest clock's helpers: move the guest's TSC by `delta` cycles through its offset (false when the host has
@@ -87,6 +90,10 @@ private:
     int kvm_fd_{-1}, vm_fd_{-1}, vcpu_fd_{-1};
     kvm_run* run_{nullptr};
     std::size_t run_size_{0};
+    kvm_coalesced_mmio_ring* coalesced_{nullptr};  // in the run area (null: an exit per device write)
+    u32 coalesced_slots_{0};
+    u64 coalesced_writes_{0}, coalesce_failures_{0};
+    int coalesced_zones_{0};
     std::thread thread_;
     std::atomic<bool> stop_requested_{false};
     std::atomic<bool> running_{false};

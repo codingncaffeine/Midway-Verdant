@@ -183,6 +183,10 @@ public:
     // is due. Called with the lock held.
     void advance_time();
     Cycles wall_cycles() const;
+    // Run first by every advance_time (either thread, the lock held): the CPU backend delivers the device writes it
+    // took without an exit (KVM's coalesced MMIO), so a device has them before its events fire and before the access
+    // the CPU exited for.
+    void set_before_events(std::function<void()> f) { before_events_ = std::move(f); }
 
     // Pacing a free-running CPU (D16). The CPU thread calls this with the lock held before it enters the guest, at
     // guest time `now`. When the CPU must not run on yet (the frame step's vblank came, or it is ahead of the host
@@ -271,6 +275,7 @@ private:
     std::unique_ptr<pgraph::VulkanRenderer> renderer_;
 
     std::mutex lock_;
+    std::function<void()> before_events_;
     std::condition_variable wake_cv_, io_cv_;
     std::chrono::steady_clock::time_point start_;
     // Pacing (pace_cpu): the frame step's vblank limit, and real time's reference point (the guest time that
