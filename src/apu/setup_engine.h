@@ -4,6 +4,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdlib>
+#include <cstring>
 
 #include "core/bus.h"
 #include "core/types.h"
@@ -142,6 +143,12 @@ private:
         u32 base{0};          // a buffer's first byte in the scatter-gather space
         u32 container{2}, sample_size{1}, channels{1}, samples_per_block{1};
         bool adpcm{false};
+        // The scatter-gather table, and the last 4 KiB page of the buffer read and where it lies in RAM (a frame reads a
+        // voice's samples from a page or two: looked up once, not for every sample; nothing can rewrite the table or its
+        // entries while the engine runs its frame).
+        PhysAddr sge_table{0};
+        mutable u32 page{~0u};
+        mutable const u8* page_ptr{nullptr};
     };
     PhysAddr voice_address(u32 handle) const;
     void link_on(u32 handle);
@@ -159,7 +166,29 @@ private:
     bool read_submix(u32 fmt, Frame& out);
     void read_sample(u32 handle, const Source& src, u32 index, float out[2]);
     bool sge_byte(u32 sge_offset, PhysAddr& phys) const;
-    u32 read_bytes(const Source& src, u32 byte_offset, u32 bytes) const;
+    // The bytes at an offset of a source: the page already looked up, read in place (inlined into the sample reads);
+    // anything else through read_bytes_slow.
+    u32 read_bytes(const Source& src, u32 byte_offset, u32 bytes) const {
+        if (!src.stream && src.page_ptr) {
+            const u32 off = src.base + byte_offset;
+            if ((off >> 12) == src.page && (off & 0xFFFu) + bytes <= 0x1000u) {
+                const u8* p = src.page_ptr + (off & 0xFFFu);
+                u32 v = 0;
+                if (bytes == 2) {
+                    u16 h;
+                    std::memcpy(&h, p, 2);
+                    v = h;
+                } else if (bytes == 4) {
+                    std::memcpy(&v, p, 4);
+                } else {
+                    for (u32 i = 0; i < bytes; ++i) v |= static_cast<u32>(p[i]) << (8 * i);
+                }
+                return v;
+            }
+        }
+        return read_bytes_slow(src, byte_offset, bytes);
+    }
+    u32 read_bytes_slow(const Source& src, u32 byte_offset, u32 bytes) const;
     // One step of an envelope (amplitude or filter) at the frame rate; its level 0..1. The amplitude envelope's
     // FORCE_RELEASE (the end of a release) sets `ended`.
     float step_envelope(u32 handle, bool amplitude, bool& ended);

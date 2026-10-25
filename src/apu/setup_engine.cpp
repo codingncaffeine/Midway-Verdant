@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <format>
 #include <string>
 
@@ -464,6 +465,7 @@ SetupEngine::Source SetupEngine::source_for(u32 fmt) const {
     s.sample_size = (fmt >> kFmtSampleSizeShift) & 3u;
     s.channels = (fmt & kFmtStereo) ? 2u : 1u;
     s.samples_per_block = 1 + ((fmt >> kFmtSamplesPerBlockShift) & 0x1Fu);
+    s.sge_table = host_.global_reg(kRegSgeTable);
     return s;
 }
 
@@ -476,7 +478,7 @@ bool SetupEngine::sge_byte(u32 sge_offset, PhysAddr& phys) const {
     return true;
 }
 
-u32 SetupEngine::read_bytes(const Source& src, u32 byte_offset, u32 bytes) const {
+u32 SetupEngine::read_bytes_slow(const Source& src, u32 byte_offset, u32 bytes) const {
     u32 v = 0;
     // The common case: all the bytes in one 4 KiB page of the buffer (one scatter-gather lookup, one read; a sample
     // was a table lookup and a bus read per byte). Anything else, byte by byte below, with the same results.
@@ -484,6 +486,16 @@ u32 SetupEngine::read_bytes(const Source& src, u32 byte_offset, u32 bytes) const
         if (bus_.read_ram(src.segment + byte_offset, &v, bytes)) return v;
         v = 0;
     } else if (((src.base + byte_offset) & 0xFFFu) + bytes <= 0x1000u) {
+        const u32 off = src.base + byte_offset;
+        if ((off >> 12) != src.page) {
+            src.page = off >> 12;
+            u32 entry = 0;
+            src.page_ptr = bus_.read_ram(src.sge_table + src.page * 8u, &entry, 4) ? bus_.ram_pointer(entry & ~0xFFFu, 0x1000) : nullptr;
+        }
+        if (src.page_ptr) {
+            std::memcpy(&v, src.page_ptr + (off & 0xFFFu), bytes);
+            return v;
+        }
         PhysAddr at = 0;
         if (!sge_byte(src.base + byte_offset, at)) return 0;
         if (bus_.read_ram(at, &v, bytes)) return v;
