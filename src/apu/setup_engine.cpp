@@ -284,10 +284,11 @@ void SetupEngine::frame() {
                 b.energy = 0;
                 b.energy_samples = 0;
                 const u32 st = field(h, kFieldState);
-                line += std::format(" {:x}(cbo {} ea {} v0 {:x} v1 {:x} fmode {} fca {:08x} fcb {:08x} pitch {} ph {}/{} lvl {:.1f}{})", h, field(h, kFieldOffset) & kOffsetMask,
-                                    field(h, kFieldOffset) >> 24, (field(h, kFieldVolA) >> 4) & 0xFFFu, field(h, kFieldVolA) >> 20, (field(h, kFieldMisc) >> 16) & 3u, field(h, kFieldFcA),
-                                    field(h, kFieldFcB), static_cast<i16>(field(h, kFieldPitchLink) >> 16), (st >> kStateEaShift) & 0xFu, (st >> kStateEfShift) & 0xFu, rms,
-                                    (st & kStatePaused) ? " paused" : "");
+                line += std::format(" {:x}(cbo {} ea {} v0 {:x} v1 {:x} fmode {} fca {:08x} fcb {:08x} pitch {} ph {}/{} lvl {:.1f} vbin {:08x} fmt {:08x}{}{})", h,
+                                    field(h, kFieldOffset) & kOffsetMask, field(h, kFieldOffset) >> 24, (field(h, kFieldVolA) >> 4) & 0xFFFu, field(h, kFieldVolA) >> 20,
+                                    (field(h, kFieldMisc) >> 16) & 3u, field(h, kFieldFcA), field(h, kFieldFcB), static_cast<i16>(field(h, kFieldPitchLink) >> 16),
+                                    (st >> kStateEaShift) & 0xFu, (st >> kStateEfShift) & 0xFu, rms, field(h, kFieldVbin), field(h, kFieldFmt),
+                                    (st & kStateActive) ? "" : " inactive", (st & kStatePaused) ? " paused" : "");
             }
         trace::log(trace::Cat::Apu, "vp: frame {} voices:{}", frames_, line.empty() ? " none" : line);
         if (census) std::fprintf(census, "%.1f s voices:%s\n", static_cast<double>(frames_) / 1500.0, line.empty() ? " none" : line.c_str());
