@@ -168,9 +168,35 @@ VulkanRenderer::VulkanRenderer(vk::Device& device, const HandleResolver& handles
     }
 }
 
+// A pipeline's create-info and everything it points at, kept together so a worker can create it after pipeline()
+// returns (background compiles).
+struct VulkanRenderer::PipelineBuild {
+    VkPipelineShaderStageCreateInfo stages[2]{};
+    VkVertexInputBindingDescription bindings[2]{};
+    VkVertexInputAttributeDescription attrs[kAttributes]{};
+    VkPipelineVertexInputStateCreateInfo vi{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+    VkPipelineViewportStateCreateInfo vp{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+    VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+    VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+    VkPipelineDepthStencilStateCreateInfo ds{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+    VkPipelineColorBlendAttachmentState cb{};
+    VkPipelineColorBlendStateCreateInfo blend{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+    VkDynamicState dynamics[5]{VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_BLEND_CONSTANTS, VK_DYNAMIC_STATE_STENCIL_REFERENCE,
+                               VK_DYNAMIC_STATE_DEPTH_BIAS};
+    VkPipelineDynamicStateCreateInfo dyn{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+    VkGraphicsPipelineCreateInfo gpi{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+    std::atomic<bool> done{false};
+    VkPipeline pipeline{VK_NULL_HANDLE};
+    VkResult result{VK_SUCCESS};
+};
+
 VulkanRenderer::~VulkanRenderer() {
+    stop_workers();  // a job in flight finishes first; queued ones are dropped
     if (!dev_.ready()) return;
     const auto& f = *fn_;
+    for (auto& [k, b] : pipelines_pending_)
+        if (b->done.load(std::memory_order_acquire) && b->pipeline) f.vkDestroyPipeline(dev_.device(), b->pipeline, nullptr);
     if (recording_) {
         end_pass();
         f.vkEndCommandBuffer(cb_);
@@ -1216,6 +1242,7 @@ VkShaderModule VulkanRenderer::vertex_shader(const KelvinState& s, std::string& 
     }
     key += smooth ? 's' : 'f';
     key += std::format(":fog{:x}", flags >> 2);
+    if (async_compile_ && shader_pending(true, key)) return VK_NULL_HANDLE;  // a worker is compiling it
     auto remember = [&](VkShaderModule m) {
         VsMemo& e = vs_memo_[vs_memo_next_];
         vs_memo_next_ = (vs_memo_next_ + 1) % kMemoEntries;
@@ -1258,7 +1285,8 @@ VkShaderModule VulkanRenderer::vertex_shader(const KelvinState& s, std::string& 
         return VK_NULL_HANDLE;
     }
     std::string log;
-    const std::vector<u32> spirv = spirv_for(true, t.glsl, "kelvin-vp", log);
+    std::vector<u32> spirv;
+    if (!spirv_ready(true, key, t.glsl, "kelvin-vp", spirv, log)) return VK_NULL_HANDLE;  // queued for a worker
     if (spirv.empty()) {
         error = "vertex program GLSL: " + log;
         return VK_NULL_HANDLE;
@@ -1298,6 +1326,7 @@ VkShaderModule VulkanRenderer::fragment_shader(const psh::Key& key, std::array<p
         fs_memo_next_ = (fs_memo_next_ + 1) % kMemoEntries;
     };
     std::string k(reinterpret_cast<const char*>(&key), sizeof key);
+    if (async_compile_ && shader_pending(false, k)) return VK_NULL_HANDLE;  // a worker is compiling it
     if (auto it = fs_cache_.find(k); it != fs_cache_.end()) {
         ++stats_.fs_cache_hits;
         kinds = fs_kinds_[k];
@@ -1315,7 +1344,8 @@ VkShaderModule VulkanRenderer::fragment_shader(const psh::Key& key, std::array<p
         if (const auto end = t.glsl.rfind('}'); end != std::string::npos) t.glsl.insert(end, "    frag_color = vec4(clamp(vtx_d0.rgb, 0.0, 1.0), 1.0);\n");
     }
     std::string log;
-    const std::vector<u32> spirv = spirv_for(false, t.glsl, "kelvin-combiners", log);
+    std::vector<u32> spirv;
+    if (!spirv_ready(false, k, t.glsl, "kelvin-combiners", spirv, log)) return VK_NULL_HANDLE;  // queued for a worker
     if (spirv.empty()) {
         error = "combiner GLSL: " + log;
         return VK_NULL_HANDLE;
@@ -1343,8 +1373,23 @@ VkPipeline VulkanRenderer::pipeline(const KelvinState& s, VkShaderModule vs, VkS
     static_assert(std::has_unique_object_representations_v<RasterKey>);
     std::string key(reinterpret_cast<const char*>(&k), sizeof k);
     if (auto it = pipelines_.find(key); it != pipelines_.end()) return it->second;
+    if (auto it = pipelines_pending_.find(key); it != pipelines_pending_.end()) {
+        PipelineBuild& b = *it->second;
+        if (!b.done.load(std::memory_order_acquire)) return VK_NULL_HANDLE;  // a worker is creating it
+        const VkPipeline p = b.pipeline;
+        const VkResult r = b.result;
+        pipelines_pending_.erase(it);
+        if (r != VK_SUCCESS) {
+            error = std::format("vkCreateGraphicsPipelines: {}", vk::result_name(r));
+            return VK_NULL_HANDLE;
+        }
+        ++stats_.pipelines;
+        pipelines_[key] = p;
+        return p;
+    }
+    auto build = std::make_shared<PipelineBuild>();
 
-    VkPipelineShaderStageCreateInfo stages[2]{};
+    auto& stages = build->stages;
     stages[0].sType = stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
     stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
     stages[0].module = vs;
@@ -1356,22 +1401,24 @@ VkPipeline VulkanRenderer::pipeline(const KelvinState& s, VkShaderModule vs, VkS
     // The attributes with per-vertex data packed in order in binding 0; the others read their constant from binding 1,
     // a block of all sixteen at a stride of zero.
     const u32 per_vertex = static_cast<u32>(std::popcount(vertex_layout & 0xFFFFu));
-    VkVertexInputBindingDescription bindings[2] = {{0, std::max(per_vertex, 1u) * 16, VK_VERTEX_INPUT_RATE_VERTEX}, {1, 0, VK_VERTEX_INPUT_RATE_VERTEX}};
-    VkVertexInputAttributeDescription attrs[kAttributes]{};
+    auto& bindings = build->bindings;
+    bindings[0] = {0, std::max(per_vertex, 1u) * 16, VK_VERTEX_INPUT_RATE_VERTEX};
+    bindings[1] = {1, 0, VK_VERTEX_INPUT_RATE_VERTEX};
+    auto& attrs = build->attrs;
     for (u32 i = 0, packed = 0; i < kAttributes; ++i)
         attrs[i] = (vertex_layout >> i) & 1u ? VkVertexInputAttributeDescription{i, 0, VK_FORMAT_R32G32B32A32_SFLOAT, 16 * packed++}
                                               : VkVertexInputAttributeDescription{i, 1, VK_FORMAT_R32G32B32A32_SFLOAT, i * 16};
-    VkPipelineVertexInputStateCreateInfo vi{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    auto& vi = build->vi;
     vi.vertexBindingDescriptionCount = 2;
     vi.pVertexBindingDescriptions = bindings;
     vi.vertexAttributeDescriptionCount = kAttributes;
     vi.pVertexAttributeDescriptions = attrs;
-    VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+    auto& ia = build->ia;
     ia.topology = topology;
-    VkPipelineViewportStateCreateInfo vp{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+    auto& vp = build->vp;
     vp.viewportCount = 1;
     vp.scissorCount = 1;
-    VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+    auto& rs = build->rs;
     rs.polygonMode = VK_POLYGON_MODE_FILL;
     rs.lineWidth = 1.0f;
     if (s.cull_face() && !debug_nocull_) {
@@ -1380,9 +1427,9 @@ VkPipeline VulkanRenderer::pipeline(const KelvinState& s, VkShaderModule vs, VkS
     }
     rs.frontFace = (s.reg(mthd::kFrontFace) == 0x900) != debug_flip_front_ ? VK_FRONT_FACE_CLOCKWISE : VK_FRONT_FACE_COUNTER_CLOCKWISE;
     rs.depthBiasEnable = VK_TRUE;  // the polygon offset, set per draw (zero when the draw has none)
-    VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+    auto& ms = build->ms;
     ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
-    VkPipelineDepthStencilStateCreateInfo ds{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+    auto& ds = build->ds;
     ds.depthTestEnable = (s.depth_test() && !debug_nodepth_) ? VK_TRUE : VK_FALSE;
     ds.depthWriteEnable = s.depth_write() ? VK_TRUE : VK_FALSE;
     ds.depthCompareOp = compare_op(s.reg(mthd::kDepthFunc));
@@ -1395,7 +1442,7 @@ VkPipeline VulkanRenderer::pipeline(const KelvinState& s, VkShaderModule vs, VkS
     st.compareMask = s.reg(mthd::kStencilFuncMask) & 0xFFu;
     st.writeMask = s.reg(mthd::kStencilMask) & 0xFFu;
     ds.front = ds.back = st;
-    VkPipelineColorBlendAttachmentState cb{};
+    auto& cb = build->cb;
     cb.blendEnable = (s.blend() && !debug_noblend_) ? VK_TRUE : VK_FALSE;
     cb.srcColorBlendFactor = cb.srcAlphaBlendFactor = blend_factor(s.reg(mthd::kBlendSfactor));
     cb.dstColorBlendFactor = cb.dstAlphaBlendFactor = blend_factor(s.reg(mthd::kBlendDfactor));
@@ -1409,15 +1456,14 @@ VkPipeline VulkanRenderer::pipeline(const KelvinState& s, VkShaderModule vs, VkS
     const u32 mask = s.color_mask();
     cb.colorWriteMask = (mask & (1u << 16) ? static_cast<u32>(VK_COLOR_COMPONENT_R_BIT) : 0u) | (mask & (1u << 8) ? static_cast<u32>(VK_COLOR_COMPONENT_G_BIT) : 0u) |
                         (mask & 1u ? static_cast<u32>(VK_COLOR_COMPONENT_B_BIT) : 0u) | (mask & (1u << 24) ? static_cast<u32>(VK_COLOR_COMPONENT_A_BIT) : 0u);
-    VkPipelineColorBlendStateCreateInfo blend{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+    auto& blend = build->blend;
     blend.attachmentCount = 1;
     blend.pAttachments = &cb;
-    const VkDynamicState dynamics[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_BLEND_CONSTANTS, VK_DYNAMIC_STATE_STENCIL_REFERENCE,
-                                       VK_DYNAMIC_STATE_DEPTH_BIAS};
-    VkPipelineDynamicStateCreateInfo dyn{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+    auto& dynamics = build->dynamics;
+    auto& dyn = build->dyn;
     dyn.dynamicStateCount = 5;
     dyn.pDynamicStates = dynamics;
-    VkGraphicsPipelineCreateInfo gpi{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+    auto& gpi = build->gpi;
     gpi.stageCount = 2;
     gpi.pStages = stages;
     gpi.pVertexInputState = &vi;
@@ -1430,6 +1476,15 @@ VkPipeline VulkanRenderer::pipeline(const KelvinState& s, VkShaderModule vs, VkS
     gpi.pDynamicState = &dyn;
     gpi.layout = pipeline_layout_;
     gpi.renderPass = t.pass;
+    if (async_compile_) {
+        pipelines_pending_.emplace(key, build);
+        ++stats_.pipelines_queued;
+        submit([this, build] {
+            build->result = fn_->vkCreateGraphicsPipelines(dev_.device(), pipeline_cache_, 1, &build->gpi, nullptr, &build->pipeline);
+            build->done.store(true, std::memory_order_release);
+        });
+        return VK_NULL_HANDLE;
+    }
     VkPipeline p = VK_NULL_HANDLE;
     if (VkResult r = fn_->vkCreateGraphicsPipelines(dev_.device(), pipeline_cache_, 1, &gpi, nullptr, &p); r != VK_SUCCESS) {
         error = std::format("vkCreateGraphicsPipelines: {}", vk::result_name(r));
@@ -2380,9 +2435,11 @@ void VulkanRenderer::draw(const KelvinState& s, const DrawBatch& batch) {
     }
     if (v.count == 0) return;
 
-    // Shaders.
+    // Shaders. With background compiles a shader not ready yet comes back null with no error: both are asked for (so
+    // both compiles start together), then the draw is skipped until they are.
+    error.clear();
     VkShaderModule vs = vertex_shader(s, error);
-    if (!vs) {
+    if (!vs && !error.empty()) {
         note(error);
         ++stats_.skipped;
         return;
@@ -2393,9 +2450,13 @@ void VulkanRenderer::draw(const KelvinState& s, const DrawBatch& batch) {
     if (debug_shadow_pass_) pkey.shadow_compare_func = 7;  // every shadow lookup lit
     std::array<psh::SamplerKind, 4> kinds{};
     VkShaderModule fs = fragment_shader(pkey, kinds, error);
-    if (!fs) {
+    if (!fs && !error.empty()) {
         note(error);
         ++stats_.skipped;
+        return;
+    }
+    if (!vs || !fs) {
+        ++stats_.pending_skips;
         return;
     }
 
@@ -2452,7 +2513,12 @@ void VulkanRenderer::draw(const KelvinState& s, const DrawBatch& batch) {
     }
 
     stats_.ns_indices += ns_since(t_part);
+    error.clear();
     VkPipeline p = pipeline(s, vs, fs, topology, *t, v.enabled, error);
+    if (!p && error.empty()) {  // a worker is creating it
+        ++stats_.pending_skips;
+        return;
+    }
     if (!p) {
         note(error);
         ++stats_.skipped;
@@ -2834,34 +2900,112 @@ void VulkanRenderer::save_pipeline_cache() {
     write_file(cache_dir_ / "pipelines.bin", data.data(), size);
 }
 
-std::vector<u32> VulkanRenderer::spirv_for(bool vertex, const std::string& glsl, const char* name, std::string& log) {
+std::vector<u32> VulkanRenderer::spirv_cached(bool vertex, const std::string& glsl) {
+    if (cache_dir_.empty()) return {};
     const std::string keyed = std::string(vertex ? "vs\n" : "fs\n") + glsl;
-    std::filesystem::path file;
     const u64 check = fnv1a(keyed, kCheckSeed);
-    if (!cache_dir_.empty()) {
-        file = cache_dir_ / "spirv" / std::format("{:016x}.spv", fnv1a(keyed, kNameSeed));
-        std::vector<char> data;
-        if (read_file(file, data) && data.size() > 20 && data.size() % 4 == 0) {
-            u32 head[4];
-            std::memcpy(head, data.data(), sizeof head);
-            u32 first = 0;
-            std::memcpy(&first, data.data() + sizeof head, 4);
-            if (head[0] == kSpvFileMagic && head[1] == kSpvFileVersion && (static_cast<u64>(head[3]) << 32 | head[2]) == check && first == 0x07230203u) {
-                std::vector<u32> spirv((data.size() - sizeof head) / 4);
-                std::memcpy(spirv.data(), data.data() + sizeof head, spirv.size() * 4);
-                ++stats_.shaders_from_disk;
-                return spirv;
-            }
-        }
-    }
+    std::vector<char> data;
+    if (!read_file(cache_dir_ / "spirv" / std::format("{:016x}.spv", fnv1a(keyed, kNameSeed)), data) || data.size() <= 20 || data.size() % 4 != 0) return {};
+    u32 head[4];
+    std::memcpy(head, data.data(), sizeof head);
+    u32 first = 0;
+    std::memcpy(&first, data.data() + sizeof head, 4);
+    if (head[0] != kSpvFileMagic || head[1] != kSpvFileVersion || (static_cast<u64>(head[3]) << 32 | head[2]) != check || first != 0x07230203u) return {};
+    std::vector<u32> spirv((data.size() - sizeof head) / 4);
+    std::memcpy(spirv.data(), data.data() + sizeof head, spirv.size() * 4);
+    ++stats_.shaders_from_disk;
+    return spirv;
+}
+
+std::vector<u32> VulkanRenderer::spirv_compile(bool vertex, const std::string& glsl, const char* name, std::string& log) const {
     CompiledShader c = compile_glsl(vertex ? ShaderStage::Vertex : ShaderStage::Fragment, glsl, name);
     log = c.log;
-    if (c.ok() && !file.empty()) {
+    if (c.ok() && !cache_dir_.empty()) {
+        const std::string keyed = std::string(vertex ? "vs\n" : "fs\n") + glsl;
+        const u64 check = fnv1a(keyed, kCheckSeed);
         std::vector<u32> out = {kSpvFileMagic, kSpvFileVersion, static_cast<u32>(check), static_cast<u32>(check >> 32)};
         out.insert(out.end(), c.spirv.begin(), c.spirv.end());
-        write_file(file, out.data(), out.size() * 4);
+        write_file(cache_dir_ / "spirv" / std::format("{:016x}.spv", fnv1a(keyed, kNameSeed)), out.data(), out.size() * 4);
     }
     return std::move(c.spirv);
+}
+
+std::vector<u32> VulkanRenderer::spirv_for(bool vertex, const std::string& glsl, const char* name, std::string& log) {
+    if (std::vector<u32> spirv = spirv_cached(vertex, glsl); !spirv.empty()) return spirv;
+    return spirv_compile(vertex, glsl, name, log);
+}
+
+// ── background compiles ──────────────────────────────────────────────────────────────────────────────────────────
+
+void VulkanRenderer::set_async_compile(bool on) {
+    async_compile_ = on;
+    if (!on || !workers_.empty()) return;
+    // A few workers: a scene change brings a burst of new shaders, and each compile is single-threaded.
+    const u32 n = std::clamp(std::thread::hardware_concurrency() / 4u, 1u, 3u);
+    for (u32 i = 0; i < n; ++i)
+        workers_.emplace_back([this] {
+            for (;;) {
+                std::function<void()> job;
+                {
+                    std::unique_lock lock(work_mutex_);
+                    work_cv_.wait(lock, [this] { return work_stop_ || !work_.empty(); });
+                    if (work_stop_) return;
+                    job = std::move(work_.front());
+                    work_.pop_front();
+                }
+                job();
+            }
+        });
+}
+
+void VulkanRenderer::submit(std::function<void()> job) {
+    {
+        std::lock_guard lock(work_mutex_);
+        work_.push_back(std::move(job));
+    }
+    work_cv_.notify_one();
+}
+
+void VulkanRenderer::stop_workers() {
+    {
+        std::lock_guard lock(work_mutex_);
+        work_stop_ = true;
+        work_.clear();
+    }
+    work_cv_.notify_all();
+    for (auto& w : workers_) w.join();
+    workers_.clear();
+}
+
+bool VulkanRenderer::shader_pending(bool vertex, const std::string& key) const {
+    const auto& pending = vertex ? vs_pending_ : fs_pending_;
+    const auto it = pending.find(key);
+    return it != pending.end() && !it->second->done.load(std::memory_order_acquire);
+}
+
+bool VulkanRenderer::spirv_ready(bool vertex, const std::string& key, const std::string& glsl, const char* name, std::vector<u32>& spirv, std::string& log) {
+    if (!async_compile_) {
+        spirv = spirv_for(vertex, glsl, name, log);
+        return true;
+    }
+    auto& pending = vertex ? vs_pending_ : fs_pending_;
+    if (auto it = pending.find(key); it != pending.end()) {
+        if (!it->second->done.load(std::memory_order_acquire)) return false;
+        spirv = std::move(it->second->spirv);
+        log = std::move(it->second->log);
+        pending.erase(it);
+        return true;
+    }
+    spirv = spirv_cached(vertex, glsl);
+    if (!spirv.empty()) return true;
+    auto job = std::make_shared<PendingShader>();
+    pending.emplace(key, job);
+    ++stats_.compiles_queued;
+    submit([this, job, vertex, glsl, label = std::string(name)] {
+        job->spirv = spirv_compile(vertex, glsl, label.c_str(), job->log);
+        job->done.store(true, std::memory_order_release);
+    });
+    return false;
 }
 
 }  // namespace mv::pgraph

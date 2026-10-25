@@ -216,6 +216,7 @@ RETRO_API void retro_set_environment(retro_environment_t cb) {
         {"midway_verdant_pipeline", "Run the next frame while the frontend shows this one (faster, up to a frame more input lag); enabled|disabled"},
         {"midway_verdant_cpu", "CPU; fast (hardware virtualization)|accurate (cycle-counted, recompiled)"},
         {"midway_verdant_disc_speed", "Disc loading; fast (8x the console's drive)|console speed"},
+        {"midway_verdant_shaders", "Shader compiling; in the background (no stutter; a new effect can appear a frame late)|in the frame (stutters the first time a scene is seen)"},
         {"midway_verdant_audio", "Audio; console (DSP effects such as reverb)|direct mix (every voice straight to stereo, no DSP effects)"},
         {nullptr, nullptr},
     };
@@ -318,6 +319,7 @@ RETRO_API bool retro_load_game(const retro_game_info* game) {
     if (const char* c = option("midway_verdant_cpu"); c && std::strncmp(c, "accurate", 8) == 0) cfg.cpu = "p6";
     cfg.disc_speed = 8;
     if (const char* d = option("midway_verdant_disc_speed"); d && std::strncmp(d, "console", 7) == 0) cfg.disc_speed = 1;
+    { const char* sh = option("midway_verdant_shaders"); cfg.async_shaders = !(sh && std::strncmp(sh, "in the frame", 12) == 0); }
     cfg.frame_step = true;
     // Instrument: MV_RTC_TIME=UNIX fixes the clock's start, so two accurate-core runs of a title can be compared.
     if (const char* t = std::getenv("MV_RTC_TIME"); t && *t) cfg.rtc_base_time = std::strtoll(t, nullptr, 10);
@@ -428,11 +430,12 @@ RETRO_API void retro_unload_game(void) {
         if (const auto* r = machine->nv2a().renderer()) {
             const auto& st = r->stats();
             const auto ms = [](mv::u64 ns) { return static_cast<double>(ns) / 1e6; };
-            log(RETRO_LOG_INFO, "gpu time: %llu draws %.0f ms (fetch %.0f, indices %.0f, textures %.0f, pipelines %.0f, shader compiles %.0f, uploads %.0f, descriptors %.0f, record %.0f); %llu submits + %llu waits %.0f ms; %llu write-backs %.0f ms (device copies %.0f); %llu textures decoded (%llu kept: pages written, bytes unchanged), %llu shaders from the disk cache",
+            log(RETRO_LOG_INFO, "gpu time: %llu draws %.0f ms (fetch %.0f, indices %.0f, textures %.0f, pipelines %.0f, shader compiles %.0f, uploads %.0f, descriptors %.0f, record %.0f); %llu submits + %llu waits %.0f ms; %llu write-backs %.0f ms (device copies %.0f); %llu textures decoded (%llu kept: pages written, bytes unchanged), %llu shaders from the disk cache; background compiles: %llu shaders + %llu pipelines, %llu draws skipped waiting",
                 static_cast<unsigned long long>(st.draws), ms(st.ns_draw), ms(st.ns_fetch), ms(st.ns_indices), ms(st.ns_texture), ms(st.ns_pipeline), ms(st.ns_vs + st.ns_fs),
                 ms(st.ns_upload), ms(st.ns_descriptors), ms(st.ns_record), static_cast<unsigned long long>(st.flushes), static_cast<unsigned long long>(st.waits),
                 ms(st.ns_flush), static_cast<unsigned long long>(st.writebacks), ms(st.ns_write_back), ms(st.ns_write_back_gpu),
-                static_cast<unsigned long long>(st.textures_decoded), static_cast<unsigned long long>(st.textures_unchanged), static_cast<unsigned long long>(st.shaders_from_disk));
+                static_cast<unsigned long long>(st.textures_decoded), static_cast<unsigned long long>(st.textures_unchanged), static_cast<unsigned long long>(st.shaders_from_disk),
+                static_cast<unsigned long long>(st.compiles_queued), static_cast<unsigned long long>(st.pipelines_queued), static_cast<unsigned long long>(st.pending_skips));
             // Draws the renderer could not draw, and why (the first of each distinct reason).
             if (st.skipped) log(RETRO_LOG_INFO, "gpu: %llu draws skipped", static_cast<unsigned long long>(st.skipped));
             log(RETRO_LOG_INFO, "gpu: write-backs by cause: frame end %llu, texture %llu, scanout %llu, 2D/range %llu, relayout %llu, idle vblank %llu; %llu targets sampled in place, %llu snapshots for draws sampling their own target, %llu depth buffers converted to colour, %llu targets the CPU wrote reloaded, %llu depth buffers handed between targets, %llu loaded from RAM; %llu targets evicted by an overlapping one, %llu retired unused, %llu rectangles of a region copied for a texture",

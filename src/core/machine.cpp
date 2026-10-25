@@ -241,6 +241,11 @@ bool Machine::init(std::string& error) {
         renderer_ = std::make_unique<pgraph::VulkanRenderer>(*gpu_device_, nv2a_, bus_.ram(), static_cast<u32>(bus_.ram_size()));
         if (!renderer_->init(error)) return false;
         if (config_.shader_cache_dir) renderer_->open_disk_cache(*config_.shader_cache_dir);
+        {
+            bool async = config_.async_shaders && config_.cpu == "kvm" && !capture_;
+            if (const char* a = std::getenv("MV_ASYNC_SHADERS"); a && (*a == '0' || *a == '1')) async = *a == '1';
+            renderer_->set_async_compile(async);
+        }
         if (const char* w = std::getenv("MV_DEBUG_NO_WRITE_TRACKING"); !(w && *w == '1')) nv2a_.set_write_tracking(cpu_.get());  // 1: a measurement control (stale textures)
         nv2a_.set_renderer(renderer_.get());
         // The pusher on its own thread (PLAN D21), in fast mode without a capture (which records RAM before each run);

@@ -1,9 +1,11 @@
 #include <gtest/gtest.h>
 
 #include <array>
+#include <chrono>
 #include <cstring>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "nv2a/pgraph/kelvin.h"
@@ -694,4 +696,31 @@ TEST(Vulkan, AClampToBorderStageShowsItsBorderColour) {
     draw_full_triangle(k, f.ram);
     f.renderer->end_frame();
     EXPECT_EQ(pixel_at(f.ram, 8, 8), 0xFFFFFFFFu);
+}
+
+// Background compiles: the first draw that needs a new shader is skipped while a worker compiles it (nothing is drawn,
+// no error), and the same draw renders once the shader and pipeline are ready.
+TEST(Vulkan, WithBackgroundCompilesANewShadersDrawIsSkippedUntilItIsReady) {
+    TextureShaderFixture f;
+    std::string error;
+    if (!f.init(error)) GTEST_SKIP() << "no Vulkan device: " << error;
+    f.renderer->set_async_compile(true);
+    Kelvin& k = f.k;
+    load_texture(k, f.ram, 0, 0x200000, 0, [](u32, u32) { return 0xFF336699u; });
+    k.method(mthd::kShaderStageProgram, 1u);
+    output_texture_stage(k, 0);
+    texcoord(k, 0, 0.5f, 0.5f, 0.0f, 1.0f);
+    draw_full_triangle(k, f.ram);
+    f.renderer->end_frame();
+    EXPECT_GE(f.renderer->stats().pending_skips, 1u);
+    EXPECT_NE(pixel_at(f.ram, 8, 8), 0xFF336699u) << "skipped, not drawn";
+    const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (pixel_at(f.ram, 8, 8) != 0xFF336699u && std::chrono::steady_clock::now() < until) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        draw_full_triangle(k, f.ram);
+        f.renderer->end_frame();
+    }
+    for (const auto& e : f.renderer->stats().errors) ADD_FAILURE() << "renderer: " << e;
+    EXPECT_EQ(pixel_at(f.ram, 8, 8), 0xFF336699u) << "drawn once ready";
+    EXPECT_EQ(f.renderer->stats().skipped, 0u) << "a pending draw is not an error";
 }

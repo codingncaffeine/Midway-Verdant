@@ -1,9 +1,15 @@
 #pragma once
 #include <array>
+#include <atomic>
+#include <condition_variable>
+#include <deque>
+#include <functional>
 #include <filesystem>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -28,6 +34,11 @@ public:
     // an earlier run loads instead of compiling, and its pipelines come from the driver's cache, so a scene seen before
     // does not stall on first use. The pipeline cache is written back when the renderer closes.
     void open_disk_cache(const std::filesystem::path& dir);
+    // Background compiles (the fast core's default; off by default): a shader or pipeline seen for the first time is
+    // compiled on a worker thread and the draws that need it are skipped until it is ready (a frame or two), instead of
+    // stalling the frame for tens of milliseconds as each new scene appears. Never for the accurate core: what a
+    // frame shows would depend on host timing.
+    void set_async_compile(bool on);
 
     void clear(const KelvinState& state, u32 clear_bits) override;
     void draw(const KelvinState& state, const DrawBatch& batch) override;
@@ -85,6 +96,7 @@ public:
         u64 evicted{0}, retired_unused{0};  // targets another target overlapped; targets nothing used for 10 s
         u64 subrect_copies{0};  // rectangles of a pitch-linear region copied for a texture
         u64 shaders_from_disk{0};  // shader compiles the disk cache answered
+        u64 compiles_queued{0}, pipelines_queued{0}, pending_skips{0};  // background compiles started; draws skipped waiting
         u64 textures_unchanged{0};
         u64 surface_reloads{0};  // render targets reloaded from RAM after another engine wrote them  // textures whose pages were written but whose bytes hashed the same: kept
         // Write-backs by cause: frame end, a texture sampling the target, the scanout at vblank, a 2D or CPU range,
@@ -388,6 +400,29 @@ private:
     VkPipelineCache pipeline_cache_{VK_NULL_HANDLE};
     // SPIR-V for a translated shader: from the disk cache when it holds this exact source, else compiled (and stored).
     std::vector<u32> spirv_for(bool vertex, const std::string& glsl, const char* name, std::string& log);
+    std::vector<u32> spirv_cached(bool vertex, const std::string& glsl);  // the disk cache's copy, or empty
+    // Compiles and stores in the disk cache; touches no renderer state (worker threads call it).
+    std::vector<u32> spirv_compile(bool vertex, const std::string& glsl, const char* name, std::string& log) const;
+    // The background compiles: SPIR-V or a pipeline being made on a worker, by the cache key that will hold it.
+    struct PendingShader {
+        std::atomic<bool> done{false};
+        std::vector<u32> spirv;
+        std::string log;
+    };
+    struct PipelineBuild;  // a pipeline's create-info with everything it points at (the .cpp)
+    // SPIR-V ready for `key`: true with `spirv` (empty + `log` on a compile error), or false while a worker compiles it.
+    bool spirv_ready(bool vertex, const std::string& key, const std::string& glsl, const char* name, std::vector<u32>& spirv, std::string& log);
+    bool shader_pending(bool vertex, const std::string& key) const;
+    void submit(std::function<void()> job);
+    void stop_workers();
+    bool async_compile_{false};
+    std::unordered_map<std::string, std::shared_ptr<PendingShader>> vs_pending_, fs_pending_;
+    std::unordered_map<std::string, std::shared_ptr<PipelineBuild>> pipelines_pending_;
+    std::vector<std::thread> workers_;
+    std::mutex work_mutex_;
+    std::condition_variable work_cv_;
+    std::deque<std::function<void()>> work_;
+    bool work_stop_{false};
     void save_pipeline_cache();
     VkFormat depth24_{VK_FORMAT_D24_UNORM_S8_UINT};
     Stats stats_;

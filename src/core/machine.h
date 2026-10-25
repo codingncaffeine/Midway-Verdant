@@ -96,6 +96,9 @@ struct MachineConfig {
     double fast_cpu_scale{2.0};
     // The DVD drive's read rate as a multiple of the console's ~8 MB/s (the libretro core's "Disc loading" option: 8, or 1).
     u32 disc_speed{1};
+    // Shaders and pipelines compiled on worker threads, a draw that needs one not ready yet skipped (the fast core only:
+    // the accurate core's pictures must not depend on host timing). MV_ASYNC_SHADERS=0/1 overrides it.
+    bool async_shaders{false};
     // Pacing of a CPU that runs free (the fast mode with its guest clock): frame steps stop the CPU at every vblank
     // until the front end asks for the next frame (the libretro core); otherwise guest time keeps to the host clock
     // times `speed` (1 = real time), or runs as fast as it can with speed 0.
