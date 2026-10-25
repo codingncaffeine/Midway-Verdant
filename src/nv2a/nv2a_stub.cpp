@@ -68,11 +68,11 @@ Nv2aStub::Nv2aStub(Bus& bus, Scheduler& sched, std::function<void(bool)> irq)
             renderer_->set_display_overlay(overlay());  // drawn over it by the same pass
             renderer_->write_back_at(reg(kPcrtcStart));
         }
-        // The GPU idle for two whole frames (a title paused, loading or starting): what it drew is in RAM on the hardware;
-        // put it there. One idle frame is not enough: a title at 30 frames a second leaves every other one idle, and
-        // writing every target back each time cost it most of a frame at a high internal resolution.
+        // A whole frame without a method: the GPU is idle, so what it drew is in RAM on the hardware; put it there. Waiting
+        // for two idle frames in a row (cea51bc, for 30 fps titles) left Forza's legal screen, which draws every other
+        // frame, reading a drawn target through RAM before it ever reached it: a yellow band over its top third.
         idle_vblanks_ = kelvin_.methods_seen() == methods_at_vblank_ ? idle_vblanks_ + 1 : 0;
-        if (renderer_ && idle_vblanks_ >= 2) renderer_->write_back_all();
+        if (renderer_ && idle_vblanks_ >= 1) renderer_->write_back_all();
         methods_at_vblank_ = kelvin_.methods_seen();
         if (vblank_hook_) vblank_hook_(sched_.now());
         regs_[kPcrtcIntr0] |= 1u;
