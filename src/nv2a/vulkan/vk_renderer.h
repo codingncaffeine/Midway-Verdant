@@ -529,7 +529,21 @@ private:
     std::unordered_map<std::string, VkPipeline> pipelines_;
     std::unordered_map<u64, VkPipeline> clear_pipelines_;  // by render pass and channel mask
     VkShaderModule clear_vs_{VK_NULL_HANDLE}, clear_fs_{VK_NULL_HANDLE};
-    std::unordered_map<std::string, std::unique_ptr<TextureEntry>> textures_;
+    // Decoded textures by what identifies them (address, format, CONTROL1, rectangle, palette), a fixed-size key: a
+    // lookup allocates nothing.
+    using TextureKey = std::array<u32, 5>;
+    struct TextureKeyHash {
+        std::size_t operator()(const TextureKey& k) const {
+            u64 h = 0xcbf29ce484222325ull;
+            for (const u32 w : k) h = (h ^ w) * 0x100000001b3ull;
+            return static_cast<std::size_t>(h ^ (h >> 29));
+        }
+    };
+    std::unordered_map<TextureKey, std::unique_ptr<TextureEntry>, TextureKeyHash> textures_;
+    // The last pipeline found for draws and its rasterizer key's bytes: a run of draws under one state finds it without
+    // building or hashing a key. Cleared with the pipelines.
+    std::array<u8, 128> last_raster_key_{};
+    VkPipeline last_raster_pipeline_{VK_NULL_HANDLE};
     // The last binding of each stage: the registers it was built from and what it resolved to, so a draw that
     // changes nothing about its textures skips the address maths, the handle lookups and the hashing.
     struct StageCache {
@@ -556,6 +570,9 @@ private:
     u32 descriptor_sets_used_{0};  // from the recording frame's pool
     // The vertex uniform block being built, and the last block of each kind uploaded in the recording frame.
     std::array<float, vsh::kUniformBytes / 4> vs_uniforms_{};
+    // A draw's fetched vertices and rewritten index lists, kept so their buffers serve draw after draw.
+    FetchedVertices fetched_;
+    std::vector<u32> draw_indices_, quad_indices_;
     struct UniformUpload {
         std::vector<u8> bytes;
         VkDeviceSize offset{0};

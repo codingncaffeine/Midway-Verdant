@@ -520,6 +520,21 @@ struct Timed {
 u64 ns_since(std::chrono::steady_clock::time_point t0) {
     return static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
 }
+// A draw's parts on one running clock: each lap adds the time since the last mark to its counter, and the scope's whole
+// time goes to `total`. One clock read a part instead of a pair per part and per helper (two dozen reads a draw were a
+// tenth of the GPU thread's time in a draw-heavy race).
+struct LapClock {
+    u64& total;
+    std::chrono::steady_clock::time_point start, mark;
+    explicit LapClock(u64& t) : total(t), start(std::chrono::steady_clock::now()), mark(start) {}
+    ~LapClock() { total += ns_since(start); }
+    void lap(u64& acc) {
+        const auto now = std::chrono::steady_clock::now();
+        acc += static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - mark).count());
+        mark = now;
+    }
+    void skip() { mark = std::chrono::steady_clock::now(); }
+};
 }  // namespace
 
 void VulkanRenderer::submit(bool rotate) {
@@ -1743,7 +1758,6 @@ VkShaderModule VulkanRenderer::module(const std::vector<u32>& spirv) {
 }
 
 VkShaderModule VulkanRenderer::vertex_shader(const KelvinState& s, std::string& error) {
-    Timed timed(stats_.ns_vs);
     const bool vp = s.vertex_program_mode();
     const bool smooth = s.reg(mthd::kShadeModel) != 0x1D00;
     if (!vp && !vsh::fixed_function_supported(s, error)) return VK_NULL_HANDLE;
@@ -1843,7 +1857,6 @@ VkShaderModule VulkanRenderer::vertex_shader(const KelvinState& s, std::string& 
 }
 
 VkShaderModule VulkanRenderer::fragment_shader(const psh::Key& key, std::array<psh::SamplerKind, 4>& kinds, std::string& error) {
-    Timed timed(stats_.ns_fs);
     for (const FsMemo& m : fs_memo_) {
         if (m.module != VK_NULL_HANDLE && m.key == key) {
             ++stats_.fs_memo_hits;
@@ -1889,7 +1902,6 @@ VkShaderModule VulkanRenderer::fragment_shader(const psh::Key& key, std::array<p
 }
 
 VkPipeline VulkanRenderer::pipeline(const KelvinState& s, VkShaderModule vs, VkShaderModule fs, VkPrimitiveTopology topology, Surface& t, u32 vertex_layout, std::string& error) {
-    Timed timed(stats_.ns_pipeline);
     struct RasterKey {
         VkShaderModule vs, fs;
         VkRenderPass pass;
@@ -1901,8 +1913,14 @@ VkPipeline VulkanRenderer::pipeline(const KelvinState& s, VkShaderModule vs, VkS
         s.stencil_test(), s.reg(mthd::kStencilFunc), s.reg(mthd::kStencilFuncMask), s.reg(mthd::kStencilMask), s.reg(mthd::kStencilOpFail),
         s.reg(mthd::kStencilOpZfail), s.reg(mthd::kStencilOpZpass), vertex_layout};
     static_assert(std::has_unique_object_representations_v<RasterKey>);
+    static_assert(sizeof(RasterKey) <= sizeof last_raster_key_);
+    if (last_raster_pipeline_ != VK_NULL_HANDLE && std::memcmp(last_raster_key_.data(), &k, sizeof k) == 0) return last_raster_pipeline_;
     std::string key(reinterpret_cast<const char*>(&k), sizeof k);
-    if (auto it = pipelines_.find(key); it != pipelines_.end()) return it->second;
+    if (auto it = pipelines_.find(key); it != pipelines_.end()) {
+        std::memcpy(last_raster_key_.data(), &k, sizeof k);
+        last_raster_pipeline_ = it->second;
+        return it->second;
+    }
     if (auto it = pipelines_pending_.find(key); it != pipelines_pending_.end()) {
         PipelineBuild& b = *it->second;
         if (!b.done.load(std::memory_order_acquire)) return VK_NULL_HANDLE;  // a worker is creating it
@@ -2107,7 +2125,6 @@ bool VulkanRenderer::texture_current(TextureEntry& e) {
 }
 
 const VulkanRenderer::TextureEntry* VulkanRenderer::texture(const KelvinState& s, u32 stage, std::string& error) {
-    Timed timed(stats_.ns_texture);
     const TextureStage ts = s.texture(stage);
     const u32 b = mthd::kTextureBase + stage * mthd::kTextureStride;
     const std::array<u32, 11> regs{s.reg(b),        s.reg(b + 4),  s.reg(b + 8),  s.reg(b + 0xC),  s.reg(b + 0x10), s.reg(b + 0x14),
@@ -2161,10 +2178,7 @@ const VulkanRenderer::TextureEntry* VulkanRenderer::texture(const KelvinState& s
     flush_parked(phys, static_cast<u64>(phys) + length);
     wb_why_ = Stats::kWbAll;
     if (same && sc.entry->valid && !sc.entry->surface && texture_current(*sc.entry)) return sc.entry;
-    struct Ident {
-        u32 phys, format, control1, rect, palette;
-    } id{phys, ts.format, ts.control1, ts.image_rect, ts.palette};
-    std::string key(reinterpret_cast<const char*>(&id), sizeof id);
+    const TextureKey key{phys, ts.format, ts.control1, ts.image_rect, ts.palette};
     auto it = textures_.find(key);
     if (it != textures_.end() && it->second->valid && texture_current(*it->second)) {
         sc = StageCache{regs, phys, length, it->second.get()};
@@ -3233,7 +3247,7 @@ void VulkanRenderer::draw(const KelvinState& s, const DrawBatch& batch) {
     // on, every few hundred draws: the GPU works on them while the CPU goes on, so a count asked for later is usually
     // in already instead of a submit and a wait for the whole batch (5.6 % of a title's CPU thread waited there).
     if (count_draws_ && frames_[slot_].queries >= kSubmitDraws) submit();
-    Timed timed(stats_.ns_draw);
+    LapClock clock(stats_.ns_draw);
     ++stats_.draws;
     ++frame_draws_;
     // The renderer's draw number since it started (unique across frames: the replay's frames and the flips differ).
@@ -3276,12 +3290,11 @@ void VulkanRenderer::draw(const KelvinState& s, const DrawBatch& batch) {
         if (last && newest > last) std::fprintf(stderr, "drawid %u: target %08x RAM written by the CPU or a device since its last draw (generation %u -> %u)\n", draw_id, t->phys, last, newest);
         last = std::max(newest, handles_.write_generation());
     }
-    FetchedVertices v;
-    bool fetched;
-    {
-        Timed timed_fetch(stats_.ns_fetch);
-        fetched = fetch_vertices(s, handles_, MemoryView{ram_, ram_size_}, batch, v);
-    }
+    // The fetched vertices and the host's index list live in members: their buffers are reused draw after draw.
+    FetchedVertices& v = fetched_;
+    clock.skip();
+    const bool fetched = fetch_vertices(s, handles_, MemoryView{ram_, ram_size_}, batch, v);
+    clock.lap(stats_.ns_fetch);
     if (!fetched) {
         note("vertex fetch: " + v.error);
         ++stats_.skipped;
@@ -3293,6 +3306,7 @@ void VulkanRenderer::draw(const KelvinState& s, const DrawBatch& batch) {
     // both compiles start together), then the draw is skipped until they are.
     error.clear();
     VkShaderModule vs = vertex_shader(s, error);
+    clock.lap(stats_.ns_vs);
     if (!vs && !error.empty()) {
         note(error);
         ++stats_.skipped;
@@ -3305,6 +3319,7 @@ void VulkanRenderer::draw(const KelvinState& s, const DrawBatch& batch) {
     if (debug_shadow_pass_) pkey.shadow_compare_func = 7;  // every shadow lookup lit
     std::array<psh::SamplerKind, 4> kinds{};
     VkShaderModule fs = fragment_shader(pkey, kinds, error);
+    clock.lap(stats_.ns_fs);
     if (!fs && !error.empty()) {
         note(error);
         ++stats_.skipped;
@@ -3330,15 +3345,19 @@ void VulkanRenderer::draw(const KelvinState& s, const DrawBatch& batch) {
     }
 
     draw_target_ = nullptr;
+    clock.lap(stats_.ns_texture);
 
-    // Topology and the index list the host understands.
-    auto t_part = std::chrono::steady_clock::now();
-    std::vector<u32> indices = v.indices;
+    // Topology and the index list the host understands: the fetched list itself, unless the primitive needs it
+    // rewritten (then a copy in draw_indices_).
+    const std::vector<u32>* index_list = &v.indices;
     auto sequential = [&]() {
-        if (indices.empty()) {
-            indices.resize(v.count);
-            for (u32 i = 0; i < v.count; ++i) indices[i] = i;
+        if (index_list->empty()) {
+            draw_indices_.resize(v.count);
+            for (u32 i = 0; i < v.count; ++i) draw_indices_[i] = i;
+        } else {
+            draw_indices_ = *index_list;
         }
+        index_list = &draw_indices_;
     };
     VkPrimitiveTopology topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
     switch (v.primitive) {
@@ -3348,28 +3367,29 @@ void VulkanRenderer::draw(const KelvinState& s, const DrawBatch& batch) {
         case Primitive::LineLoop:
             topology = VK_PRIMITIVE_TOPOLOGY_LINE_STRIP;
             sequential();
-            indices.push_back(indices.front());
+            draw_indices_.push_back(draw_indices_.front());
             break;
         case Primitive::Triangles: topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST; break;
         case Primitive::TriangleStrip: case Primitive::QuadStrip: topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP; break;
         case Primitive::TriangleFan: case Primitive::Polygon: topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN; break;
         case Primitive::Quads: {
-            sequential();
-            std::vector<u32> tris;
-            tris.reserve(indices.size() / 4 * 6);
-            for (std::size_t i = 0; i + 3 < indices.size(); i += 4) {
-                tris.insert(tris.end(), {indices[i], indices[i + 1], indices[i + 2], indices[i], indices[i + 2], indices[i + 3]});
-            }
-            indices = std::move(tris);
+            if (index_list->empty()) sequential();
+            const std::vector<u32>& quads = *index_list;
+            quad_indices_.clear();
+            quad_indices_.reserve(quads.size() / 4 * 6);
+            for (std::size_t i = 0; i + 3 < quads.size(); i += 4)
+                quad_indices_.insert(quad_indices_.end(), {quads[i], quads[i + 1], quads[i + 2], quads[i], quads[i + 2], quads[i + 3]});
+            index_list = &quad_indices_;
             topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
             break;
         }
         case Primitive::End: return;
     }
 
-    stats_.ns_indices += ns_since(t_part);
+    clock.lap(stats_.ns_indices);
     error.clear();
     VkPipeline p = pipeline(s, vs, fs, topology, *t, v.enabled, error);
+    clock.lap(stats_.ns_pipeline);
     if (!p && error.empty()) {  // a worker is creating it
         ++stats_.pending_skips;
         return;
@@ -3382,14 +3402,13 @@ void VulkanRenderer::draw(const KelvinState& s, const DrawBatch& batch) {
 
     // Vertex data: the attributes with per-vertex data as vec4s packed in order, then the sixteen constants the others
     // read (binding 1, a stride of zero). Writing every attribute for every vertex cost a draw-heavy title 3 ms a frame.
-    t_part = std::chrono::steady_clock::now();
     const u32 per_vertex = static_cast<u32>(std::popcount(static_cast<u32>(v.enabled)));
     const VkDeviceSize vertex_bytes = static_cast<VkDeviceSize>(v.count) * per_vertex * 16;
     VkDeviceSize vbytes = vertex_bytes + kAttributes * 16, voffset = 0;
     // The rings and the descriptor pool hold one batch of draws. A draw that no longer fits submits the batch so far
     // and moves to the next frame in flight's regions, so a frame can hold any number of draws (only a single draw
     // larger than a ring region is refused below).
-    if (!fits_in_batch(vbytes, indices.size() * 4)) {
+    if (!fits_in_batch(vbytes, index_list->size() * 4)) {
         submit(true);
         ++stats_.batch_flushes;
     }
@@ -3410,13 +3429,13 @@ void VulkanRenderer::draw(const KelvinState& s, const DrawBatch& batch) {
         for (u32 a = 0; a < kAttributes; ++a, d += 4) std::memcpy(d, v.constant[a].data(), 16);
     }
     VkDeviceSize ioffset = 0;
-    if (!indices.empty()) {
-        if (!ring_alloc(index_ring_, indices.size() * 4, 4, ioffset)) {
+    if (!index_list->empty()) {
+        if (!ring_alloc(index_ring_, index_list->size() * 4, 4, ioffset)) {
             note("index ring full for this frame");
             ++stats_.skipped;
             return;
         }
-        std::memcpy(static_cast<u8*>(index_ring_.buffer.mapped) + ioffset, indices.data(), indices.size() * 4);
+        std::memcpy(static_cast<u8*>(index_ring_.buffer.mapped) + ioffset, index_list->data(), index_list->size() * 4);
     }
 
     // Uniforms: built on the CPU, and uploaded only when they differ from the block the frame last uploaded (a
@@ -3458,8 +3477,7 @@ void VulkanRenderer::draw(const KelvinState& s, const DrawBatch& batch) {
         }
     }
 
-    stats_.ns_upload += ns_since(t_part);
-    t_part = std::chrono::steady_clock::now();
+    clock.lap(stats_.ns_upload);
     // Descriptors: the frame's last set serves again when it binds the same uniform offsets, views and samplers.
     VkDescriptorImageInfo imgs[4]{};
     for (u32 i = 0; i < 4; ++i) {
@@ -3497,8 +3515,7 @@ void VulkanRenderer::draw(const KelvinState& s, const DrawBatch& batch) {
         last_set_key_ = dkey;
     }
 
-    stats_.ns_descriptors += ns_since(t_part);
-    t_part = std::chrono::steady_clock::now();
+    clock.lap(stats_.ns_descriptors);
     // Record.
     // A depth test that always passes and writes nothing leaves the buffer alone: its contents do not matter to the
     // draw (Half-Life 2 draws two small targets so over a depth buffer of another shape, each bind a write-back and a
@@ -3571,9 +3588,9 @@ void VulkanRenderer::draw(const KelvinState& s, const DrawBatch& batch) {
     if (count_draws_) {
         fn_->vkCmdBeginQuery(cb_, qf.occlusion, query, dev_.occlusion_precise() ? VK_QUERY_CONTROL_PRECISE_BIT : 0);
     }
-    if (!indices.empty()) {
+    if (!index_list->empty()) {
         fn_->vkCmdBindIndexBuffer(cb_, index_ring_.buffer.buffer, ioffset, VK_INDEX_TYPE_UINT32);
-        fn_->vkCmdDrawIndexed(cb_, static_cast<u32>(indices.size()), 1, 0, 0, 0);
+        fn_->vkCmdDrawIndexed(cb_, static_cast<u32>(index_list->size()), 1, 0, 0, 0);
     } else {
         fn_->vkCmdDraw(cb_, v.count, 1, 0, 0);
     }
@@ -3585,7 +3602,7 @@ void VulkanRenderer::draw(const KelvinState& s, const DrawBatch& batch) {
         last_ticket_ = qf.first_ticket + query;
         next_ticket_ = last_ticket_ + 1;
     }
-    stats_.ns_record += ns_since(t_part);
+    clock.lap(stats_.ns_record);
 }
 
 void VulkanRenderer::write_descriptors(VkDescriptorSet set, VkDeviceSize uoffset_vs, VkDeviceSize uoffset_ps, const VkDescriptorImageInfo* imgs) {

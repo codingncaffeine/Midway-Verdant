@@ -364,8 +364,14 @@ void decode_attribute(const VertexAttribute& a, const u8* p, float out[4]) {
 
 bool fetch_vertices(const KelvinState& state, const HandleResolver& handles, const MemoryView& memory, const DrawBatch& batch,
                     FetchedVertices& out) {
-    out = FetchedVertices{};
+    // Reset field by field: the attribute and index buffers keep their storage for the next draw (a renderer fetches
+    // into the same object every draw). Only the enabled attributes' buffers are read.
     out.primitive = batch.primitive;
+    out.count = 0;
+    out.enabled = 0;
+    out.constant = {};
+    out.indices.clear();
+    out.error.clear();
 
     if (batch.immediate_count) {
         // An attribute no vertex of the batch set keeps the value it had before BEGIN for all of them.
@@ -412,18 +418,29 @@ bool fetch_vertices(const KelvinState& state, const HandleResolver& handles, con
         return true;
     }
 
-    std::vector<u32> indices = batch.indices;
-    for (const auto& [first, count] : batch.ranges)
-        for (u32 i = 0; i < count; ++i) indices.push_back(first + i);
-    if (indices.empty()) {
+    // The batch's indices, then its ranges' vertices in order, rebased on the lowest.
+    u32 lo = ~0u, hi = 0;
+    std::size_t total = batch.indices.size();
+    for (const u32 i : batch.indices) {
+        lo = std::min(lo, i);
+        hi = std::max(hi, i);
+    }
+    for (const auto& [first, count] : batch.ranges) {
+        if (count == 0) continue;
+        total += count;
+        lo = std::min(lo, first);
+        hi = std::max(hi, first + count - 1);
+    }
+    if (total == 0) {
         out.error = "batch without geometry";
         return false;
     }
-    const auto [min_it, max_it] = std::minmax_element(indices.begin(), indices.end());
-    const u32 lo = *min_it, hi = *max_it;
     out.count = hi - lo + 1;
-    out.indices.resize(indices.size());
-    for (std::size_t i = 0; i < indices.size(); ++i) out.indices[i] = indices[i] - lo;
+    out.indices.resize(total);
+    std::size_t n = 0;
+    for (const u32 i : batch.indices) out.indices[n++] = i - lo;
+    for (const auto& [first, count] : batch.ranges)
+        for (u32 i = 0; i < count; ++i) out.indices[n++] = first + i - lo;
 
     const DmaObject dma_a = handles.resolve(state.dma_handle(mthd::kDmaVertexA));
     const DmaObject dma_b = handles.resolve(state.dma_handle(mthd::kDmaVertexB));
@@ -474,7 +491,24 @@ bool fetch_vertices(const KelvinState& state, const HandleResolver& handles, con
         out.enabled = static_cast<u16>(out.enabled | (1u << a));
         auto& dst = out.attribute[a];
         dst.resize(static_cast<std::size_t>(out.count) * 4);
-        for (u32 v = 0; v < out.count; ++v) decode_attribute(fmt, p + static_cast<std::size_t>(v) * stride, &dst[static_cast<std::size_t>(v) * 4]);
+        float* d = dst.data();
+        const u32 comps = std::min<u32>(fmt.size, 4);
+        // The common forms in a loop of their own, as decode_attribute reads them: floats (missing components 0, w 1)
+        // and D3D colours (B G R A bytes read as R G B A); the rest element by element.
+        if (fmt.type == AttribType::Float) {
+            for (u32 v = 0; v < out.count; ++v, d += 4) {
+                d[0] = 0.0f, d[1] = 0.0f, d[2] = 0.0f, d[3] = 1.0f;
+                std::memcpy(d, p + static_cast<std::size_t>(v) * stride, comps * 4);
+            }
+        } else if (fmt.type == AttribType::UbD3d && comps == 4) {
+            for (u32 v = 0; v < out.count; ++v, d += 4) {
+                const u8* e = p + static_cast<std::size_t>(v) * stride;
+                d[0] = static_cast<float>(e[2]) / 255.0f, d[1] = static_cast<float>(e[1]) / 255.0f, d[2] = static_cast<float>(e[0]) / 255.0f,
+                d[3] = static_cast<float>(e[3]) / 255.0f;
+            }
+        } else {
+            for (u32 v = 0; v < out.count; ++v) decode_attribute(fmt, p + static_cast<std::size_t>(v) * stride, &dst[static_cast<std::size_t>(v) * 4]);
+        }
     }
     return true;
 }
