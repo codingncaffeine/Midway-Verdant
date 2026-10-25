@@ -631,6 +631,7 @@ Translation translate(const Key& key) {
     }
     g += "    frag_color = clamp(final_color, 0.0, 1.0);\n";
     if (g.find("vec4 debug_show") != std::string::npos) g += "    frag_color = debug_show;\n";
+    if (key.swap_rb) g += "    frag_color = frag_color.bgra;\n";  // a B8 or G8B8 target: its first channel is blue
     g += "}\n";
     t.glsl = std::move(g);
     return t;

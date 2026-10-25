@@ -169,6 +169,8 @@ public:
         u64 textures_unchanged{0};
         // Instrument: the write-backs a texture forced, by target and texture (what is not sampled in place, and why).
         std::map<std::string, u64> forced_by;
+        // Instrument: the CPU side of storing write-backs in RAM, by target: count and nanoseconds.
+        std::map<std::string, std::pair<u64, u64>> store_cost;
         u64 surface_reloads{0};  // render targets reloaded from RAM after another engine wrote them  // textures whose pages were written but whose bytes hashed the same: kept
         // Write-backs by cause: frame end, a texture sampling the target, the scanout at vblank, a 2D or CPU range,
         // a target relaid out, the idle vblank (all).
@@ -218,6 +220,9 @@ private:
         // up after a load).
         vk::Image lo;
         bool lo_linear{false};  // the device filters the format: the way down is a box filter, not one sample in sc x sc
+        // At sc > 1: a stored-size copy of the depth image, blitted down (NEAREST) for a write-back. Recording one copy
+        // region per stored row cost the driver 5 ms for a 1024 x 1024 buffer at 6x (PGR2 races, each frame).
+        vk::Image zeta_lo;
         u32 pitch{0}, zeta_pitch{0};
         bool swizzled{false};
         u32 color_format{0}, zeta_format{0};
@@ -313,6 +318,9 @@ private:
     void retire(VkFramebuffer& framebuffer);
     void end_pass();
     Surface* target_for(const KelvinState& s);
+    // B8 (R8) and G8B8 (R8G8) targets keep blue in the image's first channel: outputs, masks, clears and blend constants
+    // swap red and blue for them, so each byte in RAM is the one the hardware writes.
+    static bool swaps_rb(const Surface& t) { return t.color_format == 9 || t.color_format == 10; }
     // The rectangle of the target the current draw or clear uses (stored pixels): a pitch-linear target is memory, and
     // a title may draw at an address inside it (a smaller shape at its base, a band further down) with the same pitch,
     // which is a rectangle of the same image, as on the hardware.
@@ -540,6 +548,7 @@ private:
         Surface* surface{nullptr};
         bool zeta{false};
         VkDeviceSize offset{0};  // where its copy lands in the read-back buffer
+        bool rows{false};  // a scaled depth buffer read back a row per region: thinned when stored
     };
     std::vector<PendingWriteBack> write_backs_;
     unsigned wb_why_{Stats::kWbAll};  // the cause the write-backs being queued count under
@@ -596,6 +605,9 @@ private:
     u32 scale_for(VkFormat color, u32 width, u32 height) const;
     // Colour between the scaled image and its stored-size copy (lo): down before a write-back, up after a load.
     bool ensure_lo(Surface& s);
+    // The stored-size depth copy: false when the device cannot blit the format (the rows are read back instead).
+    bool ensure_zeta_lo(Surface& s);
+    void blit_zeta_lo(Surface& s);
     void blit_lo(Surface& s, bool down);
     // The scanout target's scaled picture, read back after its write-back at the vblank into one of the target's two
     // capture buffers, with a fence of its own that the frontend waits for (D36).
@@ -692,6 +704,7 @@ private:
     bool debug_vsh_dump_{false};
     std::unordered_map<VkShaderModule, u32> vs_debug_ids_;  // drawid/vshdump: each vertex shader's dump number
     bool debug_roundtrip_{false};  // MV_RENDER_DEBUG=roundtrip: sampled targets go through RAM as before (an A/B control)
+    bool debug_depth_rows_{false};  // MV_RENDER_DEBUG=depthrows: scaled depth read back a row per region (an A/B control)
     u32 frame_draws_{0};  // draws since the frame began (the index mv-pbcap draws lists)
 };
 

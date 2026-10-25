@@ -815,6 +815,13 @@ RETRO_API void retro_unload_game(void) {
                 std::sort(forced.begin(), forced.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
                 for (std::size_t i = 0; i < forced.size() && i < 8; ++i) log(RETRO_LOG_INFO, "gpu: forced by a texture x%llu: %s", static_cast<unsigned long long>(forced[i].second), forced[i].first.c_str());
             }
+            if (!st.store_cost.empty()) {
+                // Where storing write-backs in RAM went, by target, most first.
+                std::vector<std::pair<std::string, std::pair<mv::u64, mv::u64>>> costs(st.store_cost.begin(), st.store_cost.end());
+                std::sort(costs.begin(), costs.end(), [](const auto& a, const auto& b) { return a.second.second > b.second.second; });
+                for (std::size_t i = 0; i < costs.size() && i < 8; ++i)
+                    log(RETRO_LOG_INFO, "gpu: stored in RAM x%llu, %.3f s: %s", static_cast<unsigned long long>(costs[i].second.first), static_cast<double>(costs[i].second.second) / 1e9, costs[i].first.c_str());
+            }
             log(RETRO_LOG_INFO, "gpu: submits mid-frame: %llu with the draw rings full, %llu with the upload staging full; %llu 2D copies made on the GPU", static_cast<unsigned long long>(st.batch_flushes), static_cast<unsigned long long>(st.staging_flushes), static_cast<unsigned long long>(st.gpu_copies));
             for (const auto& e : st.errors) log(RETRO_LOG_INFO, "gpu: renderer note: %s", e.c_str());
         }

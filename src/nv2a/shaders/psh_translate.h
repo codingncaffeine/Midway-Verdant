@@ -27,7 +27,9 @@ struct Key {
     bool alpha_test{false};
     bool smooth_shading{true};
     bool fog_enable{false};
-    bool unused{false};  // fills the last word: the renderer keys its shader cache by the key's bytes
+    // The target keeps blue in its first channel (B8 as R8, G8B8 as R8G8): red and blue swapped on the way out. Also fills
+    // the last word: the renderer keys its shader cache by the key's bytes.
+    bool swap_rb{false};
     bool operator==(const Key&) const = default;
 };
 static_assert(std::has_unique_object_representations_v<Key>, "a padding byte would make equal keys differ as bytes");

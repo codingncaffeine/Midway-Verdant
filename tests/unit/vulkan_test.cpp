@@ -953,6 +953,76 @@ TEST(Vulkan, TheInternalResolutionChangesAtTheVblank) {
     EXPECT_EQ(pixel_at(f.ram, 60, 60) & 0x00FFFFFFu, 0x00FF00u) << "the triangle came back from RAM";
 }
 
+// A scaled depth buffer reaches RAM through its stored-size copy, blitted down on the GPU: the same bytes as the rows
+// read back one copy region each and thinned on the CPU (MV_RENDER_DEBUG=depthrows), for a sloped depth in 16 and 24
+// bits with stencil. At an odd scale exactly; at an even one the device may take either texel beside the block's middle.
+TEST(Vulkan, AScaledDepthBufferReachesRamThroughItsStoredSizeCopy) {
+    for (u32 scale : {3u, 6u})
+        for (u32 zfmt : {1u, 2u}) {
+            SCOPED_TRACE(std::format("scale {} zeta format {}", scale, zfmt));
+            const float zmax = zfmt == 1 ? 65535.0f : 16777215.0f;
+            auto depth_in_ram = [&](bool rows, std::vector<u8>& out) {
+                if (rows) ::setenv("MV_RENDER_DEBUG", "depthrows", 1);
+                ScaledFixture f;
+                std::string error;
+                const bool ok = f.init(scale, error);
+                ::unsetenv("MV_RENDER_DEBUG");
+                if (!ok) return false;
+                Kelvin& k = f.k;
+                setup_target(k);
+                k.method(mthd::kSurfaceFormat, (zfmt << 4) | 0x100 | 8);
+                k.method(mthd::kZstencilClear, zfmt == 1 ? 0xFFFFu : 0xFFFFFF5Au);
+                k.method(mthd::kClearRectH, 63u << 16);
+                k.method(mthd::kClearRectV, 63u << 16);
+                k.method(mthd::kClearSurface, 0x03);
+                k.method(mthd::kDepthTestEnable, 1);
+                k.method(mthd::kDepthFunc, 0x207);
+                k.method(mthd::kDepthMask, 1);
+                k.method(mthd::kBeginEnd, 5);
+                k.method(mthd::kDiffuse4ub, 0xFF00FF00);
+                for (const auto& p : {std::array<float, 3>{0.0f, 0.0f, 0.2f}, std::array<float, 3>{128.0f, 0.0f, 0.8f}, std::array<float, 3>{0.0f, 128.0f, 0.5f}}) {
+                    k.method(mthd::kVertexData4fM + 0, bits(p[0]));
+                    k.method(mthd::kVertexData4fM + 4, bits(p[1]));
+                    k.method(mthd::kVertexData4fM + 8, bits(p[2] * zmax));
+                    k.method(mthd::kVertexData4fM + 12, bits(1.0f));
+                }
+                k.method(mthd::kBeginEnd, 0);
+                f.renderer->end_frame();
+                f.renderer->write_back_all();
+                for (const auto& e : f.renderer->stats().errors) ADD_FAILURE() << "renderer: " << e;
+                out.assign(f.ram.begin() + 0x20000, f.ram.begin() + 0x20000 + 64 * 256);
+                return true;
+            };
+            std::vector<u8> blit, rows;
+            if (!depth_in_ram(false, blit) || !depth_in_ram(true, rows)) GTEST_SKIP() << "no Vulkan device";
+            const u32 bpp = zfmt == 1 ? 2u : 4u;
+            u32 misses = 0, far = 0;
+            u64 worst = 0;
+            for (u32 y = 0; y < 64; ++y)
+                for (u32 x = 0; x < 64; ++x) {
+                    u32 a = 0, b = 0;
+                    std::memcpy(&a, &blit[y * 256 + x * bpp], bpp);
+                    std::memcpy(&b, &rows[y * 256 + x * bpp], bpp);
+                    if (a == b) continue;
+                    ++misses;
+                    if (zfmt == 2 && (a & 0xFF) != (b & 0xFF)) ++far;  // the stencil is flat: never differs
+                    const u64 d = zfmt == 1 ? static_cast<u64>(a > b ? a - b : b - a) : static_cast<u64>((a >> 8) > (b >> 8) ? (a >> 8) - (b >> 8) : (b >> 8) - (a >> 8));
+                    worst = std::max(worst, d);
+                }
+            EXPECT_EQ(far, 0u);
+            u32 z;
+            std::memcpy(&z, &blit[30 * 256 + 10 * bpp], bpp);
+            if (zfmt == 1) z &= 0xFFFF;
+            EXPECT_NE(z, zfmt == 1 ? 0xFFFFu : 0xFFFFFF5Au) << "the triangle's depth reached RAM";
+            if (scale % 2) {
+                EXPECT_EQ(misses, 0u);
+            } else {
+                // One texel of the slope at the internal resolution: (0.6 + 0.3) / 128 of the range over sc texels.
+                EXPECT_LE(worst, static_cast<u64>(zmax * 0.9f / 128.0f / static_cast<float>(scale)) + 2u);
+            }
+        }
+}
+
 // A large target at a high scale: its depth rows do not fit the read-back buffer at once (1024 x 1024 at 4x is 21 MB of
 // rows) and reach RAM in bands, exactly.
 TEST(Vulkan, AScaledDepthBufferLargerThanTheReadBackReachesRamInBands) {
@@ -1678,4 +1748,126 @@ TEST(Vulkan, ATextureWrittenWithTheSameBytesIsKeptAndWithNewOnesDecodedAgain) {
     EXPECT_EQ(renderer.stats().textures_decoded, decoded + 1) << "decoded again";
     EXPECT_EQ(pixel_at(ram, 8, 8) & 0x00FFFFFFu, 0xFF0000u) << "the new texels drawn";
     for (const auto& e : renderer.stats().errors) ADD_FAILURE() << "renderer: " << e;
+}
+
+// A cube map of six R5G6B5 render targets (PGR2's reflections) is put together on the GPU like a 32-bit one: before,
+// each face went through RAM every frame.
+TEST(Vulkan, ACubeMapOfSix16BitTargetsIsPutTogetherOnTheGpu) {
+    for (u32 scale : {1u, 2u}) {
+        SCOPED_TRACE(std::format("scale {}", scale));
+        TextureShaderFixture f;
+        std::string error;
+        if (!f.init(error)) GTEST_SKIP() << "no Vulkan device: " << error;
+        f.renderer->set_resolution_scale(scale);
+        Kelvin& k = f.k;
+        constexpr u32 kCube = 0x200000, kFace = 16 * 16 * 2;
+        const u32 clears[6] = {0xF800u, 0x07E0u, 0x001Fu, 0xFFE0u, 0x07FFu, 0xF81Fu};  // 5-6-5: red green blue yellow cyan magenta
+        const u32 colours[6] = {0xFFFF0000u, 0xFF00FF00u, 0xFF0000FFu, 0xFFFFFF00u, 0xFF00FFFFu, 0xFFFF00FFu};
+        for (u32 face = 0; face < 6; ++face) {
+            k.method(mthd::kSurfaceFormat, (4u << 24) | (4u << 16) | 0x200u | 0x3u);  // swizzled 16x16 R5G6B5, no depth
+            k.method(mthd::kSurfaceClipH, 16u << 16);
+            k.method(mthd::kSurfaceClipV, 16u << 16);
+            k.method(mthd::kSurfaceColorOffset, kCube + face * kFace);
+            k.method(mthd::kColorClear, clears[face]);
+            k.method(mthd::kClearRectH, 15u << 16);
+            k.method(mthd::kClearRectV, 15u << 16);
+            k.method(mthd::kClearSurface, 0xF0);
+        }
+        setup_target(k);
+        load_texcoord_program(k);
+        const u32 b = mthd::kTextureBase;
+        k.method(b + 0x0, kCube);
+        k.method(b + 0x4, (4u << 24) | (4u << 20) | (1u << 16) | (0x05u << 8) | (2u << 4) | (1u << 2) | 1u);  // a 16x16 R5G6B5 cube map
+        k.method(b + 0x8, 0x00030303);
+        k.method(b + 0xC, 0x40000000);
+        k.method(b + 0x14, (1u << 24) | (1u << 16));
+        k.method(mthd::kShaderStageProgram, 3u);
+        output_texture_stage(k, 0);
+        const float dirs[6][3] = {{1, 0, 0}, {-1, 0, 0}, {0, 1, 0}, {0, -1, 0}, {0, 0, 1}, {0, 0, -1}};
+        for (u32 face = 0; face < 6; ++face) {
+            texcoord(k, 0, dirs[face][0], dirs[face][1], dirs[face][2], 1.0f);
+            draw_full_triangle(k, f.ram);
+            f.renderer->end_frame();
+            EXPECT_EQ(pixel_at(f.ram, 8, 8), colours[face]) << "face " << face;
+        }
+        for (const auto& e : f.renderer->stats().errors) ADD_FAILURE() << "renderer: " << e;
+        EXPECT_GE(f.renderer->stats().cube_assemblies, 1u);
+        EXPECT_EQ(f.renderer->stats().writebacks_by[VulkanRenderer::Stats::kWbTexture], 0u) << "no face went through RAM";
+    }
+}
+
+// A B8 render target sampled as a Y8 texture (PGR2) is read in place through a (Y, Y, Y, 1) view.
+TEST(Vulkan, AB8TargetSampledAsY8IsReadInPlace) {
+    for (u32 scale : {1u, 2u}) {
+        SCOPED_TRACE(std::format("scale {}", scale));
+        TextureShaderFixture f;
+        std::string error;
+        if (!f.init(error)) GTEST_SKIP() << "no Vulkan device: " << error;
+        f.renderer->set_resolution_scale(scale);
+        Kelvin& k = f.k;
+        constexpr u32 kB8 = 0x200000;
+        k.method(mthd::kSurfaceFormat, 0x00000100u | 0x9u);  // pitch-linear B8, no depth
+        k.method(mthd::kSurfaceClipH, 64u << 16);
+        k.method(mthd::kSurfaceClipV, 64u << 16);
+        k.method(mthd::kSurfacePitch, (64u << 16) | 64u);
+        k.method(mthd::kSurfaceColorOffset, kB8);
+        k.method(mthd::kColorClear, 0x00000080u);  // B8 takes the blue byte
+        k.method(mthd::kClearRectH, 63u << 16);
+        k.method(mthd::kClearRectV, 63u << 16);
+        k.method(mthd::kClearSurface, 0xF0);
+        setup_target(k);
+        load_texcoord_program(k);
+        const u32 b = mthd::kTextureBase;
+        k.method(b + 0x0, kB8);
+        k.method(b + 0x4, (1u << 16) | (0x13u << 8) | (2u << 4) | 1u);  // linear Y8, one level
+        k.method(b + 0x8, 0x00030303);
+        k.method(b + 0xC, 0x40000000);
+        k.method(b + 0x10, 64u << 16);  // pitch
+        k.method(b + 0x14, (1u << 24) | (1u << 16));
+        k.method(b + 0x1C, (64u << 16) | 64u);  // 64x64
+        k.method(mthd::kShaderStageProgram, 1u);
+        output_texture_stage(k, 0);
+        texcoord(k, 0, 8.0f, 8.0f, 0.0f, 1.0f);
+        draw_full_triangle(k, f.ram);
+        f.renderer->end_frame();
+        for (const auto& e : f.renderer->stats().errors) ADD_FAILURE() << "renderer: " << e;
+        EXPECT_EQ(pixel_at(f.ram, 8, 8), 0xFF808080u) << "(Y, Y, Y, 1)";
+        EXPECT_EQ(f.renderer->stats().writebacks_by[VulkanRenderer::Stats::kWbTexture], 0u) << "not through RAM";
+    }
+}
+
+// A B8 target stores the colour's blue byte (the hardware's single channel): a draw writing blue alone (colour mask B)
+// lands it in RAM, and red is not what it keeps. Its R8 image swaps red and blue on the way in and out.
+TEST(Vulkan, AB8TargetKeepsTheBlueByteOfADrawThatWritesBlueAlone) {
+    for (u32 scale : {1u, 2u}) {
+        SCOPED_TRACE(std::format("scale {}", scale));
+        ScaledFixture f;
+        std::string error;
+        if (!f.init(scale, error)) GTEST_SKIP() << "no Vulkan device: " << error;
+        Kelvin& k = f.k;
+        constexpr u32 kB8 = 0x200000;
+        setup_target(k);
+        k.method(mthd::kSurfaceFormat, 0x00000100u | 0x9u);  // pitch-linear B8, no depth
+        k.method(mthd::kSurfacePitch, (64u << 16) | 64u);
+        k.method(mthd::kSurfaceColorOffset, kB8);
+        k.method(mthd::kColorClear, 0x00000011u);
+        k.method(mthd::kClearRectH, 63u << 16);
+        k.method(mthd::kClearRectV, 63u << 16);
+        k.method(mthd::kClearSurface, 0xF0);
+        k.method(mthd::kColorMask, 0x00000001u);  // blue alone
+        k.method(mthd::kBeginEnd, 5);
+        k.method(mthd::kDiffuse4ub, 0xFF902010u);  // A B G R: blue 0x90, green 0x20, red 0x10
+        for (const auto& p : {std::array<float, 2>{0.0f, 0.0f}, std::array<float, 2>{64.0f, 0.0f}, std::array<float, 2>{0.0f, 64.0f}}) {
+            k.method(mthd::kVertexData4fM + 0, bits(p[0]));
+            k.method(mthd::kVertexData4fM + 4, bits(p[1]));
+            k.method(mthd::kVertexData4fM + 8, bits(0.0f));
+            k.method(mthd::kVertexData4fM + 12, bits(1.0f));
+        }
+        k.method(mthd::kBeginEnd, 0);
+        f.renderer->end_frame();
+        f.renderer->write_back_all();
+        for (const auto& e : f.renderer->stats().errors) ADD_FAILURE() << "renderer: " << e;
+        EXPECT_EQ(f.ram[kB8 + 8 * 64 + 8], 0x90u) << "the blue byte drawn";
+        EXPECT_EQ(f.ram[kB8 + 60 * 64 + 60], 0x11u) << "outside the triangle: the clear's blue byte";
+    }
 }
