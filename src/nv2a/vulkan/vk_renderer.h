@@ -44,14 +44,14 @@ public:
     // device's limit (the libretro core's "Anisotropic filtering" option).
     void set_min_anisotropy(u32 n) { min_anisotropy_.store(std::max(n, 1u), std::memory_order_relaxed); }  // any thread: new samplers take it
     // Internal resolution (PLAN D34, the libretro core's option; any thread): render targets drawn at `s` times their
-    // size (1-4), RAM still at the console's. A change takes effect at the next vblank, where every target is written
+    // size (1-8), RAM still at the console's. A change takes effect at the next vblank, where every target is written
     // back and dropped (each comes back from RAM at the new scale), or at once while there are no targets yet.
-    void set_resolution_scale(u32 s) { requested_scale_.store(std::clamp(s, 1u, 4u), std::memory_order_relaxed); }
+    void set_resolution_scale(u32 s) { requested_scale_.store(std::clamp(s, 1u, 8u), std::memory_order_relaxed); }
     // The scanned-out picture at the internal resolution: the target holding the scanout as read back at the last
     // vblank, cropped to the scanout (w x h pixels of bpp bytes at phys, rows pitch bytes apart in RAM), as `scale`
-    // x w by `scale` x h pixels in the frame buffer's format (rows tightly packed). False at 1x, or when RAM holds the
+    // x w by `scale` x h XRGB8888 pixels (alpha clear, rows tightly packed). False at 1x, or when RAM holds the
     // picture (no target there, or another engine wrote it since): the caller widens the RAM picture instead.
-    bool scaled_scanout(u32 phys, u32 pitch, u32 bpp, u32 w, u32 h, std::vector<u8>& pixels, u32& scale) const;
+    bool scaled_scanout(u32 phys, u32 pitch, u32 bpp, bool rgb565, u32 w, u32 h, std::vector<u32>& xrgb, u32& scale) const;
 
     void clear(const KelvinState& state, u32 clear_bits) override;
     void draw(const KelvinState& state, const DrawBatch& batch) override;
@@ -395,7 +395,7 @@ private:
         Surface* surface{nullptr};
         bool zeta{false};
         VkDeviceSize offset{0};  // where its copy lands in the read-back buffer
-        bool display{false};     // the scaled picture of the scanout target, in display_rb_ (capture_display)
+        bool display{false};     // the scaled picture of the scanout target, into its capture's buffer (capture_display)
     };
     std::vector<PendingWriteBack> write_backs_;
     unsigned wb_why_{Stats::kWbAll};  // the cause the write-backs being queued count under
@@ -453,24 +453,26 @@ private:
     // Colour between the scaled image and its stored-size copy (lo): down before a write-back, up after a load.
     bool ensure_lo(Surface& s);
     void blit_lo(Surface& s, bool down);
-    // The scanout target's scaled picture, read back at the vblank beside its write-back (display_rb_ holds it until
-    // finish_write_backs stores it in captures_, which scaled_scanout reads from another thread).
+    // The scanout target's scaled picture, read back at the vblank beside its write-back into its capture's buffer, which
+    // scaled_scanout reads in place from another thread once finish_write_backs has marked it stored.
     void capture_display(Surface& s);
     void store_display(Surface& s);
     // A scaled target's depth write-back: the middle row of every sc-row block, whole (depth words, then stencil bytes,
     // rows padded to four bytes), then thinned to the stored size in the layout store_zeta takes.
     std::size_t zeta_rows_bytes(const Surface& s) const;
-    void read_back_zeta_rows(Surface& s, VkDeviceSize offset);
+    void read_back_zeta_rows(Surface& s, VkDeviceSize offset, u32 y0, u32 rows);
+    void thin_zeta_rows_into(const Surface& s, const u8* in, u32 y0, u32 rows, u8* out) const;
+    void write_back_zeta_banded(Surface& s);  // rows too many for the read-back buffer at once: in bands, synchronously
     std::vector<u8> thin_zeta_rows(const Surface& s, const u8* rows) const;
     struct Capture {
         u32 phys{0}, width{0}, height{0}, pitch{0}, bpp{0}, sc{1};
+        bool valid{false};         // the buffer holds the picture these describe (false while a copy is on its way)
         u64 serial{0};             // the target's draw serial when read
-        std::vector<u8> pixels;    // sc x width by sc x height, tightly packed
+        vk::Buffer buffer;         // sc x width by sc x height, tightly packed (host-visible: read in place)
     };
     std::vector<Capture> captures_;  // the last few targets scanned out (a double or triple buffer), newest last
     u32 shown_{0};  // the capture that holds the picture the last vblank scanned out (by its target's address; 0: RAM does)
     mutable std::mutex display_mutex_;
-    vk::Buffer display_rb_;
     u32 zc_capacity_{0};  // texels the depth-to-colour buffers hold
     std::unordered_map<std::string, std::shared_ptr<PendingShader>> vs_pending_, fs_pending_;
     std::unordered_map<std::string, std::shared_ptr<PipelineBuild>> pipelines_pending_;

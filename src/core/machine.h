@@ -101,7 +101,7 @@ struct MachineConfig {
     bool async_shaders{false};
     // The least anisotropic filtering a linearly filtered texture gets (1 = what each texture asks for).
     u32 anisotropy{1};
-    // The internal resolution (PLAN D34): render targets at this many times their size, 1-4 (the fast core only; the
+    // The internal resolution (PLAN D34): render targets at this many times their size, 1-8 (the fast core only; the
     // accurate core always renders at 1x).
     u32 resolution_scale{1};
     // Pacing of a CPU that runs free (the fast mode with its guest clock): frame steps stop the CPU at every vblank

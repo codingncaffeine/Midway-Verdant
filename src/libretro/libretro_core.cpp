@@ -58,7 +58,6 @@ std::atomic<bool> direct_audio{false};
 // The internal resolution option (PLAN D34): the frame is res_scale times the scanout each way. The fast core only.
 unsigned res_scale = 1;
 bool fast_core = true;
-std::vector<mv::u8> scaled;  // the scanned-out target's picture at the internal resolution
 constexpr unsigned kPads = 4;
 unsigned pads_plugged = 1;
 // Frame pipelining: the CPU is let into the next frame before retro_run returns, up to the vblank it holds at.
@@ -118,7 +117,7 @@ bool direct_mix_option() {
 
 unsigned resolution_option() {
     const char* r = option("midway_verdant_resolution");
-    return r && r[0] >= '1' && r[0] <= '4' ? static_cast<unsigned>(r[0] - '0') : 1u;
+    return r && r[0] >= '1' && r[0] <= '8' ? static_cast<unsigned>(r[0] - '0') : 1u;
 }
 
 unsigned anisotropy_option() {
@@ -208,7 +207,8 @@ void grab_frame() {
     // holds (the CPU or a blit wrote it, nothing drew it) is widened, each pixel to a block.
     mv::u32 sc = 1;
     const mv::pgraph::VulkanRenderer* renderer = machine->renderer();
-    const bool rendered = res_scale > 1 && renderer && renderer->scaled_scanout(start, pitch, bpp, w, h, scaled, sc);
+    // The rendered picture goes straight into the frame (at 8x it is 78 MB: one pass, alpha cleared on the way).
+    const bool rendered = res_scale > 1 && renderer && renderer->scaled_scanout(start, pitch, bpp, gpu.scanout_rgb565(), w, h, frame, sc);
     if (!rendered) sc = res_scale;
     const mv::u32 fw = w * sc, fh = h * sc;
     frame_w = fw;
@@ -216,7 +216,7 @@ void grab_frame() {
     frame.resize(static_cast<std::size_t>(fw) * fh);
     mv::u8* out = reinterpret_cast<mv::u8*>(frame.data());
     if (rendered) {
-        mv::scanout_to_xrgb(scaled.data(), fw * bpp, bpp, gpu.scanout_rgb565(), fw, fh, out);
+        // In the frame already.
     } else if (sc > 1) {
         composed.resize(static_cast<std::size_t>(w) * h * 4);
         mv::scanout_to_xrgb(fb, pitch, bpp, gpu.scanout_rgb565(), w, h, composed.data());
@@ -230,18 +230,22 @@ void grab_frame() {
         mv::scanout_to_xrgb(fb, pitch, bpp, gpu.scanout_rgb565(), w, h, out);
     }
     if (const auto lut = gpu.gamma_lut()) mv::apply_gamma(*lut, out, fw * 4, fw, fh);
-    if (auto ov = gpu.overlay()) {
+    const auto ov = gpu.overlay();
+    if (ov) {
         // The overlay's rectangle and steps are in scanout pixels: sc times as many at the internal resolution.
-        ov->out_x *= sc;
-        ov->out_y *= sc;
-        ov->out_w *= sc;
-        ov->out_h *= sc;
-        ov->dsdx /= sc;
-        ov->dtdy /= sc;
-        mv::draw_overlay(*ov, bus.ram(), bus.ram_size(), out, fw * 4, fw, fh);
+        mv::Overlay o = *ov;
+        o.out_x *= sc;
+        o.out_y *= sc;
+        o.out_w *= sc;
+        o.out_h *= sc;
+        o.dsdx /= sc;
+        o.dtdy /= sc;
+        mv::draw_overlay(o, bus.ram(), bus.ram_size(), out, fw * 4, fw, fh);
     }
-    // The scanout ignores the alpha byte; the frontend's XRGB8888 wants it clear of meaning too.
-    for (auto& px : frame) px &= 0x00FFFFFFu;
+    // The scanout ignores the alpha byte; the frontend's XRGB8888 wants it clear of meaning too (a rendered 32-bit
+    // picture came with it cleared).
+    if (!(rendered && bpp == 4) || ov)
+        for (auto& px : frame) px &= 0x00FFFFFFu;
 }
 
 // The frame's geometry follows the internal resolution: the base is the console's 640x480 times it, the largest the
@@ -288,7 +292,7 @@ RETRO_API void retro_set_environment(retro_environment_t cb) {
         {"midway_verdant_pipeline", "Run the next frame while the frontend shows this one (faster, up to a frame more input lag); enabled|disabled"},
         {"midway_verdant_cpu", "CPU; fast (hardware virtualization)|accurate (cycle-counted, recompiled)"},
         {"midway_verdant_disc_speed", "Disc loading; fast (8x the console's drive)|console speed"},
-        {"midway_verdant_resolution", "Internal resolution (the fast CPU only); 1x (native)|2x|3x|4x"},
+        {"midway_verdant_resolution", "Internal resolution (the fast CPU only); 1x (native)|2x|4x|6x|8x"},
         {"midway_verdant_anisotropy", "Anisotropic filtering; off (as the game asks)|2x|4x|8x|16x"},
         {"midway_verdant_shaders", "Shader compiling; in the background (no stutter; a new effect can appear a frame late)|in the frame (stutters the first time a scene is seen)"},
         {"midway_verdant_audio", "Audio; console (DSP effects such as reverb)|direct mix (every voice straight to stereo, no DSP effects)"},

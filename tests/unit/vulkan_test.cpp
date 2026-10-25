@@ -734,7 +734,7 @@ namespace {
 // A renderer whose targets are drawn at `scale` times their size.
 struct ScaledFixture {
     vk::Device device;
-    std::vector<u8> ram = std::vector<u8>(4u << 20, 0);
+    std::vector<u8> ram = std::vector<u8>(16u << 20, 0);
     RamResolver handles;
     std::unique_ptr<VulkanRenderer> renderer;
     Kelvin k;
@@ -772,7 +772,7 @@ void draw_half_triangle(Kelvin& k) {
 // What a scaled target leaves in RAM is what a 1x target would: clears in every format, a flat draw into a two-byte
 // format, and depth with its stencil.
 TEST(Vulkan, AScaledTargetReachesRamAsA1xTargetWould) {
-    for (u32 scale : {2u, 3u, 4u}) {
+    for (u32 scale : {2u, 3u, 4u, 8u}) {
         SCOPED_TRACE(std::format("scale {}", scale));
         ScaledFixture f;
         std::string error;
@@ -829,7 +829,7 @@ TEST(Vulkan, AScaledTargetReachesRamAsA1xTargetWould) {
 // A scaled target loads what RAM holds (each pixel widened to a block) and writes back exactly those bytes around
 // what it drew: colour and depth.
 TEST(Vulkan, AScaledTargetKeepsRamsPixelsAroundADraw) {
-    for (u32 scale : {2u, 3u, 4u}) {
+    for (u32 scale : {2u, 3u, 4u, 8u}) {
         SCOPED_TRACE(std::format("scale {}", scale));
         ScaledFixture f;
         std::string error;
@@ -890,14 +890,13 @@ TEST(Vulkan, TheScanoutPictureIsTheScaledImage) {
     f.renderer->flush_frame();
     ASSERT_TRUE(f.renderer->write_back_at(0x10000));
     for (const auto& e : f.renderer->stats().errors) ADD_FAILURE() << "renderer: " << e;
-    std::vector<u8> px;
+    std::vector<u32> px;
     u32 scale = 0;
-    ASSERT_TRUE(f.renderer->scaled_scanout(0x10000, 256, 4, 64, 64, px, scale));
+    ASSERT_TRUE(f.renderer->scaled_scanout(0x10000, 256, 4, false, 64, 64, px, scale));
     EXPECT_EQ(scale, 2u);
-    ASSERT_EQ(px.size(), 128u * 128u * 4u);
+    ASSERT_EQ(px.size(), 128u * 128u);
     auto at = [&](u32 x, u32 y) {
-        u32 v;
-        std::memcpy(&v, &px[(y * 128 + x) * 4], 4);
+        const u32 v = px[y * 128 + x];
         return v & 0x00FFFFFFu;
     };
     EXPECT_EQ(at(8, 8), 0x000080u);
@@ -917,11 +916,11 @@ TEST(Vulkan, TheScanoutPictureIsTheScaledImage) {
         for (u32 x = 0; x < 64; ++x) green_1x += (pixel_at(f.ram, x, y) & 0x00FFFFFFu) == 0x00FF00u;
     EXPECT_GT(odd_edges, 16u) << "the edge steps on the image's own pixels";
     EXPECT_NEAR(static_cast<double>(green), 4.0 * green_1x, 2.0 * 128) << "the same triangle, four times the pixels (within an edge)";
-    EXPECT_FALSE(f.renderer->scaled_scanout(0x10100, 256, 4, 64, 64, px, scale)) << "a scanout one line down runs past the target";
+    EXPECT_FALSE(f.renderer->scaled_scanout(0x10100, 256, 4, false, 64, 64, px, scale)) << "a scanout one line down runs past the target";
     // Another engine writes the target's memory: RAM holds the picture until the target is drawn again.
     f.renderer->invalidate(0x10000, 64 * 256);
     ASSERT_TRUE(f.renderer->write_back_at(0x10000));
-    EXPECT_FALSE(f.renderer->scaled_scanout(0x10000, 256, 4, 64, 64, px, scale));
+    EXPECT_FALSE(f.renderer->scaled_scanout(0x10000, 256, 4, false, 64, 64, px, scale));
 }
 
 // The scale changes while targets live: at the vblank they reach RAM and go, and come back from RAM at the new size.
@@ -933,9 +932,9 @@ TEST(Vulkan, TheInternalResolutionChangesAtTheVblank) {
     draw_half_triangle(f.k);
     f.renderer->flush_frame();
     ASSERT_TRUE(f.renderer->write_back_at(0x10000));
-    std::vector<u8> px;
+    std::vector<u32> px;
     u32 scale = 0;
-    EXPECT_FALSE(f.renderer->scaled_scanout(0x10000, 256, 4, 64, 64, px, scale)) << "1x: RAM holds the picture";
+    EXPECT_FALSE(f.renderer->scaled_scanout(0x10000, 256, 4, false, 64, 64, px, scale)) << "1x: RAM holds the picture";
     const std::vector<u8> before(f.ram.begin() + 0x10000, f.ram.begin() + 0x10000 + 64 * 256);
     f.renderer->set_resolution_scale(3);
     EXPECT_FALSE(f.renderer->write_back_at(0x10000)) << "the targets went at the change";
@@ -947,8 +946,56 @@ TEST(Vulkan, TheInternalResolutionChangesAtTheVblank) {
     f.renderer->flush_frame();
     ASSERT_TRUE(f.renderer->write_back_at(0x10000));
     for (const auto& e : f.renderer->stats().errors) ADD_FAILURE() << "renderer: " << e;
-    ASSERT_TRUE(f.renderer->scaled_scanout(0x10000, 256, 4, 64, 64, px, scale));
+    ASSERT_TRUE(f.renderer->scaled_scanout(0x10000, 256, 4, false, 64, 64, px, scale));
     EXPECT_EQ(scale, 3u);
     EXPECT_EQ(pixel_at(f.ram, 4, 4), 0xFFFF0000u);
     EXPECT_EQ(pixel_at(f.ram, 60, 60) & 0x00FFFFFFu, 0x00FF00u) << "the triangle came back from RAM";
+}
+
+// A large target at a high scale: its depth rows do not fit the read-back buffer at once (1024 x 1024 at 4x is 21 MB of
+// rows) and reach RAM in bands, exactly.
+TEST(Vulkan, AScaledDepthBufferLargerThanTheReadBackReachesRamInBands) {
+    ScaledFixture f;
+    std::string error;
+    if (!f.init(4, error)) GTEST_SKIP() << "no Vulkan device: " << error;
+    Kelvin& k = f.k;
+    constexpr u32 kColor = 0x100000, kZeta = 0x600000, kSize = 1024, kPitch = kSize * 4;
+    auto zpattern = [](u32 x, u32 y) { return ((x * 977u + y * 131071u) & 0xFFFFFFu) << 8 | ((x + 3 * y) & 0xFFu); };
+    for (u32 y = 0; y < kSize; ++y)
+        for (u32 x = 0; x < kSize; ++x) {
+            const u32 z = zpattern(x, y);
+            std::memcpy(&f.ram[kZeta + y * kPitch + x * 4], &z, 4);
+        }
+    setup_target(k, 8, kColor);
+    k.method(mthd::kSurfaceClipH, kSize << 16);
+    k.method(mthd::kSurfaceClipV, kSize << 16);
+    k.method(mthd::kSurfacePitch, (kPitch << 16) | kPitch);
+    k.method(mthd::kSurfaceZetaOffset, kZeta);
+    k.method(mthd::kDepthTestEnable, 1);
+    k.method(mthd::kDepthFunc, 0x207);
+    k.method(mthd::kDepthMask, 1);
+    k.method(mthd::kBeginEnd, 5);
+    k.method(mthd::kDiffuse4ub, 0xFF00FF00);
+    for (const auto& p : {std::array<float, 2>{0.0f, 0.0f}, std::array<float, 2>{16.0f, 0.0f}, std::array<float, 2>{0.0f, 16.0f}}) {
+        k.method(mthd::kVertexData4fM + 0, bits(p[0]));
+        k.method(mthd::kVertexData4fM + 4, bits(p[1]));
+        k.method(mthd::kVertexData4fM + 8, bits(0.25f * 16777215.0f));
+        k.method(mthd::kVertexData4fM + 12, bits(1.0f));
+    }
+    k.method(mthd::kBeginEnd, 0);
+    f.renderer->end_frame();
+    f.renderer->write_back_all();
+    for (const auto& e : f.renderer->stats().errors) ADD_FAILURE() << "renderer: " << e;
+    u32 misses = 0;
+    for (u32 y = 0; y < kSize; ++y)
+        for (u32 x = 0; x < kSize; ++x) {
+            if (x + y < 20) continue;
+            u32 z;
+            std::memcpy(&z, &f.ram[kZeta + y * kPitch + x * 4], 4);
+            misses += z != zpattern(x, y);
+        }
+    EXPECT_EQ(misses, 0u);
+    u32 z;
+    std::memcpy(&z, &f.ram[kZeta + 2 * kPitch + 2 * 4], 4);
+    EXPECT_NEAR(static_cast<double>(z >> 8), 0x400000, 2.0) << "the triangle's depth";
 }

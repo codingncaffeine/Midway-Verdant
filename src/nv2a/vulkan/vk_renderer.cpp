@@ -11,6 +11,7 @@
 
 #include "debug/png.h"
 #include "nv2a/shaders/glsl_compiler.h"
+#include "nv2a/scanout.h"
 
 namespace mv::pgraph {
 
@@ -251,7 +252,7 @@ VulkanRenderer::~VulkanRenderer() {
     dev_.destroy_buffer(uniform_ring_.buffer);
     dev_.destroy_buffer(staging_.buffer);
     dev_.destroy_buffer(readback_);
-    dev_.destroy_buffer(display_rb_);
+    for (Capture& c : captures_) dev_.destroy_buffer(c.buffer);
     for (Frame& fr : frames_) {
         if (fr.pool) f.vkDestroyDescriptorPool(dev_.device(), fr.pool, nullptr);
         if (fr.fence) f.vkDestroyFence(dev_.device(), fr.fence, nullptr);
@@ -1028,14 +1029,18 @@ void VulkanRenderer::queue_write_back_zeta(Surface& s) {
     // D16; a 24-bit or float depth copies as a 32-bit word, followed by the stencil bytes. A scaled target's copy is
     // every sc-th row whole (zeta_rows), thinned to its stored size when stored.
     const std::size_t bytes = s.sc > 1 ? zeta_rows_bytes(s) : static_cast<std::size_t>(s.width) * s.height * (z16 ? 2u : 5u);
+    if (static_cast<u64>(s.zeta_phys) + s.zeta_bytes() > ram_size_) return;
+    if (s.sc > 1 && bytes > readback_.size) {
+        write_back_zeta_banded(s);
+        return;
+    }
     if (bytes > readback_.size) {
         note("depth surface too large to write back");
         return;
     }
-    if (static_cast<u64>(s.zeta_phys) + s.zeta_bytes() > ram_size_) return;
     VkDeviceSize offset = 0;
     readback_alloc(bytes, offset);  // fits: checked above
-    if (s.sc > 1) read_back_zeta_rows(s, offset);
+    if (s.sc > 1) read_back_zeta_rows(s, offset, 0, s.height);
     else read_back(s.depth, z16 ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT, s.width, s.height, offset);
     ++stats_.writebacks_by[wb_why_];
     write_backs_.push_back({&s, true, offset});
@@ -1979,7 +1984,9 @@ bool VulkanRenderer::init_zeta_convert() {
 // descriptor set pointed at them (apply_scale drops them once the GPU is idle).
 bool VulkanRenderer::zc_buffers() {
     std::string error;
-    const VkDeviceSize n = static_cast<VkDeviceSize>(kZetaConvertMaxTexels) * scale_ * scale_;
+    // Up to 4x the scale's texels (beyond that, a buffer of hundreds of MB for a rare path: larger targets go through RAM).
+    const u32 s = std::min(scale_, 4u);
+    const VkDeviceSize n = static_cast<VkDeviceSize>(kZetaConvertMaxTexels) * s * s;
     if (!dev_.create_buffer(n * 5, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, vk::BufferMemory::Device, zc_in_, error) ||
         !dev_.create_buffer(n * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, vk::BufferMemory::Device, zc_out_, error)) {
         note("depth conversion buffers: " + error);
@@ -2884,6 +2891,7 @@ void VulkanRenderer::apply_scale() {
     zc_capacity_ = 0;
     {
         std::lock_guard g(display_mutex_);
+        for (Capture& c : captures_) dev_.destroy_buffer(c.buffer);  // the GPU is idle (finish above)
         captures_.clear();
         shown_ = 0;
     }
@@ -2941,7 +2949,9 @@ std::size_t VulkanRenderer::zeta_rows_bytes(const Surface& s) const {
     return (drow + srow) * s.height;
 }
 
-void VulkanRenderer::read_back_zeta_rows(Surface& s, VkDeviceSize offset) {
+// Rows y0 .. y0 + rows of the stored size: the depth words of each (the middle image row of its block), then the
+// stencil bytes, at offset in the read-back buffer.
+void VulkanRenderer::read_back_zeta_rows(Surface& s, VkDeviceSize offset, u32 y0, u32 rows) {
     end_pass();
     VkMemoryBarrier before{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
     before.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -2950,61 +2960,104 @@ void VulkanRenderer::read_back_zeta_rows(Surface& s, VkDeviceSize offset) {
     const bool z16 = s.zeta_format == 1;
     const VkDeviceSize drow = (static_cast<VkDeviceSize>(s.iw()) * (z16 ? 2u : 4u) + 3) / 4 * 4, srow = z16 ? 0 : (static_cast<VkDeviceSize>(s.iw()) + 3) / 4 * 4;
     std::vector<VkBufferImageCopy> regions;
-    regions.reserve(static_cast<std::size_t>(s.height) * (z16 ? 1 : 2));
-    for (u32 y = 0; y < s.height; ++y) {
+    regions.reserve(static_cast<std::size_t>(rows) * (z16 ? 1 : 2));
+    for (u32 y = 0; y < rows; ++y) {
         VkBufferImageCopy r{};
         r.bufferOffset = offset + y * drow;
         r.imageSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1};
-        r.imageOffset = {0, static_cast<i32>(y * s.sc + s.sc / 2), 0};
+        r.imageOffset = {0, static_cast<i32>((y0 + y) * s.sc + s.sc / 2), 0};
         r.imageExtent = {s.iw(), 1, 1};
         regions.push_back(r);
         if (z16) continue;
-        r.bufferOffset = offset + s.height * drow + y * srow;
+        r.bufferOffset = offset + rows * drow + y * srow;
         r.imageSubresource.aspectMask = VK_IMAGE_ASPECT_STENCIL_BIT;
         regions.push_back(r);
     }
     fn_->vkCmdCopyImageToBuffer(cb_, s.depth.image, VK_IMAGE_LAYOUT_GENERAL, readback_.buffer, static_cast<u32>(regions.size()), regions.data());
 }
 
-std::vector<u8> VulkanRenderer::thin_zeta_rows(const Surface& s, const u8* rows) const {
+void VulkanRenderer::thin_zeta_rows_into(const Surface& s, const u8* in, u32 y0, u32 rows, u8* out) const {
     const bool z16 = s.zeta_format == 1;
-    const u32 dsz = z16 ? 2u : 4u, w = s.width, h = s.height, sc = s.sc, mid = sc / 2;
+    const u32 dsz = z16 ? 2u : 4u, w = s.width, sc = s.sc, mid = sc / 2;
     const std::size_t drow = (static_cast<std::size_t>(s.iw()) * dsz + 3) / 4 * 4, srow = z16 ? 0 : (static_cast<std::size_t>(s.iw()) + 3) / 4 * 4;
-    const std::size_t n = static_cast<std::size_t>(w) * h;
-    std::vector<u8> out(z16 ? n * 2 : n * 5);
-    for (u32 y = 0; y < h; ++y) {
-        const u8* d = rows + y * drow;
-        const u8* st = rows + h * drow + y * srow;
+    const std::size_t n = static_cast<std::size_t>(w) * s.height;
+    for (u32 y = 0; y < rows; ++y) {
+        const u8* d = in + y * drow;
+        const u8* st = in + rows * drow + y * srow;
         for (u32 x = 0; x < w; ++x) {
-            const std::size_t i = static_cast<std::size_t>(y) * w + x, sx = static_cast<std::size_t>(x) * sc + mid;
+            const std::size_t i = static_cast<std::size_t>(y0 + y) * w + x, sx = static_cast<std::size_t>(x) * sc + mid;
             std::memcpy(&out[i * dsz], d + sx * dsz, dsz);
             if (!z16) out[n * 4 + i] = st[sx];
         }
     }
+}
+
+std::vector<u8> VulkanRenderer::thin_zeta_rows(const Surface& s, const u8* rows) const {
+    const std::size_t n = static_cast<std::size_t>(s.width) * s.height;
+    std::vector<u8> out(s.zeta_format == 1 ? n * 2 : n * 5);
+    thin_zeta_rows_into(s, rows, 0, s.height, out.data());
     return out;
 }
 
-// The scanout target's picture at the internal resolution, read beside its write-back: retaken only when it was drawn
-// into (or reloaded) since. A target whose memory another engine wrote shows RAM's picture until it is drawn again.
+// A scaled depth buffer whose rows do not fit the read-back buffer at once: what was queued before it reaches RAM first,
+// then its rows in bands, each copied, waited for and thinned in turn.
+void VulkanRenderer::write_back_zeta_banded(Surface& s) {
+    finish_write_backs();
+    const bool z16 = s.zeta_format == 1;
+    const VkDeviceSize drow = (static_cast<VkDeviceSize>(s.iw()) * (z16 ? 2u : 4u) + 3) / 4 * 4, srow = z16 ? 0 : (static_cast<VkDeviceSize>(s.iw()) + 3) / 4 * 4;
+    const u32 band = static_cast<u32>(std::max<VkDeviceSize>(1, readback_.size / (drow + srow)));
+    const std::size_t n = static_cast<std::size_t>(s.width) * s.height;
+    std::vector<u8> out(z16 ? n * 2 : n * 5);
+    for (u32 y0 = 0; y0 < s.height; y0 += band) {
+        const u32 rows = std::min(band, s.height - y0);
+        read_back_zeta_rows(s, 0, y0, rows);
+        VkMemoryBarrier after{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        after.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        after.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+        fn_->vkCmdPipelineBarrier(cb_, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &after, 0, nullptr, 0, nullptr);
+        finish();
+        thin_zeta_rows_into(s, static_cast<const u8*>(readback_.mapped), y0, rows, out.data());
+    }
+    ++stats_.writebacks_by[wb_why_];
+    store_zeta(s, out.data());
+}
+
+// The scanout target's picture at the internal resolution, read beside its write-back into a host buffer of its own
+// (one per target scanned out, a double or triple buffer's few): retaken only when it was drawn into (or reloaded)
+// since. A target whose memory another engine wrote shows RAM's picture until it is drawn again. The buffer is read in
+// place by scaled_scanout: at 8x a picture is 78 MB, and every extra copy of it cost milliseconds a frame.
 void VulkanRenderer::capture_display(Surface& s) {
     if (s.sc <= 1 || s.swizzled || s.color_ram_newer) return;
+    const VkDeviceSize bytes = static_cast<VkDeviceSize>(s.iw()) * s.ih() * s.color_bytes();
+    Capture* c = nullptr;
     {
         std::lock_guard g(display_mutex_);
-        for (const Capture& c : captures_)
-            if (c.phys == s.phys && c.serial == s.draw_serial && c.sc == s.sc && c.width == s.width && c.height == s.height && c.pitch == s.pitch) {
-                shown_ = s.phys;
-                return;
-            }
-    }
-    const VkDeviceSize bytes = static_cast<VkDeviceSize>(s.iw()) * s.ih() * s.color_bytes();
-    if (display_rb_.size < bytes) {
-        // Nothing in flight reads the old buffer: every capture is stored before the vblank that took it returns.
-        dev_.destroy_buffer(display_rb_);
-        std::string error;
-        if (!dev_.create_buffer(bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, vk::BufferMemory::HostRead, display_rb_, error)) {
-            note("scaled picture buffer: " + error);
+        auto it = std::find_if(captures_.begin(), captures_.end(), [&](const Capture& e) { return e.phys == s.phys; });
+        if (it != captures_.end() && it->valid && it->serial == s.draw_serial && it->sc == s.sc && it->width == s.width && it->height == s.height && it->pitch == s.pitch) {
+            shown_ = s.phys;
             return;
         }
+        if (it == captures_.end()) {
+            if (captures_.size() >= 3) {
+                // The oldest goes. Nothing in flight writes it: every capture is stored before the vblank that took it returns.
+                dev_.destroy_buffer(captures_.front().buffer);
+                captures_.erase(captures_.begin());
+            }
+            captures_.emplace_back();
+            it = std::prev(captures_.end());
+        }
+        c = &*it;
+        c->valid = false;
+        if (c->buffer.size < bytes) {
+            dev_.destroy_buffer(c->buffer);
+            std::string error;
+            if (!dev_.create_buffer(bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, vk::BufferMemory::HostRead, c->buffer, error)) {
+                note("scaled picture buffer: " + error);
+                captures_.erase(it);
+                return;
+            }
+        }
+        c->phys = s.phys;
     }
     end_pass();
     VkMemoryBarrier before{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
@@ -3014,47 +3067,48 @@ void VulkanRenderer::capture_display(Surface& s) {
     VkBufferImageCopy r{};
     r.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
     r.imageExtent = {s.iw(), s.ih(), 1};
-    fn_->vkCmdCopyImageToBuffer(cb_, s.color.image, VK_IMAGE_LAYOUT_GENERAL, display_rb_.buffer, 1, &r);
+    fn_->vkCmdCopyImageToBuffer(cb_, s.color.image, VK_IMAGE_LAYOUT_GENERAL, c->buffer.buffer, 1, &r);
     write_backs_.push_back({&s, false, 0, true});
 }
 
+// The copy has landed (finish_write_backs waited for it): the capture describes the target as it is now.
 void VulkanRenderer::store_display(Surface& s) {
-    const std::size_t bytes = static_cast<std::size_t>(s.iw()) * s.ih() * s.color_bytes();
     std::lock_guard g(display_mutex_);
-    Capture c;
-    if (auto it = std::find_if(captures_.begin(), captures_.end(), [&](const Capture& e) { return e.phys == s.phys; }); it != captures_.end()) {
-        c = std::move(*it);
-        captures_.erase(it);
-    } else if (captures_.size() >= 3) {
-        captures_.erase(captures_.begin());
-    }
-    c.phys = s.phys;
-    c.width = s.width;
-    c.height = s.height;
-    c.pitch = s.pitch;
-    c.bpp = s.color_bytes();
-    c.sc = s.sc;
-    c.serial = s.draw_serial;
-    const u8* p = static_cast<const u8*>(display_rb_.mapped);
-    c.pixels.assign(p, p + bytes);
-    captures_.push_back(std::move(c));
+    auto it = std::find_if(captures_.begin(), captures_.end(), [&](const Capture& e) { return e.phys == s.phys; });
+    if (it == captures_.end()) return;
+    it->width = s.width;
+    it->height = s.height;
+    it->pitch = s.pitch;
+    it->bpp = s.color_bytes();
+    it->sc = s.sc;
+    it->serial = s.draw_serial;
+    it->valid = true;
     shown_ = s.phys;
 }
 
-bool VulkanRenderer::scaled_scanout(u32 phys, u32 pitch, u32 bpp, u32 w, u32 h, std::vector<u8>& pixels, u32& scale) const {
+bool VulkanRenderer::scaled_scanout(u32 phys, u32 pitch, u32 bpp, bool rgb565, u32 w, u32 h, std::vector<u32>& xrgb, u32& scale) const {
     std::lock_guard g(display_mutex_);
     if (!shown_) return false;
     for (const Capture& c : captures_) {
-        if (c.phys != shown_ || phys < c.phys || c.pitch != pitch || c.bpp != bpp) continue;
+        if (c.phys != shown_ || !c.valid || phys < c.phys || c.pitch != pitch || c.bpp != bpp) continue;
         const u32 off = phys - c.phys;
         if ((off % pitch) % bpp) return false;
         const u32 x0 = (off % pitch) / bpp, y0 = off / pitch;
         if (x0 + w > c.width || y0 + h > c.height) return false;
-        const u32 sc = c.sc;
-        const std::size_t src_row = static_cast<std::size_t>(c.width) * sc * bpp, dst_row = static_cast<std::size_t>(w) * sc * bpp;
-        pixels.resize(dst_row * h * sc);
-        for (u32 y = 0; y < h * sc; ++y)
-            std::memcpy(pixels.data() + y * dst_row, c.pixels.data() + (static_cast<std::size_t>(y0) * sc + y) * src_row + static_cast<std::size_t>(x0) * sc * bpp, dst_row);
+        const u32 sc = c.sc, fw = w * sc, fh = h * sc;
+        const u32 src_pitch = c.width * sc * bpp;
+        const u8* src = static_cast<const u8*>(c.buffer.mapped) + static_cast<std::size_t>(y0) * sc * src_pitch + static_cast<std::size_t>(x0) * sc * bpp;
+        xrgb.resize(static_cast<std::size_t>(fw) * fh);
+        if (bpp == 4) {
+            // One pass: the rectangle out of the read-back buffer, the scanout's ignored alpha byte cleared.
+            for (u32 y = 0; y < fh; ++y) {
+                const u32* row = reinterpret_cast<const u32*>(src + static_cast<std::size_t>(y) * src_pitch);
+                u32* out = xrgb.data() + static_cast<std::size_t>(y) * fw;
+                for (u32 x = 0; x < fw; ++x) out[x] = row[x] & 0x00FFFFFFu;
+            }
+        } else {
+            scanout_to_xrgb(src, src_pitch, bpp, rgb565, fw, fh, reinterpret_cast<u8*>(xrgb.data()));
+        }
         scale = sc;
         return true;
     }
