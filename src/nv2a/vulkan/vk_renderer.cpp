@@ -1909,14 +1909,14 @@ VkShaderModule VulkanRenderer::fragment_shader(const psh::Key& key, std::array<p
     return m;
 }
 
-VkPipeline VulkanRenderer::pipeline(const KelvinState& s, VkShaderModule vs, VkShaderModule fs, VkPrimitiveTopology topology, Surface& t, u32 vertex_layout, std::string& error) {
+VkPipeline VulkanRenderer::pipeline(const KelvinState& s, VkShaderModule vs, VkShaderModule fs, VkPrimitiveTopology topology, Surface& t, u32 vertex_layout, u32 depth_mode, std::string& error) {
     struct RasterKey {
         VkShaderModule vs, fs;
         VkRenderPass pass;
         u32 topology, blend_enable, sfactor, dfactor, equation, depth_test, depth_func, depth_write, cull_enable, cull_face, front_face,
             color_mask, stencil_enable, stencil_func, stencil_mask, stencil_write_mask, op_fail, op_zfail, op_zpass;
         u32 vertex_layout;  // the attributes with per-vertex data (also fills the last eight bytes: the key is its bytes)
-    } k{vs, fs, t.pass, static_cast<u32>(topology) | (debug_nocull_ ? 0x100u : 0u) | (debug_nodepth_ ? 0x200u : 0u) | (debug_noblend_ ? 0x400u : 0u), s.blend(), s.reg(mthd::kBlendSfactor), s.reg(mthd::kBlendDfactor), s.reg(mthd::kBlendEquation),
+    } k{vs, fs, t.pass, static_cast<u32>(topology) | (debug_nocull_ ? 0x100u : 0u) | (debug_nodepth_ ? 0x200u : 0u) | (debug_noblend_ ? 0x400u : 0u) | (depth_mode << 11), s.blend(), s.reg(mthd::kBlendSfactor), s.reg(mthd::kBlendDfactor), s.reg(mthd::kBlendEquation),
         s.depth_test(), s.reg(mthd::kDepthFunc), s.depth_write(), s.cull_face(), s.reg(mthd::kCullFace), s.reg(mthd::kFrontFace), s.color_mask(),
         s.stencil_test(), s.reg(mthd::kStencilFunc), s.reg(mthd::kStencilFuncMask), s.reg(mthd::kStencilMask), s.reg(mthd::kStencilOpFail),
         s.reg(mthd::kStencilOpZfail), s.reg(mthd::kStencilOpZpass), vertex_layout};
@@ -1982,10 +1982,11 @@ VkPipeline VulkanRenderer::pipeline(const KelvinState& s, VkShaderModule vs, VkS
         rs.cullMode = face == 0x404 ? VK_CULL_MODE_FRONT_BIT : (face == 0x408 ? VK_CULL_MODE_FRONT_AND_BACK : VK_CULL_MODE_BACK_BIT);
     }
     rs.frontFace = (s.reg(mthd::kFrontFace) == 0x900) != debug_flip_front_ ? VK_FRONT_FACE_CLOCKWISE : VK_FRONT_FACE_COUNTER_CLOCKWISE;
-    // The polygon offset and the near and far clip are the pixel shader's (it writes the console's depth): the host
-    // neither clips on z (where the device can clamp instead) nor biases.
-    rs.depthClampEnable = dev_.depth_clamp() ? VK_TRUE : VK_FALSE;
-    rs.depthBiasEnable = VK_FALSE;
+    // depth_mode bit 0: the pixel shader writes the console's depth (exact steps, its clip range and polygon offset), so
+    // the host neither clips on z (it clamps, where the device can) nor biases; bit 1: SET_ZMIN_MAX_CONTROL clamps.
+    // Otherwise the host's depth with the offset as a bias (set per draw), clamped where the console clamps.
+    rs.depthClampEnable = dev_.depth_clamp() && (depth_mode & 3u) != 0 ? VK_TRUE : VK_FALSE;
+    rs.depthBiasEnable = VK_TRUE;
     auto& ms = build->ms;
     ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
     auto& ds = build->ds;
@@ -3330,6 +3331,17 @@ void VulkanRenderer::draw(const KelvinState& s, const DrawBatch& batch) {
     psh::Key pkey = psh::key_from_state(s);
     pkey.swap_rb = swaps_rb(*t);
     if (debug_shadow_pass_) pkey.shadow_compare_func = 7;  // every shadow lookup lit
+    // The console's exact depth from the pixel shader wherever depth is stored or a test must land on the console's
+    // step: depth writes (what later draws and shadow-map compares read; the host's own depth for them drew a grid over a
+    // racing title's road), occlusion-counted draws (a test quad at a light's depth) and EQUAL tests. Draws that only
+    // test (blended and transparent layers, most of the overdraw) keep the host's depth and its early rejection: the
+    // shader's depth for every draw cost that title's race 15.9 -> 20.1 ms a vblank at 6x, the writes alone nothing
+    // measurable (15.45).
+    const bool exact_depth = (s.depth_test() || s.depth_write()) &&
+                             (s.depth_write() || counting || s.reg(mthd::kDepthFunc) == 0x202);
+    pkey.exact_depth = exact_depth ? 1u : 0u;
+    if (drawid_on()) std::fprintf(stderr, "drawid %u: depth %s, zeta %08x\n", draw_id, exact_depth ? "exact" : "host", t->zeta_phys);
+    const u32 depth_mode = (exact_depth ? 1u : 0u) | (((s.reg(kZminMaxControl) >> 4) & 0xFu) == 1 ? 2u : 0u);
     std::array<psh::SamplerKind, 4> kinds{};
     VkShaderModule fs = fragment_shader(pkey, kinds, error);
     clock.lap(stats_.ns_fs);
@@ -3401,7 +3413,7 @@ void VulkanRenderer::draw(const KelvinState& s, const DrawBatch& batch) {
 
     clock.lap(stats_.ns_indices);
     error.clear();
-    VkPipeline p = pipeline(s, vs, fs, topology, *t, v.enabled, error);
+    VkPipeline p = pipeline(s, vs, fs, topology, *t, v.enabled, depth_mode, error);
     clock.lap(stats_.ns_pipeline);
     if (!p && error.empty()) {  // a worker is creating it
         ++stats_.pending_skips;
@@ -3597,7 +3609,16 @@ void VulkanRenderer::draw(const KelvinState& s, const DrawBatch& batch) {
     }
     fn_->vkCmdSetBlendConstants(cb_, constants);
     fn_->vkCmdSetStencilReference(cb_, VK_STENCIL_FACE_FRONT_AND_BACK, s.reg(mthd::kStencilRef) & 0xFFu);
-    // The polygon offset is the pixel shader's (it writes the console's depth; the pipeline's depth bias is off).
+    {
+        // The host's depth (draws without the exact path): the polygon offset as the depth bias (bias + factor x slope, in
+        // the attachment's steps, the slope sc times smaller at the internal resolution); the host rounds to the step as
+        // the exact draws do. The exact draws make all of it in the shader.
+        const u32 mode = s.reg(mthd::kFrontPolygonMode);
+        const u32 enable = mode == 0x1B00 ? mthd::kPolyOffsetPointEnable : mode == 0x1B01 ? mthd::kPolyOffsetLineEnable : mthd::kPolyOffsetFillEnable;
+        const bool on = !exact_depth && v.primitive >= Primitive::Triangles && s.reg(enable) != 0;
+        fn_->vkCmdSetDepthBias(cb_, on ? std::bit_cast<float>(s.reg(mthd::kPolygonOffsetBias)) : 0.0f, 0.0f,
+                               on ? std::bit_cast<float>(s.reg(mthd::kPolygonOffsetFactor)) * static_cast<float>(sc) : 0.0f);
+    }
     const VkDeviceSize vb_offsets[2] = {voffset, voffset + vertex_bytes};
     const VkBuffer vbs[2] = {vertex_ring_.buffer.buffer, vertex_ring_.buffer.buffer};
     fn_->vkCmdBindVertexBuffers(cb_, 0, 2, vbs, vb_offsets);

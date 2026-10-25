@@ -576,9 +576,9 @@ TEST(Vulkan, ThePolygonOffsetMovesACoplanarTriangleInFrontOnlyWhenEnabled) {
     EXPECT_EQ(pixel_at(ram, 8, 8) & 0x00FFFFFFu, 0xFF0000u) << "pulled in front by 16 depth units";
 }
 
-TEST(Vulkan, TheDepthWrittenIsTheConsolesClampedOrCulledToTheClipRangeAndTruncated) {
+TEST(Vulkan, TheDepthWrittenIsTheConsolesClampedOrCulledToTheClipRangeAndOnItsStep) {
     // The console's depth, not the host's: culled outside the clip range (SET_ZMIN_MAX_CONTROL ZCLAMP_EN = cull) or
-    // clamped to it (= clamp), and stored truncated to the buffer's integer step. A shadow map's compare and an
+    // clamped to it (= clamp), and stored on the buffer's integer step, the nearest one. A shadow map's compare and an
     // occlusion test quad at a light's depth depend on the exact step.
     vk::Device device;
     std::string error;
@@ -621,19 +621,30 @@ TEST(Vulkan, TheDepthWrittenIsTheConsolesClampedOrCulledToTheClipRangeAndTruncat
         std::memcpy(&word, &ram[0x20000 + 8 * 256 + 8 * 4], 4);
         return word >> 8;
     };
+    // Depth-only draws (a shadow map's pass) take the exact path: the pixel shader writes the console's depth.
+    k.method(mthd::kColorMask, 0);
     k.method(kZminMaxControlForTest, 0x01);  // cull
     clear();
     triangle(12000000.0f);
     EXPECT_EQ(stored_depth(), 0xFFFFFFu) << "beyond the clip range and culled: the clear's depth stays";
-    EXPECT_EQ(pixel_at(ram, 8, 8) & 0x00FFFFFFu, 0x000080u) << "and the colour too";
     k.method(kZminMaxControlForTest, 0x11);  // clamp
     clear();
     triangle(12000000.0f);
     EXPECT_EQ(stored_depth(), 8000000u) << "clamped to the clip range's top";
-    EXPECT_EQ(pixel_at(ram, 8, 8) & 0x00FFFFFFu, 0x00FF00u);
     clear();
     triangle(4000000.75f);
-    EXPECT_EQ(stored_depth(), 4000000u) << "truncated to the step below, as the console stores it (the host rounds up)";
+    EXPECT_EQ(stored_depth(), 4000001u) << "on the nearest step (truncation would store 4000000)";
+    clear();
+    triangle(4000000.25f);
+    EXPECT_EQ(stored_depth(), 4000000u) << "on the nearest step below";
+    // A colour draw that writes depth takes the exact path too; one that only tests keeps the host's depth.
+    k.method(mthd::kColorMask, 0x01010101);
+    k.method(kZminMaxControlForTest, 0x01);
+    k.method(mthd::kClipMax, bits(16777215.0f));
+    clear();
+    triangle(4000000.75f);
+    EXPECT_EQ(stored_depth(), 4000001u) << "a colour draw lands on the same step";
+    EXPECT_EQ(pixel_at(ram, 8, 8) & 0x00FFFFFFu, 0x00FF00u);
     for (const auto& e : renderer.stats().errors) ADD_FAILURE() << "renderer: " << e;
 }
 

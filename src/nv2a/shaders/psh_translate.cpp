@@ -383,7 +383,7 @@ Translation translate(const Key& key) {
     g += "void main() {\n";
     // The depth in the console's units and its slope, taken before anything can discard (derivatives need every pixel
     // of the quad), from the screen-space z the vertex side passes (interpolated linearly across the screen).
-    if (!depth_replaced)
+    if (key.exact_depth && !depth_replaced)
         g += "    float nv_z = vtx_z;\n"
              "    float nv_slope = max(abs(dFdx(nv_z)), abs(dFdy(nv_z)));\n";
     g += "    vec4 v0 = vtx_d0;\n    vec4 v1 = vtx_d1;\n";
@@ -640,20 +640,21 @@ Translation translate(const Key& key) {
     g += "    frag_color = clamp(final_color, 0.0, 1.0);\n";
     if (g.find("vec4 debug_show") != std::string::npos) g += "    frag_color = debug_show;\n";
     if (key.swap_rb) g += "    frag_color = frag_color.bgra;\n";  // a B8 or G8B8 target: its first channel is blue
-    // The depth the console writes, as the reference emulator computes it: the polygon offset (bias + factor x slope, in
-    // depth units), then culled outside the clip range or clamped to it (SET_ZMIN_MAX_CONTROL), then truncated to the
-    // buffer's integer step (the host would round). A shadow map's compare, an occlusion test quad at a light's depth
-    // and a decal over its surface depend on the exact step. A 24-bit value is written one float step above n / 2^24 so
-    // the attachment's conversion lands on n.
-    if (!depth_replaced)
+    // The exact path (key.exact_depth: depth writes, occlusion-counted draws, EQUAL tests): the depth the console
+    // writes, modelled on the reference emulator: the screen-space z plus the polygon offset (bias + factor x slope, in
+    // depth units), culled outside the clip range or clamped to it (SET_ZMIN_MAX_CONTROL), then put on the buffer's
+    // integer step. The reference truncates; a racing title's shadow map then put a whole sunlit patch of road in
+    // shadow (its compare one step off), and rounding to the nearest step keeps it lit and clean, so we round. A 24-bit
+    // value is written one float step above n / 2^24 so the attachment's conversion lands on n.
+    if (key.exact_depth && !depth_replaced)
         g += "    nv_z += depth[0].w + depth[1].x * nv_slope;\n"
              "    if (depth[1].z > 0.5) {\n"
              "        if (nv_z < depth[0].y || nv_z > depth[0].z) discard;\n"
              "    } else {\n"
              "        nv_z = clamp(nv_z, depth[0].y, depth[0].z);\n"
              "    }\n"
-             "    if (depth[1].y < 0.5) gl_FragDepth = floor(nv_z) / 65535.0;\n"
-             "    else if (depth[1].y < 1.5) gl_FragDepth = uintBitsToFloat(floatBitsToUint(floor(nv_z) / 16777216.0) + 1u);\n"
+             "    if (depth[1].y < 0.5) gl_FragDepth = floor(nv_z + 0.5) / 65535.0;\n"
+             "    else if (depth[1].y < 1.5) gl_FragDepth = uintBitsToFloat(floatBitsToUint(floor(nv_z + 0.5) / 16777216.0) + 1u);\n"
              "    else gl_FragDepth = nv_z / depth[0].x;\n";
     g += "}\n";
     t.glsl = std::move(g);

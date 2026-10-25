@@ -23,6 +23,10 @@ struct Key {
     u32 shadow_compare_func{0};
     std::array<u32, 4> texture_format{};  // only the fields that shape the shader (dimensionality, cube, colour)
     u32 alpha_func{0x207};
+    // 1: the shader writes the console's depth itself (exact steps, the clip range and the polygon offset): the renderer
+    // asks it for depth writes, occlusion-counted draws and EQUAL tests; draws that only test keep the host's depth and
+    // its early rejection.
+    u32 exact_depth{0};
     std::array<bool, 4> texture_enabled{};
     bool alpha_test{false};
     bool smooth_shading{true};
