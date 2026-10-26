@@ -16,6 +16,8 @@ namespace mv {
 
 // Instrument: MV_DEBUG_IO_SLOW_MS=N prints each disc or disk image call on the caller's thread that took N ms or more.
 void note_slow_io(const char* what, u64 lba, u32 count, u64 ns);
+// Instrument: MV_DEBUG_IO_LOG=FILE gets a line per disc and hard-disk request (what, first sector, sectors, guest cycle).
+void io_log(const char* what, u64 lba, u32 count);
 
 // A raw disk image on the host: 512-byte sectors, read and written in place. Sparse files stay sparse.
 // DMA reads run on a thread of the image's own, as the disc's do: a cold read from a spinning host disk (the image's

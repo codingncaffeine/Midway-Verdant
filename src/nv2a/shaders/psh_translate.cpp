@@ -350,7 +350,8 @@ Translation translate(const Key& key) {
     for (u32 i = 0; i < 4; ++i) g += std::format("layout(location = {}) in vec4 vtx_t{};\n", kVaryingT0 + i, i);
     g += std::format("layout(location = {}) in float vtx_fog;\n", kVaryingFog);
     g += std::format("layout(location = {}) in vec4 vtx_pos;\n", kVaryingPos);
-    g += std::format("layout(location = {}) noperspective in float vtx_z;\n\n", kVaryingZ);
+    g += std::format("layout(location = {}) noperspective in float vtx_z;\n", kVaryingZ);
+    g += std::format("layout(location = {}) noperspective in float vtx_rw;\n\n", kVaryingRw);
     g +=
         "layout(std140, set = 0, binding = 1) uniform PshUniforms {\n"
         "    vec4 c0[9];\n"
@@ -383,7 +384,13 @@ Translation translate(const Key& key) {
     g += "void main() {\n";
     // The depth in the console's units and its slope, taken before anything can discard (derivatives need every pixel
     // of the quad), from the screen-space z the vertex side passes (interpolated linearly across the screen).
-    if (key.exact_depth && !depth_replaced)
+    // In the w-buffer mode (exact_depth bit 1) the depth is w itself, recovered from the linear 1/w, and the polygon
+    // offset's slope is that of 1/w scaled by w squared (the slope of w), as the reference emulator models it; a pixel
+    // whose w is not positive gets the largest depth.
+    if (key.exact_depth && !depth_replaced && (key.exact_depth & 2u))
+        g += "    float nv_z = vtx_rw > 0.0 ? 1.0 / vtx_rw : 3.4e38;\n"
+             "    float nv_slope = max(abs(dFdx(vtx_rw)), abs(dFdy(vtx_rw))) * nv_z * nv_z;\n";
+    else if (key.exact_depth && !depth_replaced)
         g += "    float nv_z = vtx_z;\n"
              "    float nv_slope = max(abs(dFdx(nv_z)), abs(dFdy(nv_z)));\n";
     g += "    vec4 v0 = vtx_d0;\n    vec4 v1 = vtx_d1;\n";

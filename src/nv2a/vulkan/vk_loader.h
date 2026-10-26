@@ -46,6 +46,7 @@ namespace mv::vk {
     X(vkCreateFence)                \
     X(vkDestroyFence)               \
     X(vkWaitForFences)              \
+    X(vkGetFenceStatus)             \
     X(vkResetFences)                \
     X(vkCreateBuffer)               \
     X(vkDestroyBuffer)              \

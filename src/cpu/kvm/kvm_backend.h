@@ -110,6 +110,7 @@ private:
     bool profile_timer_ok_{false};
     std::unordered_map<u32, u64> eip_samples_;
     std::unordered_map<u32, u64> eip_busy_samples_;  // MV_PROFILE_EIP: the samples taken while the GPU thread had work
+    u64 next_write_back_poll_ns_{0};  // the next exit that may land background write-backs (Nv2aStub::poll_write_backs)
     u64 busy_guest_ns_{0};                          // and the vCPU time in the guest while it had
     bool tsc_scaled_{false};
     bool dirty_tracking_{false};

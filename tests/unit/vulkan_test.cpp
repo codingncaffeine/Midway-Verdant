@@ -648,6 +648,69 @@ TEST(Vulkan, TheDepthWrittenIsTheConsolesClampedOrCulledToTheClipRangeAndOnItsSt
     for (const auto& e : renderer.stats().errors) ADD_FAILURE() << "renderer: " << e;
 }
 
+// The w-buffer mode (SET_CONTROL0 Z_PERSPECTIVE_ENABLE, bit 16): the depth stored is the vertex w at the pixel, taken
+// perspective correct (1/w is what varies linearly across the screen), not z/w. A racing title draws its whole scene
+// so and reads the depth buffer back as a texture.
+TEST(Vulkan, TheWBufferModeStoresThePerspectiveCorrectW) {
+    vk::Device device;
+    std::string error;
+    if (!device.init(error)) GTEST_SKIP() << "no Vulkan device: " << error;
+    std::vector<u8> ram(4u << 20, 0);
+    RamResolver handles;
+    handles.size = static_cast<u32>(ram.size());
+    VulkanRenderer renderer(device, handles, ram.data(), static_cast<u32>(ram.size()));
+    ASSERT_TRUE(renderer.init(error)) << error;
+    if (!device.depth_clamp()) GTEST_SKIP() << "the device cannot clamp depth";
+    Kelvin k;
+    k.set_sink(&renderer);
+    setup_target(k);
+    k.method(mthd::kDepthTestEnable, 1);
+    k.method(mthd::kDepthFunc, 0x207);  // ALWAYS: every fragment writes its depth
+    k.method(mthd::kDepthMask, 1);
+    k.method(mthd::kClipMax, bits(8000000.0f));
+    k.method(kZminMaxControlForTest, 0x11);  // clamp
+    auto clear = [&] {
+        k.method(mthd::kColorClear, 0xFF000080);
+        k.method(mthd::kZstencilClear, 0xFFFFFF00);
+        k.method(mthd::kClearRectH, 63u << 16);
+        k.method(mthd::kClearRectV, 63u << 16);
+        k.method(mthd::kClearSurface, 0xF3);
+    };
+    // Screen-space vertices (the passthrough program): x, y in pixels, z in depth units (already divided by w), w kept.
+    auto triangle = [&](std::array<float, 3> w, float z) {
+        k.method(mthd::kBeginEnd, 5);
+        k.method(mthd::kDiffuse4ub, 0xFF00FF00);
+        const std::array<std::array<float, 2>, 3> xy{{{0.0f, 0.0f}, {128.0f, 0.0f}, {0.0f, 128.0f}}};
+        for (u32 i = 0; i < 3; ++i) {
+            k.method(mthd::kVertexData4fM + 0, bits(xy[i][0]));
+            k.method(mthd::kVertexData4fM + 4, bits(xy[i][1]));
+            k.method(mthd::kVertexData4fM + 8, bits(z));
+            k.method(mthd::kVertexData4fM + 12, bits(w[i]));
+        }
+        k.method(mthd::kBeginEnd, 0);
+    };
+    auto stored_depth = [&] {
+        renderer.end_frame();
+        renderer.write_back_all();
+        u32 word;
+        std::memcpy(&word, &ram[0x20000 + 8 * 256 + 8 * 4], 4);
+        return word >> 8;
+    };
+    k.method(mthd::kControl0, 1u << 16);  // w-buffer
+    clear();
+    triangle({1000.0f, 1000.0f, 1000.0f}, 3000000.0f);
+    EXPECT_EQ(stored_depth(), 1000u) << "w itself, not the z of 3000000";
+    clear();
+    // Pixel (8.5, 8.5): screen weights 0.867, 0.066, 0.066; 1/w interpolated gives w = 105.3 (a linear w would be 119.9).
+    triangle({100.0f, 400.0f, 100.0f}, 3000000.0f);
+    EXPECT_EQ(stored_depth(), 105u) << "perspective correct";
+    k.method(mthd::kControl0, 0);  // back to z
+    clear();
+    triangle({100.0f, 400.0f, 100.0f}, 3000000.0f);
+    EXPECT_EQ(stored_depth(), 3000000u) << "z without the w-buffer mode";
+    for (const auto& e : renderer.stats().errors) ADD_FAILURE() << "renderer: " << e;
+}
+
 TEST(Vulkan, ATargetWhoseMemoryAnotherEngineRewroteIsReloadedBeforeItIsDrawnIntoAgain) {
     // One title resets a glare buffer each frame with a 2D blit and then draws into it additively. The renderer keeps
     // the target on the GPU between frames, so drawing on over that copy ignored the blit and the buffer saturated.
@@ -968,6 +1031,7 @@ TEST(Vulkan, TheScanoutPictureIsTheScaledImage) {
     draw_half_triangle(f.k);
     f.renderer->flush_frame();
     ASSERT_TRUE(f.renderer->write_back_at(0x10000));
+    f.renderer->complete_write_backs(true);  // above 1x the copy in RAM lands in the background
     for (const auto& e : f.renderer->stats().errors) ADD_FAILURE() << "renderer: " << e;
     std::vector<u32> px;
     u32 scale = 0;
@@ -999,6 +1063,7 @@ TEST(Vulkan, TheScanoutPictureIsTheScaledImage) {
     // Another engine writes the target's memory: RAM holds the picture until the target is drawn again.
     f.renderer->invalidate(0x10000, 64 * 256);
     ASSERT_TRUE(f.renderer->write_back_at(0x10000));
+    f.renderer->complete_write_backs(true);  // above 1x the copy in RAM lands in the background
     EXPECT_FALSE(f.renderer->scaled_scanout(0x10000, 256, 4, false, 64, 64, px, scale));
 }
 
@@ -1011,6 +1076,7 @@ TEST(Vulkan, TheInternalResolutionChangesAtTheVblank) {
     draw_half_triangle(f.k);
     f.renderer->flush_frame();
     ASSERT_TRUE(f.renderer->write_back_at(0x10000));
+    f.renderer->complete_write_backs(true);  // above 1x the copy in RAM lands in the background
     std::vector<u32> px;
     u32 scale = 0;
     EXPECT_FALSE(f.renderer->scaled_scanout(0x10000, 256, 4, false, 64, 64, px, scale)) << "1x: RAM holds the picture";
@@ -1024,6 +1090,7 @@ TEST(Vulkan, TheInternalResolutionChangesAtTheVblank) {
     f.k.method(mthd::kClearSurface, 0xF0);
     f.renderer->flush_frame();
     ASSERT_TRUE(f.renderer->write_back_at(0x10000));
+    f.renderer->complete_write_backs(true);  // above 1x the copy in RAM lands in the background
     for (const auto& e : f.renderer->stats().errors) ADD_FAILURE() << "renderer: " << e;
     ASSERT_TRUE(f.renderer->scaled_scanout(0x10000, 256, 4, false, 64, 64, px, scale));
     EXPECT_EQ(scale, 3u);
@@ -1260,6 +1327,7 @@ TEST(Vulkan, AScreenSpaceEdgeOnAPixelCentreCoversWholeBlocksAboveOneX) {
     k.method(mthd::kBeginEnd, 0);
     f.renderer->flush_frame();
     ASSERT_TRUE(f.renderer->write_back_at(0x10000));
+    f.renderer->complete_write_backs(true);  // above 1x the copy in RAM lands in the background
     for (const auto& e : f.renderer->stats().errors) ADD_FAILURE() << "renderer: " << e;
     std::vector<u32> px;
     u32 scale = 0;
@@ -1360,6 +1428,42 @@ TEST(Vulkan, AMipChainOfRenderTargetsIsPutTogetherOnTheGpu) {
     }
 }
 
+// Above 1x the scanout's copy in RAM lands in the background (the vblank no longer waits for the GPU): it reaches RAM
+// when completed, a page the CPU wrote meanwhile keeps the CPU's bytes, and a target drawn into meanwhile stays dirty
+// so the next write-back brings the newer picture.
+TEST(Vulkan, AScanoutWrittenBackInTheBackgroundLandsUnderTheCpusPages) {
+    ScaledFixture f;
+    std::string error;
+    if (!f.init(2, error)) GTEST_SKIP() << "no Vulkan device: " << error;
+    Kelvin& k = f.k;
+    setup_target(k);
+    k.method(mthd::kColorClear, 0xFF102030u);
+    k.method(mthd::kClearRectH, 63u << 16);
+    k.method(mthd::kClearRectV, 63u << 16);
+    k.method(mthd::kClearSurface, 0xF0);
+    f.renderer->flush_frame();
+    ASSERT_TRUE(f.renderer->write_back_at(0x10000));
+    EXPECT_TRUE(f.renderer->write_backs_in_flight()) << "queued without a wait";
+    EXPECT_EQ(pixel_at(f.ram, 5, 5), 0u) << "nothing in RAM before it lands";
+    // The CPU writes one page of the frame buffer (rows 16-31 of a 256-byte pitch) before the copy lands.
+    for (u32 i = 0; i < 4096; i += 4) {
+        const u32 v = 0xFFABCDEFu;
+        std::memcpy(&f.ram[0x11000 + i], &v, 4);
+    }
+    // And a draw goes into the target before it lands: the copy in flight is the older picture.
+    k.method(mthd::kColorClear, 0xFF405060u);
+    k.method(mthd::kClearSurface, 0xF0);
+    const std::vector<u32> cpu_pages{0x11};
+    ASSERT_TRUE(f.renderer->complete_write_backs(true, &cpu_pages));
+    EXPECT_FALSE(f.renderer->write_backs_in_flight());
+    EXPECT_EQ(pixel_at(f.ram, 5, 5), 0xFF102030u) << "the copy landed";
+    EXPECT_EQ(pixel_at(f.ram, 5, 20), 0xFFABCDEFu) << "the CPU's page kept its bytes";
+    f.renderer->write_back_all();
+    EXPECT_EQ(pixel_at(f.ram, 5, 5), 0xFF405060u) << "drawn into meanwhile: still dirty, the newer picture follows";
+    for (const auto& e : f.renderer->stats().errors) ADD_FAILURE() << "renderer: " << e;
+    EXPECT_GE(f.renderer->stats().background_write_back_batches, 1u);
+}
+
 // Above 1x the picture is converted on the GPU as it is read back: XRGB8888, the RAMDAC's colour table applied.
 TEST(Vulkan, TheScaledPictureComesBackThroughTheColourTable) {
     ScaledFixture f;
@@ -1375,6 +1479,7 @@ TEST(Vulkan, TheScaledPictureComesBackThroughTheColourTable) {
     f.renderer->set_display_lut(invert);
     f.renderer->flush_frame();
     ASSERT_TRUE(f.renderer->write_back_at(0x10000));
+    f.renderer->complete_write_backs(true);  // above 1x the copy in RAM lands in the background
     for (const auto& e : f.renderer->stats().errors) ADD_FAILURE() << "renderer: " << e;
     VulkanRenderer::ScaledPicture p;
     ASSERT_TRUE(f.renderer->scaled_picture(0x10000, 256, 4, 64, 64, p));
@@ -1488,6 +1593,86 @@ TEST(Vulkan, ACpuWriteToAParkedDepthBufferIsWhatTheNextDrawTests) {
         EXPECT_EQ(pixel_at(f.ram, 8, 8) & 0x00FFFFFFu, 0x000080u) << "the CPU's depth, not the parked image's";
         EXPECT_EQ(pixel_at(f.ram, 60, 3) & 0x00FFFFFFu, 0x000080u);
     }
+}
+
+// A draw that samples the depth buffer of the target it draws into, as a shadow map: it compares against the depth the
+// draws before it left (as the texture unit reading RAM would), taken from a GPU copy of the depth image, nothing
+// through RAM (a flight title wrote its shadow map back and waited for it 46 times a frame).
+TEST(Vulkan, ADrawSamplingItsOwnDepthBufferReadsACopyOnTheGpu) {
+    for (u32 scale : {1u, 2u}) {
+        SCOPED_TRACE(std::format("scale {}", scale));
+        TextureShaderFixture f;
+        std::string error;
+        if (!f.init(error)) GTEST_SKIP() << "no Vulkan device: " << error;
+        f.renderer->set_resolution_scale(scale);
+        Kelvin& k = f.k;
+        setup_target(k);  // A8R8G8B8 at 0x10000, Z24S8 at 0x20000, pitch 256
+        clear_depth(k, 0x3FFFFF00, 0, 31);   // left half 0.25
+        clear_depth(k, 0xBFFFFF00, 32, 63);  // right half 0.75
+        load_texcoord_program(k);
+        const u32 b = mthd::kTextureBase;
+        k.method(b + 0x0, 0x20000);
+        k.method(b + 0x4, (1u << 16) | (0x2Eu << 8) | (2u << 4) | 1u);  // linear D24S8, the depth buffer itself
+        k.method(b + 0x8, 0x00030303);
+        k.method(b + 0xC, 0x40000000);
+        k.method(b + 0x10, 256u << 16);
+        k.method(b + 0x14, (1u << 24) | (1u << 16));
+        k.method(b + 0x1C, (64u << 16) | 64u);
+        k.method(mthd::kShaderStageProgram, 2u);  // stage 0: projective 3D = the shadow compare on a depth texture
+        k.method(0x1E6C, 1u);                     // lit where the stored depth < r
+        output_texture_stage(k, 0);
+        const float r = 0.5f * 16777215.0f;
+        texcoord(k, 0, 8.0f, 8.0f, r, 1.0f);  // a texel of the left half: 0.25 < 0.5, lit
+        draw_full_triangle(k, f.ram);
+        f.renderer->end_frame();
+        EXPECT_EQ(pixel_at(f.ram, 20, 20), 0xFFFFFFFFu) << "compared against the cleared 0.25";
+        texcoord(k, 0, 56.0f, 8.0f, r, 1.0f);  // the right half: 0.75 < 0.5 fails
+        draw_full_triangle(k, f.ram);
+        f.renderer->end_frame();
+        EXPECT_EQ(pixel_at(f.ram, 20, 20), 0x00000000u) << "compared against the cleared 0.75";
+        for (const auto& e : f.renderer->stats().errors) ADD_FAILURE() << "renderer: " << e;
+        const auto& st = f.renderer->stats();
+        EXPECT_EQ(st.writebacks_by[VulkanRenderer::Stats::kWbTexture], 0u) << "the depth did not go through RAM";
+        EXPECT_GE(st.depth_snapshots, 1u);
+    }
+}
+
+// A depth buffer read as a colour texture gets the Z24S8 words' bytes: as A8R8G8B8 (blue first) or A8B8G8R8 (red
+// first, a racing title reads its scene depth so), converted on the GPU where the device holds D24S8, never through RAM.
+TEST(Vulkan, ADepthBufferReadAsColourGivesItsBytesInEitherOrder) {
+    TextureShaderFixture f;
+    std::string error;
+    if (!f.init(error)) GTEST_SKIP() << "no Vulkan device: " << error;
+    Kelvin& k = f.k;
+    setup_target(k);  // A8R8G8B8 at 0x10000, Z24S8 at 0x20000
+    clear_depth(k, 0x12345678);  // depth 0x123456, stencil 0x78
+    for (const auto& [format, expect] : {std::pair{0x12u, 0x12345678u}, std::pair{0x3Fu, 0x12785634u}}) {
+        SCOPED_TRACE(std::format("texture format {:02x}", format));
+        setup_target(k, 8, 0x100000);  // another target draws, sampling the depth buffer
+        load_texcoord_program(k);
+        const u32 b = mthd::kTextureBase;
+        k.method(b + 0x0, 0x20000);
+        k.method(b + 0x4, (1u << 16) | (format << 8) | (2u << 4) | 1u);
+        k.method(b + 0x8, 0x00030303);
+        k.method(b + 0xC, 0x40000000);
+        k.method(b + 0x10, 256u << 16);
+        k.method(b + 0x14, (1u << 24) | (1u << 16));
+        k.method(b + 0x1C, (64u << 16) | 64u);
+        k.method(mthd::kShaderStageProgram, 1u);
+        output_texture_stage(k, 0);
+        texcoord(k, 0, 8.0f, 8.0f, 0.0f, 1.0f);
+        const u64 forced = f.renderer->stats().writebacks_by[VulkanRenderer::Stats::kWbTexture];
+        draw_full_triangle(k, f.ram);
+        f.renderer->end_frame();
+        u32 v;
+        std::memcpy(&v, &f.ram[0x100000 + 8 * 256 + 8 * 4], 4);
+        EXPECT_EQ(v, expect);
+        if (f.renderer->stats().zeta_conversions) {
+            EXPECT_EQ(f.renderer->stats().writebacks_by[VulkanRenderer::Stats::kWbTexture], forced) << "converted on the GPU, not through RAM";
+        }
+        setup_target(k);
+    }
+    for (const auto& e : f.renderer->stats().errors) ADD_FAILURE() << "renderer: " << e;
 }
 
 // Only a clear of the whole depth buffer may skip loading it: a partial one keeps what RAM holds elsewhere.
@@ -1614,6 +1799,7 @@ TEST(Vulkan, TheVideoOverlayDrawnOnTheGpuIsTheOneTheCpuDraws) {
             f.renderer->set_display_overlay(std::nullopt);
             f.renderer->flush_frame();
             ASSERT_TRUE(f.renderer->write_back_at(0x10000));
+            f.renderer->complete_write_backs(true);  // above 1x the copy in RAM lands in the background
             const u32 fw = 64 * scale, fh = 64 * scale;
             std::vector<u32> want(static_cast<std::size_t>(fw) * fh);
             {
@@ -1635,6 +1821,7 @@ TEST(Vulkan, TheVideoOverlayDrawnOnTheGpuIsTheOneTheCpuDraws) {
             // The same vblank with the overlay on: drawn in by the GPU.
             f.renderer->set_display_overlay(ov);
             ASSERT_TRUE(f.renderer->write_back_at(0x10000));
+            f.renderer->complete_write_backs(true);  // above 1x the copy in RAM lands in the background
             for (const auto& e : f.renderer->stats().errors) ADD_FAILURE() << "renderer: " << e;
             VulkanRenderer::ScaledPicture p;
             ASSERT_TRUE(f.renderer->scaled_picture(0x10000, 256, 4, 64, 64, p));
@@ -1717,6 +1904,7 @@ TEST(Vulkan, AHandedOverPictureIsTheOneTheHostWouldHaveRead) {
         f.renderer->set_display_lut(lut);
         f.renderer->flush_frame();
         ASSERT_TRUE(f.renderer->write_back_at(0x10000));
+        f.renderer->complete_write_backs(true);  // above 1x the copy in RAM lands in the background
         VulkanRenderer::ScaledPicture p;
         ASSERT_TRUE(f.renderer->scaled_picture(0x10000, 256, 4, 64, 64, p));
         f.renderer->picture_ready(p);
@@ -1732,6 +1920,7 @@ TEST(Vulkan, AHandedOverPictureIsTheOneTheHostWouldHaveRead) {
     f.renderer->set_display_lut(lut);
     f.renderer->flush_frame();
     ASSERT_TRUE(f.renderer->write_back_at(0x10000));
+    f.renderer->complete_write_backs(true);  // above 1x the copy in RAM lands in the background
     VulkanRenderer::ScaledPicture p;
     ASSERT_TRUE(f.renderer->scaled_picture(0x10000, 256, 4, 64, 64, p));
     EXPECT_EQ(p.pixels, nullptr) << "nothing read back to the host";

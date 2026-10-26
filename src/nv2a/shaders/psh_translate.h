@@ -25,7 +25,8 @@ struct Key {
     u32 alpha_func{0x207};
     // 1: the shader writes the console's depth itself (exact steps, the clip range and the polygon offset): the renderer
     // asks it for depth writes, occlusion-counted draws and EQUAL tests; draws that only test keep the host's depth and
-    // its early rejection.
+    // its early rejection. 3: the same in the w-buffer mode (SET_CONTROL0 Z_PERSPECTIVE_ENABLE): the depth stored is the
+    // vertex w at the pixel (perspective correct), not z/w, so every draw that tests or writes depth takes this path.
     u32 exact_depth{0};
     std::array<bool, 4> texture_enabled{};
     bool alpha_test{false};

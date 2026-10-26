@@ -81,6 +81,7 @@ bool DvdImage::open(const std::filesystem::path& path, std::string& error) {
 }
 
 bool DvdImage::read(u64 lba, u32 count, u8* out) const {
+    io_log("dvd-read", lba, count);
     if (!file_ || lba + count > sectors_) return false;
     const auto t0 = std::chrono::steady_clock::now();
     const bool ok = read_at(base_ + lba * kSectorSize, count * kSectorSize, out);
@@ -91,6 +92,7 @@ bool DvdImage::read(u64 lba, u32 count, u8* out) const {
 }
 
 void DvdImage::begin_read(u64 lba, u32 count) {
+    io_log("dvd-read", lba, count);
     std::unique_lock lock(mutex_);
     if (!reader_.joinable()) reader_ = std::thread([this] { reader_main(); });
     done_.wait(lock, [this] { return finished_; });

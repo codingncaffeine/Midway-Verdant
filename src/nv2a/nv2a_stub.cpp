@@ -72,7 +72,9 @@ Nv2aStub::Nv2aStub(Bus& bus, Scheduler& sched, std::function<void(bool)> irq)
         // for two idle frames in a row (cea51bc, for 30 fps titles) left Forza's legal screen, which draws every other
         // frame, reading a drawn target through RAM before it ever reached it: a yellow band over its top third.
         idle_vblanks_ = kelvin_.methods_seen() == methods_at_vblank_ ? idle_vblanks_ + 1 : 0;
-        if (renderer_ && idle_vblanks_ >= 1) renderer_->write_back_all();
+        // In the background: the copies land at the CPU's next exits once the GPU has made them (poll_write_backs), or at
+        // once when the guest asks the GPU how far it is; the vblank waited 1.5-3.8 ms here in heavy 30 fps titles.
+        if (renderer_ && idle_vblanks_ >= 1) renderer_->write_back_all(true);
         methods_at_vblank_ = kelvin_.methods_seen();
         if (vblank_hook_) vblank_hook_(sched_.now());
         regs_[kPcrtcIntr0] |= 1u;
@@ -488,8 +490,9 @@ void Nv2aStub::on_method(const PushbufferMethod& m) {
 
 void Nv2aStub::execute_method(const PushbufferMethod& m) {
     // On the FIFO thread the walk stops every few methods to let a waiting register access in (the rest of the header
-    // follows on the next chunk).
-    if (fifo_threaded_ && ++chunk_methods_ >= kChunkMethods) walker_.request_stop();
+    // follows on the next chunk), and at once when one is already waiting: a game's register read used to wait for the
+    // rest of a 128-method chunk, draws included (34-41 us a read, 4-18 s a run in the heaviest titles).
+    if (fifo_threaded_ && (++chunk_methods_ >= kChunkMethods || gpu_waiters_.load(std::memory_order_relaxed))) walker_.request_stop();
     if (capture_) {
         capture_->method(m.subchannel, m.method == 0 ? 0 : bound_[m.subchannel], m.method, m.value);
         // The objects a handle names are recorded when the stream binds them: SET_OBJECT, and the context DMA
@@ -693,6 +696,30 @@ void Nv2aStub::harvest_writes() {
     collect_ns_ += static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - harvest_t0).count());
 }
 
+void Nv2aStub::land_write_backs(bool wait) {
+    if (!renderer_ || !renderer_->write_backs_in_flight()) return;
+    if (!wait && !renderer_->write_backs_ready()) return;
+    // What the guest and the devices wrote since the copies were queued stays: it is newer than they are. The pages stay
+    // harvested for the next run too (cpu_wrote reloads the targets they belong to).
+    harvest_writes();
+    std::vector<u32> pages(dirty_pending_);
+    std::sort(pages.begin(), pages.end());
+    pages.erase(std::unique(pages.begin(), pages.end()), pages.end());
+    renderer_->complete_write_backs(true, &pages);
+}
+
+bool Nv2aStub::write_backs_in_flight() const { return renderer_ && renderer_->write_backs_in_flight(); }
+
+void Nv2aStub::poll_write_backs() {
+    if (!renderer_ || !renderer_->write_backs_in_flight()) return;
+    std::unique_lock<std::mutex> gpu;
+    if (fifo_threaded_) {
+        gpu = std::unique_lock(gpu_mutex_, std::try_to_lock);
+        if (!gpu.owns_lock()) return;  // the FIFO thread works: the next exit tries again
+    }
+    land_write_backs(false);
+}
+
 void Nv2aStub::collect_writes() {
     if (!write_tracking_ && !capture_) return;
     if (!fifo_threaded_) harvest_writes();
@@ -802,6 +829,9 @@ u32 Nv2aStub::mmio_read(PhysAddr addr, unsigned size) {
     if (fifo_busy_ && (key == kUser + 0x44 || key == kCache1DmaGet)) timed_wait_progress(gpu, key);
     else if (fifo_busy_ && key == kPgraphPattColor0) timed_wait_change(gpu, key, patt_seen_, key);
     else if (fifo_busy_ && reports_progress(key)) timed_wait_idle(gpu, key);
+    // The guest asks how far the GPU has come (Direct3D does before it reads a surface with the CPU): render targets
+    // still on their way to RAM in the background are there first, as they are on the hardware once it has drawn them.
+    if (reports_progress(key)) land_write_backs(true);
     if (off == kPrmcioInputStatus1 && size == 1) {
         // Bit 3: vertical retrace in progress; bit 0: display inactive (blanking).
         const bool vr = in_vertical_retrace();
@@ -1214,8 +1244,12 @@ bool Nv2aStub::pusher_runnable() const {
 void Nv2aStub::start_fifo_thread(std::function<void()> request) {
     if (fifo_threaded_) return;
     {
+        // No lead by default: the GPU runs free beside the CPU, which waits only where the game asks (its fences and polls)
+        // and at the vblank. A lead waited for the whole queue to drain a couple of milliseconds after every kick, so in
+        // heavy frames the CPU and the GPU ran in series (PGR2's race: frames over budget 1131 -> 820 of 3000 without it).
+        // MV_FIFO_LEAD_US=N brings it back (2000 was the old default).
         const char* l = std::getenv("MV_FIFO_LEAD_US");
-        const u64 us = l && *l ? std::strtoull(l, nullptr, 10) : 2000;
+        const u64 us = l && *l ? std::strtoull(l, nullptr, 10) : 0;
         lead_cycles_ = cycles_from_ns(us * 1000);
     }
     lead_.name = "nv2a.fifo-lead";

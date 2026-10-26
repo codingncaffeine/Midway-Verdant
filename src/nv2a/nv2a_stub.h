@@ -131,6 +131,10 @@ public:
     void service();
     // Until the pusher has nothing left it can run (a halted CPU calls it before it skips guest time).
     void wait_fifo_idle();
+    // Render targets written back in the background (VulkanRenderer::complete_write_backs) land in RAM: called by the
+    // CPU's thread between runs of the guest; does nothing while they are in flight or the FIFO thread holds the GPU.
+    void poll_write_backs();
+    bool write_backs_in_flight() const;
     std::string_view name() const override { return "nv2a"; }
 
     u32 mmio_read(PhysAddr addr, unsigned size) override;
@@ -192,6 +196,9 @@ public:
     void watch_writes(u32 phys, u32 len) const override;
     void collect_writes();
     void harvest_writes();  // the logs into dirty_pending_ (on the CPU's thread when the FIFO thread runs)
+    // With the GPU lock held: background write-backs into RAM once done (at once with `wait`), the pages the guest or a
+    // device wrote since keeping their bytes.
+    void land_write_backs(bool wait);
 
 protected:
     void on_bar_changed(int index, u32 old_base, u32 new_base) override;
@@ -368,7 +375,8 @@ private:
     std::atomic<Cycles> guest_now_{0};
     std::function<void()> service_request_;
     // The lead (PLAN D21): the CPU may run this far past a kick the FIFO thread has not finished, then waits for it,
-    // so in guest time the GPU never takes longer than this over a kick (MV_FIFO_LEAD_US, microseconds of guest time).
+    // so in guest time the GPU never takes longer than this over a kick (MV_FIFO_LEAD_US, microseconds of guest time;
+    // off by default since session 28: the vblank still waits for the GPU).
     TimerEvent lead_;
     Cycles lead_cycles_{0};
     u64 lead_waits_{0}, lead_wait_ns_{0};

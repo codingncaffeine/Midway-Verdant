@@ -916,6 +916,12 @@ void KvmBackend::thread_main() {
             u64 t0;
             ~HandlerTime() { acc += mono_ns() - t0; }
         } handler_time{handler_ns_, h1};
+        // Render targets written back in the background land here, on this thread (it alone can name the pages the guest
+        // wrote meanwhile), at most every 200 us while some are in flight.
+        if (h1 >= next_write_back_poll_ns_ && machine_->nv2a().write_backs_in_flight()) {
+            next_write_back_poll_ns_ = h1 + 200'000;
+            machine_->nv2a().poll_write_backs();
+        }
         if (run_->exit_reason < 64) ++stats_.by_reason[run_->exit_reason];
         if (run_->exit_reason == KVM_EXIT_IO) ++exit_sources_[(u32{run_->io.port} << 16) | 1u];  // a port: bit 0 set (an MMIO key is a page)
         else if (run_->exit_reason == KVM_EXIT_MMIO) ++exit_sources_[static_cast<u32>(run_->mmio.phys_addr) & ~0xFFFu];

@@ -129,7 +129,17 @@ public:
     // Every dirty render target reaches RAM (colour and depth). The live machine calls it when the GPU has been idle
     // for a whole frame: the hardware wrote those pixels when it drew them, and RAM a program reuses later must not
     // receive them then (a title launched after the boot animation got the animation's targets over its own data).
-    void write_back_all();
+    // With `in_background` the colour and depth copies go to the GPU without a wait and reach RAM later
+    // (complete_write_backs), as the scanout's does above 1x.
+    void write_back_all(bool in_background = false);
+    // Write-backs queued without a wait (an idle vblank's, the scanout's above 1x: the CPU and the GPU thread used to wait
+    // there for the GPU to finish the whole frame, with both locks held). They reach RAM here: once the GPU is done with
+    // them, or at once with `wait`. RAM pages in `cpu_pages` (sorted) were written by the CPU or a device since they were
+    // queued and keep those bytes. False when they are still in flight and `wait` is not set.
+    bool complete_write_backs(bool wait, const std::vector<u32>* cpu_pages = nullptr);
+    bool write_backs_in_flight() const { return async_pending_.load(std::memory_order_acquire); }
+    // In flight and done on the GPU: the CPU's thread may store them now (it can name the pages the guest wrote since).
+    bool write_backs_ready();
     // Guest RAM in [phys, phys + len) was written: textures decoded from it are stale.
     void invalidate(u32 phys, u32 len);
     // The guest CPU (or a device) wrote these RAM pages (4 KiB, sorted): a render target over them reloads from RAM
@@ -155,6 +165,8 @@ public:
         u64 descriptor_reuses{0};  // draws that kept the previous draw's descriptor set
         u64 surface_samples{0};  // textures bound straight to a render target's image
         u64 snapshots{0};  // copies of a target taken for draws that sample the target they draw into
+        u64 background_write_back_batches{0}, background_write_back_waits{0}, background_pages_kept{0};
+        u64 depth_snapshots{0};  // the same for draws that sample the depth buffer of the target they draw into
         u64 zeta_conversions{0};  // depth buffers converted on the GPU for a colour texture at their address
         u64 cpu_written_targets{0};  // render targets whose memory the CPU wrote: reloaded from RAM
         u64 depth_handovers{0}, depth_uploads{0};  // depth buffers moved between targets sharing an address; loaded from RAM
@@ -252,6 +264,12 @@ private:
         VkImageView snap_x8_view{VK_NULL_HANDLE};
         TextureEntry snap_tex, snap_x8_tex;
         u64 draw_serial{0}, snap_serial{~0ull};
+        // The same for a draw that samples the depth buffer of the target it draws into (a shadow map tested while the
+        // target is drawn): a copy of the depth image, retaken after the target was drawn into or cleared since.
+        vk::Image zsnap;
+        VkImageView zsnap_view{VK_NULL_HANDLE};
+        TextureEntry zsnap_tex;
+        u64 zsnap_serial{~0ull};
         // Copies of rectangles of a pitch-linear region that textures read (key: x, y, width, height), each retaken after
         // the region was drawn into since.
         struct SubCopy {
@@ -266,6 +284,8 @@ private:
         vk::Image zcolor;
         VkImageView zcolor_x8_view{VK_NULL_HANDLE};
         TextureEntry zcolor_tex, zcolor_x8_tex;
+        VkImageView zcolor_abgr_view{VK_NULL_HANDLE};  // the same bytes read as A8B8G8R8 (red first)
+        TextureEntry zcolor_abgr_tex;
         u64 zcolor_serial{~0ull};
         // Depth images of other zeta addresses the target bound before, kept on the GPU with their contents (D35): a
         // target that alternates between depth buffers (the boot animation's two shadow depths, each frame) swaps
@@ -341,6 +361,10 @@ private:
     // shadow map the guest samples as a depth texture lives there.
     void queue_write_back_zeta(Surface& s);
     void finish_write_backs();
+    // The same without the wait: the copies go to the GPU and are stored by complete_write_backs (one batch in flight).
+    void finish_write_backs_async();
+    // A batch in flight that covers [b0, b1) is stored first (anything about to read that RAM).
+    void complete_write_backs_over(u64 b0, u64 b1);
     void write_back(Surface& s);       // one surface's colour, queued and finished
     void write_back_zeta(Surface& s);  // one surface's depth, queued and finished
     void store_color(Surface& s, const u8* pixels);
@@ -362,6 +386,9 @@ private:
     // A render target the stage can sample in place (same address and size, a format of the same bytes), or null.
     TextureEntry* surface_texture(const TextureStage& ts, u32 phys);
     TextureEntry* snapshot_texture(Surface& s, const TextureStage& ts, u32 phys, u32 w, u32 h, bool linear, bool x8);
+    TextureEntry* depth_snapshot_texture(Surface& s, const TextureStage& ts, u32 phys, u32 w, u32 h, bool linear);
+    // Why the last surface_texture call could not sample a target in place (for the unload report's forced lines).
+    const char* sample_miss_{""};
     TextureEntry* subrect_texture(Surface& s, const TextureStage& ts, u32 phys, u32 x0, u32 y0, u32 w, u32 h, bool x8);
     // A cube map whose six faces are render targets drawn this frame or the last: the faces copied into a cube image on
     // the GPU (at their internal resolution), retaken when any face was drawn into since; or null.
@@ -417,7 +444,7 @@ private:
     // the GPU is done with them. Returns the next entry.
     std::unordered_map<u32, std::unique_ptr<Surface>>::iterator erase_surface(std::unordered_map<u32, std::unique_ptr<Surface>>::iterator it);
     u64 vblank_index_{0};  // vblanks seen (write_back_at), for retiring targets nothing uses
-    TextureEntry* zeta_color_texture(Surface& s, const TextureStage& ts, u32 phys, u32 w, u32 h, bool linear, bool x8);
+    TextureEntry* zeta_color_texture(Surface& s, const TextureStage& ts, u32 phys, u32 w, u32 h, bool linear, bool x8, bool abgr = false);
     bool init_zeta_convert();
     bool zc_buffers(u32 texels = 0);
     // The depth-to-colour conversion: a compute pass over two device buffers (the copied depth words and stencil
@@ -555,6 +582,12 @@ private:
         TextureEntry* entry{nullptr};
     };
     std::array<StageCache, 4> stage_cache_{};
+    // The guest memory every target's images may stand for (colour, its depth address, the depth its image holds, the
+    // parked ones), gathered once per draw: a texture that overlaps none of it cannot be a target, so its lookup skips
+    // the scans of every target (three per stage per draw before, most of the texture time in heavy frames).
+    std::vector<std::pair<u64, u64>> target_ranges_;
+    bool target_ranges_valid_{false};
+    bool overlaps_target(u32 phys, u32 length);
     std::unordered_map<u64, VkSampler> samplers_;
     std::map<std::pair<u64, u32>, VkSampler> border_samplers_;  // samplers that read the stage's border colour, by it
     VkDescriptorSetLayout set_layout_{VK_NULL_HANDLE};
@@ -566,10 +599,19 @@ private:
         bool zeta{false};
         VkDeviceSize offset{0};  // where its copy lands in the read-back buffer
         bool rows{false};  // a scaled depth buffer read back a row per region: thinned when stored
+        u64 serial{0};     // the target's draw serial when queued: drawn into since, it stays dirty once stored
     };
     std::vector<PendingWriteBack> write_backs_;
+    void store_write_backs(const std::vector<PendingWriteBack>& list);
     unsigned wb_why_{Stats::kWbAll};  // the cause the write-backs being queued count under
     VkDeviceSize readback_cursor_{0};
+    // The batch in flight (finish_write_backs_async): its entries, the fence of the submission that carries it, that
+    // submission's serial; MV_ASYNC_WRITEBACK=0 stores every write-back at once (the control).
+    std::vector<PendingWriteBack> async_wb_;
+    VkFence async_fence_{VK_NULL_HANDLE};
+    u64 async_serial_{0};
+    std::atomic<bool> async_pending_{false};
+    bool async_wb_on_{true};
     u32 descriptor_sets_used_{0};  // from the recording frame's pool
     // The vertex uniform block being built, and the last block of each kind uploaded in the recording frame.
     std::array<float, vsh::kUniformBytes / 4> vs_uniforms_{};

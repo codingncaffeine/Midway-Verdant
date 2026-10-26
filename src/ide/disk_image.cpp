@@ -1,5 +1,9 @@
 #include "ide/disk_image.h"
 
+#include <mutex>
+
+#include "debug/trace.h"
+
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -27,6 +31,15 @@ struct Timed {
     }
 };
 }  // namespace
+
+void io_log(const char* what, u64 lba, u32 count) {
+    static std::FILE* log = [] { const char* f = std::getenv("MV_DEBUG_IO_LOG"); return f && *f ? std::fopen(f, "w") : nullptr; }();
+    if (!log) return;
+    static std::mutex m;
+    std::lock_guard g(m);
+    std::fprintf(log, "%llu %s %llu %u\n", static_cast<unsigned long long>(trace::now()), what, static_cast<unsigned long long>(lba), count);
+    std::fflush(log);
+}
 
 void note_slow_io(const char* what, u64 lba, u32 count, u64 ns) {
     static const u64 limit = [] { const char* v = std::getenv("MV_DEBUG_IO_SLOW_MS"); return v && *v ? static_cast<u64>(std::atoll(v)) * 1000000u : 0u; }();
@@ -90,11 +103,13 @@ void DiskImage::overlay_pending(u64 lba, u32 count, u8* out) const {
 }
 
 bool DiskImage::read(u64 lba, u32 count, u8* out) const {
+    io_log("hdd-read", lba, count);
     Timed timed{host_read_ns_, "hdd read", lba, count};
     return read_at(lba, count, out);
 }
 
 void DiskImage::begin_read(u64 lba, u32 count) {
+    io_log("hdd-read", lba, count);
     std::unique_lock lock(mutex_);
     if (!reader_.joinable()) reader_ = std::thread([this] { reader_main(); });
     done_.wait(lock, [this] { return finished_; });
@@ -145,6 +160,7 @@ void DiskImage::reader_main() {
 }
 
 bool DiskImage::write(u64 lba, u32 count, const u8* in) {
+    io_log("hdd-write", lba, count);
     Timed timed{host_read_ns_, "hdd write", lba, count};
     if (!file_ || read_only_ || lba + count > sectors_) return false;
     std::unique_lock lock(pending_mutex_);
