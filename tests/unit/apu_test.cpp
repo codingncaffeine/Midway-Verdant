@@ -502,19 +502,20 @@ TEST(ApuSynthesis, ABufferVoicePlaysItsSamplesIntoItsBinAtItsVolumeAndHeadroom) 
     EXPECT_EQ(r.apu.setup_engine().voices_retired(), 1u) << "and turned off";
 }
 
-TEST(ApuSynthesis, ProgrammingAPlayingOneShotsEndStartsItAgainAndAReplayedVoiceIsLinkedOnce) {
+TEST(ApuSynthesis, ProgrammingAPlayingOneShotsEndKeepsItsPlaceAndAReplayedVoiceIsLinkedOnce) {
     using SE = apu::SetupEngine;
     SynthRig r;
     r.fill_pcm(64);
     r.start(kPcm16Mono, 63, 0, 0, 0);  // two frames of samples, no loop
     r.sched.advance_to(Rig::frame(1));
     EXPECT_FLOAT_EQ(r.bin(0, 5), SynthRig::pcm(5) / 32768.0f);
-    // The kernel's replay of a voice it still counts as playing: the buffer's end and loop offsets, no VOICE_ON.
+    // DirectSound reprograms a playing buffer's end and loop offsets many times a second: the voice plays on from where
+    // it is (restarting it there replayed a title's character-select blip for ever).
     r.vp(SE::kMethodSetCurrentVoice, SynthRig::kVoice);
     r.vp(SE::kMethodBufEbo, 63);
     r.vp(SE::kMethodBufLbo, 0);
     r.sched.advance_to(Rig::frame(2));
-    for (u32 i = 0; i < 32; ++i) EXPECT_FLOAT_EQ(r.bin(0, i), SynthRig::pcm(i) / 32768.0f) << "played again from its start, sample " << i;
+    for (u32 i = 0; i < 32; ++i) EXPECT_FLOAT_EQ(r.bin(0, i), SynthRig::pcm(32 + i) / 32768.0f) << "played on, sample " << i;
     // VOICE_ON for a voice still on its list starts it without linking it a second time.
     r.vp(SE::kMethodSetAntecedentVoice, 0x1FFFFu);
     r.vp(SE::kMethodVoiceOn, SynthRig::kVoice);

@@ -222,11 +222,16 @@ bool SetupEngine::method(u32 offset, u32 value) {
             book_[current_].fraction = 0;
             return true;
         case kMethodBufEbo: {
+            const u32 old_ebo = field(current_, kFieldNext) & kOffsetMask, cbo = field(current_, kFieldOffset) & kOffsetMask;
             set_field(current_, kFieldNext, (field(current_, kFieldNext) & ~kOffsetMask) | (value & kOffsetMask));
-            // Programming a playing one-shot buffer's end starts it again from its beginning. The kernel replays a
-            // sound this way, without VOICE_ON, on a voice it still counts as playing: the boot sound's closing chime
-            // and the echoes of its jingle, both in the recording of a real console. [INFERRED]
-            if (!(field(current_, kFieldFmt) & (kFmtLoop | kFmtStream))) {
+            // Programming the end of a one-shot buffer that has played to its end starts it again from its beginning.
+            // The kernel replays a sound this way, without VOICE_ON, on a voice it still counts as playing: the boot
+            // sound's closing chime and the echoes of its jingle, both in the recording of a real console. [INFERRED]
+            // Only a finished one: DirectSound reprograms a playing buffer's base, loop start and end many times a
+            // second (a title's character-select sound, ~4000 times in a minute), and restarting it at each write
+            // replayed its first fraction of a second for ever: a bass blip that never ended. The reference
+            // emulator never restarts on this write.
+            if (!(field(current_, kFieldFmt) & (kFmtLoop | kFmtStream)) && cbo >= old_ebo) {
                 Bookkeeping& b = book_[current_];
                 b.fraction = 0;
                 set_field(current_, kFieldOffset, field(current_, kFieldOffset) & ~kOffsetMask);
