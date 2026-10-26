@@ -275,7 +275,7 @@ u32 texture_size_in_memory(const TextureStage& stage) {
     return total;
 }
 
-bool decode_texture(const TextureStage& stage, u32 base, const MemoryView& memory, const u8* palette, DecodedTexture& out) {
+bool decode_texture(const TextureStage& stage, u32 base, const MemoryView& memory, const u8* palette, DecodedTexture& out, bool keep_blocks) {
     out = DecodedTexture{};
     const u32 format = stage.color_format();
     const FormatInfo f = format_info(format);
@@ -335,6 +335,17 @@ bool decode_texture(const TextureStage& stage, u32 base, const MemoryView& memor
             if (!src) {
                 out.error = std::format("texture level {} face {} at {:08x} ({} bytes) is outside RAM", level, face, offset, bytes);
                 return false;
+            }
+            if (f.compressed && keep_blocks && !volume) {
+                // The blocks as stored (block rows of 8 or 16 bytes, a level under 4x4 one block): the device decodes them.
+                out.pixel = format == 0x0C ? HostPixel::Bc1 : format == 0x0E ? HostPixel::Bc2 : HostPixel::Bc3;
+                out.images.emplace_back(src, src + bytes);
+                offset += bytes;
+                w = std::max(w >> 1, 1u);
+                h = std::max(h >> 1, 1u);
+                lw = lw ? lw - 1 : 0;
+                lh = lh ? lh - 1 : 0;
+                continue;
             }
             std::vector<u8> img(static_cast<std::size_t>(w) * h * d * texel);
             if (f.compressed) {

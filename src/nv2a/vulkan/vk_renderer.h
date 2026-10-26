@@ -166,6 +166,8 @@ public:
         u64 surface_samples{0};  // textures bound straight to a render target's image
         u64 snapshots{0};  // copies of a target taken for draws that sample the target they draw into
         u64 background_write_back_batches{0}, background_write_back_waits{0}, background_pages_kept{0};
+        u64 pending_waits{0};
+        u64 textures_native_dxt{0};  // DXT textures uploaded as blocks  // short waits for background compiles (wait_a_little)
         u64 depth_snapshots{0};  // the same for draws that sample the depth buffer of the target they draw into
         u64 zeta_conversions{0};  // depth buffers converted on the GPU for a colour texture at their address
         u64 cpu_written_targets{0};  // render targets whose memory the CPU wrote: reloaded from RAM
@@ -184,6 +186,9 @@ public:
         u64 textures_unchanged{0};
         // Instrument: the write-backs a texture forced, by target and texture (what is not sampled in place, and why).
         std::map<std::string, u64> forced_by;
+        // Blended draws by source factor, destination factor, equation, w-buffer and stage 0's format and edge modes
+        // (key bits: sf 63:48, df 47:32, equation 31:16, w-buffer 15, format 14:8, wrap u 7:4, wrap v 3:0).
+        std::unordered_map<u64, u64> blend_modes;
         // Instrument: the CPU side of storing write-backs in RAM, by target: count and nanoseconds.
         std::map<std::string, std::pair<u64, u64>> store_cost;
         u64 surface_reloads{0};  // render targets reloaded from RAM after another engine wrote them  // textures whose pages were written but whose bytes hashed the same: kept
@@ -588,6 +593,15 @@ private:
     std::vector<std::pair<u64, u64>> target_ranges_;
     bool target_ranges_valid_{false};
     bool overlaps_target(u32 phys, u32 length);
+    // Background compiles: a draw whose shader or pipeline a worker is still making waits for it, up to this much
+    // waiting per vblank (MV_PENDING_WAIT_MS, default 10), before it is skipped. Skipping at once left whole effects
+    // undrawn for frames whenever the cache was cold (the boot animation's X drawn stretched, now and then).
+    i64 pending_wait_budget_ns_{0};
+    i64 pending_wait_per_vblank_ns_{10'000'000};
+    bool wait_a_little();
+    // DXT textures uploaded as their blocks (BC1-3) where the device samples them: decoding them on the CPU took 3-4 ms
+    // a texture inside the frame (a racing title's dips) and uploaded four to eight times the bytes.
+    bool native_dxt_requested_{true}, native_dxt_{false};
     std::unordered_map<u64, VkSampler> samplers_;
     std::map<std::pair<u64, u32>, VkSampler> border_samplers_;  // samplers that read the stage's border colour, by it
     VkDescriptorSetLayout set_layout_{VK_NULL_HANDLE};

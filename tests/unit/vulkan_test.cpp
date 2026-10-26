@@ -1383,6 +1383,63 @@ TEST(Vulkan, A16BitTargetIsSampledInPlace) {
     }
 }
 
+// A DXT1 texture uploaded as its blocks (BC1) reads as the CPU decoder reads it: the four-colour blocks, and the
+// three-colour ones with index 3 transparent black. Checked against the decoder with MV_NATIVE_DXT=0 as well.
+TEST(Vulkan, ADxtTextureSampledAsBlocksMatchesTheDecoder) {
+    // Four 4x4 blocks (an 8x8 texture): four-colour red/blue at index 0, 2 and 3, and a three-colour block at index 3.
+    const auto block = [](u16 c0, u16 c1, u8 index) {
+        std::array<u8, 8> b{static_cast<u8>(c0), static_cast<u8>(c0 >> 8), static_cast<u8>(c1), static_cast<u8>(c1 >> 8)};
+        const u8 row = static_cast<u8>(index | (index << 2) | (index << 4) | (index << 6));
+        for (u32 i = 4; i < 8; ++i) b[i] = row;
+        return b;
+    };
+    const std::array<std::array<u8, 8>, 4> blocks{block(0xF800, 0x001F, 0), block(0xF800, 0x001F, 2), block(0xF800, 0x001F, 3), block(0x001F, 0xF800, 3)};
+    std::vector<u8> expect_rgba(8 * 8 * 4);
+    std::vector<u8> raw;
+    for (const auto& b : blocks) raw.insert(raw.end(), b.begin(), b.end());
+    pgraph::decode_dxt1(raw.data(), 8, 8, expect_rgba.data());
+    for (const bool native : {true, false}) {
+        SCOPED_TRACE(native ? "as blocks" : "decoded on the CPU");
+        if (native) unsetenv("MV_NATIVE_DXT");
+        else setenv("MV_NATIVE_DXT", "0", 1);
+        TextureShaderFixture f;
+        std::string error;
+        if (!f.init(error)) GTEST_SKIP() << "no Vulkan device: " << error;
+        Kelvin& k = f.k;
+        std::memcpy(&f.ram[0x200000], raw.data(), raw.size());
+        load_texcoord_program(k);
+        const u32 b = mthd::kTextureBase;
+        k.method(b + 0x0, 0x200000);
+        k.method(b + 0x4, (3u << 24) | (3u << 20) | (1u << 16) | (0x0Cu << 8) | (2u << 4) | 1u);  // 8x8 DXT1, one level
+        k.method(b + 0x8, 0x00030303);
+        k.method(b + 0xC, 0x40000000);
+        k.method(b + 0x14, (1u << 24) | (1u << 16));  // nearest
+        k.method(mthd::kShaderStageProgram, 1u);
+        output_texture_stage(k, 0);
+        for (u32 i = 0; i < 4; ++i) {
+            const u32 bx = i % 2, by = i / 2;
+            texcoord(k, 0, (static_cast<float>(bx) * 4.0f + 2.0f) / 8.0f, (static_cast<float>(by) * 4.0f + 2.0f) / 8.0f, 0.0f, 1.0f);
+            draw_full_triangle(k, f.ram);
+            f.renderer->end_frame();
+            const u8* e = &expect_rgba[((by * 4 + 2) * 8 + bx * 4 + 2) * 4];
+            const u32 got = pixel_at(f.ram, 10, 10);
+            const int gr = static_cast<int>((got >> 16) & 0xFF), gg = static_cast<int>((got >> 8) & 0xFF), gb = static_cast<int>(got & 0xFF), ga = static_cast<int>(got >> 24);
+            EXPECT_NEAR(gr, e[0], 3) << "block " << i << " red";
+            EXPECT_NEAR(gg, e[1], 3) << "block " << i << " green";
+            EXPECT_NEAR(gb, e[2], 3) << "block " << i << " blue";
+            EXPECT_NEAR(ga, e[3], 3) << "block " << i << " alpha";
+        }
+        for (const auto& e : f.renderer->stats().errors) ADD_FAILURE() << "renderer: " << e;
+        if (native && f.device.bc_textures()) {
+            EXPECT_EQ(f.renderer->stats().textures_native_dxt, 1u) << "uploaded as blocks";
+        }
+        if (!native) {
+            EXPECT_EQ(f.renderer->stats().textures_native_dxt, 0u);
+        }
+    }
+    unsetenv("MV_NATIVE_DXT");
+}
+
 // A mip chain drawn as one target per level, then sampled as one mip-mapped texture: put together on the GPU (at any
 // internal resolution), nothing through RAM.
 TEST(Vulkan, AMipChainOfRenderTargetsIsPutTogetherOnTheGpu) {

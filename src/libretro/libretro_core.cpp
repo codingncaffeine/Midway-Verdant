@@ -790,12 +790,12 @@ RETRO_API void retro_unload_game(void) {
         if (const auto* r = machine->nv2a().renderer()) {
             const auto& st = r->stats();
             const auto ms = [](mv::u64 ns) { return static_cast<double>(ns) / 1e6; };
-            log(RETRO_LOG_INFO, "gpu time: %llu draws %.0f ms (fetch %.0f, indices %.0f, textures %.0f, pipelines %.0f, shader compiles %.0f, uploads %.0f, descriptors %.0f, record %.0f); %llu submits + %llu waits %.0f ms; %llu write-backs %.0f ms (device copies %.0f); %llu textures decoded (%llu kept: pages written, bytes unchanged), %llu shaders from the disk cache; background compiles: %llu shaders + %llu pipelines, %llu draws skipped waiting; %llu pipelines made from the cache at once",
+            log(RETRO_LOG_INFO, "gpu time: %llu draws %.0f ms (fetch %.0f, indices %.0f, textures %.0f, pipelines %.0f, shader compiles %.0f, uploads %.0f, descriptors %.0f, record %.0f); %llu submits + %llu waits %.0f ms; %llu write-backs %.0f ms (device copies %.0f); %llu textures decoded (%llu as DXT blocks; %llu kept: pages written, bytes unchanged), %llu shaders from the disk cache; background compiles: %llu shaders + %llu pipelines, %llu draws skipped waiting (%llu short waits first); %llu pipelines made from the cache at once",
                 static_cast<unsigned long long>(st.draws), ms(st.ns_draw), ms(st.ns_fetch), ms(st.ns_indices), ms(st.ns_texture), ms(st.ns_pipeline), ms(st.ns_vs + st.ns_fs),
                 ms(st.ns_upload), ms(st.ns_descriptors), ms(st.ns_record), static_cast<unsigned long long>(st.flushes), static_cast<unsigned long long>(st.waits),
                 ms(st.ns_flush), static_cast<unsigned long long>(st.writebacks), ms(st.ns_write_back), ms(st.ns_write_back_gpu),
-                static_cast<unsigned long long>(st.textures_decoded), static_cast<unsigned long long>(st.textures_unchanged), static_cast<unsigned long long>(st.shaders_from_disk),
-                static_cast<unsigned long long>(st.compiles_queued), static_cast<unsigned long long>(st.pipelines_queued), static_cast<unsigned long long>(st.pending_skips), static_cast<unsigned long long>(st.pipeline_cache_hits));
+                static_cast<unsigned long long>(st.textures_decoded), static_cast<unsigned long long>(st.textures_native_dxt), static_cast<unsigned long long>(st.textures_unchanged), static_cast<unsigned long long>(st.shaders_from_disk),
+                static_cast<unsigned long long>(st.compiles_queued), static_cast<unsigned long long>(st.pipelines_queued), static_cast<unsigned long long>(st.pending_skips), static_cast<unsigned long long>(st.pending_waits), static_cast<unsigned long long>(st.pipeline_cache_hits));
             // Draws the renderer could not draw, and why (the first of each distinct reason).
             if (st.skipped) log(RETRO_LOG_INFO, "gpu: %llu draws skipped", static_cast<unsigned long long>(st.skipped));
             log(RETRO_LOG_INFO, "gpu: write-backs by cause: frame end %llu, texture %llu, scanout %llu, 2D/range %llu, relayout %llu, idle vblank %llu; %llu targets sampled in place, %llu snapshots for draws sampling their own target (%llu of depth), %llu depth buffers converted to colour, %llu targets the CPU wrote reloaded, %llu depth buffers handed between targets, %llu loaded from RAM; %llu targets evicted by an overlapping one, %llu retired unused, %llu rectangles of a region copied for a texture",
@@ -814,6 +814,18 @@ RETRO_API void retro_unload_game(void) {
                 std::vector<std::pair<std::string, mv::u64>> forced(st.forced_by.begin(), st.forced_by.end());
                 std::sort(forced.begin(), forced.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
                 for (std::size_t i = 0; i < forced.size() && i < 8; ++i) log(RETRO_LOG_INFO, "gpu: forced by a texture x%llu: %s", static_cast<unsigned long long>(forced[i].second), forced[i].first.c_str());
+            }
+            if (!st.blend_modes.empty()) {
+                // The blended draws, most first: which blend each effect uses (a white patch, a missing glow).
+                std::vector<std::pair<mv::u64, mv::u64>> modes(st.blend_modes.begin(), st.blend_modes.end());
+                std::sort(modes.begin(), modes.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+                std::string line;
+                for (std::size_t i = 0; i < modes.size() && i < 16; ++i) {
+                    const mv::u64 k = modes[i].first;
+                    line += std::format(" [sf {:x} df {:x} eq {:x}{} tex0 fmt {:02x} wrap {}/{}] x{}", (k >> 48) & 0xFFFFu, (k >> 32) & 0xFFFFu, (k >> 16) & 0xFFFFu,
+                                        (k & 0x8000u) ? " w" : "", (k >> 8) & 0x7Fu, (k >> 4) & 0xFu, k & 0xFu, modes[i].second);
+                }
+                log(RETRO_LOG_INFO, "gpu: blended draws:%s", line.c_str());
             }
             if (!st.store_cost.empty()) {
                 // Where storing write-backs in RAM went, by target, most first.

@@ -11,7 +11,9 @@
 // format decodes to one of three host pixel layouts. Format numbers and layouts per local-notes/hw/nv2a-pgraph.md.
 namespace mv::pgraph {
 
-enum class HostPixel : u8 { Rgba8, R16, R32f };
+// Bc1/Bc2/Bc3: a DXT1/DXT3/DXT5 image's blocks as stored, for a device that samples them (Vulkan BC1-3 have the same
+// layout and the same 1-bit alpha rule for DXT1).
+enum class HostPixel : u8 { Rgba8, R16, R32f, Bc1, Bc2, Bc3 };
 
 struct FormatInfo {
     u32 bytes_per_pixel{0};  // 0 = unknown format
@@ -39,7 +41,8 @@ u32 swizzled_offset(u32 x, u32 y, u32 z, u32 log_w, u32 log_h, u32 log_d);
 u32 texture_size_in_memory(const TextureStage& stage);
 
 // Decodes a texture stage's image from guest memory. `base` is the physical address the stage's offset resolves to.
-bool decode_texture(const TextureStage& stage, u32 base, const MemoryView& memory, const u8* palette, DecodedTexture& out);
+// With `keep_blocks`, a 2D or cube DXT texture keeps its blocks (HostPixel::Bc1-3) instead of being decoded to RGBA8.
+bool decode_texture(const TextureStage& stage, u32 base, const MemoryView& memory, const u8* palette, DecodedTexture& out, bool keep_blocks = false);
 
 // Decoders of single images (exposed for tests): each writes RGBA8 into `out` (w*h*4 bytes).
 void decode_dxt1(const u8* blocks, u32 w, u32 h, u8* out);

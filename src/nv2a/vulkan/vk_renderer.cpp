@@ -145,6 +145,9 @@ VulkanRenderer::VulkanRenderer(vk::Device& device, const HandleResolver& handles
     : dev_(device), handles_(handles), ram_(ram), ram_size_(ram_size), fn_(&device.fn()) {
     // MV_ASYNC_WRITEBACK=0: every write-back waits for the GPU where it is asked for (the control for the background ones).
     if (const char* a = std::getenv("MV_ASYNC_WRITEBACK"); a && *a == '0') async_wb_on_ = false;
+    // MV_NATIVE_DXT=0: DXT textures decoded to RGBA8 on the CPU as before (the control).
+    if (const char* n = std::getenv("MV_NATIVE_DXT"); n && *n == '0') native_dxt_requested_ = false;
+    if (const char* w = std::getenv("MV_PENDING_WAIT_MS"); w && *w) pending_wait_per_vblank_ns_ = std::atoll(w) * 1'000'000;
     if (const char* d = std::getenv("MV_RENDER_DEBUG")) {
         const std::string s = d;
         debug_flat_ = s.find("flat") != std::string::npos;
@@ -311,6 +314,8 @@ bool VulkanRenderer::init(std::string& error) {
     constexpr VkFormatFeatureFlags kSampledFiltered = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
     depth16_sampled_ = dev_.format_supports(VK_FORMAT_D16_UNORM, kSampledFiltered);
     depth24_sampled_ = dev_.format_supports(depth24_, kSampledFiltered);
+    native_dxt_ = native_dxt_requested_ && dev_.bc_textures() && dev_.format_supports(VK_FORMAT_BC1_RGBA_UNORM_BLOCK, kSampledFiltered) && dev_.format_supports(VK_FORMAT_BC2_UNORM_BLOCK, kSampledFiltered) &&
+                  dev_.format_supports(VK_FORMAT_BC3_UNORM_BLOCK, kSampledFiltered);
 
     if (!create_ring(vertex_ring_, kVertexRingBytes, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, error)) return false;
     if (!create_ring(index_ring_, kIndexRingBytes, VK_BUFFER_USAGE_INDEX_BUFFER_BIT, error)) return false;
@@ -2254,6 +2259,16 @@ bool VulkanRenderer::texture_current(TextureEntry& e) {
     return true;
 }
 
+// One short wait for a background compile, out of the vblank's budget; false once the budget is spent.
+bool VulkanRenderer::wait_a_little() {
+    if (pending_wait_budget_ns_ <= 0) return false;
+    const auto t0 = std::chrono::steady_clock::now();
+    std::this_thread::sleep_for(std::chrono::microseconds(200));
+    pending_wait_budget_ns_ -= std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
+    ++stats_.pending_waits;
+    return true;
+}
+
 bool VulkanRenderer::overlaps_target(u32 phys, u32 length) {
     if (!target_ranges_valid_) {
         target_ranges_.clear();
@@ -2354,7 +2369,7 @@ const VulkanRenderer::TextureEntry* VulkanRenderer::texture(const KelvinState& s
     // Its pages are watched before they are read: a write from here on marks the texture stale.
     handles_.watch_writes(phys, length);
     if (palette_phys) handles_.watch_writes(palette_phys, 256 * 4);
-    if (!decode_texture(ts, phys, MemoryView{ram_, ram_size_}, palette, d)) {
+    if (!decode_texture(ts, phys, MemoryView{ram_, ram_size_}, palette, d, native_dxt_)) {
         error = d.error;
         return nullptr;
     }
@@ -2397,7 +2412,16 @@ const VulkanRenderer::TextureEntry* VulkanRenderer::texture(const KelvinState& s
             png::write(std::format("scratch/texlog-cube-{:08x}-{}.png", phys, cubes), d.width * 6, d.height, strip.data(), d.width * 6 * 4, e);
         }
     }
-    const VkFormat format = d.pixel == HostPixel::Rgba8 ? VK_FORMAT_R8G8B8A8_UNORM : (d.pixel == HostPixel::R16 ? VK_FORMAT_R16_UNORM : VK_FORMAT_R32_SFLOAT);
+    VkFormat format = VK_FORMAT_R32_SFLOAT;
+    switch (d.pixel) {
+        case HostPixel::Rgba8: format = VK_FORMAT_R8G8B8A8_UNORM; break;
+        case HostPixel::R16: format = VK_FORMAT_R16_UNORM; break;
+        case HostPixel::R32f: format = VK_FORMAT_R32_SFLOAT; break;
+        case HostPixel::Bc1: format = VK_FORMAT_BC1_RGBA_UNORM_BLOCK; break;
+        case HostPixel::Bc2: format = VK_FORMAT_BC2_UNORM_BLOCK; break;
+        case HostPixel::Bc3: format = VK_FORMAT_BC3_UNORM_BLOCK; break;
+    }
+    if (d.pixel == HostPixel::Bc1 || d.pixel == HostPixel::Bc2 || d.pixel == HostPixel::Bc3) ++stats_.textures_native_dxt;
     auto entry = std::make_unique<TextureEntry>();
     if (it != textures_.end()) {
         entry = std::move(it->second);
@@ -2509,7 +2533,7 @@ VulkanRenderer::TextureEntry* VulkanRenderer::surface_texture(const TextureStage
             if (TextureEntry* e = parked_texture(s, ts, phys, w, h, linear, depth16)) return e;
         const bool recent = !s.ram_newer && s.last_rendered_frame + 1 >= frame_index_;
         // The depth buffer read as colour at its own address: converted on the GPU (Z24S8 on a device with D24S8).
-        if (want == VK_FORMAT_B8G8R8A8_UNORM && s.depth_holds == phys && s.phys != phys && s.zeta_format == 2 && depth24_ == VK_FORMAT_D24_UNORM_S8_UINT && s.aa_x == 1 && s.aa_y == 1 &&
+        if (want == VK_FORMAT_B8G8R8A8_UNORM && s.depth_holds == phys && s.phys != phys && s.zeta_format == 2 && depth24_ == VK_FORMAT_D24_UNORM_S8_UINT &&
             (s.zeta_dirty || recent) && linear == !s.swizzled && (!linear || ts.pitch() == (s.holds_pitch ? s.holds_pitch : s.zeta_pitch)))
             return zeta_color_texture(s, ts, phys, w, h, linear, x8, abgr);
         if (color) {
@@ -3555,6 +3579,13 @@ void VulkanRenderer::draw(const KelvinState& s, const DrawBatch& batch) {
                      s.reg(mthd::kCombinerFactor0), s.reg(mthd::kCombinerFactor1), s.reg(mthd::kCombinerSpecFogCw0), s.reg(mthd::kCombinerSpecFogCw1),
                      s.reg(mthd::kTextureBase + 0x18), s.reg(mthd::kTextureBase + 0x0C), s.reg(mthd::kTextureBase + 0x10), s.reg(mthd::kTextureBase + 0x14), s.reg(mthd::kTextureBase + 0x08));
     if (debug_skip_blend_ && s.blend()) return;  // MV_RENDER_DEBUG=skipblend: the opaque passes alone
+    if (s.blend()) {
+        const TextureStage t0 = s.texture(0);
+        const u64 key = (static_cast<u64>(s.reg(mthd::kBlendSfactor) & 0xFFFFu) << 48) | (static_cast<u64>(s.reg(mthd::kBlendDfactor) & 0xFFFFu) << 32) |
+                        (static_cast<u64>(s.reg(mthd::kBlendEquation) & 0xFFFFu) << 16) | ((s.reg(mthd::kControl0) & (1u << 16)) ? 0x8000u : 0u) |
+                        (static_cast<u64>(t0.color_format() & 0x7Fu) << 8) | ((t0.wrap_u() & 0xFu) << 4) | (t0.wrap_v() & 0xFu);
+        ++stats_.blend_modes[key];
+    }
     std::string error;
     Surface* t = target_for(s);
     if (!t) {
@@ -3622,7 +3653,13 @@ void VulkanRenderer::draw(const KelvinState& s, const DrawBatch& batch) {
         ++stats_.skipped;
         return;
     }
+    while ((!vs || !fs) && wait_a_little()) {
+        if (!vs) vs = vertex_shader(s, error);
+        if (!fs) fs = fragment_shader(pkey, kinds, error);
+        if (!error.empty()) break;
+    }
     if (!vs || !fs) {
+        if (!error.empty()) note(error);
         ++stats_.pending_skips;
         return;
     }
@@ -3687,6 +3724,7 @@ void VulkanRenderer::draw(const KelvinState& s, const DrawBatch& batch) {
     clock.lap(stats_.ns_indices);
     error.clear();
     VkPipeline p = pipeline(s, vs, fs, topology, *t, v.enabled, depth_mode, error);
+    while (!p && error.empty() && wait_a_little()) p = pipeline(s, vs, fs, topology, *t, v.enabled, depth_mode, error);
     clock.lap(stats_.ns_pipeline);
     if (!p && error.empty()) {  // a worker is creating it
         ++stats_.pending_skips;
@@ -3960,6 +3998,7 @@ bool VulkanRenderer::write_back_at(u32 phys) {
     if (requested_scale_.load(std::memory_order_relaxed) != scale_) apply_scale();
     // A frame boundary: the next submit moves to the next frame in flight, so what the frame retired is freed in time.
     rotate_pending_ = true;
+    pending_wait_budget_ns_ = pending_wait_per_vblank_ns_;
     // Targets nothing has drawn into or sampled for ten seconds, and that hold nothing newer than RAM, retire.
     if (++vblank_index_ % 60 == 0)
         for (auto it = surfaces_.begin(); it != surfaces_.end();) {

@@ -145,6 +145,8 @@ VkDevice Device::create_logical(const Functions& fn, VkPhysicalDevice gpu, u32& 
     features.samplerAnisotropy = available.samplerAnisotropy;
     enabled.anisotropy = available.samplerAnisotropy;
     features.depthClamp = available.depthClamp;
+    features.textureCompressionBC = available.textureCompressionBC;
+    enabled.bc_textures = available.textureCompressionBC;
     enabled.depth_clamp = available.depthClamp;
     features.independentBlend = available.independentBlend;
     features.largePoints = available.largePoints;

@@ -2,6 +2,7 @@
 // per-instruction step — on generated programs (integer forms, memory through a base register, short branches),
 // on code that rewrites itself inside the block that runs it, and on code a device rewrites. The block schedule's
 // rules are pinned on asymmetric cases.
+#include <filesystem>
 #include <gtest/gtest.h>
 
 #include <cstdlib>
@@ -55,8 +56,8 @@ struct Rig {
 };
 
 // Run to the program's HLT (or a step budget) one instruction at a time. Instrument: P6DBG=1 prints the first faults
-// (the handler they reach, the faulting bytes) and the wide test writes each program to p6-wide-N.bin in the working
-// directory (objdump -D -b binary -m i386 --adjust-vma=0x1000).
+// (the handler they reach, the faulting bytes) and the wide test writes each program to scratch/p6-wide/N.bin under the
+// working directory (objdump -D -b binary -m i386 --adjust-vma=0x1000).
 void run_steps(Rig& r) {
     static const bool dbg = std::getenv("P6DBG") != nullptr;
     unsigned shown = 0;
@@ -1328,7 +1329,9 @@ TEST(P6Block, WideProgramsMatchTheInterpreter) {
         code.insert(code.end(), {0xFF, 0x0C, 0x24, 0x0F, 0x85, static_cast<u8>(back), static_cast<u8>(back >> 8), static_cast<u8>(back >> 16),
                                  static_cast<u8>(back >> 24), 0x58, 0xF4});  // dec dword [esp]; jnz body; pop eax; hlt
         if (std::getenv("P6DBG")) {
-            if (std::FILE* f = std::fopen(std::format("p6-wide-{}.bin", program).c_str(), "wb")) {
+            std::error_code ec;
+            std::filesystem::create_directories("scratch/p6-wide", ec);  // its own folder, never the working directory itself
+            if (std::FILE* f = std::fopen(std::format("scratch/p6-wide/{}.bin", program).c_str(), "wb")) {
                 std::fwrite(code.data(), 1, code.size(), f);
                 std::fclose(f);
             }

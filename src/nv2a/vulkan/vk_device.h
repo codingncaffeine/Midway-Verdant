@@ -36,6 +36,7 @@ struct Enabled {
     bool custom_border{false}, custom_border_unformatted{false};
     bool anisotropy{false};
     bool depth_clamp{false};  // depthClamp: primitives are not clipped at the near and far planes (the console clamps or culls per pixel)
+    bool bc_textures{false};  // textureCompressionBC: DXT textures sampled as BC1-3 blocks
     bool cache_control{false};  // pipelines can be asked of the cache alone (FAIL_ON_PIPELINE_COMPILE_REQUIRED)
 };
 
@@ -86,6 +87,7 @@ public:
     bool custom_border_unformatted() const { return enabled_.custom_border_unformatted; }
     bool anisotropy() const { return enabled_.anisotropy; }  // samplerAnisotropy enabled
     bool depth_clamp() const { return enabled_.depth_clamp; }
+    bool bc_textures() const { return enabled_.bc_textures; }
     bool cache_control() const { return enabled_.cache_control; }  // pipeline creation from the cache alone
     bool external() const { return external_; }  // a frontend's device (adopt)
 
