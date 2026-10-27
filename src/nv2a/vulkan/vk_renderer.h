@@ -783,6 +783,7 @@ private:
     u64 frame_index_{1};  // frames ended so far, plus one
     bool attachments_written_{false}, sampled_since_barrier_{false};  // hazards the next surface_barrier() covers
     bool depth16_sampled_{false}, depth24_sampled_{false};  // the device samples (and filters) these depth formats
+    u32 signed_half_{0};  // the half of a signed blend whose pipeline is asked for (psh::Key::signed_half)
     bool debug_tex_log_{false};
     bool debug_no_fog_{false};
     bool debug_vsh_dump_{false};

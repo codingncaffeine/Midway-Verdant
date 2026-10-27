@@ -789,6 +789,41 @@ TEST(Vulkan, ATargetWhoseMemoryAnotherEngineRewroteIsReloadedBeforeItIsDrawnInto
     EXPECT_EQ(renderer.stats().surface_reloads, 1u);
 }
 
+TEST(Vulkan, TheSignedBlendsReadTheSourceByteAsTwosComplementAndIgnoreTheFactors) {
+    // Hardware-measured (both equations, every source byte): result = clamp(D + signed(S)) for ADD_SIGNED and
+    // clamp(D - signed(S)) for REVERSE_SUBTRACT_SIGNED, signed(S) = S - 256 from 128 up, the factors ignored. A racing
+    // title counts light volumes in alpha with the vertex alpha 0xFF (-1): blended unsigned, the pool came out white.
+    for (const u32 equation : {0xF006u, 0xF005u}) {
+        vk::Device device;
+        std::string error;
+        if (!device.init(error)) GTEST_SKIP() << "no Vulkan device: " << error;
+        std::vector<u8> ram(4u << 20, 0);
+        for (u32 y = 0; y < 64; ++y)
+            for (u32 x = 0; x < 64; ++x) {
+                const u32 dst = 0x80404040u;
+                std::memcpy(&ram[0x10000 + y * 256 + x * 4], &dst, 4);
+            }
+        RamResolver handles;
+        handles.size = static_cast<u32>(ram.size());
+        VulkanRenderer renderer(device, handles, ram.data(), static_cast<u32>(ram.size()));
+        ASSERT_TRUE(renderer.init(error)) << error;
+        Kelvin k;
+        k.set_sink(&renderer);
+        setup_target(k);
+        k.method(mthd::kVertexDataArrayFormat + 12, 2u);
+        k.method(mthd::kDiffuse4ub, 0xFF20F010u);  // A B G R: alpha -1, blue +32, green -16, red +16
+        k.method(mthd::kBlendEnable, 1);
+        k.method(mthd::kBlendSfactor, 0x302);  // SRC_ALPHA / ONE_MINUS_SRC_ALPHA: ignored
+        k.method(mthd::kBlendDfactor, 0x303);
+        k.method(mthd::kBlendEquation, equation);
+        draw_full_triangle(k, ram);
+        renderer.end_frame();
+        for (const auto& e : renderer.stats().errors) ADD_FAILURE() << "renderer: " << e;
+        if (equation == 0xF006u) EXPECT_EQ(pixel_at(ram, 8, 8), 0x7F503060u) << "ADD_SIGNED (ARGB): 0x80 - 1, 0x40 + 16, 0x40 - 16, 0x40 + 32";
+        else EXPECT_EQ(pixel_at(ram, 8, 8), 0x81305020u) << "REVERSE_SUBTRACT_SIGNED (ARGB): 0x80 + 1, 0x40 - 16, 0x40 + 16, 0x40 - 32";
+    }
+}
+
 TEST(Vulkan, AWriteReportFromBeforeTheTargetExistedDoesNotUndoALaterClear) {
     // A title copies the last boot frame into its new buffers with the CPU, then clears them on the GPU. The watch on a
     // new target's pages is applied later, and the write log then reports pages written before the target existed:

@@ -2085,7 +2085,7 @@ VkPipeline VulkanRenderer::pipeline(const KelvinState& s, VkShaderModule vs, VkS
         u32 topology, blend_enable, sfactor, dfactor, equation, depth_test, depth_func, depth_write, cull_enable, cull_face, front_face,
             color_mask, stencil_enable, stencil_func, stencil_mask, stencil_write_mask, op_fail, op_zfail, op_zpass;
         u32 vertex_layout;  // the attributes with per-vertex data (also fills the last eight bytes: the key is its bytes)
-    } k{vs, fs, t.pass, static_cast<u32>(topology) | (debug_nocull_ ? 0x100u : 0u) | (debug_nodepth_ ? 0x200u : 0u) | (debug_noblend_ ? 0x400u : 0u) | (depth_mode << 11), s.blend(), s.reg(mthd::kBlendSfactor), s.reg(mthd::kBlendDfactor), s.reg(mthd::kBlendEquation),
+    } k{vs, fs, t.pass, static_cast<u32>(topology) | (debug_nocull_ ? 0x100u : 0u) | (debug_nodepth_ ? 0x200u : 0u) | (debug_noblend_ ? 0x400u : 0u) | (depth_mode << 11), s.blend(), s.reg(mthd::kBlendSfactor), s.reg(mthd::kBlendDfactor), s.reg(mthd::kBlendEquation) | (signed_half_ << 16),
         s.depth_test(), s.reg(mthd::kDepthFunc), s.depth_write(), s.cull_face(), s.reg(mthd::kCullFace), s.reg(mthd::kFrontFace), s.color_mask(),
         s.stencil_test(), s.reg(mthd::kStencilFunc), s.reg(mthd::kStencilFuncMask), s.reg(mthd::kStencilMask), s.reg(mthd::kStencilOpFail),
         s.reg(mthd::kStencilOpZfail), s.reg(mthd::kStencilOpZpass), vertex_layout};
@@ -2176,6 +2176,15 @@ VkPipeline VulkanRenderer::pipeline(const KelvinState& s, VkShaderModule vs, VkS
     cb.srcColorBlendFactor = cb.srcAlphaBlendFactor = blend_factor(s.reg(mthd::kBlendSfactor));
     cb.dstColorBlendFactor = cb.dstAlphaBlendFactor = blend_factor(s.reg(mthd::kBlendDfactor));
     cb.colorBlendOp = cb.alphaBlendOp = blend_op(s.reg(mthd::kBlendEquation));
+    if (signed_half_) {
+        // The console ignores both factors under a signed equation: the destination plus or minus the source byte read
+        // as two's complement, saturated (hardware-measured). The pass of the bytes below 128 adds them for ADD_SIGNED
+        // and takes them away for REVERSE_SUBTRACT_SIGNED; the pass of the negative bytes' magnitudes does the opposite.
+        cb.srcColorBlendFactor = cb.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+        cb.dstColorBlendFactor = cb.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+        const bool add = (signed_half_ == 1) == (s.reg(mthd::kBlendEquation) == 0xF006);
+        cb.colorBlendOp = cb.alphaBlendOp = add ? VK_BLEND_OP_ADD : VK_BLEND_OP_REVERSE_SUBTRACT;
+    }
     if (drawid_on()) {
         cb.blendEnable = VK_TRUE;
         cb.srcColorBlendFactor = cb.srcAlphaBlendFactor = VK_BLEND_FACTOR_CONSTANT_COLOR;
@@ -3695,6 +3704,11 @@ void VulkanRenderer::draw(const KelvinState& s, const DrawBatch& batch) {
         if (auto it = vs_debug_ids_.find(vs); it != vs_debug_ids_.end()) std::fprintf(stderr, "drawid %u: vertex shader vs-%u\n", draw_id, it->second);
     psh::Key pkey = psh::key_from_state(s);
     pkey.swap_rb = swaps_rb(*t);
+    // A signed blend is drawn twice, a pass per half of the source byte (psh::Key::signed_half): a light volume counted
+    // in alpha, the vertex alpha 0xFF being -1, came out as the volume's whole shadow in white when blended unsigned.
+    const u32 equation = s.reg(mthd::kBlendEquation);
+    const bool signed_blend = s.blend() && !debug_noblend_ && !counting && (equation == 0xF005 || equation == 0xF006);  // counted: one draw, one count
+    if (signed_blend) pkey.signed_half = 1;
     if (debug_shadow_pass_) pkey.shadow_compare_func = 7;  // every shadow lookup lit
     // The console's exact depth from the pixel shader wherever depth is stored or a test must land on the console's
     // step: depth writes (what later draws and shadow-map compares read; the host's own depth for them drew a grid over a
@@ -3721,12 +3735,17 @@ void VulkanRenderer::draw(const KelvinState& s, const DrawBatch& batch) {
         ++stats_.skipped;
         return;
     }
-    while ((!vs || !fs) && wait_a_little()) {
+    psh::Key pkey_neg = pkey;
+    pkey_neg.signed_half = 2;
+    std::array<psh::SamplerKind, 4> kinds_neg{};
+    VkShaderModule fs_neg = signed_blend ? fragment_shader(pkey_neg, kinds_neg, error) : VK_NULL_HANDLE;
+    while ((!vs || !fs || (signed_blend && !fs_neg)) && wait_a_little()) {
         if (!vs) vs = vertex_shader(s, error);
         if (!fs) fs = fragment_shader(pkey, kinds, error);
+        if (signed_blend && !fs_neg) fs_neg = fragment_shader(pkey_neg, kinds_neg, error);
         if (!error.empty()) break;
     }
-    if (!vs || !fs) {
+    if (!vs || !fs || (signed_blend && !fs_neg)) {
         if (!error.empty()) note(error);
         ++stats_.pending_skips;
         return;
@@ -3791,8 +3810,17 @@ void VulkanRenderer::draw(const KelvinState& s, const DrawBatch& batch) {
 
     clock.lap(stats_.ns_indices);
     error.clear();
+    signed_half_ = signed_blend ? 1u : 0u;
     VkPipeline p = pipeline(s, vs, fs, topology, *t, v.enabled, depth_mode, error);
     while (!p && error.empty() && wait_a_little()) p = pipeline(s, vs, fs, topology, *t, v.enabled, depth_mode, error);
+    VkPipeline p_neg = VK_NULL_HANDLE;
+    if (signed_blend && p) {
+        signed_half_ = 2;
+        p_neg = pipeline(s, vs, fs_neg, topology, *t, v.enabled, depth_mode, error);
+        while (!p_neg && error.empty() && wait_a_little()) p_neg = pipeline(s, vs, fs_neg, topology, *t, v.enabled, depth_mode, error);
+        if (!p_neg) p = VK_NULL_HANDLE;  // both halves or neither
+    }
+    signed_half_ = 0;
     clock.lap(stats_.ns_pipeline);
     if (!p && error.empty()) {  // a worker is creating it
         ++stats_.pending_skips;
@@ -4006,11 +4034,12 @@ void VulkanRenderer::draw(const KelvinState& s, const DrawBatch& batch) {
     if (counting) {
         fn_->vkCmdBeginQuery(cb_, qf.occlusion, query, dev_.occlusion_precise() ? VK_QUERY_CONTROL_PRECISE_BIT : 0);
     }
-    if (!index_list->empty()) {
-        fn_->vkCmdBindIndexBuffer(cb_, index_ring_.buffer.buffer, ioffset, VK_INDEX_TYPE_UINT32);
-        fn_->vkCmdDrawIndexed(cb_, static_cast<u32>(index_list->size()), 1, 0, 0, 0);
-    } else {
-        fn_->vkCmdDraw(cb_, v.count, 1, 0, 0);
+    if (!index_list->empty()) fn_->vkCmdBindIndexBuffer(cb_, index_ring_.buffer.buffer, ioffset, VK_INDEX_TYPE_UINT32);
+    for (const VkPipeline pass_pipeline : {p, p_neg}) {
+        if (!pass_pipeline) continue;
+        if (pass_pipeline != p) fn_->vkCmdBindPipeline(cb_, VK_PIPELINE_BIND_POINT_GRAPHICS, pass_pipeline);
+        if (!index_list->empty()) fn_->vkCmdDrawIndexed(cb_, static_cast<u32>(index_list->size()), 1, 0, 0, 0);
+        else fn_->vkCmdDraw(cb_, v.count, 1, 0, 0);
     }
     if (counting) {
         fn_->vkCmdEndQuery(cb_, qf.occlusion, query);

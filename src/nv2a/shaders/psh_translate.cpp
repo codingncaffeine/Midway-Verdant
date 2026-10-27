@@ -646,6 +646,11 @@ Translation translate(const Key& key) {
     }
     g += "    frag_color = clamp(final_color, 0.0, 1.0);\n";
     if (g.find("vec4 debug_show") != std::string::npos) g += "    frag_color = debug_show;\n";
+    // A signed blend's half (see Key::signed_half): the byte the console blends, split at its sign bit.
+    if (key.signed_half == 1)
+        g += "    { vec4 s = round(frag_color * 255.0); frag_color = vec4(lessThan(s, vec4(128.0))) * s / 255.0; }\n";
+    else if (key.signed_half == 2)
+        g += "    { vec4 s = round(frag_color * 255.0); frag_color = vec4(greaterThanEqual(s, vec4(128.0))) * (256.0 - s) / 255.0; }\n";
     if (key.swap_rb) g += "    frag_color = frag_color.bgra;\n";  // a B8 or G8B8 target: its first channel is blue
     // The exact path (key.exact_depth: depth writes, occlusion-counted draws, EQUAL tests): the depth the console
     // writes, modelled on the reference emulator: the screen-space z plus the polygon offset (bias + factor x slope, in

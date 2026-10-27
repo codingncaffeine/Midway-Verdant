@@ -28,6 +28,10 @@ struct Key {
     // its early rejection. 3: the same in the w-buffer mode (SET_CONTROL0 Z_PERSPECTIVE_ENABLE): the depth stored is the
     // vertex w at the pixel (perspective correct), not z/w, so every draw that tests or writes depth takes this path.
     u32 exact_depth{0};
+    // The signed blends (ADD_SIGNED, REVERSE_SUBTRACT_SIGNED) read the source byte as two's complement: the renderer
+    // draws such a draw twice, 1: the bytes below 128 as they are (others 0), 2: the magnitude 256 - S of the bytes from
+    // 128 up (others 0), each pass under the operation that adds or takes away that half.
+    u32 signed_half{0};
     std::array<bool, 4> texture_enabled{};
     bool alpha_test{false};
     bool smooth_shading{true};
