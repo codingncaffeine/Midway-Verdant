@@ -39,6 +39,7 @@ bool reports_progress(u32 key) {
 Nv2aStub::Nv2aStub(Bus& bus, Scheduler& sched, std::function<void(bool)> irq)
     : PciDevice("nv2a", 0x10DE, 0x02A0, 0x030000, 0xA1), bus_(bus), sched_(sched), irq_(std::move(irq)), walker_(bus) {
     walker_.set_sink([this](const PushbufferMethod& m) { on_method(m); });
+    walker_.set_bulk_sink([this](u32 sub, u32 method, const u32* words, u32 count) { return bulk_methods(sub, method, words, count); });
     define_bar(0, BarKind::Memory, kMmioSize);
     define_bar(1, BarKind::Memory, 128u * 1024 * 1024, true);
     define_bar(2, BarKind::Memory, 512u * 1024, true);
@@ -495,6 +496,24 @@ void Nv2aStub::on_method(const PushbufferMethod& m) {
         charge(m);
     }
     execute_method(m);
+}
+
+u32 Nv2aStub::bulk_methods(u32 subchannel, u32 method, const u32* words, u32 count) {
+    // ARRAY_ELEMENT16 does nothing but add two indices to the draw: Fable's heavy scenes carried 270k such words a frame,
+    // each a trip through the sink, this function and the state machine.
+    if (method != pgraph::mthd::kArrayElement16 || subchannel != ctx_switch_subchannel_ || bound_[subchannel & 7u] != 0x97 || !renderer_ || render_thread_ ||
+        timed_ || capture_ || trace::on(trace::Cat::Gpu))
+        return 0;
+    kelvin_.elements16(words, count);
+    for (u32 i = count - std::min<u32>(count, static_cast<u32>(last_methods_.size())); i < count; ++i) {
+        u32 v;
+        std::memcpy(&v, words + i, 4);
+        last_methods_[last_method_at_++ % last_methods_.size()] = {subchannel, method, v, 0};
+    }
+    method_log_lines_ = std::min<u64>(200000, method_log_lines_ + count);
+    chunk_methods_ += count;
+    if (fifo_threaded_ && (chunk_methods_ >= kChunkMethods || gpu_waiters_.load(std::memory_order_relaxed))) walker_.request_stop();
+    return count;
 }
 
 void Nv2aStub::execute_method(const PushbufferMethod& m) {

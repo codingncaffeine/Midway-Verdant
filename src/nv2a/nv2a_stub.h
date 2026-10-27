@@ -232,6 +232,9 @@ private:
     Cycles gpu_now() const;
     void on_method(const PushbufferMethod& m);
     void execute_method(const PushbufferMethod& m);
+    // The walker's bulk sink: a run of Kelvin index words on the plain fast path, as execute_method would take them one by
+    // one; 0 (declined) wherever a method is more than its value (timed, captured, traced, the render thread).
+    u32 bulk_methods(u32 subchannel, u32 method, const u32* words, u32 count);
     bool observable(const PushbufferMethod& m) const;
     u64 method_clocks(const PushbufferMethod& m) const;
     void charge(const PushbufferMethod& m);

@@ -203,6 +203,22 @@ const std::array<Decoded, 0x800>& decoded_methods() {
 
 }  // namespace
 
+void Kelvin::elements16(const u32* words, u32 count) {
+    if (count == 0) return;
+    methods_ += count;
+    histogram_[mthd::kArrayElement16 >> 2] += count;
+    std::memcpy(&state_.r[mthd::kArrayElement16 >> 2], words + count - 1, 4);
+    const std::size_t at = batch_.indices.size();
+    batch_.indices.resize(at + 2 * static_cast<std::size_t>(count));
+    u32* out = batch_.indices.data() + at;
+    for (u32 i = 0; i < count; ++i) {
+        u32 v;
+        std::memcpy(&v, words + i, 4);  // the ring need not be aligned for the host
+        out[2 * i] = v & 0xFFFFu;
+        out[2 * i + 1] = v >> 16;
+    }
+}
+
 void Kelvin::method(u32 method, u32 value) {
     method &= 0x1FFCu;
     ++methods_;

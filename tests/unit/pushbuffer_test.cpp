@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <vector>
 
 #include "core/bus.h"
@@ -105,4 +106,57 @@ TEST(Pushbuffer, ASinkCanStopTheWalkMidHeaderAndTheRestIsDeliveredOnResume) {
     EXPECT_EQ(seen[4].value, 9u);
     EXPECT_EQ(seen[4].subchannel, 1u);
     EXPECT_EQ(w.methods_seen(), 5u);
+}
+
+// A bulk sink takes runs of a non-increasing header's words as the methods they are: the same methods, values, counts
+// and GET as one by one, through a header it takes in parts, one it turns down, increasing headers it is never
+// offered, a stop it asks for mid-run and a run cut short by the end of the DMA object.
+TEST(Pushbuffer, ABulkSinkSeesTheSameMethodsAsOneByOne) {
+    Bus bus(1u << 20);
+    u32 p = 0x1000;
+    put(bus, p, hdr(3, 0, 0x1800)); p += 4;  // increasing: never offered
+    for (u32 i = 0; i < 3; ++i, p += 4) put(bus, p, 0x100 + i);
+    put(bus, p, hdr(9, 0, 0x1800, false)); p += 4;  // taken in parts of at most four
+    for (u32 i = 0; i < 9; ++i, p += 4) put(bus, p, 0x200 + i);
+    put(bus, p, hdr(4, 0, 0x1818, false)); p += 4;  // turned down
+    for (u32 i = 0; i < 4; ++i, p += 4) put(bus, p, 0x300 + i);
+    put(bus, p, hdr(6, 1, 0x1800, false)); p += 4;  // the sink asks for a stop after its first part
+    for (u32 i = 0; i < 6; ++i, p += 4) put(bus, p, 0x400 + i);
+    const u32 put_at = p;
+
+    struct Seen {
+        u32 sub, method, value;
+        bool operator==(const Seen&) const = default;
+    };
+    auto walk = [&](bool bulk, u32 limit, std::vector<Seen>& seen, PushbufferWalker& w) {
+        w.set_sink([&](const PushbufferMethod& m) { seen.push_back({m.subchannel, m.method, m.value}); });
+        bool stopped_once = false;
+        if (bulk)
+            w.set_bulk_sink([&](u32 sub, u32 method, const u32* words, u32 count) -> u32 {
+                if (method != 0x1800) return 0;
+                const u32 take = std::min(count, 4u);
+                for (u32 i = 0; i < take; ++i) seen.push_back({sub, method, words[i]});
+                if (sub == 1 && !stopped_once) {
+                    stopped_once = true;
+                    w.request_stop();
+                }
+                return take;
+            });
+        PushbufferWalker::DmaObject dma{0, limit, true};
+        u32 get = 0x1000;
+        for (int i = 0; i < 4 && get != put_at && !w.errored(); ++i) get = w.run(dma, get, put_at);
+        return get;
+    };
+    for (const u32 limit : {(1u << 20) - 1, put_at - 9}) {  // the second ends the object two words into the last header
+        SCOPED_TRACE(limit);
+        PushbufferWalker a(bus), b(bus);
+        std::vector<Seen> one, many;
+        const u32 get_a = walk(false, limit, one, a);
+        const u32 get_b = walk(true, limit, many, b);
+        EXPECT_EQ(get_a, get_b);
+        EXPECT_EQ(a.errored(), b.errored());
+        EXPECT_EQ(a.methods_seen(), b.methods_seen());
+        EXPECT_EQ(a.words_fetched(), b.words_fetched());
+        EXPECT_TRUE(one == many) << one.size() << " methods one by one, " << many.size() << " with the bulk sink";
+    }
 }

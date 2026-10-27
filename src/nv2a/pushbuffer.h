@@ -24,6 +24,9 @@ struct PushbufferMethod {
 class PushbufferWalker {
 public:
     using Sink = std::function<void(const PushbufferMethod&)>;
+    // Offered the rest of a non-increasing header's data words where they lie contiguous in RAM: returns how many it
+    // took as that many methods (0: none, they go to the Sink one by one). Index runs are most of a heavy frame.
+    using BulkSink = std::function<u32(u32 subchannel, u32 method, const u32* words, u32 count)>;
 
     struct DmaObject {
         u32 base{0};
@@ -33,6 +36,7 @@ public:
 
     explicit PushbufferWalker(Bus& bus) : bus_(bus) {}
     void set_sink(Sink s) { sink_ = std::move(s); }
+    void set_bulk_sink(BulkSink s) { bulk_sink_ = std::move(s); }
 
     // Run from `get` until it reaches `put` or an error; returns the new GET. Jump targets, like GET and PUT,
     // are offsets within the DMA object (physical addresses when the object spans RAM from zero).
@@ -58,6 +62,7 @@ private:
 
     Bus& bus_;
     Sink sink_;
+    BulkSink bulk_sink_;
     std::vector<u32> call_stack_;
     u64 methods_{0}, words_{0};
     bool error_{false};
@@ -67,6 +72,7 @@ private:
     struct PendingHeader {
         u32 remaining{0}, method{0}, subchannel{0}, header_at{0};
         bool increasing{false};
+        bool declined{false};  // the bulk sink turned this header down: its words go one by one
     } pending_;
 };
 

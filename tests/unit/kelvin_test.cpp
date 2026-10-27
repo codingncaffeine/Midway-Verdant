@@ -326,3 +326,25 @@ TEST(Kelvin, ConstantAttributesReadTheirOneValue) {
     k.method(mthd::kBeginEnd, 0);
     EXPECT_FLOAT_EQ(k.state().immediate[0][0], 8.0f);
 }
+
+// A run of ARRAY_ELEMENT16 words taken at once leaves what the same words one method at a time leave: the draw's
+// indices, the register's last value and the method counts.
+TEST(Kelvin, ARunOfIndexWordsAtOnceIsThoseWordsOneByOne) {
+    std::vector<u32> words(1 + 777);
+    for (u32 i = 0; i < words.size(); ++i) words[i] = (i * 2654435761u) ^ 0x5A5Au;
+    RecordingSink one_sink, run_sink;
+    Kelvin one, run;
+    one.set_sink(&one_sink);
+    run.set_sink(&run_sink);
+    for (Kelvin* k : {&one, &run}) k->method(mthd::kBeginEnd, 5);  // triangles
+    for (u32 i = 1; i < words.size(); ++i) one.method(mthd::kArrayElement16, words[i]);
+    run.elements16(words.data() + 1, static_cast<u32>(words.size() - 1));  // an odd start: the ring need not be aligned for the host
+    EXPECT_EQ(one.batch().indices, run.batch().indices);
+    EXPECT_EQ(one.state().reg(mthd::kArrayElement16), run.state().reg(mthd::kArrayElement16));
+    EXPECT_EQ(one.methods_seen(), run.methods_seen());
+    EXPECT_EQ(one.histogram(), run.histogram());
+    for (Kelvin* k : {&one, &run}) k->method(mthd::kBeginEnd, 0);
+    ASSERT_EQ(one_sink.draws.size(), 1u);
+    ASSERT_EQ(run_sink.draws.size(), 1u);
+    EXPECT_EQ(one_sink.draws[0].indices, run_sink.draws[0].indices);
+}

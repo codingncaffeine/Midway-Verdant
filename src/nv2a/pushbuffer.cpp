@@ -1,5 +1,6 @@
 #include "nv2a/pushbuffer.h"
 
+#include <algorithm>
 #include <format>
 
 #include "debug/trace.h"
@@ -9,6 +10,23 @@ namespace mv {
 // The data words of the current header, from `get`; stops early when the sink asks.
 bool PushbufferWalker::deliver(const DmaObject& dma, u32& get) {
     while (pending_.remaining) {
+        if (bulk_sink_ && !pending_.increasing && !pending_.declined && pending_.remaining > 1 && dma.valid && get <= dma.limit) {
+            const u64 room = (static_cast<u64>(dma.limit) + 1 - get) / 4;
+            const u32 n = static_cast<u32>(std::min<u64>(pending_.remaining, room));
+            const u8* p = n > 1 ? bus_.ram_pointer(dma.base + get, static_cast<std::size_t>(n) * 4) : nullptr;
+            const u32 k = p ? bulk_sink_(pending_.subchannel, pending_.method, reinterpret_cast<const u32*>(p), n) : 0;
+            if (k == 0) {
+                pending_.declined = true;
+            } else {
+                get += 4 * k;
+                position_ = get;
+                methods_ += k;
+                words_ += k;
+                pending_.remaining -= k;
+                if (stop_requested_) return true;
+                continue;
+            }
+        }
         u32 v;
         if (!fetch(dma, get, v)) {
             error_ = true;

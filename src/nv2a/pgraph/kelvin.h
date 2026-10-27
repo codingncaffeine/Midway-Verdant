@@ -77,6 +77,8 @@ public:
         vertex_memory_ = memory;
     }
     void method(u32 method, u32 value);
+    // A run of ARRAY_ELEMENT16 words, as that many method() calls would take them (most of a draw-heavy frame's methods).
+    void elements16(const u32* words, u32 count);
 
     const KelvinState& state() const { return state_; }
     KelvinState& state() { return state_; }
