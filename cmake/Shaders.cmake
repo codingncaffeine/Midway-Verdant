@@ -1,6 +1,9 @@
 # glslang compiles the GLSL our translators emit into SPIR-V at run time. The system package is used where it
-# provides CMake targets (Arch, recent Debian/Ubuntu); otherwise a pinned copy is fetched and built (Windows CI).
-find_package(glslang CONFIG QUIET)
+# provides CMake targets (Arch, recent Debian/Ubuntu); otherwise, and always for a portable core (MV_PORTABLE), a pinned
+# copy is fetched and built in statically.
+if(NOT MV_PORTABLE)
+  find_package(glslang CONFIG QUIET)
+endif()
 if(glslang_FOUND AND TARGET glslang::glslang AND TARGET glslang::SPIRV)
   message(STATUS "glslang: system ${glslang_VERSION}")
 else()

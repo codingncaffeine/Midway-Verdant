@@ -47,7 +47,9 @@ include(GoogleTest)
 gtest_discover_tests(mv_tests DISCOVERY_TIMEOUT 60 PROPERTIES TIMEOUT 120)
 
 # The emulator answers --version; a build that cannot is not a build.
-add_test(NAME cli_version COMMAND midway-verdant --version)
+if(MV_BUILD_SHELL)
+  add_test(NAME cli_version COMMAND midway-verdant --version)
+endif()
 set_tests_properties(cli_version PROPERTIES PASS_REGULAR_EXPRESSION "^Midway Verdant [0-9]+\\.[0-9]+\\.[0-9]+")
 
 # The boot smoke test runs only where the user's console dumps are (local-notes/user-files.env); elsewhere it skips.

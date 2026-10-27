@@ -84,6 +84,10 @@ target_link_libraries(mvcore PUBLIC Vulkan::Headers)
 target_compile_definitions(mvcore PUBLIC VK_NO_PROTOTYPES)
 if(NOT WIN32)
   target_link_libraries(mvcore PUBLIC ${CMAKE_DL_LIBS})
+  # timer_create and friends were in librt until glibc 2.34 (an empty stub from then on).
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    target_link_libraries(mvcore PUBLIC rt)
+  endif()
   # Vulkan structures are filled sType-first with the rest zeroed: the idiom the API documents.
   set_source_files_properties(nv2a/vulkan/vk_device.cpp nv2a/vulkan/vk_renderer.cpp tools/mv-retro-host.cpp PROPERTIES COMPILE_OPTIONS "-Wno-missing-field-initializers;-Wno-old-style-cast")
 endif()
@@ -98,9 +102,11 @@ if(NOT MSVC)
 endif()
 
 # midway-verdant: the emulator shell — the SDL3 window around the core (the core itself never sees SDL).
+if(MV_BUILD_SHELL)
 include(${CMAKE_SOURCE_DIR}/cmake/SDL3.cmake)
 add_executable(midway-verdant ui/main.cpp ui/window.cpp ui/pad_input.cpp)
 target_link_libraries(midway-verdant PRIVATE mvcore SDL3::SDL3)
+endif()
 
 # mv-pbcap: the pushbuffer capture reader (summaries and dumps of what --capture wrote).
 add_executable(mv-pbcap tools/mv-pbcap.cpp)
@@ -118,9 +124,16 @@ target_link_libraries(mv-fatx PRIVATE mvcore)
 add_library(midway_verdant_libretro SHARED libretro/libretro_core.cpp)
 target_link_libraries(midway_verdant_libretro PRIVATE mvcore)
 set_target_properties(midway_verdant_libretro PROPERTIES PREFIX "" CXX_VISIBILITY_PRESET hidden)
+if(MV_PORTABLE AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  # The C++ runtime inside the core, and only retro_* exported: the static libraries' symbols stay the core's own.
+  target_link_options(midway_verdant_libretro PRIVATE -static-libstdc++ -static-libgcc -Wl,--exclude-libs,ALL -Wl,--no-undefined)
+endif()
 
 # mv-retro-host: a headless libretro frontend that drives the core frame by frame for tests (POSIX dlopen).
 if(NOT WIN32)
   add_executable(mv-retro-host tools/mv-retro-host.cpp)
   target_link_libraries(mv-retro-host PRIVATE mvcore ${CMAKE_DL_LIBS})
+  if(MV_PORTABLE)
+    target_link_options(mv-retro-host PRIVATE -static-libstdc++ -static-libgcc)  # runs the release core on other distributions
+  endif()
 endif()

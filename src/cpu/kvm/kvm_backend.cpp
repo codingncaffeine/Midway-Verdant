@@ -10,6 +10,7 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <time.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -761,7 +762,7 @@ void KvmBackend::thread_main() {
         sigevent sev{};
         sev.sigev_notify = SIGEV_THREAD_ID;
         sev.sigev_signo = kProfileSignal;
-        sev._sigev_un._tid = gettid();
+        sev._sigev_un._tid = static_cast<pid_t>(syscall(SYS_gettid));  // gettid() itself is glibc 2.30 on
         if (timer_create(CLOCK_THREAD_CPUTIME_ID, &sev, &profile_timer_) == 0) {
             profile_timer_ok_ = true;
             itimerspec its{};
@@ -782,7 +783,7 @@ void KvmBackend::thread_main() {
         sigevent sev{};
         sev.sigev_notify = SIGEV_THREAD_ID;
         sev.sigev_signo = kKickSignal;
-        sev._sigev_un._tid = gettid();
+        sev._sigev_un._tid = static_cast<pid_t>(syscall(SYS_gettid));  // gettid() itself is glibc 2.30 on
         std::lock_guard lock(machine_->lock());
         backstop_ok_ = timer_create(CLOCK_MONOTONIC, &sev, &backstop_) == 0;
         backstop_at_ns_ = 0;
