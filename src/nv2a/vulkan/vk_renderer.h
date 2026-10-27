@@ -197,6 +197,7 @@ public:
         u64 depth_snapshots{0};  // the same for draws that sample the depth buffer of the target they draw into
         u64 zeta_conversions{0};  // depth buffers converted on the GPU for a colour texture at their address
         u64 cpu_written_targets{0};  // render targets whose memory the CPU wrote: reloaded from RAM
+        u64 cpu_written_depth{0};    // of them, depth buffers (held or parked) let go because the CPU wrote their memory
         u64 depth_handovers{0}, depth_uploads{0};  // depth buffers moved between targets sharing an address; loaded from RAM
         u64 depth_unparks{0}, parked_samples{0};  // parked depth images bound again; sampled in place
         u64 depth_loads_skipped{0};  // depth buffers bound for a clear of the whole buffer: nothing loaded
@@ -217,6 +218,7 @@ public:
         std::unordered_map<u64, u64> blend_modes;
         // Instrument: the CPU side of storing write-backs in RAM, by target: count and nanoseconds.
         std::map<std::string, std::pair<u64, u64>> store_cost;
+        std::map<std::string, u64> relayouts;  // a target given up for one at its memory, by old -> new layout (relaid out or evicted)
         u64 surface_reloads{0};  // render targets reloaded from RAM after another engine wrote them  // textures whose pages were written but whose bytes hashed the same: kept
         // Write-backs by cause: frame end, a texture sampling the target, the scanout at vblank, a 2D or CPU range,
         // a target relaid out, the idle vblank (all).
@@ -227,6 +229,7 @@ public:
         // submits and the fence waits; the copies back to RAM, colour and depth (and the wait for the device copy
         // inside them).
         u64 ns_draw{0}, ns_fetch{0}, ns_texture{0}, ns_pipeline{0}, ns_flush{0}, ns_write_back{0}, ns_write_back_gpu{0};
+        u64 ns_wait_slot{0}, ns_wait_finish{0};  // waits for a frame slot the GPU still runs, and for everything submitted (finish)
         u64 ns_vs{0}, ns_fs{0}, ns_indices{0}, ns_upload{0}, ns_descriptors{0}, ns_record{0};
         u64 vs_memo_hits{0}, vs_cache_hits{0}, fs_memo_hits{0}, fs_cache_hits{0};
         std::vector<std::string> errors;  // distinct messages, in order of first appearance
@@ -495,6 +498,8 @@ private:
     void invalidate_textures(u32 phys, u32 len);
     u64 texture_content(u32 phys, u32 length, u32 palette_phys) const;  // the bytes a decode reads, hashed
     void remember_pages(Surface& s);  // s.page_hashes from RAM as it is now
+    // The hash of the part of RAM page `page` the target occupies (a CPU write elsewhere in the page is not the target's).
+    u64 target_page_hash(const Surface& s, u32 page) const;
     bool texture_current(TextureEntry& e);  // RAM still holds what e was decoded from (rehashed when pages were written)  // the decoded textures over a range (RAM now holds what a target wrote)
     void hash_pages(TextureEntry& e) const;  // e.page_hashes and e.palette_hash from RAM as it is now
     VkSampler sampler(const TextureStage& ts, u32 levels);

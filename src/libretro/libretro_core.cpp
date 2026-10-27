@@ -770,6 +770,22 @@ RETRO_API void retro_unload_game(void) {
         log(RETRO_LOG_INFO, "retro_run: the CPU held at each vblank for the picture: noticed after %.3f ms (max %.1f), grabbed in %.3f ms (means)",
             frames_run ? hold_wake_ms_sum / static_cast<double>(frames_run) : 0.0, hold_wake_ms_max, frames_run ? hold_grab_ms_sum / static_cast<double>(frames_run) : 0.0);
         log(RETRO_LOG_INFO, "gpu: busiest register reads:%s", machine->nv2a().busiest_reads(6).c_str());
+        // MV_DUMP_AT_EXIT=FILE: the guest RAM to FILE and the CPU's registers to FILE.regs as the game is closed (a game
+        // stuck in a loop: what the loop reads, and CR3 to find its code).
+        if (const char* e = std::getenv("MV_DUMP_AT_EXIT"); e && *e) {
+            if (std::FILE* f = std::fopen(e, "wb")) {
+                std::fwrite(machine->bus().ram(), 1, machine->bus().ram_size(), f);
+                std::fclose(f);
+            }
+            mv::CpuBackend::Regs r{};
+            if (machine->cpu() && machine->cpu()->read_regs(r))
+                if (std::FILE* f = std::fopen(std::format("{}.regs", e).c_str(), "w")) {
+                    std::fprintf(f, "eax %08x ebx %08x ecx %08x edx %08x esi %08x edi %08x ebp %08x esp %08x eip %08x eflags %08x cr0 %08x cr3 %08x cr4 %08x\n", r.eax, r.ebx, r.ecx,
+                                 r.edx, r.esi, r.edi, r.ebp, r.esp, r.eip, r.eflags, r.cr0, r.cr3, r.cr4);
+                    std::fclose(f);
+                }
+            log(RETRO_LOG_INFO, "guest RAM and registers written to %s", e);
+        }
         if (machine->nv2a().timed())
             log(RETRO_LOG_INFO, "gpu timing: %.3f s of GPU time for %.3f s of console time; %llu pixels drawn costing %.3f s; their counts waited for %llu times; %llu z-pass reports",
                 static_cast<double>(machine->nv2a().gpu_clocks()) / (static_cast<double>(mv::clk::kGpuHzNum) / mv::clk::kGpuHzDen),
@@ -806,6 +822,8 @@ RETRO_API void retro_unload_game(void) {
                 static_cast<unsigned long long>(st.writebacks_by[3]), static_cast<unsigned long long>(st.writebacks_by[4]), static_cast<unsigned long long>(st.writebacks_by[5]),
                 static_cast<unsigned long long>(st.surface_samples), static_cast<unsigned long long>(st.snapshots), static_cast<unsigned long long>(st.depth_snapshots), static_cast<unsigned long long>(st.zeta_conversions), static_cast<unsigned long long>(st.cpu_written_targets),
                 static_cast<unsigned long long>(st.depth_handovers), static_cast<unsigned long long>(st.depth_uploads), static_cast<unsigned long long>(st.evicted), static_cast<unsigned long long>(st.retired_unused), static_cast<unsigned long long>(st.subrect_copies));
+            log(RETRO_LOG_INFO, "gpu: waits for a frame slot %.3f s, for everything submitted %.3f s", static_cast<double>(st.ns_wait_slot) / 1e9, static_cast<double>(st.ns_wait_finish) / 1e9);
+            if (st.cpu_written_depth) log(RETRO_LOG_INFO, "gpu: of the targets the CPU wrote, %llu were depth buffers let go", static_cast<unsigned long long>(st.cpu_written_depth));
             if (st.surface_reloads) log(RETRO_LOG_INFO, "gpu: %llu render targets reloaded from RAM after a 2D write", static_cast<unsigned long long>(st.surface_reloads));
             if (st.cube_assemblies) log(RETRO_LOG_INFO, "gpu: %llu cube maps put together on the GPU from their face targets", static_cast<unsigned long long>(st.cube_assemblies));
             if (st.depth_unparks || st.parked_samples || st.depth_loads_skipped || st.depth_borrows)
@@ -836,6 +854,12 @@ RETRO_API void retro_unload_game(void) {
                 std::sort(costs.begin(), costs.end(), [](const auto& a, const auto& b) { return a.second.second > b.second.second; });
                 for (std::size_t i = 0; i < costs.size() && i < 8; ++i)
                     log(RETRO_LOG_INFO, "gpu: stored in RAM x%llu, %.3f s: %s", static_cast<unsigned long long>(costs[i].second.first), static_cast<double>(costs[i].second.second) / 1e9, costs[i].first.c_str());
+            }
+            if (!st.relayouts.empty()) {
+                // Targets given up for another at their memory (each written back with a wait when drawn into), most first.
+                std::vector<std::pair<std::string, mv::u64>> given_up(st.relayouts.begin(), st.relayouts.end());
+                std::sort(given_up.begin(), given_up.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+                for (std::size_t i = 0; i < given_up.size() && i < 12; ++i) log(RETRO_LOG_INFO, "gpu: x%llu %s", static_cast<unsigned long long>(given_up[i].second), given_up[i].first.c_str());
             }
             log(RETRO_LOG_INFO, "gpu: submits mid-frame: %llu with the draw rings full, %llu with the upload staging full; %llu 2D copies made on the GPU", static_cast<unsigned long long>(st.batch_flushes), static_cast<unsigned long long>(st.staging_flushes), static_cast<unsigned long long>(st.gpu_copies));
             for (const auto& e : st.errors) log(RETRO_LOG_INFO, "gpu: renderer note: %s", e.c_str());

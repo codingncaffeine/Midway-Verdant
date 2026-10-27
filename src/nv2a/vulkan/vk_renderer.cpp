@@ -413,7 +413,9 @@ void VulkanRenderer::begin_frame(u32 slot) {
     Frame& fr = frames_[slot];
     if (fr.serial > completed_) {
         // The GPU may still be executing this frame's last submission (its rings and descriptor sets are in use).
+        const auto t0 = std::chrono::steady_clock::now();
         f.vkWaitForFences(dev_.device(), 1, &fr.last, VK_TRUE, ~0ull);
+        stats_.ns_wait_slot += static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
         completed_ = fr.serial;
         ++stats_.waits;
     }
@@ -626,6 +628,7 @@ void VulkanRenderer::finish() {
     // A fence's signal covers every submission before its own on the queue, so the latest one is all it takes.
     Frame& fr = frames_[last];
     if (fr.serial > completed_) {
+        Timed timed_wait(stats_.ns_wait_finish);
         fn_->vkWaitForFences(dev_.device(), 1, &fr.last, VK_TRUE, ~0ull);
         completed_ = fr.serial;
         ++stats_.waits;
@@ -739,6 +742,8 @@ VulkanRenderer::Surface* VulkanRenderer::target_for(const KelvinState& s) {
         // The guest reuses the memory with another layout: finish with the old one.
         note(std::format("surface {:08x} relaid out: {}x{} {} format {:x} -> {}x{} {} format {:x}", phys, s0.width, s0.height, s0.swizzled ? "swizzled" : "pitch",
                          s0.color_format, width, height, d.swizzled() ? "swizzled" : "pitch", d.color_format()));
+        ++stats_.relayouts[std::format("relaid out {:08x} {}x{} {} fmt {:x}{} -> {}x{} {} fmt {:x}", phys, s0.width, s0.height, s0.swizzled ? "swz" : "pitch", s0.color_format, s0.dirty ? " dirty" : "", width, height,
+                                       d.swizzled() ? "swz" : "pitch", d.color_format())];
         erase_surface(it);
     }
     if (debug_tex_log_)
@@ -795,6 +800,8 @@ VulkanRenderer::Surface* VulkanRenderer::target_for(const KelvinState& s) {
             drop_parked(other, b0, b1, true);
             if (other.phys < b1 && b0 < static_cast<u64>(other.phys) + other.bytes()) {
                 ++stats_.evicted;
+                ++stats_.relayouts[std::format("evicted {:08x} {}x{} {} fmt {:x}{} by {:08x} {}x{} {} fmt {:x}", other.phys, other.width, other.height, other.swizzled ? "swz" : "pitch", other.color_format,
+                                               other.dirty ? " dirty" : "", t.phys, t.width, t.height, t.swizzled ? "swz" : "pitch", t.color_format)];
                 o = erase_surface(o);
             } else {
                 ++o;
@@ -857,7 +864,13 @@ void VulkanRenderer::remember_pages(Surface& s) {
     constexpr u32 kPage = 4096;
     const u32 first = s.phys / kPage, last = static_cast<u32>((static_cast<u64>(s.phys) + s.bytes() - 1) / kPage);
     s.page_hashes.resize(last - first + 1);
-    for (u32 p = first; p <= last; ++p) s.page_hashes[p - first] = texture_content(p * kPage, kPage, 0);
+    for (u32 p = first; p <= last; ++p) s.page_hashes[p - first] = target_page_hash(s, p);
+}
+
+u64 VulkanRenderer::target_page_hash(const Surface& s, u32 page) const {
+    constexpr u64 kPage = 4096;
+    const u64 a0 = std::max<u64>(page * kPage, s.phys), a1 = std::min<u64>((page + 1) * kPage, static_cast<u64>(s.phys) + s.bytes());
+    return a1 > a0 ? texture_content(static_cast<u32>(a0), static_cast<u32>(a1 - a0), 0) : 0;
 }
 
 bool VulkanRenderer::ensure_pass(Surface& t, bool writes_color) {
@@ -2016,7 +2029,7 @@ void VulkanRenderer::cpu_wrote(const std::vector<u32>& pages, u32 generation) {
         // Only pages whose bytes changed since the image and RAM last agreed (remember_pages).
         std::vector<u32> written;
         for (auto p = lo; p != hi; ++p)
-            if (s.page_hashes.size() != last - first + 1 || texture_content(*p * kPage, kPage, 0) != s.page_hashes[*p - first]) written.push_back(*p);
+            if (s.page_hashes.size() != last - first + 1 || target_page_hash(s, *p) != s.page_hashes[*p - first]) written.push_back(*p);
         if (debug_tex_log_)
             std::fprintf(stderr, "texlog: cpu wrote %zu pages (first %05x, %zu reported) of target %08x %ux%u dirty %d\n", written.size(), *lo, static_cast<std::size_t>(hi - lo), s.phys, s.width, s.height, s.dirty ? 1 : 0);
         if (written.empty()) {
@@ -2049,6 +2062,7 @@ void VulkanRenderer::cpu_wrote(const std::vector<u32>& pages, u32 generation) {
         release();
         put_back_pages(held, kept);
         ++stats_.cpu_written_targets;
+        ++stats_.cpu_written_depth;
     };
     for (auto& [k, sp] : surfaces_) {
         Surface& s = *sp;
