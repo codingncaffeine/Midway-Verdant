@@ -502,6 +502,20 @@ TEST(ApuSynthesis, ABufferVoicePlaysItsSamplesIntoItsBinAtItsVolumeAndHeadroom) 
     EXPECT_EQ(r.apu.setup_engine().voices_retired(), 1u) << "and turned off";
 }
 
+// A 24-bit sample is the top three bytes of its 32-bit container (Halo 2's cutscene voices; read as the low three they
+// were loud noise): the low byte, here junk, is below the sample's last bit.
+TEST(ApuSynthesis, A24BitSampleIsTheTopThreeBytesOfItsContainer) {
+    SynthRig r;
+    const auto s24 = [](u32 i) { return static_cast<i32>(i) * 150000 - 3000000; };
+    for (u32 i = 0; i < 64; ++i) {
+        const u32 w = (static_cast<u32>(s24(i)) << 8) | 0x5Au;
+        ASSERT_TRUE(r.bus.write_ram(SynthRig::kPage + i * 4, &w, 4));
+    }
+    r.start(0xE0000000u, 63, 0, 0, 0);  // container 32-bit, sample size S24, mono
+    r.sched.advance_to(Rig::frame(1));
+    for (u32 i = 0; i < 32; ++i) EXPECT_NEAR(r.bin(0, i), static_cast<float>(s24(i)) / 8388608.0f, 1e-6f) << "sample " << i;
+}
+
 TEST(ApuSynthesis, ProgrammingAPlayingOneShotsEndKeepsItsPlaceAndAReplayedVoiceIsLinkedOnce) {
     using SE = apu::SetupEngine;
     SynthRig r;

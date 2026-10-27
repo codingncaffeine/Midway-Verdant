@@ -297,7 +297,9 @@ void SetupEngine::frame() {
             }
         trace::log(trace::Cat::Apu, "vp: frame {} voices:{}", frames_, line.empty() ? " none" : line);
         if (census) std::fprintf(census, "%.1f s voices:%s\n", static_cast<double>(frames_) / 1500.0, line.empty() ? " none" : line.c_str());
-        if (const u32 d = dump_handle(); d < kMaxVoices && (field(d, kFieldState) & kStateActive)) dump_voice(d);
+        // MV_DEBUG_VOICE_DUMP_FROM=SECONDS: the dumps start that far into the run (64 at most).
+        static const double dump_from = std::getenv("MV_DEBUG_VOICE_DUMP_FROM") ? std::atof(std::getenv("MV_DEBUG_VOICE_DUMP_FROM")) : 0.0;
+        if (const u32 d = dump_handle(); d < kMaxVoices && (field(d, kFieldState) & kStateActive) && static_cast<double>(frames_) / 1500.0 >= dump_from) dump_voice(d);
         // And the RMS level of each bin that carried sound over the half second, in dB of full scale.
         std::string bins;
         for (u32 b = 0; b < kBins; ++b) {
@@ -577,7 +579,10 @@ void SetupEngine::read_sample(u32 handle, const Source& src, u32 index, float ou
         switch (src.sample_size) {
             case 0: v = (static_cast<float>(raw & 0xFFu) - 128.0f) / 128.0f; break;                       // U8
             case 1: v = static_cast<i16>(raw & 0xFFFFu) / 32768.0f; break;                                 // S16
-            case 2: v = static_cast<float>(static_cast<i32>(raw << 8) >> 8) / 8388608.0f; break;           // S24
+            // S24 sits in the top three bytes of its 32-bit container (Halo 2's cutscene voices: ff8e0000, ff910000...,
+            // the low 15 bits always clear); read as the low three it was loud noise.
+            case 2: v = src.container == 4 ? static_cast<float>(static_cast<i32>(raw)) / 2147483648.0f
+                                           : static_cast<float>(static_cast<i32>(raw << 8) >> 8) / 8388608.0f; break;  // S24
             default: v = static_cast<float>(static_cast<i32>(raw)) / 2147483648.0f; break;                 // S32
         }
         out[c] = v;
@@ -847,6 +852,15 @@ void SetupEngine::dump_voice(u32 handle) {
         if (std::FILE* w = std::fopen(std::format("scratch/voice-{:x}-{}.adpcm", handle, at).c_str(), "wb")) {
             const u32 bytes = (n + kAdpcmSamplesPlayed - 1) / kAdpcmSamplesPlayed * 36u * src.channels;
             for (u32 i = 0; i < bytes; i += 4) {
+                const u32 v = read_bytes(src, i, 4);
+                std::fwrite(&v, 4, 1, w);
+            }
+            std::fclose(w);
+        }
+    if (!src.adpcm)  // and a PCM buffer's bytes as stored (scratch/voice-HEX-N.raw), to check how its containers hold samples
+        if (std::FILE* w = std::fopen(std::format("scratch/voice-{:x}-{}.raw", handle, at).c_str(), "wb")) {
+            const u32 bytes = n * std::max(src.samples_per_block, src.channels) * src.container;
+            for (u32 i = 0; i + 4 <= bytes; i += 4) {
                 const u32 v = read_bytes(src, i, 4);
                 std::fwrite(&v, 4, 1, w);
             }
