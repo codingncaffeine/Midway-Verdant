@@ -91,6 +91,7 @@ KvmBackend::KvmBackend() {
     debug_lead_ = std::getenv("MV_DEBUG_TSC_LEAD") != nullptr;
     if (const char* us = std::getenv("MV_PROFILE_EIP_US"); profile_eip_ && us && *us) profile_us_ = std::min(999u, static_cast<unsigned>(std::strtoul(us, nullptr, 10)));
     if (const char* s = std::getenv("MV_IDLE_SKIP"); s && *s == '0') idle_skip_ = false;
+    if (const char* f = std::getenv("MV_BREAK_FROM"); f && *f) break_from_ = std::strtoull(f, nullptr, 10);
     if (const char* w = std::getenv("MV_WATCH_AT_BREAK"); w && *w) {
         const std::string s = w;
         const auto plus = s.find('+'), star = s.find('*');
@@ -564,7 +565,9 @@ void KvmBackend::join() {
         u64 total = 0;
         for (const auto& [eip, n] : top) total += n;
         std::fprintf(stderr, "eip profile (%llu samples):\n", static_cast<unsigned long long>(total));
-        for (std::size_t i = 0; i < top.size() && i < 20; ++i)
+        // MV_PROFILE_EIP_TOP=N: list N addresses (default 20).
+        static const std::size_t shown = std::getenv("MV_PROFILE_EIP_TOP") ? std::strtoull(std::getenv("MV_PROFILE_EIP_TOP"), nullptr, 10) : 20;
+        for (std::size_t i = 0; i < top.size() && i < shown; ++i)
             std::fprintf(stderr, "  %08x  %6llu  %5.1f%%\n", top[i].first, static_cast<unsigned long long>(top[i].second), 100.0 * static_cast<double>(top[i].second) / static_cast<double>(total));
         eip_samples_.clear();
         std::vector<std::pair<u32, u64>> busy(eip_busy_samples_.begin(), eip_busy_samples_.end());
@@ -870,6 +873,10 @@ void KvmBackend::thread_main() {
         }
         if (watch_pending_.load(std::memory_order_acquire)) apply_pending_watches();  // out of the guest: clears are cheap
         const bool gpu_busy = machine_->nv2a().fifo_busy_now();
+        if (break_from_ && !breakpoints_armed_ && !break_eips_.empty() && machine_->nv2a().vblanks() >= break_from_) {
+            vblank_seen_ = machine_->nv2a().vblanks();
+            arm_breakpoints();
+        }
         const bool sampling = profile_eip_ && vblank_seen_ >= profile_from_ && vblank_seen_ < profile_to_;
         const bool idle_run = at_idle_;
         const u64 guest_before = clock_.stats().in_guest_ns;
@@ -1000,6 +1007,85 @@ void KvmBackend::thread_main() {
                     }
                     continue;
                 }
+                // MV_BREAK_KEEP=N: the breakpoints stay armed for N hits, each a short line: the caller and, at a file
+                // call's entry, the name its OBJECT_ATTRIBUTES carries (the first or third stdcall argument).
+                if (static const u32 keep = std::getenv("MV_BREAK_KEEP") ? static_cast<u32>(std::strtoul(std::getenv("MV_BREAK_KEEP"), nullptr, 10)) : 0u;
+                    keep && break_hits_ < keep) {
+                    ++break_hits_;
+                    const auto rd32 = [&](u32 va) -> u32 {
+                        u32 v = 0;
+                        if (const auto pa = debug::virt_to_phys(machine_->bus(), r, va)) machine_->bus().read_ram(*pa, &v, 4);
+                        return v;
+                    };
+                    const auto name_of = [&](u32 attributes) -> std::string {
+                        const u32 string = attributes ? rd32(attributes + 4) : 0;
+                        if (!string) return {};
+                        const u32 len = rd32(string) & 0xFFFFu, buf = rd32(string + 4);
+                        std::string s;
+                        for (u32 i = 0; i < len && i < 160; ++i) {
+                            const u32 ch = rd32(buf + i) & 0xFFu;
+                            s += (ch >= 0x20 && ch < 0x7F) ? static_cast<char>(ch) : '.';
+                        }
+                        return s;
+                    };
+                    std::string up;  // the code addresses further up the stack: the callers
+                    for (u32 i = 4, found = 0; i < 64 && found < 6; ++i)
+                        if (const u32 w = rd32(r.esp + i * 4); w >= 0x10000 && w < 0x400000) {
+                            up += std::format(" {:08x}", w);
+                            ++found;
+                        }
+                    std::string text;  // MV_BREAK_STR=[*]REG+HEX: the text there too (with *, at the pointer stored there)
+                    if (const char* bs = std::getenv("MV_BREAK_STR"); bs && *bs) {
+                        const bool deref = *bs == '*';
+                        const std::string spec = bs + (deref ? 1 : 0);
+                        const std::string g = spec.substr(0, spec.find('+'));
+                        const u32 off = spec.find('+') != std::string::npos ? static_cast<u32>(std::strtoul(spec.c_str() + spec.find('+') + 1, nullptr, 16)) : 0u;
+                        const u32 base = g == "eax" ? r.eax : g == "ebx" ? r.ebx : g == "ecx" ? r.ecx : g == "edx" ? r.edx : g == "esi" ? r.esi : g == "edi" ? r.edi : g == "esp" ? r.esp : r.ebp;
+                        const u32 at = deref ? rd32(base + off) : base + off;
+                        for (u32 i = 0; i < 160; ++i) {
+                            const u32 c = rd32(at + i) & 0xFFu;
+                            if (!c) break;
+                            text += static_cast<char>(c);
+                        }
+                    }
+                    trace::log(trace::Cat::Boot, "break: eip {:08x} from {:08x} eax {:08x} args {:08x} {:08x} {:08x} names [{}] [{}] up{} esp {:08x} text [{}]", r.eip, rd32(r.esp),
+                               r.eax, rd32(r.esp + 4), rd32(r.esp + 8), rd32(r.esp + 12), name_of(rd32(r.esp + 4)), name_of(rd32(r.esp + 12)), up, r.esp, text);
+                    kvm_regs regs{};
+                    if (ioctl(vcpu_fd_, KVM_GET_REGS, &regs) == 0) {
+                        regs.rflags |= 1u << 16;
+                        ioctl(vcpu_fd_, KVM_SET_REGS, &regs);
+                    }
+                    continue;
+                }
+                // MV_BREAK_STR=REG+HEX: also the text at that address (a name the code is working on).
+                if (const char* bs = std::getenv("MV_BREAK_STR"); bs && *bs) {
+                    const std::string spec = bs;
+                    const std::string g = spec.substr(0, spec.find('+'));
+                    const u32 off = spec.find('+') != std::string::npos ? static_cast<u32>(std::strtoul(spec.c_str() + spec.find('+') + 1, nullptr, 16)) : 0u;
+                    const u32 base = g == "eax" ? r.eax : g == "ebx" ? r.ebx : g == "ecx" ? r.ecx : g == "edx" ? r.edx : g == "esi" ? r.esi : g == "edi" ? r.edi : g == "esp" ? r.esp : r.ebp;
+                    std::string text;
+                    for (u32 i = 0; i < 160; ++i) {
+                        u8 c = 0;
+                        if (const auto pa = debug::virt_to_phys(machine_->bus(), r, base + off + i)) machine_->bus().read_ram(*pa, &c, 1);
+                        if (!c) break;
+                        text += static_cast<char>(c);
+                    }
+                    trace::log(trace::Cat::Boot, "break: text at {}: [{}]", spec, text);
+                }
+                // MV_BREAK_EBPWALK=1: the callers by the frame-pointer chain (code built with frame pointers).
+                if (const char* w = std::getenv("MV_BREAK_EBPWALK"); w && *w == '1') {
+                    std::string chain;
+                    u32 bp = r.ebp;
+                    for (int i = 0; i < 24 && bp; ++i) {
+                        u32 frame[2]{};
+                        const auto pa = debug::virt_to_phys(machine_->bus(), r, bp);
+                        if (!pa || !machine_->bus().read_ram(*pa, frame, 8)) break;
+                        chain += std::format(" {:08x}", frame[1]);
+                        if (frame[0] <= bp) break;
+                        bp = frame[0];
+                    }
+                    trace::log(trace::Cat::Boot, "break: callers by ebp:{}", chain);
+                }
                 trace::log(trace::Cat::Boot, "break: eip {:08x} reached\n{}", r.eip, debug::describe_stack(machine_->bus(), r));
                 if (!watch_reg_.empty() && !watch_va_ && !watch_hits_) {
                     const std::string& g = watch_reg_;
@@ -1047,6 +1133,7 @@ void KvmBackend::thread_main() {
 void KvmBackend::arm_breakpoints() {
     const bool idle = idle_eip_ && break_eips_.empty() && !watch_va_;
     if (break_eips_.empty() && !watch_va_ && !idle) return;
+    if (vblank_seen_ < break_from_ && !idle) return;
     kvm_guest_debug dbg{};
     dbg.control = KVM_GUESTDBG_ENABLE | KVM_GUESTDBG_USE_HW_BP;
     dbg.arch.debugreg[7] = 1u << 10;  // the bit that is always set in DR7

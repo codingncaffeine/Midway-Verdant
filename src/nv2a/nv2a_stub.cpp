@@ -75,7 +75,8 @@ Nv2aStub::Nv2aStub(Bus& bus, Scheduler& sched, std::function<void(bool)> irq)
             renderer_->write_back_at(reg(kPcrtcStart));
             // In the background: the copies land at the CPU's next exits once the GPU has made them (poll_write_backs), or
             // at once when the guest asks the GPU how far it is; the vblank waited 1.5-3.8 ms here in heavy 30 fps titles.
-            if (idle_vblanks_ >= 1) renderer_->write_back_all(true);
+            static const bool idle_wb = !(std::getenv("MV_IDLE_WRITEBACK") && *std::getenv("MV_IDLE_WRITEBACK") == '0');  // control
+            if (idle_wb && idle_vblanks_ >= 1) renderer_->write_back_all(true);
         }
         if (render_thread_) land_stores();  // what the render thread stored by now, on this thread
         methods_at_vblank_ = kelvin_.methods_seen();

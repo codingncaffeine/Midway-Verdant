@@ -182,6 +182,8 @@ private:
     void find_idle_loop();
     Cycles tsc_epoch_{0};   // guest time at which the TSC was zero
     u64 vblank_seen_{0};
+    u64 break_from_{0};  // MV_BREAK_FROM=VBLANK: the --break-eip breakpoints are armed from that vblank on
+    u32 break_hits_{0};  // MV_BREAK_KEEP: hits logged so far
     bool frame_tsc_due_{false};
     // Instruments for the report: interrupt latency from INTR to injection in guest time (buckets up to 10, 50,
     // 100, 250, 500, 1000 us and beyond); the busiest port and MMIO page exits.
