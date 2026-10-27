@@ -121,6 +121,7 @@ public:
     void set_direct_sink(DirectSink sink) { direct_sink_ = std::move(sink); }
     bool frame_clock_running() const { return counting_; }
     u64 traps() const { return traps_; }
+    u64 held_frames() const { return held_frames_; }
     u64 fence_writes() const { return fence_writes_; }
     bool front_end_trapped() const { return fe_trapped_; }
     // SetupEngineHost.
@@ -232,6 +233,7 @@ private:
     std::deque<std::pair<u32, u32>> trap_queue_;
     bool fe_trapped_{false};
     u64 traps_{0};
+    u64 held_frames_{0};  // frames held by a trapped front end
     u64 fence_writes_{0};
     TimerEvent frame_;
     u64 frames_{0};

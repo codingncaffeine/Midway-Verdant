@@ -338,15 +338,12 @@ bool SetupEngine::retire(u32 handle, u32 list, u32 prev, u32 next, u32 state) {
     return host_unlinks;
 }
 
-// One idle report a frame while the front end is free: the listed idle voice after the last one reported, in walk order,
-// or the first when none follows it (or it is no longer listed idle). A report never waits in a queue: what is listed
-// is read again each frame, so a voice the host took off meanwhile is never reported.
+// One idle report a frame while the front end is free: the walk's last idle voice (each idle voice overwrites the
+// trapped parameter, the last one stays). A report never waits in a queue: what is listed is read again each frame,
+// so a voice the host took off meanwhile is never reported.
 void SetupEngine::report_idle() {
     if (idle_seen_.empty() || host_.front_end_busy()) return;
-    auto at = std::ranges::find(idle_seen_, idle_cursor_);
-    at = at == idle_seen_.end() || std::next(at) == idle_seen_.end() ? idle_seen_.begin() : std::next(at);
-    idle_cursor_ = *at;
-    host_.front_end_trap(kSe2FeIdleVoice, idle_cursor_);
+    host_.front_end_trap(kSe2FeIdleVoice, idle_seen_.back());
 }
 
 void SetupEngine::walk(u32 list) {

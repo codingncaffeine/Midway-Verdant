@@ -362,6 +362,14 @@ void Apu::on_frame(Cycles now) {
     (void)now;
     if (census_ && dsp_busy_.load(std::memory_order_acquire)) ++census_counts_[0xFFFFFFF2u];  // the frame itself waited
     dsp_sync();  // the last frame's processor run, before this frame touches their memories
+    // A trapped front end holds the whole frame (voice lists, the processors, the sample counter) until the host
+    // resumes it, as the reference emulator does: the host's handler sees the voice lists as they were at the trap.
+    if (fe_trapped_) {
+        ++held_frames_;
+        ++epoch_frames_;
+        sched_.schedule(frame_, frame_epoch_ + cycles_from_ticks(epoch_frames_ + 1, clk::kApuFramesPerSecond));
+        return;
+    }
     ++frames_;
     // The setup engine walks the voice lists first; its idle reports trap to the host once the front end is free.
     {

@@ -167,13 +167,12 @@ private:
     // the reference emulator's hardware does: a report the host consumed early (one title turns a voice off twice and
     // waits on the second) is raised again. MV_IDLE_RETRAP=0: the engine unlinks the voice and reports once (old).
     bool retrap_{true};
-    // The idle voices this frame's walk found, in list order, and the last one reported. The hardware stalls its walk
-    // at each report and goes on to the next voice when the host resumes it, so every listed idle voice is reported in
-    // turn: one report a frame here, the next idle voice after the last one reported (from the top when none follows).
-    // Reporting the first idle voice every frame starved the ones behind it: DirectSound takes a multi-voice buffer
-    // off only on the report of its last voice, and a racing title waited for ever on a stopped stereo buffer.
+    // The idle voices this frame's walk found, in list order. Each one is an idle-voice method to the front end and
+    // each overwrites the trapped method's parameter, so the host sees the LAST idle voice of the walk (the reference
+    // emulator's model; the front end then holds every frame until the host resumes it, Apu::on_frame). Reporting the
+    // first one starved the rest: DirectSound takes a multi-voice buffer off only on the report of its last voice, and
+    // a racing title waited for ever on a stopped stereo buffer.
     std::vector<u32> idle_seen_;
-    u32 idle_cursor_{kNoVoice};
     void report_idle();
     // A voice's frame of samples; false when the voice ends during it (the rest of the frame is silence).
     bool render_buffer(u32 handle, u32 fmt, double step, Frame& out);

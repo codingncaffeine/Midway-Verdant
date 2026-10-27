@@ -355,7 +355,7 @@ TEST(ApuVoices, ALoopingVoiceWrapsAndRetiresOnlyWhenTurnedOffAndQueuedTrapsWaitF
     EXPECT_FALSE(r.irq);
 
     // Both turned off in the same frame: off at the next frame and still listed; their idle reports come on the frame
-    // after, the 2D list's first (it is walked first); the other is raised again once the front end is free.
+    // after, the walk's last idle voice first (the 3D list is walked last); the other once the front end is free.
     r.vp(SE::kMethodVoiceOff, 0x40);
     r.vp(SE::kMethodVoiceOff, 7);
     r.sched.advance_to(Rig::frame(2));
@@ -364,17 +364,17 @@ TEST(ApuVoices, ALoopingVoiceWrapsAndRetiresOnlyWhenTurnedOffAndQueuedTrapsWaitF
     EXPECT_EQ(r.rd(SE::kRegListTop[0]), 0x40u) << "and still listed";
     EXPECT_EQ(r.rd(SE::kRegListTop[1]), 7u);
     r.sched.advance_to(Rig::frame(3));
-    EXPECT_EQ(r.rd(Apu::kFeDecParam), 0x40u);
+    EXPECT_EQ(r.rd(Apu::kFeDecParam), 7u);
     EXPECT_TRUE(r.irq);
     EXPECT_EQ(r.apu.traps(), 1u) << "the second report waits for the front end";
-    r.take_off(0x40);
+    r.take_off(7);
     r.service_trap();
     EXPECT_FALSE(r.irq);
     r.sched.advance_to(Rig::frame(4));
-    EXPECT_EQ(r.rd(Apu::kFeDecParam), 7u) << "the other report comes once the front end is free";
+    EXPECT_EQ(r.rd(Apu::kFeDecParam), 0x40u) << "the other report comes once the front end is free";
     EXPECT_TRUE(r.irq);
     EXPECT_EQ(r.apu.traps(), 2u) << "and not raised twice while it is pending";
-    r.take_off(7);
+    r.take_off(0x40);
     r.service_trap();
     r.sched.advance_to(Rig::frame(5));
     EXPECT_EQ(r.apu.traps(), 2u);
@@ -928,7 +928,7 @@ TEST(ApuVoices, AnIdleReportRaisedWhileTheFrontEndIsBusyNeverReachesAHostThatToo
     r.vp(SE::kMethodVoiceOff, 0x40);
     r.vp(SE::kMethodVoiceOff, 7);
     r.sched.advance_to(Rig::frame(3));
-    EXPECT_EQ(r.rd(Apu::kFeDecParam), 0x40u) << "the 2D list's voice reports first";
+    EXPECT_EQ(r.rd(Apu::kFeDecParam), 7u) << "the walk's last idle voice (the 3D list is walked after the 2D) is what the host sees";
     EXPECT_EQ(r.apu.traps(), 1u);
     // The host's handler takes both voices off (and frees what they played) before it frees the front end.
     r.take_off(0x40);
@@ -940,10 +940,11 @@ TEST(ApuVoices, AnIdleReportRaisedWhileTheFrontEndIsBusyNeverReachesAHostThatToo
     EXPECT_FALSE(r.apu.front_end_trapped());
 }
 
-TEST(ApuVoices, EveryListedIdleVoiceIsReportedInTurnNotOnlyTheFirst) {
+TEST(ApuVoices, TheHostSeesTheWalksLastIdleVoiceAndTheFrameHoldsWhileTheTrapIsPending) {
     // A stereo buffer plays on three voices listed together. DirectSound's idle handler takes the buffer off only on the
     // report of its LAST voice and ignores the others; reporting the list's first idle voice every frame never reached
-    // it, so the stop never finished and a racing title waited on it for ever (its quick race froze).
+    // it, so the stop never finished and a racing title waited on it for ever (its quick race froze). Each idle voice
+    // overwrites the trapped parameter, so the last one of the walk is what the host reads.
     using SE = apu::SetupEngine;
     VoiceRig r;
     constexpr std::array<u32, 3> kGroup{0xF4u, 0xF5u, 0xF6u};
@@ -957,21 +958,21 @@ TEST(ApuVoices, EveryListedIdleVoiceIsReportedInTurnNotOnlyTheFirst) {
     ASSERT_EQ(r.rd(SE::kRegListTop[0]), 0xF4u);
     r.sched.advance_to(Rig::frame(1));
     for (u32 v : kGroup) r.vp(SE::kMethodVoiceOff, v);
-    std::vector<u32> reported;
-    for (u32 f = 2; f < 12; ++f) {
-        r.sched.advance_to(Rig::frame(f));
-        if (!r.apu.front_end_trapped()) continue;
-        const u32 h = r.rd(Apu::kFeDecParam);
-        reported.push_back(h);
-        if (h == kGroup.back())
-            for (u32 v : kGroup) r.take_off(v);
-        r.service_trap();
-    }
-    ASSERT_GE(reported.size(), 3u);
-    EXPECT_EQ((std::vector<u32>{reported[0], reported[1], reported[2]}), (std::vector<u32>{0xF4u, 0xF5u, 0xF6u}))
-        << "each idle voice in list order, the walk going on past the ones the host left listed";
-    EXPECT_EQ(r.rd(SE::kRegListTop[0]), 0x43u) << "the group's last report reached the host, which took the group off";
-    EXPECT_EQ(reported.size(), 3u) << "nothing left to report after that";
+    r.sched.advance_to(Rig::frame(3));
+    ASSERT_TRUE(r.apu.front_end_trapped());
+    EXPECT_EQ(r.rd(Apu::kFeDecParam), 0xF6u) << "the walk's last idle voice: the group's last";
+    // While the host has not resumed the front end, no frame runs.
+    const u64 frames = r.apu.frames();
+    r.sched.advance_to(Rig::frame(6));
+    EXPECT_EQ(r.apu.frames(), frames) << "a trapped front end holds the frame";
+    EXPECT_GE(r.apu.held_frames(), 2u);
+    for (u32 v : kGroup) r.take_off(v);
+    r.service_trap();
+    const u64 traps = r.apu.traps();
+    r.sched.advance_to(Rig::frame(9));
+    EXPECT_GT(r.apu.frames(), frames) << "resumed: frames run again";
+    EXPECT_EQ(r.rd(SE::kRegListTop[0]), 0x43u) << "the host took the group off on its last voice's report";
+    EXPECT_EQ(r.apu.traps(), traps) << "nothing left to report after that";
     EXPECT_TRUE(r.field(0x43, SE::kFieldState) & SE::kStateActive) << "the voice behind them still plays";
 }
 
