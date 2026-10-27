@@ -731,6 +731,9 @@ RETRO_API bool retro_load_game(const retro_game_info* game) {
     }
     cfg.pads = pads_plugged;
     if (game && game->path && *game->path) cfg.dvd_image = game->path;
+    // MV_CAPTURE=FILE: a pushbuffer capture of the whole run (GPU methods, RAM pages, objects) for offline replay with
+    // mv-pbcap, as the shell's --capture (a picture fault seen under a frontend, replayed draw by draw). Large: GBs a minute.
+    if (const char* c = std::getenv("MV_CAPTURE"); c && *c) cfg.capture_path = c;
     if (offer_hw_render()) {
         pending_cfg = cfg;  // started on the frontend's device (hw_context_reset)
         log(RETRO_LOG_INFO, "video: the frontend's Vulkan device, frames handed over as images");
