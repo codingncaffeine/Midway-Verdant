@@ -483,7 +483,7 @@ private:
     // Staging space for an upload in the recording frame, submitting the frame first when its region is full.
     bool staging_alloc(VkDeviceSize bytes, VkDeviceSize& offset);
     // A new image enters GENERAL before its first use (nothing earlier uses it, so nothing is waited for).
-    void fresh_image(const vk::Image& image);
+    void fresh_image(const vk::Image& image, VkCommandBuffer cb = VK_NULL_HANDLE);  // into cb_ unless another is named
     // The uploads recorded so far land before the draws that sample them and the copies that read them.
     void upload_barrier();
     // Whether a draw with these vertex and index sizes still fits the rings and the descriptor pool of the batch.
@@ -506,6 +506,7 @@ private:
         // while the GPU runs the last (a submit no longer moves to another frame in flight and waits for it); `used` of
         // them so far, and the fence of the last, which signals once everything submitted before it has run too.
         std::vector<VkCommandBuffer> cbs;
+        std::vector<VkCommandBuffer> upload_cbs;  // each submission's new-texture uploads, submitted just ahead of it
         std::vector<VkFence> fences;
         u32 used{0};
         VkFence last{VK_NULL_HANDLE};
@@ -535,6 +536,13 @@ private:
     u64 submitted_{0}, completed_{0};  // submissions made, and the last one known to have finished
     VkCommandBuffer cb_{VK_NULL_HANDLE};  // the recording frame's command buffer
     bool recording_{false};
+    // A new texture's upload goes to the submission's upload command buffer, which the queue runs before its draws: no
+    // draw recorded so far can sample an image just made, and the render pass stays open (an upload in cb_ ended it, and
+    // at 6x every pass begun again reloaded and stored the whole target: Crimson Skies met 176 new textures in a frame).
+    VkCommandBuffer upload_cb();  // begun on first use in a submission
+    VkCommandBuffer upload_cb_{VK_NULL_HANDLE};
+    bool uploads_recording_{false};
+    bool hoist_uploads_{true};  // MV_HOIST_UPLOADS=0: uploads in cb_ as before (a control)
     bool pass_open_{false};
     Surface* pass_target_{nullptr};
     VkFramebuffer pass_fb_{VK_NULL_HANDLE};  // the open pass's framebuffer (the target's own, or its borrow_fb)

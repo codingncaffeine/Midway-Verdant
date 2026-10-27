@@ -103,6 +103,49 @@ void decode_texel(u32 format, const u8* p, const u8* palette, HostPixel pixel, u
     }
 }
 
+// A run of n texels, texel i at src + off(i), into dst: the format picked once for the run (decode_texel's switch per
+// texel made a 640x480 linear image 0.36 ms; Crimson Skies decodes one 3-4 times a second), the common 32- and 16-bit
+// formats inline with decode_texel's results, the rest through it.
+template <class Off>
+void decode_run(u32 format, const u8* src, u32 n, Off off, const u8* palette, HostPixel pixel, u32 texel, u8* dst) {
+    const auto each16 = [&](auto&& f) {
+        for (u32 i = 0; i < n; ++i, dst += 4) {
+            u16 h;
+            std::memcpy(&h, src + off(i), 2);
+            f(h);
+        }
+    };
+    switch (format) {
+        case 0x06: case 0x12:  // A8R8G8B8: bytes B G R A
+            for (u32 i = 0; i < n; ++i, dst += 4) {
+                const u8* p = src + off(i);
+                put(dst, p[2], p[1], p[0], p[3]);
+            }
+            return;
+        case 0x07: case 0x1E:  // X8R8G8B8
+            for (u32 i = 0; i < n; ++i, dst += 4) {
+                const u8* p = src + off(i);
+                put(dst, p[2], p[1], p[0], 255);
+            }
+            return;
+        case 0x02: case 0x10:
+            each16([&](u32 h) { put(dst, expand5((h >> 10) & 31), expand5((h >> 5) & 31), expand5(h & 31), expand1(h >> 15)); });
+            return;
+        case 0x03: case 0x1C:
+            each16([&](u32 h) { put(dst, expand5((h >> 10) & 31), expand5((h >> 5) & 31), expand5(h & 31), 255); });
+            return;
+        case 0x04: case 0x1D:
+            each16([&](u32 h) { put(dst, expand4((h >> 8) & 15), expand4((h >> 4) & 15), expand4(h & 15), expand4(h >> 12)); });
+            return;
+        case 0x05: case 0x11:
+            each16([&](u32 h) { put(dst, expand5(h >> 11), expand6((h >> 5) & 63), expand5(h & 31), 255); });
+            return;
+        default:
+            for (u32 i = 0; i < n; ++i, dst += texel) decode_texel(format, src + off(i), palette, pixel, dst);
+            return;
+    }
+}
+
 // The YUV 4:2:2 formats (linear only): every two pixels are four bytes holding both lumas and one U and V. 0x24
 // (CR8YB8CB8YA8) is Y0 U Y1 V in memory, YUY2; 0x25 (YB8CR8YA8CB8) is U Y0 V Y1, UYVY. `pair` is the group's first
 // byte, `odd` picks its second pixel.
@@ -304,11 +347,13 @@ bool decode_texture(const TextureStage& stage, u32 base, const MemoryView& memor
             return false;
         }
         std::vector<u8> img(static_cast<std::size_t>(out.width) * out.height * texel);
+        const u32 bpp = f.bytes_per_pixel;
         for (u32 y = 0; y < out.height; ++y) {
-            for (u32 x = 0; x < out.width; ++x) {
-                u8* dst = &img[(static_cast<std::size_t>(y) * out.width + x) * texel];
-                if (yuv) decode_yuv_texel(format, src + y * pitch + (x & ~1u) * 2, (x & 1u) != 0, dst);
-                else decode_texel(format, src + y * pitch + x * f.bytes_per_pixel, palette, out.pixel, dst);
+            u8* row = &img[static_cast<std::size_t>(y) * out.width * texel];
+            if (yuv) {
+                for (u32 x = 0; x < out.width; ++x) decode_yuv_texel(format, src + y * pitch + (x & ~1u) * 2, (x & 1u) != 0, row + x * texel);
+            } else {
+                decode_run(format, src + y * pitch, out.width, [bpp](u32 x) { return x * bpp; }, palette, out.pixel, texel, row);
             }
         }
         out.images.push_back(std::move(img));
@@ -360,23 +405,12 @@ bool decode_texture(const TextureStage& stage, u32 base, const MemoryView& memor
                 for (u32 x = 0; x < w; ++x) sx[x] = swizzled_offset(x, 0, 0, lw, lh, ld);
                 for (u32 y = 0; y < h; ++y) sy[y] = swizzled_offset(0, y, 0, lw, lh, ld);
                 for (u32 z = 0; z < d; ++z) sz[z] = swizzled_offset(0, 0, z, lw, lh, ld);
-                const bool argb = format == 0x06 || format == 0x12, xrgb = format == 0x07 || format == 0x1E;
+                const u32 bpp = f.bytes_per_pixel;
                 u8* dst = img.data();
                 for (u32 z = 0; z < d; ++z)
-                    for (u32 y = 0; y < h; ++y) {
+                    for (u32 y = 0; y < h; ++y, dst += static_cast<std::size_t>(w) * texel) {
                         const u32 row = sz[z] | sy[y];
-                        if (argb || xrgb) {
-                            // Bytes B G R A to R G B A, alpha forced for X8R8G8B8 (decode_texel's result, without its switch).
-                            for (u32 x = 0; x < w; ++x, dst += 4) {
-                                const u8* p = src + (row | sx[x]) * 4u;
-                                dst[0] = p[2];
-                                dst[1] = p[1];
-                                dst[2] = p[0];
-                                dst[3] = xrgb ? 255 : p[3];
-                            }
-                        } else {
-                            for (u32 x = 0; x < w; ++x, dst += texel) decode_texel(format, src + (row | sx[x]) * f.bytes_per_pixel, palette, out.pixel, dst);
-                        }
+                        decode_run(format, src, w, [&sx, row, bpp](u32 x) { return (row | sx[x]) * bpp; }, palette, out.pixel, texel, dst);
                     }
             }
             out.images.push_back(std::move(img));

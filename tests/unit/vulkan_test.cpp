@@ -116,6 +116,41 @@ u32 pixel_at(const std::vector<u8>& ram, u32 x, u32 y) {
 
 }  // namespace
 
+// Pooled images share a block without overlapping; a freed range is the first fit for the next, and freed neighbours
+// merge back into one range.
+TEST(Vulkan, PooledImagesShareABlockAndTheirFreedRangesAreReused) {
+    vk::Device device;
+    std::string error;
+    if (!device.init(error)) GTEST_SKIP() << "no Vulkan device: " << error;
+    const auto make = [&](vk::Image& i) {
+        ASSERT_TRUE(device.create_image(VK_FORMAT_R8G8B8A8_UNORM, 64, 64, 1, 1, 1, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                                        VK_IMAGE_ASPECT_COLOR_BIT, false, i, error, 0, true)) << error;
+    };
+    vk::Image a, b, c, d, e;
+    make(a);
+    make(b);
+    make(c);
+    ASSERT_NE(a.block, ~0u) << "placed in a block";
+    EXPECT_EQ(a.memory, VkDeviceMemory{VK_NULL_HANDLE}) << "with no allocation of its own";
+    EXPECT_EQ(b.block, a.block);
+    EXPECT_LE(a.offset + a.bytes, b.offset);
+    EXPECT_LE(b.offset + b.bytes, c.offset);
+    const VkDeviceSize b_at = b.offset, a_at = a.offset;
+    device.destroy_image(b);
+    make(d);
+    EXPECT_EQ(d.offset, b_at) << "the freed range is the first fit";
+    device.destroy_image(a);
+    device.destroy_image(d);
+    device.destroy_image(c);
+    vk::Image big;
+    ASSERT_TRUE(device.create_image(VK_FORMAT_R8G8B8A8_UNORM, 256, 256, 1, 1, 1, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                                    VK_IMAGE_ASPECT_COLOR_BIT, false, big, error, 0, true)) << error;
+    EXPECT_EQ(big.offset, a_at) << "the three freed neighbours merged into one range a bigger image fits";
+    device.destroy_image(big);
+    make(e);
+    device.destroy_image(e);
+}
+
 TEST(Vulkan, RendersATriangleIntoGuestRam) {
     vk::Device device;
     std::string error;

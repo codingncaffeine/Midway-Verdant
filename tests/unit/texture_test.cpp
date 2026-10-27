@@ -68,14 +68,53 @@ TEST(Texture, DecodesASwizzledArgbImageWithMipLevels) {
     EXPECT_EQ(d.image(0, 1)[1 * 4 + 3], 8);
 }
 
-// The table-driven swizzle reads every texel where swizzled_offset says, in non-square images, volumes and the three
-// loops (A8R8G8B8, X8R8G8B8 and the generic one, here R5G6B5).
+namespace {
+// The RGBA8 (r in the top byte) a texel of these formats decodes to, from its bytes, written out per format.
+u32 expected_rgba(u32 format, const u8* p) {
+    const u32 v = p[0] | (u32{p[1]} << 8);
+    const auto e5 = [](u32 x) { return (x << 3) | (x >> 2); };
+    const auto rgba = [](u32 r, u32 g, u32 b, u32 a) { return (r << 24) | (g << 16) | (b << 8) | a; };
+    switch (format) {
+        case 0x06: case 0x12: return rgba(p[2], p[1], p[0], p[3]);
+        case 0x07: case 0x1E: return rgba(p[2], p[1], p[0], 255);
+        case 0x05: case 0x11: return rgba(e5(v >> 11), (((v >> 5) & 63) << 2) | (((v >> 5) & 63) >> 4), e5(v & 31), 255);
+        case 0x04: case 0x1D: return rgba(((v >> 8) & 15) * 17, ((v >> 4) & 15) * 17, (v & 15) * 17, (v >> 12) * 17);
+        case 0x02: case 0x10: return rgba(e5((v >> 10) & 31), e5((v >> 5) & 31), e5(v & 31), (v >> 15) ? 255 : 0);
+        case 0x03: case 0x1C: return rgba(e5((v >> 10) & 31), e5((v >> 5) & 31), e5(v & 31), 255);
+        case 0x19: return rgba(255, 255, 255, p[0]);  // A8: the generic path
+        default: return 0;
+    }
+}
+u32 bytes_of(u32 format) { return format == 0x19 ? 1 : (format == 0x06 || format == 0x07 || format == 0x12 || format == 0x1E) ? 4 : 2; }
+u32 rgba_at(const std::vector<u8>& img, std::size_t i) {
+    return (u32{img[i * 4]} << 24) | (u32{img[i * 4 + 1]} << 16) | (u32{img[i * 4 + 2]} << 8) | img[i * 4 + 3];
+}
+}  // namespace
+
+// Linear images read each row at its pitch, through the inline loops for the 32- and 16-bit formats.
+TEST(Texture, LinearDecodesReadEachRowAtItsPitch) {
+    for (const u32 format : {0x12u, 0x1Eu, 0x11u, 0x1Du, 0x10u, 0x1Cu}) {
+        SCOPED_TRACE(std::to_string(format));
+        const u32 bpp = bytes_of(format), w = 13, h = 5, pitch = 64;
+        std::vector<u8> ram(pitch * h + 16);
+        u32 seed = 777;
+        for (auto& b : ram) b = static_cast<u8>((seed = seed * 1103515245u + 12345u) >> 16);
+        const TextureStage t = stage_of(fmt(format, 0, 0), pitch << 16, (w << 16) | h);
+        DecodedTexture dec;
+        ASSERT_TRUE(decode_texture(t, 0, MemoryView{ram.data(), static_cast<u32>(ram.size())}, nullptr, dec)) << dec.error;
+        for (u32 y = 0; y < h; ++y)
+            for (u32 x = 0; x < w; ++x) ASSERT_EQ(rgba_at(dec.image(0, 0), y * w + x), expected_rgba(format, &ram[y * pitch + x * bpp])) << x << "," << y;
+    }
+}
+
+// The table-driven swizzle reads every texel where swizzled_offset says, in non-square images and volumes, through the
+// inline loops (32- and 16-bit formats) and the generic one (A8).
 TEST(Texture, SwizzledDecodesReadEachTexelAtItsInterleavedOffset) {
     struct Shape { u32 lw, lh, ld; };
     for (const Shape s : {Shape{5, 3, 0}, Shape{2, 6, 0}, Shape{3, 2, 2}})
-        for (const u32 format : {0x06u, 0x07u, 0x05u}) {
+        for (const u32 format : {0x06u, 0x07u, 0x05u, 0x04u, 0x02u, 0x03u, 0x19u}) {
             SCOPED_TRACE(std::to_string(format) + " " + std::to_string(s.lw) + "x" + std::to_string(s.lh) + "x" + std::to_string(s.ld));
-            const u32 bpp = format == 0x05 ? 2 : 4, w = 1u << s.lw, h = 1u << s.lh, d = 1u << s.ld;
+            const u32 bpp = bytes_of(format), w = 1u << s.lw, h = 1u << s.lh, d = 1u << s.ld;
             std::vector<u8> ram(w * h * d * bpp + 64);
             u32 seed = 12345;
             for (auto& b : ram) b = static_cast<u8>((seed = seed * 1103515245u + 12345u) >> 16);
@@ -87,16 +126,7 @@ TEST(Texture, SwizzledDecodesReadEachTexelAtItsInterleavedOffset) {
                 for (u32 y = 0; y < h; ++y)
                     for (u32 x = 0; x < w; ++x) {
                         const u8* p = &ram[swizzled_offset(x, y, z, s.lw, s.lh, s.ld) * bpp];
-                        const u8* q = &img[((static_cast<std::size_t>(z) * h + y) * w + x) * 4];
-                        u32 r = p[2], g = p[1], b = p[0], a = format == 0x07 ? 255u : p[3];
-                        if (format == 0x05) {
-                            const u32 v = p[0] | (p[1] << 8);
-                            r = ((v >> 11) << 3) | (v >> 13);
-                            g = (((v >> 5) & 63) << 2) | (((v >> 5) & 63) >> 4);
-                            b = ((v & 31) << 3) | ((v & 31) >> 2);
-                            a = 255;
-                        }
-                        ASSERT_EQ((u32{q[0]} << 24) | (u32{q[1]} << 16) | (u32{q[2]} << 8) | q[3], (r << 24) | (g << 16) | (b << 8) | a) << x << "," << y << "," << z;
+                        ASSERT_EQ(rgba_at(img, (static_cast<std::size_t>(z) * h + y) * w + x), expected_rgba(format, p)) << x << "," << y << "," << z;
                     }
         }
 }

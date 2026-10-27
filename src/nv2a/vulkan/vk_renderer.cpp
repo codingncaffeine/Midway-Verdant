@@ -147,6 +147,8 @@ VulkanRenderer::VulkanRenderer(vk::Device& device, const HandleResolver& handles
     if (const char* a = std::getenv("MV_ASYNC_WRITEBACK"); a && *a == '0') async_wb_on_ = false;
     // MV_NATIVE_DXT=0: DXT textures decoded to RGBA8 on the CPU as before (the control).
     if (const char* n = std::getenv("MV_NATIVE_DXT"); n && *n == '0') native_dxt_requested_ = false;
+    // MV_HOIST_UPLOADS=0: a new texture's upload is recorded among the draws, ending the render pass (the control).
+    if (const char* h = std::getenv("MV_HOIST_UPLOADS"); h && *h == '0') hoist_uploads_ = false;
     if (const char* w = std::getenv("MV_PENDING_WAIT_MS"); w && *w) pending_wait_per_vblank_ns_ = std::atoll(w) * 1'000'000;
     if (const char* d = std::getenv("MV_RENDER_DEBUG")) {
         const std::string s = d;
@@ -220,6 +222,10 @@ VulkanRenderer::~VulkanRenderer() {
         end_pass();
         f.vkEndCommandBuffer(cb_);
         recording_ = false;
+    }
+    if (uploads_recording_) {
+        f.vkEndCommandBuffer(upload_cb_);
+        uploads_recording_ = false;
     }
     dev_.wait_queue_idle();  // the one queue the renderer uses (a frontend's device: its lock, not a device-wide wait)
     for (Handoff& h : handoffs_) {
@@ -298,6 +304,7 @@ VulkanRenderer::~VulkanRenderer() {
         for (VkFence fence : fr.fences) f.vkDestroyFence(dev_.device(), fence, nullptr);
         if (fr.occlusion) f.vkDestroyQueryPool(dev_.device(), fr.occlusion, nullptr);
         if (!fr.cbs.empty()) f.vkFreeCommandBuffers(dev_.device(), dev_.pool(), static_cast<u32>(fr.cbs.size()), fr.cbs.data());
+        if (!fr.upload_cbs.empty()) f.vkFreeCommandBuffers(dev_.device(), dev_.pool(), static_cast<u32>(fr.upload_cbs.size()), fr.upload_cbs.data());
     }
 }
 
@@ -457,6 +464,32 @@ void VulkanRenderer::begin_commands() {
     recording_ = true;
 }
 
+VkCommandBuffer VulkanRenderer::upload_cb() {
+    if (!hoist_uploads_) {
+        end_pass();  // copies cannot sit inside a render pass
+        return cb_;
+    }
+    if (uploads_recording_) return upload_cb_;
+    const auto& f = *fn_;
+    Frame& fr = frames_[slot_];
+    while (fr.upload_cbs.size() <= fr.used) {
+        VkCommandBufferAllocateInfo cai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+        cai.commandPool = dev_.pool();
+        cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        cai.commandBufferCount = 1;
+        VkCommandBuffer cb = VK_NULL_HANDLE;
+        f.vkAllocateCommandBuffers(dev_.device(), &cai, &cb);
+        fr.upload_cbs.push_back(cb);
+    }
+    upload_cb_ = fr.upload_cbs[fr.used];  // its submission's fence covers it, as it does cbs[used]
+    f.vkResetCommandBuffer(upload_cb_, 0);
+    VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    f.vkBeginCommandBuffer(upload_cb_, &bi);
+    uploads_recording_ = true;
+    return upload_cb_;
+}
+
 // A finished frame's query results into counts_, by ticket (once).
 void VulkanRenderer::harvest(Frame& fr) {
     if (fr.harvested) return;
@@ -557,8 +590,21 @@ void VulkanRenderer::submit(bool rotate) {
     recording_ = false;
     Frame& fr = frames_[slot_];
     VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
-    si.commandBufferCount = 1;
-    si.pCommandBuffers = &cb_;
+    VkCommandBuffer both[2] = {upload_cb_, cb_};
+    if (uploads_recording_) {
+        // The uploads first, then everything that samples them: their closing barrier orders the draws after them.
+        VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+        f.vkCmdPipelineBarrier(upload_cb_, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+        f.vkEndCommandBuffer(upload_cb_);
+        uploads_recording_ = false;
+        si.commandBufferCount = 2;
+        si.pCommandBuffers = both;
+    } else {
+        si.commandBufferCount = 1;
+        si.pCommandBuffers = &cb_;
+    }
     fr.last = fr.fences[fr.used++];
     dev_.submit(1, &si, fr.last);
     fr.serial = ++submitted_;
@@ -2205,8 +2251,19 @@ u32 VulkanRenderer::texture_phys(const KelvinState& s, const TextureStage& ts) c
 u64 VulkanRenderer::texture_content(u32 phys, u32 length, u32 palette_phys) const {
     const MemoryView ram{ram_, ram_size_};
     u64 h = 0x9E3779B97F4A7C15ull ^ length;
+    // Four independent lanes over 32-byte steps, folded at the end: one chain of multiplies ran at ~3.5 GB/s, and a
+    // 640x480 image rewritten every few frames (Crimson Skies) spent as long hashing as decoding.
     auto mix = [&h](const u8* p, u32 n) {
+        u64 lane[4] = {h, h ^ 0xC2B2AE3D27D4EB4Full, h ^ 0x165667B19E3779F9ull, h ^ 0x27D4EB2F165667C5ull};
         u32 i = 0;
+        for (; i + 32 <= n; i += 32)
+            for (u32 k = 0; k < 4; ++k) {
+                u64 w;
+                std::memcpy(&w, p + i + k * 8, 8);
+                lane[k] = (lane[k] ^ w) * 0xFF51AFD7ED558CCDull;
+                lane[k] ^= lane[k] >> 32;
+            }
+        for (u32 k = 0; k < 4; ++k) h = (h ^ lane[k]) * 0xFF51AFD7ED558CCDull;
         for (; i + 8 <= n; i += 8) {
             u64 w;
             std::memcpy(&w, p + i, 8);
@@ -2357,6 +2414,9 @@ const VulkanRenderer::TextureEntry* VulkanRenderer::texture(const KelvinState& s
         return it->second.get();
     }
 
+    // MV_RENDER_DEBUG=texlog: each decode's parts (texlog: cost), to find what a burst of new textures spends.
+    const auto tx0 = std::chrono::steady_clock::now();
+    u64 tx_watch = 0, tx_decode = 0, tx_create = 0, tx_upload = 0;
     DecodedTexture d;
     const u32 generation = handles_.write_generation();
     u32 palette_phys = 0;
@@ -2369,10 +2429,12 @@ const VulkanRenderer::TextureEntry* VulkanRenderer::texture(const KelvinState& s
     // Its pages are watched before they are read: a write from here on marks the texture stale.
     handles_.watch_writes(phys, length);
     if (palette_phys) handles_.watch_writes(palette_phys, 256 * 4);
+    tx_watch = ns_since(tx0);
     if (!decode_texture(ts, phys, MemoryView{ram_, ram_size_}, palette, d, native_dxt_)) {
         error = d.error;
         return nullptr;
     }
+    tx_decode = ns_since(tx0);
     ++stats_.textures_decoded;
     if (debug_tex_log_) {
         bool target = false;
@@ -2437,12 +2499,13 @@ const VulkanRenderer::TextureEntry* VulkanRenderer::texture(const KelvinState& s
         }
     }
     if (!dev_.create_image(format, d.width, d.height, d.depth, d.levels, d.faces, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
-                           VK_IMAGE_ASPECT_COLOR_BIT, d.faces == 6, entry->image, error))
+                           VK_IMAGE_ASPECT_COLOR_BIT, d.faces == 6, entry->image, error, 0, true))
         return nullptr;
-    // Upload each face and level through the staging ring, recorded into the frame ahead of the draw that samples
-    // the texture (copies cannot sit inside a render pass).
-    end_pass();
-    fresh_image(entry->image);
+    // Upload each face and level through the staging ring into the submission's upload command buffer, which the queue
+    // runs ahead of every draw in it (none of them can sample an image made just now), so the render pass stays open.
+    // A full staging region submits mid-way: the copies after it go to the next submission's upload buffer.
+    tx_create = ns_since(tx0);
+    fresh_image(entry->image, upload_cb());
     for (u32 face = 0; face < d.faces; ++face) {
         u32 w = d.width, h = d.height, dp = d.depth;
         for (u32 level = 0; level < d.levels; ++level) {
@@ -2454,13 +2517,14 @@ const VulkanRenderer::TextureEntry* VulkanRenderer::texture(const KelvinState& s
             region.bufferOffset = offset;
             region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, face, 1};
             region.imageExtent = {w, h, dp};
-            fn_->vkCmdCopyBufferToImage(cb_, staging_.buffer.buffer, entry->image.image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+            fn_->vkCmdCopyBufferToImage(upload_cb(), staging_.buffer.buffer, entry->image.image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
             w = std::max(w >> 1, 1u);
             h = std::max(h >> 1, 1u);
             if (d.depth > 1) dp = std::max(dp >> 1, 1u);
         }
     }
-    upload_barrier();
+    if (!hoist_uploads_) upload_barrier();  // hoisted, the upload buffer's closing barrier orders them
+    tx_upload = ns_since(tx0);
     entry->phys = phys;
     entry->length = length;
     entry->valid = true;
@@ -2471,6 +2535,10 @@ const VulkanRenderer::TextureEntry* VulkanRenderer::texture(const KelvinState& s
     entry->palette_phys = palette_phys;
     entry->content = texture_content(phys, length, palette_phys);
     hash_pages(*entry);
+    if (debug_tex_log_)
+        std::fprintf(stderr, "texlog: cost %08x fmt %02x %ux%u levels %u: watch %.3f decode %.3f create %.3f upload %.3f content+hash %.3f ms\n", phys,
+                     ts.color_format(), d.width, d.height, d.levels, static_cast<double>(tx_watch) / 1e6, static_cast<double>(tx_decode - tx_watch) / 1e6,
+                     static_cast<double>(tx_create - tx_decode) / 1e6, static_cast<double>(tx_upload - tx_create) / 1e6, static_cast<double>(ns_since(tx0) - tx_upload) / 1e6);
     TextureEntry* raw = entry.get();
     textures_[key] = std::move(entry);
     sc = StageCache{regs, phys, length, raw};
@@ -3350,7 +3418,7 @@ bool VulkanRenderer::staging_alloc(VkDeviceSize bytes, VkDeviceSize& offset) {
     return ring_alloc(staging_, bytes, 16, offset);
 }
 
-void VulkanRenderer::fresh_image(const vk::Image& image) {
+void VulkanRenderer::fresh_image(const vk::Image& image, VkCommandBuffer cb) {
     VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
     b.srcAccessMask = 0;
     b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
@@ -3360,7 +3428,7 @@ void VulkanRenderer::fresh_image(const vk::Image& image) {
     b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     b.image = image.image;
     b.subresourceRange = {image.aspect, 0, image.levels, 0, image.layers};
-    fn_->vkCmdPipelineBarrier(cb_, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
+    fn_->vkCmdPipelineBarrier(cb ? cb : cb_, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
 }
 
 void VulkanRenderer::upload_barrier() {

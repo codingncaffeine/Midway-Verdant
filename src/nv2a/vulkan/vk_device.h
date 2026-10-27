@@ -1,5 +1,7 @@
 #pragma once
 #include <functional>
+#include <map>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -28,6 +30,10 @@ struct Image {
     u32 width{0}, height{0}, depth{1}, levels{1}, layers{1};
     VkImageAspectFlags aspect{VK_IMAGE_ASPECT_COLOR_BIT};
     bool cube{false};
+    // Placed in one of the device's shared texture blocks (create_image with pooled): which, where and how much;
+    // memory is then the block's and is not freed with the image.
+    u32 block{~0u};
+    VkDeviceSize offset{0}, bytes{0};
 };
 
 // What the device was created with, of the optional things the renderer uses.
@@ -104,7 +110,7 @@ public:
     bool create_buffer(VkDeviceSize size, VkBufferUsageFlags usage, BufferMemory where, Buffer& out, std::string& error);
     void destroy_buffer(Buffer& b);
     bool create_image(VkFormat format, u32 width, u32 height, u32 depth, u32 levels, u32 layers, VkImageUsageFlags usage,
-                      VkImageAspectFlags aspect, bool cube, Image& out, std::string& error, VkImageCreateFlags flags = 0);
+                      VkImageAspectFlags aspect, bool cube, Image& out, std::string& error, VkImageCreateFlags flags = 0, bool pooled = false);
     void destroy_image(Image& i);
     bool format_supports(VkFormat format, VkFormatFeatureFlags features) const;
 
@@ -131,6 +137,18 @@ private:
     VkPhysicalDeviceMemoryProperties memory_{};
     VkPhysicalDeviceLimits limits_{};
     std::string name_;
+    // Shared blocks of device memory that sampled textures are placed in (a vkAllocateMemory each was ~0.03-0.07 ms,
+    // most of what a new texture cost: Crimson Skies met 176 in one frame). First fit, freed ranges merged.
+    struct Block {
+        VkDeviceMemory memory{VK_NULL_HANDLE};
+        u32 type{0};
+        std::map<VkDeviceSize, VkDeviceSize> free;  // offset -> size
+    };
+    static constexpr VkDeviceSize kBlockBytes = 64ull << 20;
+    std::vector<Block> blocks_;
+    std::mutex blocks_mutex_;
+    bool place(u32 type, VkDeviceSize bytes, VkDeviceSize alignment, u32& block, VkDeviceSize& offset);
+    void release(u32 block, VkDeviceSize offset, VkDeviceSize bytes);
 };
 
 }  // namespace mv::vk

@@ -13,6 +13,8 @@ namespace mv::vk {
 Device::~Device() {
     if (device_) {
         wait_queue_idle();
+        for (Block& b : blocks_)
+            if (b.memory) fn_.vkFreeMemory(device_, b.memory, nullptr);
         if (pool_) fn_.vkDestroyCommandPool(device_, pool_, nullptr);
         if (!external_) fn_.vkDestroyDevice(device_, nullptr);
     }
@@ -290,7 +292,7 @@ void Device::destroy_buffer(Buffer& b) {
 }
 
 bool Device::create_image(VkFormat format, u32 width, u32 height, u32 depth, u32 levels, u32 layers, VkImageUsageFlags usage,
-                          VkImageAspectFlags aspect, bool cube, Image& out, std::string& error, VkImageCreateFlags flags) {
+                          VkImageAspectFlags aspect, bool cube, Image& out, std::string& error, VkImageCreateFlags flags, bool pooled) {
     out = Image{};
     VkImageCreateInfo ici{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     ici.flags = flags | (cube ? static_cast<u32>(VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT) : 0u);
@@ -317,15 +319,21 @@ bool Device::create_image(VkFormat format, u32 width, u32 height, u32 depth, u32
         destroy_image(out);
         return false;
     }
-    VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-    mai.allocationSize = req.size;
-    mai.memoryTypeIndex = type;
-    if (VkResult r = fn_.vkAllocateMemory(device_, &mai, nullptr, &out.memory); r != VK_SUCCESS) {
-        error = std::format("vkAllocateMemory (image): {}", result_name(r));
-        destroy_image(out);
-        return false;
+    // A small sampled image goes into a shared block (only optimal-tiling images live there, so no granularity padding).
+    if (pooled && req.size <= kBlockBytes / 4 && place(type, req.size, req.alignment, out.block, out.offset)) {
+        out.bytes = req.size;
+        fn_.vkBindImageMemory(device_, out.image, blocks_[out.block].memory, out.offset);
+    } else {
+        VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        mai.allocationSize = req.size;
+        mai.memoryTypeIndex = type;
+        if (VkResult r = fn_.vkAllocateMemory(device_, &mai, nullptr, &out.memory); r != VK_SUCCESS) {
+            error = std::format("vkAllocateMemory (image): {}", result_name(r));
+            destroy_image(out);
+            return false;
+        }
+        fn_.vkBindImageMemory(device_, out.image, out.memory, 0);
     }
-    fn_.vkBindImageMemory(device_, out.image, out.memory, 0);
     VkImageViewCreateInfo vci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
     vci.image = out.image;
     vci.viewType = cube ? VK_IMAGE_VIEW_TYPE_CUBE : (depth > 1 ? VK_IMAGE_VIEW_TYPE_3D : VK_IMAGE_VIEW_TYPE_2D);
@@ -351,7 +359,56 @@ void Device::destroy_image(Image& i) {
     if (i.view) fn_.vkDestroyImageView(device_, i.view, nullptr);
     if (i.image) fn_.vkDestroyImage(device_, i.image, nullptr);
     if (i.memory) fn_.vkFreeMemory(device_, i.memory, nullptr);
+    if (i.block != ~0u) release(i.block, i.offset, i.bytes);
     i = Image{};
+}
+
+bool Device::place(u32 type, VkDeviceSize bytes, VkDeviceSize alignment, u32& block, VkDeviceSize& offset) {
+    std::lock_guard g(blocks_mutex_);
+    const auto fit = [&](Block& b) {
+        for (auto it = b.free.begin(); it != b.free.end(); ++it) {
+            const VkDeviceSize start = (it->first + alignment - 1) / alignment * alignment, end = it->first + it->second;
+            if (start + bytes > end) continue;
+            const VkDeviceSize first = it->first;
+            b.free.erase(it);
+            if (start > first) b.free[first] = start - first;  // the gap the alignment left
+            if (start + bytes < end) b.free[start + bytes] = end - (start + bytes);
+            offset = start;
+            return true;
+        }
+        return false;
+    };
+    for (u32 i = 0; i < blocks_.size(); ++i)
+        if (blocks_[i].type == type && blocks_[i].memory && fit(blocks_[i])) {
+            block = i;
+            return true;
+        }
+    VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    mai.allocationSize = kBlockBytes;
+    mai.memoryTypeIndex = type;
+    Block b;
+    b.type = type;
+    if (fn_.vkAllocateMemory(device_, &mai, nullptr, &b.memory) != VK_SUCCESS) return false;  // the image gets its own
+    b.free[0] = kBlockBytes;
+    blocks_.push_back(std::move(b));
+    block = static_cast<u32>(blocks_.size() - 1);
+    return fit(blocks_.back());
+}
+
+void Device::release(u32 block, VkDeviceSize offset, VkDeviceSize bytes) {
+    std::lock_guard g(blocks_mutex_);
+    auto& free = blocks_[block].free;
+    auto it = free.emplace(offset, bytes).first;
+    // Merged with the free range after it and the one before it.
+    if (auto next = std::next(it); next != free.end() && it->first + it->second == next->first) {
+        it->second += next->second;
+        free.erase(next);
+    }
+    if (it != free.begin())
+        if (auto prev = std::prev(it); prev->first + prev->second == it->first) {
+            prev->second += it->second;
+            free.erase(it);
+        }
 }
 
 bool Device::format_supports(VkFormat format, VkFormatFeatureFlags features) const {
