@@ -7,7 +7,9 @@
 
 #include "cpu/p6/cpu.h"
 
-#if defined(__x86_64__) || defined(__i386__)
+// MSVC names x86 _M_X64 / _M_IX86: without them its builds ran SSE arithmetic under the host's rounding and read no
+// exception flags (0/0 raised no invalid-operation flag, round-toward-zero rounded to nearest).
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
 #include <xmmintrin.h>
 #define MV_HOST_SSE 1
 #else
