@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "nv2a/overlay.h"
+#include "nv2a/render_thread.h"
 #include "nv2a/pgraph/kelvin.h"
 #include "nv2a/pgraph/texture.h"
 #include "nv2a/vulkan/vk_device.h"
@@ -41,7 +42,8 @@ struct RamResolver : HandleResolver {
 };
 
 // The vertex program: oPos = v0 (already in screen space), oD0 = v3.
-void load_passthrough_program(Kelvin& k) {
+template <class K>
+void load_passthrough_program(K& k) {
     // mov oPos.xyzw, v0 ; mov oD0.xyzw, v3 (final)
     auto enc = [](u32 v, u32 out, bool fin) {
         std::array<u32, 4> t{};
@@ -67,7 +69,8 @@ void load_passthrough_program(Kelvin& k) {
 }
 
 // Combiners: final colour = v0 (diffuse), alpha = v0.a.
-void load_passthrough_combiners(Kelvin& k) {
+template <class K>
+void load_passthrough_combiners(K& k) {
     k.method(mthd::kCombinerControl, 1);
     k.method(mthd::kCombinerColorIcw, (4u << 24) | ((1u << 5) << 16));  // A = v0, B = one
     k.method(mthd::kCombinerColorOcw, 12u << 4);                        // AB -> r0
@@ -79,7 +82,8 @@ void load_passthrough_combiners(Kelvin& k) {
 
 // A 64x64 linear target at 0x10000 (pitch 256) with a Z24S8 buffer at 0x20000, the pass-through program and
 // combiners, no depth test, no culling.
-void setup_target(Kelvin& k, u32 color_format = 8, u32 color_offset = 0x10000) {
+template <class K>
+void setup_target(K& k, u32 color_format = 8, u32 color_offset = 0x10000) {
     k.method(mthd::kDmaColor, 9);
     k.method(mthd::kDmaZeta, 10);
     k.method(mthd::kDmaVertexA, 3);
@@ -98,7 +102,8 @@ void setup_target(Kelvin& k, u32 color_format = 8, u32 color_offset = 0x10000) {
 }
 
 // One triangle over the whole 64x64 target, from a position array of four floats per vertex at 0x30000.
-void draw_full_triangle(Kelvin& k, std::vector<u8>& ram) {
+template <class K>
+void draw_full_triangle(K& k, std::vector<u8>& ram) {
     const float verts[3][4] = {{0.0f, 0.0f, 0.0f, 1.0f}, {128.0f, 0.0f, 0.0f, 1.0f}, {0.0f, 128.0f, 0.0f, 1.0f}};
     std::memcpy(&ram[0x30000], verts, sizeof verts);
     k.method(mthd::kVertexDataArrayFormat + 0, (16u << 8) | (4u << 4) | 2u);
@@ -822,6 +827,51 @@ TEST(Vulkan, TheSignedBlendsReadTheSourceByteAsTwosComplementAndIgnoreTheFactors
         if (equation == 0xF006u) EXPECT_EQ(pixel_at(ram, 8, 8), 0x7F503060u) << "ADD_SIGNED (ARGB): 0x80 - 1, 0x40 + 16, 0x40 - 16, 0x40 + 32";
         else EXPECT_EQ(pixel_at(ram, 8, 8), 0x81305020u) << "REVERSE_SUBTRACT_SIGNED (ARGB): 0x80 + 1, 0x40 - 16, 0x40 + 16, 0x40 - 32";
     }
+}
+
+namespace {
+// The render thread's two decoders fed as the GPU's stub feeds them: the method decoded here (a draw's vertices
+// fetched), then queued for the thread, and the draw's packet committed with the current values it left.
+struct TeeDecoder {
+    Kelvin parse;
+    RenderThread& rt;
+    PrefetchSink& prefetch;
+    TeeDecoder(RenderThread& r, PrefetchSink& p) : rt(r), prefetch(p) { parse.set_sink(&prefetch); }
+    void method(u32 m, u32 v) {
+        parse.method(m, v);
+        rt.method(m, v);
+        if (prefetch.take_drew()) rt.commit_packet(parse.state().immediate);
+    }
+};
+}  // namespace
+
+TEST(Vulkan, TheRenderThreadDrawsWhatTheStreamHeldWhenItWasDecoded) {
+    // A game reuses a vertex buffer as soon as its fence passes, and the fence passes once the stream is decoded, before
+    // the render thread records the draw: the draw keeps the vertices the memory held at the decode.
+    vk::Device device;
+    std::string error;
+    if (!device.init(error)) GTEST_SKIP() << "no Vulkan device: " << error;
+    std::vector<u8> ram(4u << 20, 0);
+    RamResolver handles;
+    handles.size = static_cast<u32>(ram.size());
+    VulkanRenderer renderer(device, handles, ram.data(), static_cast<u32>(ram.size()));
+    ASSERT_TRUE(renderer.init(error)) << error;
+    RenderThread rt(renderer);
+    PrefetchSink prefetch(rt, handles, MemoryView{ram.data(), static_cast<u32>(ram.size())});
+    TeeDecoder k(rt, prefetch);
+    setup_target(k);
+    k.method(mthd::kVertexDataArrayFormat + 12, 2u);
+    k.method(mthd::kDiffuse4ub, 0xFF00FF00u);  // green
+    draw_full_triangle(k, ram);
+    // The guest rewrites the array (every vertex at the corner: nothing would be drawn) before the thread records.
+    std::fill(ram.begin() + 0x30000, ram.begin() + 0x30000 + 48, u8{0});
+    rt.publish();
+    {
+        const auto own = rt.catch_up();
+        renderer.end_frame();
+    }
+    for (const auto& e : renderer.stats().errors) ADD_FAILURE() << "renderer: " << e;
+    EXPECT_EQ(pixel_at(ram, 8, 8), 0xFF00FF00u) << "the triangle the stream held when it was decoded";
 }
 
 TEST(Vulkan, AWriteReportFromBeforeTheTargetExistedDoesNotUndoALaterClear) {

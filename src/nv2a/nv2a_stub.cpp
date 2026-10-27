@@ -62,19 +62,21 @@ Nv2aStub::Nv2aStub(Bus& bus, Scheduler& sched, std::function<void(bool)> irq)
         guest_now_.store(sched_.now(), std::memory_order_relaxed);
         ++vblanks_;
         sync_point(kSyncVblank);
-        // The scanout reads the frame buffer now: a rendered one comes down from the device first.
-        if (renderer_) {
-            renderer_->set_display_lut(gamma_lut());  // applied to the scaled picture as it is read back
-            renderer_->set_display_overlay(overlay());  // drawn over it by the same pass
-            renderer_->write_back_at(reg(kPcrtcStart));
-        }
+        // The scanout reads the frame buffer now: a rendered one comes down from the device first (with the render thread,
+        // once it has recorded everything decoded before the vblank).
         // A whole frame without a method: the GPU is idle, so what it drew is in RAM on the hardware; put it there. Waiting
         // for two idle frames in a row (cea51bc, for 30 fps titles) left Forza's legal screen, which draws every other
         // frame, reading a drawn target through RAM before it ever reached it: a yellow band over its top third.
         idle_vblanks_ = kelvin_.methods_seen() == methods_at_vblank_ ? idle_vblanks_ + 1 : 0;
-        // In the background: the copies land at the CPU's next exits once the GPU has made them (poll_write_backs), or at
-        // once when the guest asks the GPU how far it is; the vblank waited 1.5-3.8 ms here in heavy 30 fps titles.
-        if (renderer_ && idle_vblanks_ >= 1) renderer_->write_back_all(true);
+        if (renderer_) {
+            const auto own = own_renderer();
+            renderer_->set_display_lut(gamma_lut());  // applied to the scaled picture as it is read back
+            renderer_->set_display_overlay(overlay());  // drawn over it by the same pass
+            renderer_->write_back_at(reg(kPcrtcStart));
+            // In the background: the copies land at the CPU's next exits once the GPU has made them (poll_write_backs), or
+            // at once when the guest asks the GPU how far it is; the vblank waited 1.5-3.8 ms here in heavy 30 fps titles.
+            if (idle_vblanks_ >= 1) renderer_->write_back_all(true);
+        }
         methods_at_vblank_ = kelvin_.methods_seen();
         if (vblank_hook_) vblank_hook_(sched_.now());
         regs_[kPcrtcIntr0] |= 1u;
@@ -157,6 +159,11 @@ void Nv2aStub::reset() {
     fast_zpass_count_ = 0;
     kelvin_ = pgraph::Kelvin();
     kelvin_.set_sink(renderer_);
+    if (render_thread_) {
+        kelvin_.set_sink(prefetch_sink_.get());
+        render_thread_->reset_decoder();
+        render_thread_->publish();
+    }
     kelvin_.set_vertex_memory(this, {bus_.ram(), static_cast<u32>(bus_.ram_size())});
     update_irq();
 }
@@ -568,9 +575,20 @@ void Nv2aStub::execute_method(const PushbufferMethod& m) {
             default: break;
         }
     }
+    // With the render thread: the method is decoded here (a draw's vertices are fetched as it ends) and again there,
+    // where it is recorded; the frame's flush keeps its place in the stream.
+    if (render_thread_ && bound_[m.subchannel] == 0x97) {
+        kelvin_.method(m.method, m.value);
+        render_thread_->method(m.method, m.value);
+        if (prefetch_sink_->take_drew()) render_thread_->commit_packet(kelvin_.state().immediate);
+        if (m.method == 0x1D70) {
+            render_thread_->call([](pgraph::VulkanRenderer& r) { r.flush_frame(); });
+            ++rendered_frames_;
+        }
+    }
     // The live GPU: every Kelvin method goes through the state machine to the renderer; the semaphore release is
     // the frame marker, so the frame is rendered and written back to RAM before the CPU can see the semaphore.
-    if (renderer_ && bound_[m.subchannel] == 0x97) {
+    else if (renderer_ && bound_[m.subchannel] == 0x97) {
         const bool draw_end = timed_ && m.method == pgraph::mthd::kBeginEnd && m.value == 0 && kelvin_.in_begin();
         const u64 passes = draw_end ? gpu_timing::pixel_passes(kelvin_.state()) : 0;
         const u64 bytes = draw_end ? gpu_timing::pixel_bytes(kelvin_.state()) : 0;
@@ -612,8 +630,13 @@ void Nv2aStub::execute_method(const PushbufferMethod& m) {
         }
     }
     // The 2D engine: the surfaces object and the image blit.
-    if (bound_[m.subchannel] == pgraph::TwoD::kClassSurfaces || bound_[m.subchannel] == pgraph::TwoD::kClassBlit)
+    // A blit reads and writes RAM and the renderer's targets here and now: the render thread catches up with the stream
+    // first.
+    if (bound_[m.subchannel] == pgraph::TwoD::kClassSurfaces || bound_[m.subchannel] == pgraph::TwoD::kClassBlit) {
+        const bool copies = bound_[m.subchannel] == pgraph::TwoD::kClassBlit && m.method == pgraph::TwoD::kBlitSize;  // the method that copies
+        const auto own = copies ? own_renderer() : std::unique_lock<std::mutex>{};
         twod_->method(bound_[m.subchannel], m.method, m.value);
+    }
     // The synchronisation methods every class shares, and Kelvin's semaphore: these are what the CPU waits on,
     // so they are executed here while every drawing method is only logged (the real engine arrives in Phase 4).
     SyncState& s = sync_[m.subchannel];
@@ -697,7 +720,16 @@ void Nv2aStub::harvest_writes() {
 }
 
 void Nv2aStub::land_write_backs(bool wait) {
-    if (!renderer_ || !renderer_->write_backs_in_flight()) return;
+    if (!renderer_) return;
+    // With the render thread the copies land when it is not recording, without catching up with it: a fence the guest
+    // reads must not wait for the recording (the reason the thread exists). A target the CPU reads straight after a
+    // fence could be older than the hardware's [the trade, watched for in the user's games].
+    std::unique_lock<std::mutex> own;
+    if (render_thread_) {
+        own = render_thread_->try_renderer();
+        if (!own.owns_lock()) return;
+    }
+    if (!renderer_->write_backs_in_flight()) return;
     if (!wait && !renderer_->write_backs_ready()) return;
     // What the guest and the devices wrote since the copies were queued stays: it is newer than they are. The pages stay
     // harvested for the next run too (cpu_wrote reloads the targets they belong to).
@@ -708,10 +740,13 @@ void Nv2aStub::land_write_backs(bool wait) {
     renderer_->complete_write_backs(true, &pages);
 }
 
-bool Nv2aStub::write_backs_in_flight() const { return renderer_ && renderer_->write_backs_in_flight(); }
+bool Nv2aStub::write_backs_in_flight() const {
+    if (render_thread_) return true;  // the render thread's state: poll_write_backs looks under its lock
+    return renderer_ && renderer_->write_backs_in_flight();
+}
 
 void Nv2aStub::poll_write_backs() {
-    if (!renderer_ || !renderer_->write_backs_in_flight()) return;
+    if (!renderer_ || (!render_thread_ && !renderer_->write_backs_in_flight())) return;
     std::unique_lock<std::mutex> gpu;
     if (fifo_threaded_) {
         gpu = std::unique_lock(gpu_mutex_, std::try_to_lock);
@@ -730,7 +765,8 @@ void Nv2aStub::collect_writes() {
     if (dirty_scratch_.empty()) return;
     std::sort(dirty_scratch_.begin(), dirty_scratch_.end());
     dirty_scratch_.erase(std::unique(dirty_scratch_.begin(), dirty_scratch_.end()), dirty_scratch_.end());
-    if (renderer_) renderer_->cpu_wrote(dirty_scratch_);
+    if (render_thread_) render_thread_->call([pages = dirty_scratch_](pgraph::VulkanRenderer& r) { r.cpu_wrote(pages); });  // before the draws after it
+    else if (renderer_) renderer_->cpu_wrote(dirty_scratch_);
     if (write_tracking_) {
         ++write_generation_;
         for (u32 p : dirty_scratch_)
@@ -1219,6 +1255,9 @@ std::string Nv2aStub::fifo_wait_report() const {
     std::vector<std::pair<u32, std::pair<u64, u64>>> v(idle_waits_.begin(), idle_waits_.end());
     std::ranges::sort(v, std::greater{}, [](const auto& e) { return e.second.second; });
     std::string r = std::format("the lock {} times ({:.3f} s);", lock_waits_.load(), static_cast<double>(lock_wait_ns_.load()) / 1e9);
+    if (render_thread_)
+        r += std::format(" render thread busy {:.3f} s, caught up with {} times ({:.3f} s);", static_cast<double>(render_thread_->busy_ns()) / 1e9,
+                         render_thread_->catch_ups(), static_cast<double>(render_thread_->catch_up_ns()) / 1e9);
     for (std::size_t i = 0; i < v.size() && i < 8; ++i)
         r += std::format(" {} +{:06x} x{} {:.3f} s;", (v[i].first >> 31) ? "write" : (v[i].first & 0x40000000u) ? "poll" : "read", v[i].first & 0x3FFFFFFFu, v[i].second.first, static_cast<double>(v[i].second.second) / 1e9);
     return r;
@@ -1264,9 +1303,33 @@ void Nv2aStub::start_fifo_thread(std::function<void()> request) {
     };
     service_request_ = std::move(request);
     guest_now_.store(sched_.now(), std::memory_order_relaxed);
+    start_render_thread();
     fifo_stop_ = false;
     fifo_threaded_ = true;
     fifo_thread_ = std::thread([this] { fifo_main(); });
+}
+
+void Nv2aStub::start_render_thread() {
+    // The timed pusher and the real reports read the renderer's draw tickets as each draw is decoded: they keep it inline.
+    const char* e = std::getenv("MV_RENDER_THREAD");
+    if (!renderer_ || timed_ || real_reports_ || !(e && *e == '1') || render_thread_) return;
+    render_thread_ = std::make_unique<RenderThread>(*renderer_);
+    prefetch_sink_ = std::make_unique<PrefetchSink>(*render_thread_, *this, pgraph::MemoryView{bus_.ram(), static_cast<u32>(bus_.ram_size())});
+    kelvin_.set_sink(prefetch_sink_.get());
+    trace::log(trace::Cat::Gpu, "render thread on");
+}
+
+void Nv2aStub::stop_render_thread() {
+    if (!render_thread_) return;
+    render_thread_.reset();  // executes what is queued, then joins
+    prefetch_sink_.reset();
+    kelvin_.set_sink(renderer_);
+}
+
+std::unique_lock<std::mutex> Nv2aStub::own_renderer() {
+    if (!render_thread_) return {};
+    render_thread_->publish();  // the FIFO thread's own calls: what it queued comes first
+    return render_thread_->catch_up();
 }
 
 void Nv2aStub::stop_fifo_thread() {
@@ -1277,6 +1340,7 @@ void Nv2aStub::stop_fifo_thread() {
     }
     fifo_cv_.notify_all();
     if (fifo_thread_.joinable()) fifo_thread_.join();
+    stop_render_thread();
     fifo_threaded_ = false;
     fifo_busy_ = false;
     sched_.cancel(lead_);
@@ -1301,6 +1365,7 @@ void Nv2aStub::fifo_main() {
         fifo_busy_ = true;
         const u32 get_before = reg(kCache1DmaGet);
         run_pusher_inline();
+        if (render_thread_) render_thread_->publish();  // a thread that takes the lock next finds nothing unpublished
         if (reg(kCache1DmaGet) != get_before) idle_cv_.notify_all();  // a poll of GET waits for progress
         if (!pusher_runnable()) {
             fifo_busy_ = false;

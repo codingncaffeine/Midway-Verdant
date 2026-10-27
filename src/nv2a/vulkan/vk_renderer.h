@@ -99,6 +99,9 @@ public:
 
     void clear(const KelvinState& state, u32 clear_bits) override;
     void draw(const KelvinState& state, const DrawBatch& batch) override;
+    // The next draw's vertices, fetched already (the render thread's draws: fetched when the stream was decoded, before
+    // the guest could reuse the memory); the draw takes them instead of reading RAM. Null: it reads RAM.
+    void set_prefetched(FetchedVertices* v) { prefetched_ = v; }
     // Submits the frame's work and writes every rendered surface back into guest RAM (waiting for the GPU only when
     // one was drawn).
     void end_frame();
@@ -639,6 +642,7 @@ private:
     std::array<float, vsh::kUniformBytes / 4> vs_uniforms_{};
     // A draw's fetched vertices and rewritten index lists, kept so their buffers serve draw after draw.
     FetchedVertices fetched_;
+    FetchedVertices* prefetched_{nullptr};  // set_prefetched: taken (swapped into fetched_) by the next draw
     std::vector<u32> draw_indices_, quad_indices_;
     struct UniformUpload {
         std::vector<u8> bytes;

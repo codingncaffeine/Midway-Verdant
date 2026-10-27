@@ -52,6 +52,12 @@ public:
         (void)state;
         (void)value;
     }
+    // After a draw: true when the sink set the current values the draw leaves behind itself (a second decoder of the
+    // stream takes the first one's, read before the arrays could be rewritten); false and the state machine reads them.
+    virtual bool latch(KelvinState& state) {
+        (void)state;
+        return false;
+    }
 };
 
 // The Kelvin (class 0x97) method state machine: every method lands in the state; the streaming methods fill the

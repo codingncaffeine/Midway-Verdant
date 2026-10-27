@@ -8,6 +8,7 @@
 #include <cstring>
 #include <format>
 #include <type_traits>
+#include <utility>
 
 #include "debug/png.h"
 #include "nv2a/shaders/glsl_compiler.h"
@@ -3622,6 +3623,7 @@ VkPipeline VulkanRenderer::clear_pipeline(VkRenderPass pass, VkColorComponentFla
 
 void VulkanRenderer::draw(const KelvinState& s, const DrawBatch& batch) {
     last_ticket_ = 0;
+    FetchedVertices* const prefetched = std::exchange(prefetched_, nullptr);  // this draw's, whichever way it returns
     // A frame whose queries are used up goes to the GPU before this draw (its pass reopens below); and with counting
     // on, every few hundred draws: the GPU works on them while the CPU goes on, so a count asked for later is usually
     // in already instead of a submit and a wait for the whole batch (5.6 % of a title's CPU thread waited there).
@@ -3681,7 +3683,13 @@ void VulkanRenderer::draw(const KelvinState& s, const DrawBatch& batch) {
     // The fetched vertices and the host's index list live in members: their buffers are reused draw after draw.
     FetchedVertices& v = fetched_;
     clock.skip();
-    const bool fetched = fetch_vertices(s, handles_, MemoryView{ram_, ram_size_}, batch, v);
+    bool fetched;
+    if (prefetched) {
+        std::swap(v, *prefetched);  // the caller's buffers get this one's old ones back for its next fetch
+        fetched = v.error.empty();
+    } else {
+        fetched = fetch_vertices(s, handles_, MemoryView{ram_, ram_size_}, batch, v);
+    }
     clock.lap(stats_.ns_fetch);
     if (!fetched) {
         note("vertex fetch: " + v.error);

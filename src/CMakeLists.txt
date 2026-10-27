@@ -40,6 +40,7 @@ add_library(mvcore STATIC
   mcpx/rtc.cpp
   nv2a/capture.cpp
   nv2a/nv2a_stub.cpp
+  nv2a/render_thread.cpp
   nv2a/gpu_timing.cpp
   nv2a/overlay.cpp
   nv2a/scanout.cpp

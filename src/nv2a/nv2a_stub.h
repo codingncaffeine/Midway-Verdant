@@ -22,6 +22,7 @@
 #include "nv2a/pgraph/twod.h"
 #include "nv2a/pgraph/kelvin.h"
 #include "nv2a/pushbuffer.h"
+#include "nv2a/render_thread.h"
 #include "pci/pci.h"
 
 namespace mv {
@@ -308,6 +309,14 @@ private:
     u32 idle_vblanks_{0};       // vblanks in a row with no Kelvin method between them
     pgraph::VulkanRenderer* renderer_{nullptr};
     std::unique_ptr<pgraph::TwoD> twod_;  // the 2D surfaces and image-blit classes
+    // PLAN 12d: the render thread (MV_RENDER_THREAD=1; the fast core without real reports). Kelvin methods are decoded
+    // here for the vertex fetch and the fences, and recorded there; prefetch_sink_ is then kelvin_'s sink.
+    std::unique_ptr<RenderThread> render_thread_;
+    std::unique_ptr<PrefetchSink> prefetch_sink_;
+    // The renderer for a call from outside the stream: caught up with the render thread first (an empty lock without one).
+    std::unique_lock<std::mutex> own_renderer();
+    void start_render_thread();
+    void stop_render_thread();
     u64 rendered_frames_{0};
     std::array<u32, 8> bound_{};
     std::array<u32, 8> bound_handles_{};

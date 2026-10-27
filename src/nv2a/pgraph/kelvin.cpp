@@ -96,7 +96,7 @@ void Kelvin::begin_end(u32 value) {
     }
     in_begin_ = false;
     if (sink_ && !batch_.empty()) sink_->draw(state_, batch_);
-    if (!batch_.empty()) latch_current_values(state_, vertex_handles_, vertex_memory_, batch_);
+    if (!batch_.empty() && !(sink_ && sink_->latch(state_))) latch_current_values(state_, vertex_handles_, vertex_memory_, batch_);
     batch_ = DrawBatch{};
 }
 
