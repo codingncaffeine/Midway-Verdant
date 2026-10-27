@@ -235,7 +235,7 @@ struct ShaderDumpSink : mv::pgraph::RenderSink {
     bool done{false};
     void clear(const mv::pgraph::KelvinState&, mv::u32) override {}
     void semaphore_release(const mv::pgraph::KelvinState&, mv::u32) override { ++frame; n = 0; }
-    void draw(const mv::pgraph::KelvinState& s, const mv::pgraph::DrawBatch&) override {
+    void draw(const mv::pgraph::KelvinState& s, const mv::pgraph::DrawBatch& batch) override {
         if (frame != want_frame || n++ != want_draw || done) return;
         done = true;
         using namespace mv::pgraph;
@@ -262,6 +262,34 @@ struct ShaderDumpSink : mv::pgraph::RenderSink {
             if ((s.reg(mthd::kVertexDataArrayFormat + 4 * i) >> 4) & 0xFu)
                 std::printf(" v%u %08x@%08x", i, s.reg(mthd::kVertexDataArrayFormat + 4 * i), s.reg(mthd::kVertexDataArrayOffset + 4 * i));
         std::printf("\n");
+        // The first vertices' raw attribute bytes as the draw's arrays hold them (what a colour or alpha really is).
+        std::printf("zeta %08x pitch %08x; cull face %x front face %x\n", d.zeta_offset, d.pitch, s.reg(mthd::kCullFace), s.reg(mthd::kFrontFace));
+        std::printf("ranges:");
+        for (const auto& [first, count] : batch.ranges) std::printf(" %u+%u", first, count);
+        std::printf("; %zu indices, %zu inline words\n", batch.indices.size(), batch.inline_words.size());
+        for (std::size_t w = 0; w < batch.inline_words.size(); ++w) std::printf("%s%08x", w % 8 == 0 ? (w ? "\n  " : "  ") : " ", batch.inline_words[w]);
+        if (!batch.inline_words.empty()) std::printf("\n");
+        const mv::u32 first = batch.ranges.empty() ? (batch.indices.empty() ? 0u : batch.indices[0]) : batch.ranges[0].first;
+        for (mv::u32 v = first; v < first + 6; ++v) {
+            std::printf("  vertex %u:", v);
+            for (mv::u32 i = 0; i < 16; ++i) {
+                const mv::u32 fmt = s.reg(mthd::kVertexDataArrayFormat + 4 * i), off = s.reg(mthd::kVertexDataArrayOffset + 4 * i);
+                const mv::u32 type = fmt & 0xFu, count = (fmt >> 4) & 0xFu;
+                if (count == 0) continue;
+                const mv::u32 size = type == 2 ? 4 * count : (type == 0 || type == 4 ? count : (type == 6 ? 4 : 2 * count));
+                const DmaObject vd = replay->resolve(s.dma_handle(off & 0x80000000u ? mthd::kDmaVertexB : mthd::kDmaVertexA));
+                const mv::u8* p = replay->memory().at(vd.base + (off & 0x7FFFFFFFu) + v * (fmt >> 8), size);
+                std::printf(" v%u[", i);
+                for (mv::u32 k = 0; p && k < size; ++k) std::printf("%02x", p[k]);
+                for (mv::u32 k = 0; p && type == 2 && k < count; ++k) {
+                    float f;
+                    std::memcpy(&f, p + 4 * k, 4);
+                    std::printf(" %g", static_cast<double>(f));
+                }
+                std::printf("]");
+            }
+            std::printf("\n");
+        }
         std::printf("combiner control %08x; stage programs %08x; other stage input %08x\n", s.reg(mthd::kCombinerControl), s.reg(mthd::kShaderStageProgram), s.reg(mthd::kShaderOtherStageInput));
         for (mv::u32 i = 0; i < 8; ++i)
             std::printf("stage %u: colour icw %08x ocw %08x alpha icw %08x ocw %08x factor0 %08x factor1 %08x\n", i, s.reg(mthd::kCombinerColorIcw + 4 * i),
@@ -300,10 +328,10 @@ struct DrawListSink : mv::pgraph::RenderSink {
             const DmaObject dma = replay->resolve(s.dma_handle(ts.dma_select() == 2 ? mthd::kDmaB : mthd::kDmaA));
             tex += std::format(" t{}:{:02x}@{:08x}/{}x{}{}", t, ts.color_format(), dma.base + ts.offset, 1u << ts.log_width(), 1u << ts.log_height(), ts.cubemap() ? "cube" : "");
         }
-        std::printf("draw %3u -> %08x %ux%u %s; %s x%zu/%zu; mode %u lit %u; stages %05x combiners %u; blend %d %x/%x; depth %d; alpha %d;%s\n", n++,
+        std::printf("draw %3u -> %08x %ux%u %s; %s x%zu/%zu; mode %u lit %u; stages %05x combiners %u; blend %d %x/%x eq %x; depth %d func %x; cull %x; alpha %d;%s\n", n++,
                     d.color_offset, d.clip_width(), d.clip_height(), d.swizzled() ? "swizzled" : "pitch", primitive_name(b.primitive), b.indices.size(),
                     b.immediate_vertices.size() / 16, s.transform_mode(), s.reg(mthd::kLightingEnable) & 1u, s.reg(mthd::kShaderStageProgram),
-                    s.combiner_stages(), s.blend(), s.reg(mthd::kBlendSfactor), s.reg(mthd::kBlendDfactor), s.depth_test(), s.alpha_test(), tex.c_str());
+                    s.combiner_stages(), s.blend(), s.reg(mthd::kBlendSfactor), s.reg(mthd::kBlendDfactor), s.reg(mthd::kBlendEquation), s.depth_test(), s.reg(mthd::kDepthFunc), s.cull_face() ? s.reg(mthd::kCullFace) : 0u, s.alpha_test(), tex.c_str());
     }
 };
 
@@ -437,6 +465,14 @@ struct RenderObserver : mv::pgraph::Replay::Observer {
             if (!s.rendered_this_frame || index < first_png || (index - first_png) % stride != 0) continue;
             std::vector<mv::u8> rgba;
             if (!renderer->surface_rgba(s, rgba)) continue;
+            // MV_PBCAP_ALPHA=1: a 32-bit pitch surface's alpha byte as grey (what a later blend weighs by).
+            if (std::getenv("MV_PBCAP_ALPHA") && s.bytes_per_pixel == 4 && !s.swizzled)
+                for (mv::u32 y = 0; y < s.height; ++y)
+                    for (mv::u32 x = 0; x < s.width; ++x)
+                        if (const mv::u8* p = replay->memory().at(s.phys + y * s.pitch + x * 4, 4)) {
+                            mv::u8* d = &rgba[(static_cast<std::size_t>(y) * s.width + x) * 4];
+                            d[0] = d[1] = d[2] = p[3];
+                        }
             const auto path = dir / std::format("frame{:02}_{:08x}.png", index, s.phys);
             if (!mv::png::write(path, s.width, s.height, rgba.data(), s.width * 4, error)) std::fprintf(stderr, "mv-pbcap: %s\n", error.c_str());
             else std::printf("frame %u: %s (%ux%u, %s, format %x)\n", index, path.string().c_str(), s.width, s.height, s.swizzled ? "swizzled" : "pitch", s.color_format);
@@ -460,6 +496,24 @@ struct RenderObserver : mv::pgraph::Replay::Observer {
     }
 };
 
+// MV_PBCAP_SKIP=FRAME:FIRST-LAST: those draws of that frame never reach the renderer (a pass's state before the
+// draws that consume it, or which draw paints a fault).
+struct SkipSink : mv::pgraph::RenderSink {
+    mv::pgraph::RenderSink* next{nullptr};
+    mv::u32 skip_frame{~0u}, skip_first{0}, skip_last{0}, frame{0}, n{0};
+    void clear(const mv::pgraph::KelvinState& s, mv::u32 bits) override { next->clear(s, bits); }
+    void semaphore_release(const mv::pgraph::KelvinState& s, mv::u32 v) override {
+        ++frame;
+        n = 0;
+        next->semaphore_release(s, v);
+    }
+    void draw(const mv::pgraph::KelvinState& s, const mv::pgraph::DrawBatch& b) override {
+        const mv::u32 i = n++;
+        if (frame == skip_frame && i >= skip_first && i <= skip_last) return;
+        next->draw(s, b);
+    }
+};
+
 int render(const char* path, const char* dir, mv::u32 frames, mv::u32 first_png, mv::u32 stride) {
     mv::vk::Device device;
     std::string error;
@@ -480,7 +534,12 @@ int render(const char* path, const char* dir, mv::u32 frames, mv::u32 first_png,
         return 1;
     }
     mv::pgraph::Kelvin kelvin;
-    kelvin.set_sink(&renderer);
+    SkipSink skip;
+    skip.next = &renderer;
+    if (const char* k = std::getenv("MV_PBCAP_SKIP"); k && std::sscanf(k, "%u:%u-%u", &skip.skip_frame, &skip.skip_first, &skip.skip_last) == 3)
+        kelvin.set_sink(&skip);
+    else
+        kelvin.set_sink(&renderer);
     kelvin.set_vertex_memory(&r, r.memory());
     RenderObserver observer;
     observer.renderer = &renderer;
