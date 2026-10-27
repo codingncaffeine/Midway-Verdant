@@ -940,6 +940,41 @@ TEST(ApuVoices, AnIdleReportRaisedWhileTheFrontEndIsBusyNeverReachesAHostThatToo
     EXPECT_FALSE(r.apu.front_end_trapped());
 }
 
+TEST(ApuVoices, EveryListedIdleVoiceIsReportedInTurnNotOnlyTheFirst) {
+    // A stereo buffer plays on three voices listed together. DirectSound's idle handler takes the buffer off only on the
+    // report of its LAST voice and ignores the others; reporting the list's first idle voice every frame never reached
+    // it, so the stop never finished and a racing title waited on it for ever (its quick race froze).
+    using SE = apu::SetupEngine;
+    VoiceRig r;
+    constexpr std::array<u32, 3> kGroup{0xF4u, 0xF5u, 0xF6u};
+    for (u32 v : {0x43u, 0xF6u, 0xF5u, 0xF4u}) {  // each at the top: listed F4, F5, F6, 43
+        r.vp(SE::kMethodSetCurrentVoice, v);
+        r.vp(0x304, 0x5200E0E6u);  // looping: it plays until turned off
+        r.vp(SE::kMethodBufEbo, 0x1F);
+        r.vp(SE::kMethodSetAntecedentVoice, 0x1FFFFu);
+        r.vp(SE::kMethodVoiceOn, v);
+    }
+    ASSERT_EQ(r.rd(SE::kRegListTop[0]), 0xF4u);
+    r.sched.advance_to(Rig::frame(1));
+    for (u32 v : kGroup) r.vp(SE::kMethodVoiceOff, v);
+    std::vector<u32> reported;
+    for (u32 f = 2; f < 12; ++f) {
+        r.sched.advance_to(Rig::frame(f));
+        if (!r.apu.front_end_trapped()) continue;
+        const u32 h = r.rd(Apu::kFeDecParam);
+        reported.push_back(h);
+        if (h == kGroup.back())
+            for (u32 v : kGroup) r.take_off(v);
+        r.service_trap();
+    }
+    ASSERT_GE(reported.size(), 3u);
+    EXPECT_EQ((std::vector<u32>{reported[0], reported[1], reported[2]}), (std::vector<u32>{0xF4u, 0xF5u, 0xF6u}))
+        << "each idle voice in list order, the walk going on past the ones the host left listed";
+    EXPECT_EQ(r.rd(SE::kRegListTop[0]), 0x43u) << "the group's last report reached the host, which took the group off";
+    EXPECT_EQ(reported.size(), 3u) << "nothing left to report after that";
+    EXPECT_TRUE(r.field(0x43, SE::kFieldState) & SE::kStateActive) << "the voice behind them still plays";
+}
+
 TEST(ApuDirectMix, A3dVoiceIsHeardAtTheHeadroomOfTheBinItNamesNotTheHrtfSubmix) {
     using SE = apu::SetupEngine;
     SynthRig r;

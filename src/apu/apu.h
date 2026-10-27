@@ -127,6 +127,7 @@ public:
     u32 global_reg(u32 offset) override { return regs_[offset / 4]; }
     void set_global_reg(u32 offset, u32 value) override { regs_[offset / 4] = value; }
     void front_end_trap(u32 method, u32 parameter) override;
+    bool front_end_busy() const override { return fe_trapped_; }
     void raise_interrupt(u32 ists_bits) override { raise(ists_bits); }
     // The last frame's cycle use and the longest so far, per processor.
     struct FrameStats {

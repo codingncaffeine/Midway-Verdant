@@ -28,6 +28,8 @@ public:
     virtual u32 global_reg(u32 offset) = 0;
     virtual void set_global_reg(u32 offset, u32 value) = 0;
     virtual void front_end_trap(u32 method, u32 parameter) = 0;
+    // Whether the front end holds a trap the host has not resumed from yet.
+    virtual bool front_end_busy() const = 0;
     // Sets interrupt status bits (ISTS) and re-evaluates the interrupt line.
     virtual void raise_interrupt(u32 ists_bits) = 0;
 };
@@ -165,6 +167,14 @@ private:
     // the reference emulator's hardware does: a report the host consumed early (one title turns a voice off twice and
     // waits on the second) is raised again. MV_IDLE_RETRAP=0: the engine unlinks the voice and reports once (old).
     bool retrap_{true};
+    // The idle voices this frame's walk found, in list order, and the last one reported. The hardware stalls its walk
+    // at each report and goes on to the next voice when the host resumes it, so every listed idle voice is reported in
+    // turn: one report a frame here, the next idle voice after the last one reported (from the top when none follows).
+    // Reporting the first idle voice every frame starved the ones behind it: DirectSound takes a multi-voice buffer
+    // off only on the report of its last voice, and a racing title waited for ever on a stopped stereo buffer.
+    std::vector<u32> idle_seen_;
+    u32 idle_cursor_{kNoVoice};
+    void report_idle();
     // A voice's frame of samples; false when the voice ends during it (the rest of the frame is silence).
     bool render_buffer(u32 handle, u32 fmt, double step, Frame& out);
     bool render_stream(u32 handle, u32 fmt, double step, Frame& out);

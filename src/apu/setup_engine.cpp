@@ -273,7 +273,9 @@ void SetupEngine::frame() {
     direct_on_ = direct_mix();
     for (auto& s : direct_) s = {0.0f, 0.0f};
     direct_skip_ = direct_on_ ? multipass_bins() : 0u;
+    idle_seen_.clear();
     for (u32 list = 0; list < kRegListTop.size(); ++list) walk(list);
+    report_idle();
     for (u32 b = 0; b < kBins; ++b)
         for (float s : mix_[b]) bin_energy_[b] += static_cast<double>(s) * static_cast<double>(s);
     // Twice a second, under the APU trace or into MV_VOICE_CENSUS=FILE alone (a census to leave on while playing): every
@@ -336,6 +338,17 @@ bool SetupEngine::retire(u32 handle, u32 list, u32 prev, u32 next, u32 state) {
     return host_unlinks;
 }
 
+// One idle report a frame while the front end is free: the listed idle voice after the last one reported, in walk order,
+// or the first when none follows it (or it is no longer listed idle). A report never waits in a queue: what is listed
+// is read again each frame, so a voice the host took off meanwhile is never reported.
+void SetupEngine::report_idle() {
+    if (idle_seen_.empty() || host_.front_end_busy()) return;
+    auto at = std::ranges::find(idle_seen_, idle_cursor_);
+    at = at == idle_seen_.end() || std::next(at) == idle_seen_.end() ? idle_seen_.begin() : std::next(at);
+    idle_cursor_ = *at;
+    host_.front_end_trap(kSe2FeIdleVoice, idle_cursor_);
+}
+
 void SetupEngine::walk(u32 list) {
     u32 prev = kNoVoice;
     u32 handle = host_.global_reg(kRegListTop[list]) & kHandleMask;
@@ -345,7 +358,7 @@ void SetupEngine::walk(u32 list) {
         u32 state = field(handle, kFieldState);
         bool retire_now = book_[handle].off_pending;
         if (retrap_ && !(state & kStateActive) && !retire_now && (host_.global_reg(kRegTrapForce1) & kTrapForceIdleVoice)) {
-            host_.front_end_trap(kSe2FeIdleVoice, handle);  // an idle voice the host has not taken off yet
+            idle_seen_.push_back(handle);  // an idle voice the host has not taken off yet: report_idle() picks one
             prev = handle;
             handle = next;
             continue;
