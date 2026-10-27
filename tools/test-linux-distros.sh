@@ -22,7 +22,8 @@ gpu_args=(); [ "$gpu" = nvidia ] && gpu_args=(--device nvidia.com/gpu=all)
 
 declare -A image loader soft
 apt="apt-get update -qq && { apt-get install -y -qq PKGS || { apt-get update -qq && apt-get install -y -qq --fix-missing PKGS; }; }"
-for d in debian-11 debian-12 debian-13 ubuntu-20.04 ubuntu-22.04 ubuntu-24.04; do
+# Debian 11 left long-term support in August 2026 (its packages moved to archive.debian.org): not tested.
+for d in debian-12 debian-13 ubuntu-20.04 ubuntu-22.04 ubuntu-24.04; do
     # The NVIDIA driver's Vulkan library needs libX11 and libXext (every desktop has them); no recommended packages, or a
     # software driver comes along and serves the core in the GPU's place.
     image[$d]=${d/-/:}; loader[$d]=${apt//PKGS/--no-install-recommends libvulkan1 libx11-6 libxext6}; soft[$d]=${apt//PKGS/libvulkan1 mesa-vulkan-drivers}
@@ -31,7 +32,7 @@ image[fedora]=fedora:latest;         loader[fedora]="dnf install -y -q --setopt=
 image[arch]=archlinux:latest;        loader[arch]="pacman -Sy --noconfirm --needed vulkan-icd-loader libx11 libxext >/dev/null"
 soft[arch]="pacman -Sy --noconfirm --needed vulkan-icd-loader vulkan-swrast >/dev/null"
 image[opensuse]=opensuse/tumbleweed; loader[opensuse]="zypper -q install -y --no-recommends libvulkan1 libX11-6 libXext6"; soft[opensuse]="zypper -q install -y libvulkan1 libvulkan_lvp"
-order=(debian-11 debian-12 debian-13 ubuntu-20.04 ubuntu-22.04 ubuntu-24.04 fedora arch opensuse)
+order=(debian-12 debian-13 ubuntu-20.04 ubuntu-22.04 ubuntu-24.04 fedora arch opensuse)
 [ $# -gt 0 ] && order=("$@")
 
 mkdir -p scratch/release/distros
@@ -44,7 +45,7 @@ run_one() {
     "$engine" run --rm --device /dev/kvm "${gpu_args[@]}" -e DEBIAN_FRONTEND=noninteractive \
         -v "$PWD/$core:/mv/midway_verdant_libretro.so:ro" -v "$PWD/$host:/mv/mv-retro-host:ro" -v "$(realpath "$game"):/game.iso:ro" \
         -v "$PWD/$out:/out" "${image[$d]}" bash -c "$setup && grep -h PRETTY_NAME /etc/os-release && ldd --version | head -1 && \
-        timeout $cap /mv/mv-retro-host /mv/midway_verdant_libretro.so /out/system /game.iso --frames $frames --png-every $((frames / 2)) /out/png" > "$out/log" 2>&1
+        echo core-start; timeout $cap /mv/mv-retro-host /mv/midway_verdant_libretro.so /out/system /game.iso --frames $frames --png-every $((frames / 2)) /out/png; echo \"core-exit \$?\"" > "$out/log" 2>&1
     echo "exit $?" >> "$out/log"
     rm -f "$out/system/midway-verdant/xbox_hdd.raw"
     local os ran shown eeprom
