@@ -3871,20 +3871,19 @@ void VulkanRenderer::draw(const KelvinState& s, const DrawBatch& batch) {
     const bool signed_blend = s.blend() && !debug_noblend_ && !counting && (equation == 0xF005 || equation == 0xF006);  // counted: one draw, one count
     if (signed_blend) pkey.signed_half = 1;
     if (debug_shadow_pass_) pkey.shadow_compare_func = 7;  // every shadow lookup lit
-    // The console's exact depth from the pixel shader wherever depth is stored or a test must land on the console's
-    // step: depth writes (what later draws and shadow-map compares read; the host's own depth for them drew a grid over a
-    // racing title's road), occlusion-counted draws (a test quad at a light's depth) and EQUAL tests. Draws that only
-    // test (blended and transparent layers, most of the overdraw) keep the host's depth and its early rejection: the
-    // shader's depth for every draw cost that title's race 15.9 -> 20.1 ms a vblank at 6x, the writes alone nothing
-    // measurable (15.45).
+    // The console's exact depth from the pixel shader for every draw that tests or writes depth: what one draw stores and
+    // what a later one compares must be on the same step (the host's own depth for the stored side drew a grid over a
+    // racing title's road). Exact depth only for writes, counted draws and EQUAL tests, with the host's for the test-only
+    // rest (for its early rejection), broke Fable: its lighting passes test against the exact depth its base pass wrote,
+    // land a step off on part of each triangle, and leave the ground in jagged dark triangles that crawl as the camera
+    // turns, the hair wrong too.
     // The w-buffer mode (SET_CONTROL0 bit 16) stores w, which the host's depth cannot give: every draw that tests or
     // writes depth there takes the exact path (a racing title draws its whole scene so and reads its depth buffer back
     // as a texture).
     // MV_WBUFFER=0: the w-buffer mode ignored (depth z/w as before): the control for comparing a title both ways.
     static const bool w_buffer_on = [] { const char* e = std::getenv("MV_WBUFFER"); return !(e && *e == '0'); }();
     const bool w_buffer = w_buffer_on && (s.reg(mthd::kControl0) & (1u << 16)) != 0;
-    const bool exact_depth = (s.depth_test() || s.depth_write()) &&
-                             (w_buffer || s.depth_write() || counting || s.reg(mthd::kDepthFunc) == 0x202);
+    const bool exact_depth = s.depth_test() || s.depth_write();
     pkey.exact_depth = exact_depth ? (w_buffer ? 3u : 1u) : 0u;
     if (drawid_on()) std::fprintf(stderr, "drawid %u: depth %s, zeta %08x\n", draw_id, exact_depth ? "exact" : "host", t->zeta_phys);
     const u32 depth_mode = (exact_depth ? 1u : 0u) | (((s.reg(kZminMaxControl) >> 4) & 0xFu) == 1 ? 2u : 0u);
