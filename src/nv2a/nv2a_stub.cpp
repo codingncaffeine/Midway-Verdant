@@ -77,6 +77,7 @@ Nv2aStub::Nv2aStub(Bus& bus, Scheduler& sched, std::function<void(bool)> irq)
             // at once when the guest asks the GPU how far it is; the vblank waited 1.5-3.8 ms here in heavy 30 fps titles.
             if (idle_vblanks_ >= 1) renderer_->write_back_all(true);
         }
+        if (render_thread_) land_stores();  // what the render thread stored by now, on this thread
         methods_at_vblank_ = kelvin_.methods_seen();
         if (vblank_hook_) vblank_hook_(sched_.now());
         regs_[kPcrtcIntr0] |= 1u;
@@ -714,20 +715,35 @@ void Nv2aStub::harvest_writes() {
     if (!write_tracking_ && !capture_) return;
     const auto harvest_t0 = std::chrono::steady_clock::now();
     ++collect_calls_;
+    std::lock_guard dirty(dirty_mutex_);
     if (cpu_) cpu_->take_dirty_pages(dirty_pending_);
     bus_.take_dirty_pages(dirty_pending_);
     collect_ns_ += static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - harvest_t0).count());
 }
 
+void Nv2aStub::land_stores() {
+    if (!renderer_ || !renderer_->stores_pending()) return;
+    // The logs read first: a page written between a store's place in the stream and the store itself shows only there.
+    harvest_writes();
+    std::lock_guard dirty(dirty_mutex_);
+    std::vector<u32> pending(dirty_pending_);
+    std::sort(pending.begin(), pending.end());
+    renderer_->land_stores([&](u32 page, u32 tag) {
+        return std::binary_search(pending.begin(), pending.end(), page) || (page < page_generation_.size() && page_generation_[page] > tag);
+    });
+}
+
 void Nv2aStub::land_write_backs(bool wait) {
     if (!renderer_) return;
-    // With the render thread the copies land when it is not recording, without catching up with it: a fence the guest
-    // reads must not wait for the recording (the reason the thread exists). A target the CPU reads straight after a
-    // fence could be older than the hardware's [the trade, watched for in the user's games].
-    std::unique_lock<std::mutex> own;
+    // With the render thread the copies go to its journal when it is not recording, without catching up with it: a fence
+    // the guest reads must not wait for the recording (the reason the thread exists). The journal lands here, on the
+    // CPU's thread, except over pages written since [a target the CPU reads straight after a fence could still be older
+    // than the hardware's: the trade, watched for in the user's games].
     if (render_thread_) {
-        own = render_thread_->try_renderer();
-        if (!own.owns_lock()) return;
+        if (auto own = render_thread_->try_renderer(); own.owns_lock() && renderer_->write_backs_in_flight() && (wait || renderer_->write_backs_ready()))
+            renderer_->complete_write_backs(true);
+        land_stores();
+        return;
     }
     if (!renderer_->write_backs_in_flight()) return;
     if (!wait && !renderer_->write_backs_ready()) return;
@@ -747,6 +763,10 @@ bool Nv2aStub::write_backs_in_flight() const {
 
 void Nv2aStub::poll_write_backs() {
     if (!renderer_ || (!render_thread_ && !renderer_->write_backs_in_flight())) return;
+    if (render_thread_) {
+        land_write_backs(false);  // the renderer's lock and the journal's: the GPU's is not needed
+        return;
+    }
     std::unique_lock<std::mutex> gpu;
     if (fifo_threaded_) {
         gpu = std::unique_lock(gpu_mutex_, std::try_to_lock);
@@ -758,19 +778,32 @@ void Nv2aStub::poll_write_backs() {
 void Nv2aStub::collect_writes() {
     if (!write_tracking_ && !capture_) return;
     if (!fifo_threaded_) harvest_writes();
-    // What was written since the last run, by the guest or a device.
+    // What was written since the last run, by the guest or a device. The pages move from dirty_pending_ to their
+    // generation under one hold of the lock: a landing in between would find them in neither.
+    std::unique_lock dirty(dirty_mutex_);
     dirty_scratch_.swap(dirty_pending_);
     dirty_pending_.clear();
     collect_pages_ += dirty_scratch_.size();
     if (dirty_scratch_.empty()) return;
     std::sort(dirty_scratch_.begin(), dirty_scratch_.end());
     dirty_scratch_.erase(std::unique(dirty_scratch_.begin(), dirty_scratch_.end()), dirty_scratch_.end());
-    if (render_thread_) render_thread_->call([pages = dirty_scratch_](pgraph::VulkanRenderer& r) { r.cpu_wrote(pages); });  // before the draws after it
-    else if (renderer_) renderer_->cpu_wrote(dirty_scratch_);
-    if (write_tracking_) {
+    const u32 generation = write_tracking_ ? write_generation_ + 1 : 0;  // the one these pages get
+    const auto next_generation = [&] {
+        if (!write_tracking_) return;
         ++write_generation_;
         for (u32 p : dirty_scratch_)
             if (p < page_generation_.size()) page_generation_[p] = write_generation_;
+    };
+    if (render_thread_) {
+        render_thread_->call([pages = dirty_scratch_, generation](pgraph::VulkanRenderer& r) { r.cpu_wrote(pages, generation); });  // before the draws after it
+        next_generation();
+        dirty.unlock();
+    } else {
+        dirty.unlock();
+        if (renderer_) renderer_->cpu_wrote(dirty_scratch_, generation);
+        dirty.lock();
+        next_generation();
+        dirty.unlock();
     }
     if (!capture_) return;
     // The capture records them coalesced into contiguous runs of pages.
@@ -1255,9 +1288,13 @@ std::string Nv2aStub::fifo_wait_report() const {
     std::vector<std::pair<u32, std::pair<u64, u64>>> v(idle_waits_.begin(), idle_waits_.end());
     std::ranges::sort(v, std::greater{}, [](const auto& e) { return e.second.second; });
     std::string r = std::format("the lock {} times ({:.3f} s);", lock_waits_.load(), static_cast<double>(lock_wait_ns_.load()) / 1e9);
-    if (render_thread_)
+    if (render_thread_) {
         r += std::format(" render thread busy {:.3f} s, caught up with {} times ({:.3f} s);", static_cast<double>(render_thread_->busy_ns()) / 1e9,
                          render_thread_->catch_ups(), static_cast<double>(render_thread_->catch_up_ns()) / 1e9);
+        const auto j = renderer_->journal_stats();
+        r += std::format(" journal: {} stores ({} pages), {} pages landed, {} kept the CPU's bytes, {} dropped as the CPU's, {} overlaid reads;", j.stores, j.pages, j.landed,
+                         j.kept, j.dropped, j.overlaid_reads);
+    }
     for (std::size_t i = 0; i < v.size() && i < 8; ++i)
         r += std::format(" {} +{:06x} x{} {:.3f} s;", (v[i].first >> 31) ? "write" : (v[i].first & 0x40000000u) ? "poll" : "read", v[i].first & 0x3FFFFFFFu, v[i].second.first, static_cast<double>(v[i].second.second) / 1e9);
     return r;
@@ -1314,6 +1351,10 @@ void Nv2aStub::start_render_thread() {
     const char* e = std::getenv("MV_RENDER_THREAD");
     if (!renderer_ || timed_ || real_reports_ || !(e && *e == '1') || render_thread_) return;
     render_thread_ = std::make_unique<RenderThread>(*renderer_);
+    // Its stores reach RAM on the CPU's thread (land_stores), the 2D engine's copies through RAM with them.
+    renderer_->set_deferred_stores(true);
+    if (cpu_) cpu_->set_exact_reports(true);
+    twod_->set_ram_copy([this](u32 dp, u32 dpitch, u32 sp, u32 spitch, u32 row, u32 h) { renderer_->ram_copy_rows(dp, dpitch, sp, spitch, row, h); });
     prefetch_sink_ = std::make_unique<PrefetchSink>(*render_thread_, *this, pgraph::MemoryView{bus_.ram(), static_cast<u32>(bus_.ram_size())});
     kelvin_.set_sink(prefetch_sink_.get());
     trace::log(trace::Cat::Gpu, "render thread on");
@@ -1324,6 +1365,10 @@ void Nv2aStub::stop_render_thread() {
     render_thread_.reset();  // executes what is queued, then joins
     prefetch_sink_.reset();
     kelvin_.set_sink(renderer_);
+    land_stores();
+    renderer_->set_deferred_stores(false);
+    if (cpu_) cpu_->set_exact_reports(false);
+    twod_->set_ram_copy(nullptr);
 }
 
 std::unique_lock<std::mutex> Nv2aStub::own_renderer() {

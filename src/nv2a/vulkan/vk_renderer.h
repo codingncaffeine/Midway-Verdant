@@ -146,8 +146,31 @@ public:
     // Guest RAM in [phys, phys + len) was written: textures decoded from it are stale.
     void invalidate(u32 phys, u32 len);
     // The guest CPU (or a device) wrote these RAM pages (4 KiB, sorted): a render target over them reloads from RAM
-    // before it is drawn into again, its own unwritten pages written back first.
-    void cpu_wrote(const std::vector<u32>& pages);
+    // before it is drawn into again, its own unwritten pages written back first. `generation`: the write generation the
+    // pages carry, the stream position the deferred stores after this point are tagged with.
+    void cpu_wrote(const std::vector<u32>& pages, u32 generation = 0);
+
+    // PLAN 12d stage 2: with the render thread the renderer runs behind the stream position whose fences the CPU has
+    // seen, so its stores must not reach RAM from its own thread (Halo 2: a write-back landed over kernel structures the
+    // game had put in a target's old memory once the fence passed). Deferred, every store goes to a journal of whole
+    // pages, each with the bytes RAM held when the renderer first stored there and the write generation of its place in
+    // the stream; the renderer's own reads of RAM see the journal. The CPU's thread lands it (land_stores) between exits.
+    void set_deferred_stores(bool on) { deferred_ = on; }
+    bool stores_pending() const { return journal_pages_.load(std::memory_order_acquire) != 0; }
+    // A journal page reaches RAM unless the CPU or a device wrote it later than the store's place in the stream: RAM no
+    // longer holds the bytes it was stored over (a write since), or `written_after(page, tag)` (the write log names it
+    // after the tag: a write between that place and the store, which the bytes cannot show). Then the CPU's bytes stay.
+    // Returns the pages stored. Only where the guest cannot run (the CPU's thread between exits).
+    std::size_t land_stores(const std::function<bool(u32 page, u32 tag)>& written_after);
+    // The 2D engine's copy through RAM (h rows of `row` bytes) as the renderer sees RAM, stored as the renderer stores.
+    void ram_copy_rows(u32 dst, u32 dst_pitch, u32 src, u32 src_pitch, u32 row, u32 h);
+    struct JournalStats {
+        u64 stores{0}, pages{0}, landed{0}, kept{0}, dropped{0}, overlaid_reads{0};
+    };
+    JournalStats journal_stats() const {
+        std::lock_guard g(journal_mutex_);
+        return journal_stats_;
+    }
 
     struct SurfaceInfo {
         u32 phys{0}, width{0}, height{0}, pitch{0}, bytes_per_pixel{0}, color_format{0};
@@ -500,6 +523,33 @@ private:
     u8* ram_;
     u32 ram_size_;
     const vk::Functions* fn_{nullptr};
+
+    // The deferred stores (set_deferred_stores). begin_store hands out where a store of [phys, phys + len) writes (RAM,
+    // or a copy of its whole pages as the renderer sees them) and end_store journals that copy. ram_view is a read of
+    // RAM with the journal over it (`keep` holds the copy when one is needed).
+    u8* begin_store(u32 phys, u64 len);
+    void end_store();
+    const u8* ram_view(u32 phys, u64 len, std::vector<u8>& keep) const;
+    MemoryView mem_view(u32 phys, u64 len, std::vector<u8>& keep) const;
+    // The CPU's pages keep their bytes across a store of the rest of a target: read before, put back after (deferred:
+    // in the journal, or out of it where RAM holds them).
+    std::vector<u8> keep_pages(const std::vector<u32>& pages) const;
+    void put_back_pages(const std::vector<u32>& pages, const std::vector<u8>& kept);
+    // The CPU wrote these pages: copies over the bytes RAM held are dropped (a page reported but unchanged keeps its copy).
+    void drop_overwritten_stores(const std::vector<u32>& pages);
+    bool deferred_{false};
+    struct JournalPage {
+        std::unique_ptr<u8[]> base, bytes;  // what RAM held when first stored over, and what the renderer stored
+        u32 tag{0};                         // the stream generation of the last store
+    };
+    mutable std::mutex journal_mutex_;
+    std::unordered_map<u32, JournalPage> journal_;
+    std::atomic<std::size_t> journal_pages_{0};
+    mutable JournalStats journal_stats_;
+    std::vector<u8> store_copy_, store_base_;
+    u32 store_first_page_{0}, store_pages_{0};
+    u32 stream_generation_{0};  // where the renderer is in the stream (cpu_wrote)
+    u32 async_tag_{0};          // the stream generation of the write-backs in flight (finish_write_backs_async)
 
     // The frames in flight. Each owns command buffers and the fences their submissions signal, a descriptor pool and a
     // region of every ring, so a submit does not wait: a frame's resources are reused only once its fence signals.

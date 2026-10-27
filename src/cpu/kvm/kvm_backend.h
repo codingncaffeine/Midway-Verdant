@@ -46,6 +46,7 @@ public:
     void request_selective_tracking() override { selective_requested_ = true; }
     bool selective_tracking() const override { return selective_; }
     void watch_pages(u32 first, u32 count) override;
+    void set_exact_reports(bool on) override { exact_reports_.store(on, std::memory_order_relaxed); }
     void set_break_eips(const std::vector<u32>& eips) override { break_eips_ = eips; }
     bool owns_timeline() const override { return guest_clock_on_; }
     Cycles timeline_cycles() const override;
@@ -117,6 +118,7 @@ private:
     std::vector<u64> dirty_bitmap_;
     bool selective_requested_{false}, selective_{false};
     std::vector<u64> watched_;  // selective tracking: the pages whose next write is reported
+    std::atomic<bool> exact_reports_{false};
     // Watches asked for on another thread (the FIFO thread's renderer) wait for the vCPU thread: a clear while the guest
     // runs flushes its TLB and costs it guest time. Applied at the next exit, conservatively: a page already marked
     // written then (perhaps after the texture read it) is reported as written.

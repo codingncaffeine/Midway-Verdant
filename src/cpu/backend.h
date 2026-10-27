@@ -95,6 +95,10 @@ public:
     virtual void request_selective_tracking() {}
     virtual bool selective_tracking() const { return false; }
     virtual void watch_pages(u32 first, u32 count) { (void)first; (void)count; }
+    // Exact reports (the render thread's deferred stores): a page reported is re-protected at once, so naming it again
+    // reports it only if written since; otherwise a page named again after a report is reported again whether or not
+    // it was written (its log bit stays set), which a deferred store would take as the CPU's newer bytes.
+    virtual void set_exact_reports(bool on) { (void)on; }
 
     // Instrument: the first time execution reaches one of these linear addresses (up to four), log the registers
     // and the stack under the boot trace. The fast mode uses the hardware debug registers.

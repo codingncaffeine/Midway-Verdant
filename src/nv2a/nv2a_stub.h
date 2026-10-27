@@ -200,6 +200,8 @@ public:
     // With the GPU lock held: background write-backs into RAM once done (at once with `wait`), the pages the guest or a
     // device wrote since keeping their bytes.
     void land_write_backs(bool wait);
+    // With the render thread: its journal reaches RAM over the pages the CPU has not written since (on the CPU's thread).
+    void land_stores();
 
 protected:
     void on_bar_changed(int index, u32 old_base, u32 new_base) override;
@@ -351,6 +353,7 @@ private:
     CpuBackend* cpu_{nullptr};
     std::vector<u32> dirty_scratch_;
     std::vector<u32> dirty_pending_;  // pages harvested, not yet applied
+    std::mutex dirty_mutex_;  // dirty_pending_ and page_generation_ (the render thread's landings read them without the GPU's lock)
     bool write_tracking_{false};
     u32 write_generation_{1};
     std::vector<u32> page_generation_;  // per 4 KiB RAM page: the generation of the last write seen

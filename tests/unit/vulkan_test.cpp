@@ -905,6 +905,61 @@ TEST(Vulkan, AWriteReportFromBeforeTheTargetExistedDoesNotUndoALaterClear) {
     EXPECT_EQ(renderer.stats().cpu_written_targets, 0u);
 }
 
+TEST(Vulkan, ADeferredStoreLandsOnlyOnPagesTheCpuHasNotWrittenSince) {
+    // With the render thread the renderer runs behind the fences the CPU has seen, and its stores wait in a journal for
+    // the CPU's thread. Halo 2 put kernel structures in a target's memory once the fence passed, and the late write-back
+    // went over them. The CPU's pages are the ones whose bytes changed since the store, and the ones the write log names
+    // after the store's place in the stream (written before the store, so the bytes cannot show it); a page the log
+    // reported to the renderer with its bytes unchanged still lands.
+    vk::Device device;
+    std::string error;
+    if (!device.init(error)) GTEST_SKIP() << "no Vulkan device: " << error;
+    std::vector<u8> ram(4u << 20, 0);
+    RamResolver handles;
+    handles.size = static_cast<u32>(ram.size());
+    VulkanRenderer renderer(device, handles, ram.data(), static_cast<u32>(ram.size()));
+    ASSERT_TRUE(renderer.init(error)) << error;
+    renderer.set_deferred_stores(true);
+    Kelvin k;
+    k.set_sink(&renderer);
+    setup_target(k);
+    k.method(mthd::kColorClear, 0xFF00FF00u);
+    k.method(mthd::kClearRectH, 63u << 16);
+    k.method(mthd::kClearRectV, 63u << 16);
+    k.method(mthd::kClearSurface, 0xF0);
+    renderer.end_frame();  // the write-back: into the journal
+    for (const auto& e : renderer.stats().errors) ADD_FAILURE() << "renderer: " << e;
+    EXPECT_EQ(pixel_at(ram, 8, 8), 0u) << "RAM waits for the CPU's thread";
+    ASSERT_TRUE(renderer.stores_pending());
+    // The CPU reuses the memory under the target's last rows (pages 0x12 and 0x13). The log reports 0x13 and the first
+    // page; the landing comes before it reports 0x12.
+    const u32 kernel = 0x8BADF00Du;
+    std::memcpy(&ram[0x12000 + 16], &kernel, 4);
+    std::memcpy(&ram[0x13000 + 16], &kernel, 4);
+    renderer.cpu_wrote({0x10, 0x13});
+    EXPECT_EQ(renderer.stats().cpu_written_targets, 1u) << "only the page whose bytes changed is the CPU's";
+    renderer.cpu_wrote({0x30}, 7);  // later in the stream: what is stored from here is tagged 7
+    std::vector<u32> named;
+    EXPECT_EQ(renderer.land_stores([&](u32 page, u32 tag) {
+        named.push_back(page);
+        EXPECT_EQ(tag, 0u) << "the stores came before generation 7";
+        return page == 0x11 && tag < 3;  // the log: page 0x11 written in generation 3
+    }),
+              1u);
+    EXPECT_EQ(pixel_at(ram, 8, 8), 0xFF00FF00u) << "a page the CPU reported unchanged lands";
+    EXPECT_EQ(pixel_at(ram, 8, 24), 0u) << "a page the log names after the store keeps RAM's bytes";
+    std::sort(named.begin(), named.end());
+    EXPECT_EQ(named, (std::vector<u32>{0x10, 0x11})) << "the log is asked only about pages whose bytes did not change";
+    for (u32 page : {0x12u, 0x13u}) {
+        u32 kept;
+        std::memcpy(&kept, &ram[page * 4096 + 16], 4);
+        EXPECT_EQ(kept, kernel) << "the CPU's bytes stay, reported or not: page " << page;
+    }
+    EXPECT_EQ(pixel_at(ram, 8, 40), 0u) << "the whole page the CPU wrote keeps RAM's bytes";
+    EXPECT_EQ(pixel_at(ram, 8, 60), 0u) << "the whole page the CPU wrote keeps RAM's bytes";
+    EXPECT_FALSE(renderer.stores_pending());
+}
+
 TEST(Vulkan, ACpuWriteAfterTheTargetWasDrawnIsKeptAndDrawnOver) {
     // One title copies its last frame into both buffers with the CPU when it pauses, then draws its menu over them.
     vk::Device device;

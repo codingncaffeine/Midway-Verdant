@@ -31,12 +31,16 @@ public:
 };
 
 // Guest RAM as the engine reads it (through the direct window or the 0xF0000000 alias).
+// `base`: the physical address `ram` holds (a copy of part of RAM; 0 for all of it).
 struct MemoryView {
     const u8* ram{nullptr};
     u32 size{0};
+    u32 base{0};
     const u8* at(u32 phys, u32 len) const {
         u32 off = phys;
         if (off >= 0xF0000000u) off -= 0xF0000000u;
+        if (off < base) return nullptr;
+        off -= base;
         if (!ram || off >= size || len > size - off) return nullptr;
         return ram + off;
     }

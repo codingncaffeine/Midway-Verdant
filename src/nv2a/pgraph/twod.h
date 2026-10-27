@@ -30,6 +30,9 @@ public:
     // alone (the destination image is then newer than RAM, as after a draw).
     using GpuCopy = std::function<bool(u32 src_phys, u32 src_pitch, u32 dst_phys, u32 dst_pitch, u32 w, u32 h, u32 bpp)>;
     void set_gpu_copy(GpuCopy copy) { gpu_copy_ = std::move(copy); }
+    // The copy through RAM, when the host stores what it writes there itself (a renderer whose stores are deferred).
+    using RamCopy = std::function<void(u32 dst_phys, u32 dst_pitch, u32 src_phys, u32 src_pitch, u32 row, u32 h)>;
+    void set_ram_copy(RamCopy copy) { ram_copy_ = std::move(copy); }
     void set_hooks(std::function<void(u32 phys, u32 len)> before_read, std::function<void(u32 phys, u32 len)> after_write) {
         before_read_ = std::move(before_read);
         after_write_ = std::move(after_write);
@@ -52,6 +55,7 @@ private:
     const HandleResolver& resolver_;
     std::function<void(u32, u32)> before_read_, after_write_;
     GpuCopy gpu_copy_;
+    RamCopy ram_copy_;
     u64 gpu_blits_{0};
     u32 dma_source_{0}, dma_destination_{0}, format_{0}, pitch_{0}, offset_source_{0}, offset_destination_{0};
     u32 operation_{kOperationSrcCopy}, point_in_{0}, point_out_{0}, size_{0};

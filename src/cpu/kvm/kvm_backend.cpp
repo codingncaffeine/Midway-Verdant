@@ -1100,6 +1100,17 @@ void KvmBackend::take_dirty_pages(std::vector<u32>& pages) {
             merged[w] &= watched_[w];
             watched_[w] &= ~merged[w];  // reported once; named again when the texture is decoded or checked
         }
+    // Exact reports: the reported pages' bits are cleared (each write-protected again, one fault on its next write), so a
+    // later watch of them reports only a write made after this report.
+    if (selective_ && exact_reports_.load(std::memory_order_relaxed) && std::any_of(merged.begin(), merged.end(), [](u64 w) { return w != 0; }))
+        for (u32 slot : {kSlotRam, kSlotRamAlias}) {
+            kvm_clear_dirty_log clear{};
+            clear.slot = slot;
+            clear.first_page = 0;
+            clear.num_pages = static_cast<u32>(merged.size() * 64);
+            clear.dirty_bitmap = merged.data();
+            ioctl(vm_fd_, KVM_CLEAR_DIRTY_LOG, &clear);
+        }
     for (std::size_t w = 0; w < merged.size(); ++w) {
         u64 bits = merged[w];
         while (bits) {

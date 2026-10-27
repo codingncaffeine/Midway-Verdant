@@ -89,7 +89,9 @@ bool TwoD::blit() {
         before_read_(static_cast<u32>(ps), static_cast<u32>(s1 - s0));
         before_read_(static_cast<u32>(pd), static_cast<u32>(d1 - d0));
     }
-    for (u32 y = 0; y < h; ++y) std::memmove(ram_ + pd + y * dst_pitch, ram_ + ps + y * src_pitch, row);
+    if (ram_copy_) ram_copy_(static_cast<u32>(pd), static_cast<u32>(dst_pitch), static_cast<u32>(ps), static_cast<u32>(src_pitch), static_cast<u32>(row), h);
+    else
+        for (u32 y = 0; y < h; ++y) std::memmove(ram_ + pd + y * dst_pitch, ram_ + ps + y * src_pitch, row);
     if (after_write_) after_write_(static_cast<u32>(pd), static_cast<u32>(d1 - d0));
     ++blits_;
     trace::log(trace::Cat::Gpu, "2d: blit {}x{} ({} B/px) {:08x} -> {:08x}", w, h, bpp, ps, pd);

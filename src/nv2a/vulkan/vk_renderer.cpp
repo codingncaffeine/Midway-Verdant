@@ -826,11 +826,12 @@ void VulkanRenderer::upload_color_from_ram(Surface& t) {
     if (debug_tex_log_) std::fprintf(stderr, "texlog: reload colour %08x %ux%u frame %llu\n", t.phys, t.width, t.height, static_cast<unsigned long long>(frame_index_));
     ++t.draw_serial;
     const u32 bpp = t.color_bytes();
-    std::vector<u8> pixels(static_cast<std::size_t>(t.width) * t.height * bpp, 0);
-    for (u32 y = 0; y < t.height; ++y) {
+    std::vector<u8> pixels(static_cast<std::size_t>(t.width) * t.height * bpp, 0), keep;
+    const u8* src = t.phys < ram_size_ ? ram_view(t.phys, std::min<u64>(t.bytes(), ram_size_ - t.phys), keep) : nullptr;
+    for (u32 y = 0; src && y < t.height; ++y) {
         for (u32 x = 0; x < t.width; ++x) {
             const u32 off = t.swizzled ? swizzled_offset(x, y, 0, t.log_w, t.log_h, 0) * bpp : y * t.pitch + x * bpp;
-            if (static_cast<u64>(t.phys) + off + bpp <= ram_size_) std::memcpy(&pixels[(static_cast<std::size_t>(y) * t.width + x) * bpp], ram_ + t.phys + off, bpp);
+            if (static_cast<u64>(t.phys) + off + bpp <= ram_size_) std::memcpy(&pixels[(static_cast<std::size_t>(y) * t.width + x) * bpp], src + off, bpp);
         }
     }
     VkDeviceSize offset = 0;
@@ -1217,8 +1218,8 @@ void VulkanRenderer::upload_depth_from_ram(Surface& t) {
     const u32 bpp = z16 ? 2u : 4u;
     if (static_cast<u64>(t.zeta_phys) + t.zeta_bytes() > ram_size_) return;
     const std::size_t n = static_cast<std::size_t>(t.width) * t.height;
-    std::vector<u8> pixels(z16 ? n * 2 : n * 5, 0);
-    const u8* base = ram_ + t.zeta_phys;
+    std::vector<u8> pixels(z16 ? n * 2 : n * 5, 0), keep;
+    const u8* base = ram_view(t.zeta_phys, t.zeta_bytes(), keep);
     for (u32 y = 0; y < t.height; ++y) {
         for (u32 x = 0; x < t.width; ++x) {
             const std::size_t off = t.swizzled ? static_cast<std::size_t>(swizzled_offset(x, y, 0, t.log_w, t.log_h, 0)) * bpp : static_cast<std::size_t>(y) * t.zeta_pitch + x * bpp;
@@ -1531,6 +1532,7 @@ void VulkanRenderer::finish_write_backs_async() {
     async_fence_ = frames_[slot].last;
     async_serial_ = frames_[slot].serial;
     async_wb_.swap(write_backs_);
+    async_tag_ = stream_generation_;
     write_backs_.clear();
     ++stats_.background_write_back_batches;
     async_pending_.store(true, std::memory_order_release);
@@ -1559,7 +1561,7 @@ bool VulkanRenderer::complete_write_backs(bool wait, const std::vector<u32>* cpu
     // Pages the CPU or a device wrote since the copies were queued keep what was written: the copies hold older pixels.
     constexpr u32 kPage = 4096;
     std::vector<std::pair<u32, std::vector<u8>>> kept;
-    if (cpu_pages && !cpu_pages->empty())
+    if (cpu_pages && !cpu_pages->empty() && !deferred_)  // deferred: land_stores keeps them (the tag below)
         for (const PendingWriteBack& w : async_wb_) {
             const Surface& s = *w.surface;
             const u64 a0 = w.zeta ? s.zeta_phys : s.phys, a1 = a0 + (w.zeta ? s.zeta_bytes() : s.bytes());
@@ -1571,7 +1573,10 @@ bool VulkanRenderer::complete_write_backs(bool wait, const std::vector<u32>* cpu
         }
     std::vector<PendingWriteBack> list;
     list.swap(async_wb_);
+    // Deferred, they are stored with the place in the stream they were queued at: the CPU's writes since are newer.
+    const u32 stream_generation = std::exchange(stream_generation_, async_tag_);
     store_write_backs(list);
+    stream_generation_ = stream_generation;
     for (const auto& [page, bytes] : kept) std::memcpy(ram_ + static_cast<std::size_t>(page) * kPage, bytes.data(), kPage);
     stats_.background_pages_kept += kept.size();
     async_pending_.store(false, std::memory_order_release);
@@ -1590,6 +1595,145 @@ void VulkanRenderer::complete_write_backs_over(u64 b0, u64 b1) {
     }
 }
 
+// ── deferred stores (12d stage 2) ─────────────────────────────────────────────────────────────────────────────────────
+u8* VulkanRenderer::begin_store(u32 phys, u64 len) {
+    if (!deferred_) return ram_ + phys;
+    constexpr u32 kPage = 4096;
+    store_first_page_ = phys / kPage;
+    store_pages_ = static_cast<u32>((static_cast<u64>(phys) + len + kPage - 1) / kPage - store_first_page_);
+    // The whole pages as the renderer sees them (bytes between the rows or past the ends keep what they hold), and that
+    // copy again: a page new to the journal remembers it as what RAM held.
+    const u32 a0 = store_first_page_ * kPage;
+    const u64 n = std::min<u64>(static_cast<u64>(store_pages_) * kPage, ram_size_ - a0);
+    store_copy_.assign(static_cast<std::size_t>(store_pages_) * kPage, 0);
+    std::vector<u8> keep;
+    std::memcpy(store_copy_.data(), ram_view(a0, n, keep), static_cast<std::size_t>(n));
+    store_base_ = store_copy_;
+    return store_copy_.data() + (phys - a0);
+}
+
+void VulkanRenderer::end_store() {
+    if (!deferred_) return;
+    constexpr u32 kPage = 4096;
+    std::lock_guard g(journal_mutex_);
+    ++journal_stats_.stores;
+    for (u32 i = 0; i < store_pages_; ++i) {
+        const u32 page = store_first_page_ + i;
+        if (static_cast<u64>(page + 1) * kPage > ram_size_) break;
+        JournalPage& j = journal_[page];
+        if (!j.bytes) {
+            // New, or landed since begin_store (RAM then holds what was copied).
+            j.base = std::make_unique<u8[]>(kPage);
+            j.bytes = std::make_unique<u8[]>(kPage);
+            std::memcpy(j.base.get(), store_base_.data() + static_cast<std::size_t>(i) * kPage, kPage);
+        }
+        std::memcpy(j.bytes.get(), store_copy_.data() + static_cast<std::size_t>(i) * kPage, kPage);
+        j.tag = stream_generation_;
+        ++journal_stats_.pages;
+    }
+    journal_pages_.store(journal_.size(), std::memory_order_release);
+}
+
+const u8* VulkanRenderer::ram_view(u32 phys, u64 len, std::vector<u8>& keep) const {
+    if (phys >= 0xF0000000u) phys -= 0xF0000000u;
+    if (phys >= ram_size_ || len > ram_size_ - phys) return nullptr;
+    if (journal_pages_.load(std::memory_order_acquire) == 0 || len == 0) return ram_ + phys;
+    constexpr u32 kPage = 4096;
+    const u32 first = phys / kPage, last = static_cast<u32>((static_cast<u64>(phys) + len - 1) / kPage);
+    std::lock_guard g(journal_mutex_);
+    bool any = false;
+    for (u32 p = first; p <= last && !any; ++p) any = journal_.contains(p);
+    if (!any) return ram_ + phys;
+    ++journal_stats_.overlaid_reads;
+    keep.assign(ram_ + phys, ram_ + phys + len);
+    for (u32 p = first; p <= last; ++p) {
+        const auto it = journal_.find(p);
+        if (it == journal_.end()) continue;
+        const u64 a0 = std::max<u64>(static_cast<u64>(p) * kPage, phys), a1 = std::min<u64>(static_cast<u64>(p + 1) * kPage, static_cast<u64>(phys) + len);
+        std::memcpy(keep.data() + (a0 - phys), it->second.bytes.get() + (a0 - static_cast<u64>(p) * kPage), static_cast<std::size_t>(a1 - a0));
+    }
+    return keep.data();
+}
+
+MemoryView VulkanRenderer::mem_view(u32 phys, u64 len, std::vector<u8>& keep) const {
+    const u32 at = phys >= 0xF0000000u ? phys - 0xF0000000u : phys;
+    const u8* p = ram_view(at, len, keep);
+    if (!p || keep.empty() || p != keep.data()) return MemoryView{ram_, ram_size_};  // RAM itself (or out of it: at() refuses)
+    return MemoryView{keep.data(), static_cast<u32>(keep.size()), at};
+}
+
+std::vector<u8> VulkanRenderer::keep_pages(const std::vector<u32>& pages) const {
+    constexpr u32 kPage = 4096;
+    std::vector<u8> kept(pages.size() * kPage), keep;
+    for (std::size_t i = 0; i < pages.size(); ++i)
+        if (static_cast<u64>(pages[i] + 1) * kPage <= ram_size_) std::memcpy(kept.data() + i * kPage, ram_view(pages[i] * kPage, kPage, keep), kPage);
+    return kept;
+}
+
+void VulkanRenderer::put_back_pages(const std::vector<u32>& pages, const std::vector<u8>& kept) {
+    constexpr u32 kPage = 4096;
+    if (!deferred_) {
+        for (std::size_t i = 0; i < pages.size(); ++i)
+            if (static_cast<u64>(pages[i] + 1) * kPage <= ram_size_) std::memcpy(ram_ + static_cast<std::size_t>(pages[i]) * kPage, kept.data() + i * kPage, kPage);
+        return;
+    }
+    // The journal's copy takes back what the renderer saw before; one that is what RAM held goes.
+    std::lock_guard g(journal_mutex_);
+    for (std::size_t i = 0; i < pages.size(); ++i) {
+        const auto it = journal_.find(pages[i]);
+        if (it == journal_.end()) continue;
+        const u8* k = kept.data() + i * kPage;
+        if (std::memcmp(k, it->second.base.get(), kPage) == 0) journal_.erase(it);
+        else std::memcpy(it->second.bytes.get(), k, kPage);
+    }
+    journal_pages_.store(journal_.size(), std::memory_order_release);
+}
+
+void VulkanRenderer::drop_overwritten_stores(const std::vector<u32>& pages) {
+    if (journal_pages_.load(std::memory_order_acquire) == 0) return;
+    constexpr u32 kPage = 4096;
+    std::lock_guard g(journal_mutex_);
+    for (u32 p : pages) {
+        const auto it = journal_.find(p);
+        if (it == journal_.end() || std::memcmp(ram_ + static_cast<std::size_t>(p) * kPage, it->second.base.get(), kPage) == 0) continue;
+        journal_.erase(it);
+        ++journal_stats_.dropped;
+    }
+    journal_pages_.store(journal_.size(), std::memory_order_release);
+}
+
+std::size_t VulkanRenderer::land_stores(const std::function<bool(u32 page, u32 tag)>& written_after) {
+    if (journal_pages_.load(std::memory_order_acquire) == 0) return 0;
+    constexpr u32 kPage = 4096;
+    std::lock_guard g(journal_mutex_);
+    std::size_t landed = 0;
+    for (const auto& [page, j] : journal_) {
+        u8* ram = ram_ + static_cast<std::size_t>(page) * kPage;
+        if (std::memcmp(ram, j.base.get(), kPage) != 0 || written_after(page, j.tag)) {
+            ++journal_stats_.kept;  // written since the store's place in the stream: newer than it
+            continue;
+        }
+        std::memcpy(ram, j.bytes.get(), kPage);
+        ++landed;
+    }
+    journal_stats_.landed += landed;
+    journal_.clear();
+    journal_pages_.store(0, std::memory_order_release);
+    return landed;
+}
+
+void VulkanRenderer::ram_copy_rows(u32 dst, u32 dst_pitch, u32 src, u32 src_pitch, u32 row, u32 h) {
+    if (h == 0 || row == 0) return;
+    const u64 src_span = static_cast<u64>(h - 1) * src_pitch + row, dst_span = static_cast<u64>(h - 1) * dst_pitch + row;
+    std::vector<u8> keep;
+    const u8* s = ram_view(src, src_span, keep);
+    if (!s || static_cast<u64>(dst) + dst_span > ram_size_) return;
+    const std::vector<u8> source(s, s + src_span);  // a copy: the destination may overlap it
+    u8* d = begin_store(dst, dst_span);
+    for (u32 y = 0; y < h; ++y) std::memcpy(d + static_cast<std::size_t>(y) * dst_pitch, source.data() + static_cast<std::size_t>(y) * src_pitch, row);
+    end_store();
+}
+
 void VulkanRenderer::write_back(Surface& s) {
     queue_write_back(s);
     finish_write_backs();
@@ -1606,14 +1750,17 @@ void VulkanRenderer::store_color(Surface& s, const u8* pixels) {
     if (!s.swizzled) {
         // Linear: a row at a time.
         const u32 row_bytes = s.width * bpp;
-        for (u32 y = 0; y < s.height; ++y) {
+        const u64 span = s.height ? std::min<u64>(static_cast<u64>(s.height - 1) * s.pitch + row_bytes, ram_size_ > s.phys ? ram_size_ - s.phys : 0) : 0;
+        u8* base = span ? begin_store(s.phys, span) : nullptr;
+        for (u32 y = 0; base && y < s.height; ++y) {
             const u64 off = static_cast<u64>(y) * s.pitch;
-            if (static_cast<u64>(s.phys) + off + row_bytes <= ram_size_) std::memcpy(ram_ + s.phys + off, pixels + static_cast<std::size_t>(y) * row_bytes, row_bytes);
+            if (static_cast<u64>(s.phys) + off + row_bytes <= ram_size_) std::memcpy(base + off, pixels + static_cast<std::size_t>(y) * row_bytes, row_bytes);
         }
+        if (base) end_store();
     } else if (static_cast<u64>(s.phys) + bytes <= ram_size_) {
         std::vector<u32> xs, ys;
         swizzle_tables(s.width, s.height, s.log_w, s.log_h, xs, ys);
-        u8* base = ram_ + s.phys;
+        u8* base = begin_store(s.phys, bytes);
         if (bpp == 4) {
             scatter_swizzled(reinterpret_cast<u32*>(base), reinterpret_cast<const u32*>(pixels), s.width, s.height, xs, ys);
         } else if (bpp == 2) {
@@ -1624,6 +1771,7 @@ void VulkanRenderer::store_color(Surface& s, const u8* pixels) {
                 for (u32 x = 0; x < s.width; ++x) std::memcpy(base + static_cast<std::size_t>(ys[y] | xs[x]) * bpp, row + static_cast<std::size_t>(x) * bpp, bpp);
             }
         }
+        end_store();
     }
     s.dirty = false;
     ++stats_.writebacks;
@@ -1678,7 +1826,8 @@ void VulkanRenderer::store_zeta(Surface& s, const u8* px) {
     const u8* stencil = px + static_cast<std::size_t>(s.width) * s.height * 4;
     std::vector<u32> xs, ys;
     if (s.swizzled) swizzle_tables(s.width, s.height, s.log_w, s.log_h, xs, ys);
-    u8* base = ram_ + s.zeta_phys;
+    if (static_cast<u64>(s.zeta_phys) + s.zeta_bytes() > ram_size_) return;
+    u8* base = begin_store(s.zeta_phys, s.zeta_bytes());
     if (z16) {
         if (s.swizzled) {
             scatter_swizzled(reinterpret_cast<u16*>(base), reinterpret_cast<const u16*>(px), s.width, s.height, xs, ys);
@@ -1712,6 +1861,7 @@ void VulkanRenderer::store_zeta(Surface& s, const u8* px) {
             }
         }
     }
+    end_store();
     ++stats_.writebacks;
     invalidate_textures(s.zeta_phys, s.zeta_bytes());
 }
@@ -1833,8 +1983,15 @@ void VulkanRenderer::invalidate(u32 phys, u32 len) {
 // showed two different stale frames in turn). The reference emulator marks a surface for upload when the CPU writes
 // it. Here: the pages the CPU wrote keep what it wrote, the target's other pages get what the GPU rendered (written
 // back around them when the image is newer than RAM), and the image reloads from RAM before its next draw.
-void VulkanRenderer::cpu_wrote(const std::vector<u32>& pages) {
+void VulkanRenderer::cpu_wrote(const std::vector<u32>& pages, u32 generation) {
     if (pages.empty()) return;
+    // Deferred, what is stored here carries the place before these writes, and what is stored after this call the pages'
+    // generation.
+    struct Advance {
+        u32& at;
+        u32 to;
+        ~Advance() { at = std::max(at, to); }
+    } advance{stream_generation_, generation};
     // Copies in flight over these pages land first, under the CPU's bytes (a write anywhere else needs no wait: most are
     // texture pages, and waiting there for every batch cost the GPU thread, with its lock held, several seconds a run).
     if (write_backs_in_flight())
@@ -1847,6 +2004,8 @@ void VulkanRenderer::cpu_wrote(const std::vector<u32>& pages) {
                 break;
             }
         }
+    // The journal's copies of pages the CPU changed are older than its bytes: the renderer reads what RAM holds there.
+    drop_overwritten_stores(pages);
     constexpr u32 kPage = 4096;
     for (auto& [k, sp] : surfaces_) {
         Surface& s = *sp;
@@ -1866,16 +2025,11 @@ void VulkanRenderer::cpu_wrote(const std::vector<u32>& pages) {
         }
         if (s.dirty) {
             // Keep the CPU's pages across the write-back of the rest.
-            std::vector<u8> kept(written.size() * kPage);
-            std::size_t i = 0;
-            for (u32 p : written)
-                if (static_cast<u64>(p + 1) * kPage <= ram_size_) std::memcpy(kept.data() + i++ * kPage, ram_ + static_cast<std::size_t>(p) * kPage, kPage);
+            const std::vector<u8> kept = keep_pages(written);
             wb_why_ = Stats::kWbRange;
             write_back(s);
             wb_why_ = Stats::kWbAll;
-            i = 0;
-            for (u32 p : written)
-                if (static_cast<u64>(p + 1) * kPage <= ram_size_) std::memcpy(ram_ + static_cast<std::size_t>(p) * kPage, kept.data() + i++ * kPage, kPage);
+            put_back_pages(written, kept);
         }
         s.color_ram_newer = true;
         s.ram_newer = true;
@@ -1890,15 +2044,10 @@ void VulkanRenderer::cpu_wrote(const std::vector<u32>& pages) {
         const u32 first = addr / kPage, last = static_cast<u32>((static_cast<u64>(addr) + bytes - 1) / kPage);
         auto lo = std::lower_bound(pages.begin(), pages.end(), first);
         if (lo == pages.end() || *lo > last) return;
-        const auto hi = std::upper_bound(lo, pages.end(), last);
-        std::vector<u8> kept(static_cast<std::size_t>(hi - lo) * kPage);
-        std::size_t i = 0;
-        for (auto p = lo; p != hi; ++p, ++i)
-            if (static_cast<u64>(*p + 1) * kPage <= ram_size_) std::memcpy(kept.data() + i * kPage, ram_ + static_cast<std::size_t>(*p) * kPage, kPage);
+        const std::vector<u32> held(lo, std::upper_bound(lo, pages.end(), last));
+        const std::vector<u8> kept = keep_pages(held);
         release();
-        i = 0;
-        for (auto p = lo; p != hi; ++p, ++i)
-            if (static_cast<u64>(*p + 1) * kPage <= ram_size_) std::memcpy(ram_ + static_cast<std::size_t>(*p) * kPage, kept.data() + i * kPage, kPage);
+        put_back_pages(held, kept);
         ++stats_.cpu_written_targets;
     };
     for (auto& [k, sp] : surfaces_) {
@@ -2282,9 +2431,11 @@ u64 VulkanRenderer::texture_content(u32 phys, u32 length, u32 palette_phys) cons
         }
         for (; i < n; ++i) h = (h ^ p[i]) * 0x100000001B3ull;
     };
-    if (const u8* p = ram.at(phys, length)) mix(p, length);
-    if (palette_phys)
-        if (const u8* p = ram.at(palette_phys, 256 * 4)) mix(p, 256 * 4);
+    std::vector<u8> keep;
+    if (ram.at(phys, length))
+        if (const u8* p = ram_view(phys, length, keep)) mix(p, length);
+    if (palette_phys && ram.at(palette_phys, 256 * 4))
+        if (const u8* p = ram_view(palette_phys, 256 * 4, keep)) mix(p, 256 * 4);
     return h;
 }
 
@@ -2431,16 +2582,18 @@ const VulkanRenderer::TextureEntry* VulkanRenderer::texture(const KelvinState& s
     const u32 generation = handles_.write_generation();
     u32 palette_phys = 0;
     const u8* palette = nullptr;
+    std::vector<u8> palette_keep, texels_keep;
     if (ts.color_format() == 0x0B) {
         const DmaObject pdma = handles_.resolve(s.dma_handle((ts.palette & 1u) ? mthd::kDmaB : mthd::kDmaA));
-        palette = MemoryView{ram_, ram_size_}.at(pdma.base + (ts.palette & 0xFFFFFFC0u), 256 * 4);
         palette_phys = pdma.base + (ts.palette & 0xFFFFFFC0u);
+        palette = mem_view(palette_phys, 256 * 4, palette_keep).at(palette_phys, 256 * 4);
     }
     // Its pages are watched before they are read: a write from here on marks the texture stale.
     handles_.watch_writes(phys, length);
     if (palette_phys) handles_.watch_writes(palette_phys, 256 * 4);
     tx_watch = ns_since(tx0);
-    if (!decode_texture(ts, phys, MemoryView{ram_, ram_size_}, palette, d, native_dxt_)) {
+    const MemoryView texels = mem_view(phys, length, texels_keep);
+    if (!decode_texture(ts, phys, texels, palette, d, native_dxt_)) {
         error = d.error;
         return nullptr;
     }
@@ -2451,7 +2604,7 @@ const VulkanRenderer::TextureEntry* VulkanRenderer::texture(const KelvinState& s
         for (auto& [k2, surf] : surfaces_)
             target = target || (surf->phys < phys + length && phys < surf->phys + surf->bytes()) || (surf->zeta_phys < phys + length && phys < surf->zeta_phys + surf->zeta_bytes());
         std::string head;
-        if (const u8* src = MemoryView{ram_, ram_size_}.at(phys, 16))
+        if (const u8* src = texels.at(phys, 16))
             for (u32 i = 0; i < 16; ++i) head += std::format(" {:02x}", src[i]);
         std::fprintf(stderr, "texlog: decode %08x format %02x %ux%u levels %u faces %u filter %08x%s; bytes%s\n", phys, ts.color_format(), d.width, d.height, d.levels, d.faces, ts.filter,
                      target ? " (a render target)" : "", head.c_str());
@@ -3688,7 +3841,7 @@ void VulkanRenderer::draw(const KelvinState& s, const DrawBatch& batch) {
         std::swap(v, *prefetched);  // the caller's buffers get this one's old ones back for its next fetch
         fetched = v.error.empty();
     } else {
-        fetched = fetch_vertices(s, handles_, MemoryView{ram_, ram_size_}, batch, v);
+        fetched = fetch_vertices(s, handles_, MemoryView{ram_, ram_size_}, batch, v);  // not deferred: the render thread prefetches
     }
     clock.lap(stats_.ns_fetch);
     if (!fetched) {
