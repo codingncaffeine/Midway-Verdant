@@ -33,13 +33,14 @@ bool Replay::run(Kelvin& kelvin, Observer* observer, std::string& error, u32 unt
     capture::Record rec;
     TwoD twod(ram_.data(), ram_.size(), *this);
     twod.set_hooks(blit_before_read_, blit_after_write_);
+    if (blit_ram_copy_) twod.set_ram_copy(blit_ram_copy_);
     while (reader_.next(rec)) {
         switch (rec.type) {
             case capture::Rec::Pages: {
-                if (page_observer_) page_observer_(rec.first_page, rec.page_count);
                 const std::size_t off = static_cast<std::size_t>(rec.first_page) * capture::kPageSize;
                 const std::size_t len = static_cast<std::size_t>(rec.page_count) * capture::kPageSize;
                 if (off + len <= ram_.size()) std::memcpy(ram_.data() + off, rec.page_data, len);
+                if (page_observer_) page_observer_(rec.first_page, rec.page_count);
                 break;
             }
             case capture::Rec::Object:
@@ -55,6 +56,7 @@ bool Replay::run(Kelvin& kelvin, Observer* observer, std::string& error, u32 unt
                 ++methods_;
                 if (rec.cls == 0x97) {
                     kelvin.method(rec.method, rec.value);
+                    if (method_hook_) method_hook_(rec.method, rec.value);
                     if (rec.method == mthd::kSemaphoreRelease) {
                         if (observer) observer->frame_end(frames_, rec.value);
                         ++frames_;

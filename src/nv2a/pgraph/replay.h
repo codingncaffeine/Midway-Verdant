@@ -40,13 +40,17 @@ public:
 
     MemoryView memory() const { return {ram_.data(), static_cast<u32>(ram_.size())}; }
     u8* mutable_ram() { return ram_.data(); }
-    // Called with every page record before it lands in RAM (first page, count).
+    // Called with every page record once it is in RAM (first page, count).
     void set_page_observer(std::function<void(u32, u32)> f) { page_observer_ = std::move(f); }
     // The 2D engine's blits run during the replay; these hear the RAM a blit reads and writes (see TwoD).
     void set_blit_hooks(std::function<void(u32, u32)> before_read, std::function<void(u32, u32)> after_write) {
         blit_before_read_ = std::move(before_read);
         blit_after_write_ = std::move(after_write);
     }
+    // Every 3D method once Kelvin has taken it, before a frame's end is reported (a second decoder of the stream).
+    void set_method_hook(std::function<void(u32 method, u32 value)> f) { method_hook_ = std::move(f); }
+    // The blit's copy through RAM, when the host stores it itself (TwoD::set_ram_copy).
+    void set_blit_ram_copy(std::function<void(u32, u32, u32, u32, u32, u32)> f) { blit_ram_copy_ = std::move(f); }
     DmaObject resolve(u32 handle) const override;
     u32 frames() const { return frames_; }
     u32 scanout_start() const { return scanout_start_; }
@@ -61,6 +65,8 @@ private:
     u64 methods_{0};
     std::function<void(u32, u32)> page_observer_;
     std::function<void(u32, u32)> blit_before_read_, blit_after_write_;
+    std::function<void(u32, u32)> method_hook_;
+    std::function<void(u32, u32, u32, u32, u32, u32)> blit_ram_copy_;
 };
 
 }  // namespace mv::pgraph

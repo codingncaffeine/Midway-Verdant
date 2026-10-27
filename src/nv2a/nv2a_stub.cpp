@@ -646,6 +646,7 @@ void Nv2aStub::execute_method(const PushbufferMethod& m) {
             s.notifier_handle = m.value;
             return;
         case 0x0104: {  // NOTIFY: write the notifier (timestamp, info, status = done) when the next method completes
+            const auto drawn = own_renderer();  // the render thread has drawn what came before (see the semaphore)
             const auto dma = dma_object(lookup_handle(s.notifier_handle) & 0xFFFFu);
             if (!dma.valid) {
                 trace::log(trace::Cat::Gpu, "notify with no notifier object (handle {:08x})", s.notifier_handle);
@@ -665,6 +666,9 @@ void Nv2aStub::execute_method(const PushbufferMethod& m) {
             s.semaphore_offset = m.value;
             return;
         case 0x1D70: {  // BACK_END_WRITE_SEMAPHORE_RELEASE
+            // With the render thread: the game takes the semaphore as the GPU being done with what came before it and
+            // rewrites that memory; the thread must have drawn it by then (Crimson Skies' menu text read late, blank).
+            const auto drawn = own_renderer();
             const auto dma = dma_object(lookup_handle(s.semaphore_handle) & 0xFFFFu);
             if (!dma.valid || s.semaphore_offset + 4 > dma.limit + 1) {
                 trace::log(trace::Cat::Gpu, "semaphore release with no object (handle {:08x})", s.semaphore_handle);
@@ -900,6 +904,10 @@ u32 Nv2aStub::mmio_read(PhysAddr addr, unsigned size) {
     else if (fifo_busy_ && reports_progress(key)) timed_wait_idle(gpu, key);
     // The guest asks how far the GPU has come (Direct3D does before it reads a surface with the CPU): render targets
     // still on their way to RAM in the background are there first, as they are on the hardware once it has drawn them.
+    // With the render thread the answer may let the game reuse memory the commands before it read: they are drawn first.
+    if (render_thread_ && reports_progress(key)) {
+        const auto drawn = own_renderer();
+    }
     if (reports_progress(key)) land_write_backs(true);
     if (off == kPrmcioInputStatus1 && size == 1) {
         // Bit 3: vertical retrace in progress; bit 0: display inactive (blanking).

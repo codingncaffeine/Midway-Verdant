@@ -13,6 +13,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <memory>
+#include <mutex>
+#include <unordered_map>
 #include <utility>
 #include <string>
 #include <vector>
@@ -20,6 +23,7 @@
 #include "nv2a/capture.h"
 #include "nv2a/pgraph/kelvin.h"
 #include "nv2a/pgraph/replay.h"
+#include "nv2a/render_thread.h"
 #include "nv2a/vulkan/vk_device.h"
 #include "nv2a/vulkan/vk_renderer.h"
 #include "nv2a/shaders/psh_translate.h"
@@ -452,11 +456,17 @@ struct RenderObserver : mv::pgraph::Replay::Observer {
     mv::u32 scanout{0};
     mv::u32 first_png{0};  // frames before this render but write no picture (a long capture's late frames)
     mv::u32 stride{1};     // from first_png on, a picture every stride-th frame
+    // MV_PBCAP_RENDER_THREAD=1: the renderer is the render thread's until frame_end has it (own), and its deferred stores
+    // reach RAM before the pictures are read (land).
+    std::function<std::unique_lock<std::mutex>()> own;
+    std::function<void()> land;
     void register_write(mv::u32 offset, mv::u32 value) override {
         if (offset == 0x600800) scanout = value;
     }
     void frame_end(mv::u32 index, mv::u32) override {
+        const auto owned = own ? own() : std::unique_lock<std::mutex>{};
         renderer->end_frame();
+        if (land) land();
         std::string error;
         for (const auto& s : renderer->surfaces()) {
             std::printf("   surface %08x %ux%u %s format %x: %llu draws, %llu clears%s\n", s.phys, s.width, s.height, s.swizzled ? "swizzled" : "pitch",
@@ -547,8 +557,73 @@ int render(const char* path, const char* dir, mv::u32 frames, mv::u32 first_png,
     observer.stride = stride;
     observer.dir = dir;
     observer.replay = &r;
-    r.set_page_observer([&](mv::u32 first_page, mv::u32 count) { renderer.invalidate(first_page * 4096, count * 4096); });
-    r.set_blit_hooks([&](mv::u32 phys, mv::u32 len) { renderer.write_back_range(phys, len); }, [&](mv::u32 phys, mv::u32 len) { renderer.invalidate(phys, len); });
+    // MV_PBCAP_CPU_WROTE=1: the capture's pages reach the renderer as the live machine reports them (cpu_wrote, with a
+    // write generation each), not as a plain invalidation. MV_PBCAP_RENDER_THREAD=1 (implies it): the live machine's
+    // render thread, wired as Nv2aStub wires it, behind a decoder that fetches each draw's vertices as it is decoded; the
+    // replay writes the capture's pages into RAM as soon as it reaches them, ahead of the recording, as the guest does.
+    const bool threaded = [] { const char* e = std::getenv("MV_PBCAP_RENDER_THREAD"); return e && *e == '1'; }();
+    const bool wrote = threaded || [] { const char* e = std::getenv("MV_PBCAP_CPU_WROTE"); return e && *e == '1'; }();
+    std::unordered_map<mv::u32, mv::u32> page_generation;
+    mv::u32 generation = 1;
+    std::unique_ptr<mv::RenderThread> rt;
+    std::unique_ptr<mv::PrefetchSink> prefetch;
+    if (threaded) {
+        renderer.set_deferred_stores(true);
+        rt = std::make_unique<mv::RenderThread>(renderer);
+        prefetch = std::make_unique<mv::PrefetchSink>(*rt, r, r.memory());
+        kelvin.set_sink(prefetch.get());
+        // MV_PBCAP_PUBLISH=N: the replay hands the thread its work every N methods (default 256); 0 = only at a frame's end,
+        // the thread then records a whole frame behind the pages the replay has written (the widest lag).
+        const mv::u32 publish_every = [] { const char* e = std::getenv("MV_PBCAP_PUBLISH"); return e ? static_cast<mv::u32>(std::strtoul(e, nullptr, 10)) : 256u; }();
+        mv::u32 since_publish = 0;
+        r.set_method_hook([&, since_publish, publish_every](mv::u32 m, mv::u32 v) mutable {
+            rt->method(m, v);
+            if (prefetch->take_drew()) rt->commit_packet(kelvin.state().immediate);
+            if (m == mv::pgraph::mthd::kSemaphoreRelease) rt->call([](mv::pgraph::VulkanRenderer& rr) { rr.flush_frame(); });
+            if (publish_every && ++since_publish == publish_every) {
+                since_publish = 0;
+                rt->publish();
+            }
+        });
+        observer.own = [&] {
+            rt->publish();
+            return rt->catch_up();
+        };
+        observer.land = [&] {
+            renderer.land_stores([&](mv::u32 page, mv::u32 tag) {
+                const auto it = page_generation.find(page);
+                return it != page_generation.end() && it->second > tag;
+            });
+        };
+    }
+    r.set_page_observer([&](mv::u32 first_page, mv::u32 count) {
+        if (!wrote) {
+            renderer.invalidate(first_page * 4096, count * 4096);
+            return;
+        }
+        ++generation;
+        std::vector<mv::u32> pages;
+        for (mv::u32 p = first_page; p < first_page + count; ++p) {
+            pages.push_back(p);
+            page_generation[p] = generation;
+        }
+        if (rt) rt->call([pages, g = generation](mv::pgraph::VulkanRenderer& rr) { rr.cpu_wrote(pages, g); });
+        else renderer.cpu_wrote(pages, generation);
+    });
+    if (rt) {
+        const auto owned_blit = [&] {
+            rt->publish();
+            return rt->catch_up();
+        };
+        r.set_blit_hooks([&, owned_blit](mv::u32 phys, mv::u32 len) { const auto own = owned_blit(); renderer.write_back_range(phys, len); },
+                         [&, owned_blit](mv::u32 phys, mv::u32 len) { const auto own = owned_blit(); renderer.invalidate(phys, len); });
+        r.set_blit_ram_copy([&, owned_blit](mv::u32 dp, mv::u32 dpitch, mv::u32 sp, mv::u32 spitch, mv::u32 row, mv::u32 h) {
+            const auto own = owned_blit();
+            renderer.ram_copy_rows(dp, dpitch, sp, spitch, row, h);
+        });
+    } else {
+        r.set_blit_hooks([&](mv::u32 phys, mv::u32 len) { renderer.write_back_range(phys, len); }, [&](mv::u32 phys, mv::u32 len) { renderer.invalidate(phys, len); });
+    }
     if (!r.run(kelvin, &observer, error, frames)) {
         std::fprintf(stderr, "mv-pbcap: %s\n", error.c_str());
         return 1;
