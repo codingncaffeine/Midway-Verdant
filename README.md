@@ -46,10 +46,48 @@ Midway Verdant contains no Microsoft code or data. You supply dumps from your ow
 
 - the 512-byte MCPX boot ROM
 - a flash BIOS image (256 KiB, 512 KiB or 1 MiB)
-- a hard-disk image (raw; a qcow2 image can be converted)
-- an EEPROM image (one can be generated from the running kernel's own key)
 
-Game discs are read from XISO or full-dump (Redump-layout) images. For the libretro core, the files go in a `midway-verdant` folder inside the frontend's system directory; a blank hard disk is created there when none exists.
+Both are found by their size, whatever the files are called. On the first start the core generates an EEPROM from the BIOS's own kernel and saves it as `eeprom.bin`, and creates a blank retail-layout hard disk, `xbox_hdd.raw` (sparse: it takes almost no space until the games write to it). A hard-disk image of your own can be used instead: a raw image of 8 GB or more in the same folder (convert a qcow2 one with `qemu-img convert -O raw xbox_hdd.qcow2 xbox_hdd.raw`).
+
+Game discs are read from XISO or full-dump (Redump-layout) images, including FAT32 copies split into `NAME.1.iso`, `NAME.2.iso`, ...
+
+The computer: an x86-64 CPU with hardware virtualisation (Intel VT-x or AMD-V, switched on in the firmware setup), Linux with KVM, and a GPU with a Vulkan 1.1 driver.
+
+## Playing in RetroArch (Linux)
+
+1. **Get the core.** From the [releases page](https://github.com/codingncaffeine/Midway-Verdant/releases), download `midway_verdant_libretro-linux-x86_64.zip`. It holds `midway_verdant_libretro.so` and `midway_verdant_libretro.info`. The core is self-contained: it runs on any distribution with glibc 2.27 or newer (2018 on).
+2. **Install it.** In RetroArch, *Main Menu → Load Core → Install or Restore a Core* and pick the `.so`. Then copy the `.info` file into RetroArch's core-info folder (*Settings → Directory → Core Info*) so the core shows its name and firmware list. The usual folders:
+
+   | RetroArch from | Cores | Core info | System (BIOS) |
+   |---|---|---|---|
+   | your distribution's package, the AUR, or a build of your own | `~/.config/retroarch/cores` | `~/.config/retroarch/cores` or `/usr/share/libretro/info` | `~/.config/retroarch/system` |
+   | Flatpak | `~/.var/app/org.libretro.RetroArch/config/retroarch/cores` | the same folder | `~/.var/app/org.libretro.RetroArch/config/retroarch/system` |
+
+   *Settings → Directory* shows the ones your RetroArch actually uses.
+3. **Add the firmware.** Make a folder named `midway-verdant` inside the System folder and put the MCPX boot ROM and the BIOS in it.
+4. **Use the Vulkan video driver.** *Settings → Drivers → Video* → `vulkan`, then restart RetroArch. The core always draws with Vulkan; with RetroArch on Vulkan too, each frame is handed over on the GPU. Under another video driver it still runs, but every frame is copied back through the CPU, which costs speed at the higher internal resolutions.
+5. **Let RetroArch use KVM.** Check with `ls -l /dev/kvm`: your user needs read and write access, which on most distributions means the `kvm` group (`sudo usermod -aG kvm $USER`, then log out and back in). If `/dev/kvm` is missing, switch on virtualisation (VT-x / AMD-V / SVM) in your firmware setup. The Flatpak normally has device access already; if not, `flatpak override --user --device=all org.libretro.RetroArch`.
+6. **Play.** *Load Content*, pick a disc image, choose *Midway Verdant*. The console's boot animation plays first, then the game. *Quick Menu → Core Options* holds the settings below; the internal resolution changes while the game runs.
+
+The first start of each game compiles its shaders (a stutter or two the first time a scene appears); they are kept in `system/midway-verdant/shader-cache` for the next time.
+
+RetroArch from Steam runs cores inside Steam's own container, which may not pass `/dev/kvm` through: it has not been tested.
+
+### Tested distributions
+
+The release core is booted from a first start (only the MCPX ROM and the BIOS in the folder) in a container of each distribution with KVM and the distribution's own Vulkan loader and software driver (`tools/test-linux-distros.sh`), up to a game's first pictures. Day-to-day play is on Arch Linux with an NVIDIA GPU.
+
+| Distribution | glibc | Result |
+|---|---|---|
+| Arch Linux | 2.44 | boots and draws |
+| Debian 13 (trixie) | 2.41 | boots and draws |
+| Fedora 44 | 2.43 | boots and draws |
+| openSUSE Tumbleweed | 2.44 | boots and draws |
+| Ubuntu 20.04 LTS | 2.31 | boots and draws |
+| Ubuntu 24.04 LTS | 2.39 | boots and draws |
+| Debian 12 (bookworm), Ubuntu 22.04 LTS | 2.36, 2.35 | the core loads, KVM runs and the console starts, but their software Vulkan driver (llvmpipe built with LLVM 15) stalls drawing; not yet tried with a hardware GPU driver |
+
+Windows: a build with a hypervisor backend (Windows Hypervisor Platform) is in progress. macOS: not yet.
 
 ## Building
 
@@ -68,6 +106,8 @@ build/src/midway-verdant --mcpx mcpx.bin --bios flash.bin --hdd disk.img --dvd g
 ```
 
 `--help` lists every option. `--create-hdd FILE` writes a blank retail-layout drive. The build also produces `midway_verdant_libretro` for libretro frontends.
+
+A release core is built with `tools/build-linux-core.sh` (podman or docker): in the manylinux_2_28 container (glibc 2.28, GCC 14) with `-DMV_PORTABLE=ON`, which builds glslang and the C++ runtime into the core and exports nothing but the libretro API. `tools/test-linux-distros.sh` then boots it in containers of other distributions.
 
 ## License
 

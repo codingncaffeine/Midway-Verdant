@@ -1,0 +1,48 @@
+name: Release
+
+# A tag v* builds the release cores and attaches them to a DRAFT release (published by hand after a look).
+# Run by hand (workflow_dispatch) it builds the same files as an artifact only.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  linux:
+    name: Linux core (x86-64, glibc 2.27+)
+    runs-on: ubuntu-24.04
+    container: quay.io/pypa/manylinux_2_28_x86_64
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: tools/build-linux-core.sh dist/linux
+      - name: Package
+        run: |
+          command -v zip >/dev/null || dnf install -y -q zip
+          cp packaging/midway_verdant_libretro.info dist/linux/
+          cp LICENSE dist/linux/
+          cd dist/linux && zip -q ../midway_verdant_libretro-linux-x86_64.zip midway_verdant_libretro.so midway_verdant_libretro.info LICENSE
+      - uses: actions/upload-artifact@v4
+        with:
+          name: midway_verdant_libretro-linux-x86_64
+          path: dist/midway_verdant_libretro-linux-x86_64.zip
+
+  release:
+    name: Draft release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [linux]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        run: cd dist && sha256sum *.zip > SHA256SUMS
+      - name: Draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/*.zip dist/SHA256SUMS --repo "$GITHUB_REPOSITORY" --draft --title "Midway Verdant $GITHUB_REF_NAME" --notes "Release notes to be written before publishing."

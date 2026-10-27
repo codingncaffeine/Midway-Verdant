@@ -1,0 +1,45 @@
+# Midway Verdant: RetroArch core information. Goes in RetroArch's "info" directory beside the other cores' .info files.
+
+# Software Information
+display_name = "Microsoft - Xbox (Midway Verdant)"
+authors = "codingncaffeine"
+supported_extensions = "iso|xiso"
+corename = "Midway Verdant"
+categories = "Emulator"
+license = "GPLv3"
+permissions = ""
+display_version = "0.0.1"
+
+# Hardware Information
+manufacturer = "Microsoft"
+systemname = "Xbox"
+systemid = "xbox"
+
+# Libretro Features
+database = "Microsoft - Xbox"
+supports_no_game = "false"
+hw_render = "true"
+required_hw_api = "Vulkan >= 1.1"
+needs_fullpath = "true"
+savestate = "false"
+cheats = "false"
+input_descriptors = "false"
+memory_descriptors = "false"
+libretro_saves = "false"
+core_options = "true"
+load_subsystem = "false"
+disk_control = "false"
+is_experimental = "true"
+
+# BIOS / Firmware
+# The core finds both files by their size, whatever they are named; these are the usual names.
+firmware_count = 2
+firmware0_desc = "midway-verdant/mcpx_1.0.bin (MCPX boot ROM, 512 bytes)"
+firmware0_path = "midway-verdant/mcpx_1.0.bin"
+firmware0_opt = "false"
+firmware1_desc = "midway-verdant/Complex_4627.bin (flash BIOS, 256 KiB, 512 KiB or 1 MiB)"
+firmware1_path = "midway-verdant/Complex_4627.bin"
+firmware1_opt = "false"
+notes = "(!) Dumps from your own console go in system/midway-verdant/: the 512-byte MCPX boot ROM and the flash BIOS (any file names: they are found by size).|(!) The EEPROM is generated from the BIOS's kernel on the first start and saved as eeprom.bin; a blank hard disk (xbox_hdd.raw) is created when there is none.|(!) Linux: the CPU runs under KVM, so your user needs access to /dev/kvm (usually the kvm group).|(!) Video driver: vulkan."
+
+description = "A clean-room, low-level emulator of the original Xbox. The console's own boot ROM, BIOS and kernel run unmodified on emulated hardware: MCPX, NV2A graphics, the APU and its DSPs, IDE, USB and SMBus. On Linux the CPU runs under KVM at full speed."
