@@ -565,6 +565,7 @@ bool start_machine(const mv::MachineConfig& cfg) {
         cfg.mcpx_rom.parent_path().string().c_str());
     log(RETRO_LOG_INFO, "timeline: %s; one console frame per retro_run", machine->cpu()->clock_name().c_str());
     log(RETRO_LOG_INFO, "audio: %s", direct_audio ? "direct mix" : "console");
+    if (const auto* d = machine->gpu_device()) log(RETRO_LOG_INFO, "gpu: %s", d->name().c_str());  // which device draws (a software one is slow)
     // The disc image as the drive reads it: its parts, and a split image missing its later parts (say so: a title then
     // fails where its data runs past the end, one racing title waiting for ever on a loading screen).
     if (const auto* drive = dynamic_cast<const mv::AtapiCdrom*>(machine->ide().primary().device(1)); drive && drive->disc()) {

@@ -161,6 +161,7 @@ public:
     CpuBackend* cpu() { return cpu_.get(); }
     const pgraph::VulkanRenderer* renderer() const { return renderer_.get(); }
     pgraph::VulkanRenderer* renderer() { return renderer_.get(); }
+    const vk::Device* gpu_device() const { return gpu_device_.get(); }
     std::string gpu_name() const;  // the Vulkan device's name when --gpu is on, else empty
 
     // The machine lock and the wake-ups: `wake_cpu` for the CPU thread's waits (HLT, pacing), `wake` for those and
