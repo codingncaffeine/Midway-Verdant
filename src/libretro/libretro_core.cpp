@@ -802,6 +802,7 @@ RETRO_API void retro_unload_game(void) {
                 static_cast<unsigned long long>(machine->nv2a().fifo_lead_waits()), static_cast<double>(machine->nv2a().fifo_lead_wait_ns()) / 1e9,
                 static_cast<unsigned long long>(machine->nv2a().fifo_vblank_waits()), static_cast<double>(machine->nv2a().fifo_vblank_wait_ns()) / 1e9);
         if (machine->nv2a().fifo_threaded()) log(RETRO_LOG_INFO, "gpu: the CPU side waited for the FIFO thread: %s", machine->nv2a().fifo_wait_report().c_str());
+        log(RETRO_LOG_INFO, "gpu state: %s", machine->nv2a().state_report().c_str());
         log(RETRO_LOG_INFO, "gpu: what ended those runs' overlap (pusher time not hidden):%s", machine->nv2a().sync_reasons(8).c_str());
         log(RETRO_LOG_INFO, "apu: %llu front-end memory fences written, %llu front-end traps raised", static_cast<unsigned long long>(machine->apu().fence_writes()),
             static_cast<unsigned long long>(machine->apu().traps()));

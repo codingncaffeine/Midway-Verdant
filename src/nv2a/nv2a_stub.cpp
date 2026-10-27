@@ -497,6 +497,7 @@ void Nv2aStub::on_method(const PushbufferMethod& m) {
 }
 
 void Nv2aStub::execute_method(const PushbufferMethod& m) {
+    last_methods_[last_method_at_++ % last_methods_.size()] = m;
     // On the FIFO thread the walk stops every few methods to let a waiting register access in (the rest of the header
     // follows on the next chunk), and at once when one is already waiting: a game's register read used to wait for the
     // rest of a 128-method chunk, draws included (34-41 us a read, 4-18 s a run in the heaviest titles).
@@ -1290,6 +1291,21 @@ void Nv2aStub::timed_wait_idle(std::unique_lock<std::mutex>& lock, u32 why) {
     auto& w = idle_waits_[why];
     ++w.first;
     w.second += static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
+}
+
+std::string Nv2aStub::state_report() const {
+    auto gpu = std::unique_lock(gpu_mutex_);
+    std::string r = std::format("holds: software method {}, flip stall {}, walk stuck {}, FIFO busy {}; push {:08x} PUT {:08x} GET {:08x} ref {:08x}; PGRAPH intr {:08x} "
+                                "nsource {:08x} trapped {:08x} data {:08x} FIFO {:08x}; PGRAPH surface (flip read 26:24, write 22:20, modulo 30:28) {:08x}; {} software methods; last methods (oldest first):",
+                                pgraph_stalled_ ? 1 : 0, flip_stalled_ ? 1 : 0, stuck_ ? 1 : 0, fifo_busy_ ? 1 : 0, reg(kCache1DmaPush), reg(kCache1DmaPut), reg(kCache1DmaGet),
+                                reg(kCache1Ref), reg(kPgraphIntr), reg(kPgraphNsource), reg(kPgraphTrappedAddr), reg(kPgraphTrappedData), reg(kPgraphFifo),
+                                reg(kPgraphSurface), software_methods_);
+    const u32 n = std::min<u32>(last_method_at_, static_cast<u32>(last_methods_.size()));
+    for (u32 i = last_method_at_ - n; i != last_method_at_; ++i) {
+        const PushbufferMethod& m = last_methods_[i % last_methods_.size()];
+        r += std::format(" [{}:{:x}] {:04x}={:08x}", m.subchannel, bound_[m.subchannel & 7u], m.method, m.value);
+    }
+    return r;
 }
 
 std::string Nv2aStub::fifo_wait_report() const {

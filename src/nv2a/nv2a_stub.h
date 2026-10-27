@@ -348,6 +348,8 @@ private:
     bool flip_stalled_{false};
     u32 report_handle_{0};
     u64 flip_stalls_{0}, reports_{0};
+    std::array<PushbufferMethod, 32> last_methods_{};  // the methods executed last, a ring (state_report)
+    u32 last_method_at_{0};
     u64 display_flips_{0};  // INCREMENT writes that moved the display on to the next buffer
     capture::Writer* capture_{nullptr};
     CpuBackend* cpu_{nullptr};
@@ -416,6 +418,9 @@ public:
     u64 fifo_vblank_waits() const { return vblank_waits_; }
     u64 fifo_vblank_wait_ns() const { return vblank_wait_ns_; }
     std::string fifo_wait_report() const;
+    // Where the GPU stands (a game that waits on it for ever): its holds, PUT and GET, the trap and interrupt registers and
+    // the last methods it executed.
+    std::string state_report() const;
     u64 reports() const { return reports_; }
 };
 
