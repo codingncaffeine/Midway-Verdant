@@ -840,6 +840,7 @@ void AtapiCdrom::read_sectors(u64 lba, u32 count) {
         return;
     }
     if (lba + count > disc_->sectors()) {
+        disc_->note_past_end(lba, count);  // an incomplete image: the title reads where the file ends
         check_condition(0x05, 0x21, 0x00);  // illegal request: logical block address out of range
         return;
     }

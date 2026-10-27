@@ -30,17 +30,34 @@ DvdImage::~DvdImage() {
     }
     wake_.notify_all();
     if (reader_.joinable()) reader_.join();
-    if (file_) std::fclose(file_);
+    for (Part& p : parts_)
+        if (p.file) std::fclose(p.file);
 }
 
+// Bytes of the whole image, across the parts they fall in.
 bool DvdImage::read_at(u64 offset, u32 bytes, u8* out) const {
     std::lock_guard g(file_mutex_);
+    for (const Part& p : parts_) {
+        if (bytes == 0) break;
+        if (offset >= p.start + p.size) continue;
+        if (offset < p.start) return false;
+        const u32 n = static_cast<u32>(std::min<u64>(bytes, p.start + p.size - offset));
 #if defined(_WIN32)
-    if (_fseeki64(file_, static_cast<long long>(offset), SEEK_SET) != 0) return false;
+        if (_fseeki64(p.file, static_cast<long long>(offset - p.start), SEEK_SET) != 0) return false;
 #else
-    if (fseeko(file_, static_cast<off_t>(offset), SEEK_SET) != 0) return false;
+        if (fseeko(p.file, static_cast<off_t>(offset - p.start), SEEK_SET) != 0) return false;
 #endif
-    return std::fread(out, 1, bytes, file_) == bytes;
+        if (std::fread(out, 1, n, p.file) != n) return false;
+        offset += n;
+        out += n;
+        bytes -= n;
+    }
+    return bytes == 0;
+}
+
+void DvdImage::note_past_end(u64 lba, u32 count) const {
+    if (past_end_reads_.fetch_add(1, std::memory_order_relaxed) == 0) first_past_end_lba_.store(lba, std::memory_order_relaxed);
+    (void)count;
 }
 
 bool DvdImage::has_volume_descriptor(u64 partition) const {
@@ -49,17 +66,38 @@ bool DvdImage::has_volume_descriptor(u64 partition) const {
 }
 
 bool DvdImage::open(const std::filesystem::path& path, std::string& error) {
-    std::error_code ec;
-    const u64 size = std::filesystem::file_size(path, ec);
-    if (ec) {
-        error = std::format("cannot stat {}: {}", path.string(), ec.message());
-        return false;
+    // The parts: the file itself, and for NAME.1.EXT the NAME.2.EXT, NAME.3.EXT ... that follow it.
+    std::vector<std::filesystem::path> paths{path};
+    const std::string stem = path.stem().string();
+    const bool first_part = stem.size() > 2 && stem.ends_with(".1");
+    if (first_part) {
+        const std::string name = stem.substr(0, stem.size() - 2);
+        for (int n = 2; n < 100; ++n) {
+            const auto next = path.parent_path() / std::format("{}.{}{}", name, n, path.extension().string());
+            std::error_code exists_ec;
+            if (!std::filesystem::is_regular_file(next, exists_ec)) break;
+            paths.push_back(next);
+        }
+        if (paths.size() == 1)
+            note_ = std::format("{} is the first part of a split image and {}.2{} is not beside it: the rest of the disc is missing", path.filename().string(),
+                                name, path.extension().string());
     }
-    file_ = std::fopen(path.string().c_str(), "rb");
-    if (!file_) {
-        error = std::format("cannot open {}", path.string());
-        return false;
+    for (const auto& p : paths) {
+        std::error_code ec;
+        const u64 part_size = std::filesystem::file_size(p, ec);
+        if (ec) {
+            error = std::format("cannot stat {}: {}", p.string(), ec.message());
+            return false;
+        }
+        std::FILE* f = std::fopen(p.string().c_str(), "rb");
+        if (!f) {
+            error = std::format("cannot open {}", p.string());
+            return false;
+        }
+        parts_.push_back({p, f, size_, part_size});
+        size_ += part_size;
     }
+    const u64 size = size_;
     if (has_volume_descriptor(0)) {
         kind_ = Kind::Xiso;
         base_ = 0;
@@ -67,22 +105,26 @@ bool DvdImage::open(const std::filesystem::path& path, std::string& error) {
         kind_ = Kind::Redump;
         base_ = kRedumpGamePartition;
     } else {
-        std::fclose(file_);
-        file_ = nullptr;
+        for (Part& p : parts_) std::fclose(p.file);
+        parts_.clear();
         error = std::format("{} is not an Xbox game disc image (no XDVDFS volume at sector 32, nor at the game partition of a full dump)",
                             path.string());
         return false;
     }
     sectors_ = (size - base_) / kSectorSize;
 #if defined(__linux__)
-    warmer_ = std::thread([this, p = path, size] { warm_main(p, size); });
+    warmer_ = std::thread([this] { warm_main(); });
 #endif
     return true;
 }
 
 bool DvdImage::read(u64 lba, u32 count, u8* out) const {
     io_log("dvd-read", lba, count);
-    if (!file_ || lba + count > sectors_) return false;
+    if (parts_.empty()) return false;
+    if (lba + count > sectors_) {
+        note_past_end(lba, count);
+        return false;
+    }
     const auto t0 = std::chrono::steady_clock::now();
     const bool ok = read_at(base_ + lba * kSectorSize, count * kSectorSize, out);
     const auto ns = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
@@ -136,6 +178,9 @@ void DvdImage::reader_main() {
         if (ahead_count_ && lba >= ahead_lba_ && lba + count <= ahead_lba_ + ahead_count_) {
             std::memcpy(out.data(), ahead_.data() + static_cast<std::size_t>(lba - ahead_lba_) * kSectorSize, out.size());
             read_ahead_hits_.fetch_add(1, std::memory_order_relaxed);
+        } else if (lba + count > sectors_) {
+            note_past_end(lba, count);
+            ok = false;
         } else {
             lock.unlock();
             ok = read_at(base_ + lba * kSectorSize, count * kSectorSize, out.data());
@@ -166,8 +211,9 @@ void DvdImage::reader_main() {
     }
 }
 
-void DvdImage::warm_main([[maybe_unused]] std::filesystem::path path, [[maybe_unused]] u64 size) {
+void DvdImage::warm_main() {
 #if defined(__linux__)
+    const u64 size = size_;
     pthread_setname_np(pthread_self(), "mv-dvd-warm");
     // Only when the image fits in half the memory the host has available.
     u64 available_kb = 0;
@@ -181,17 +227,20 @@ void DvdImage::warm_main([[maybe_unused]] std::filesystem::path path, [[maybe_un
     // The idle I/O class: the drive's own reads go first.
     constexpr int kIoprioWhoProcess = 1, kIoprioClassIdle = 3, kIoprioClassShift = 13;
     syscall(SYS_ioprio_set, kIoprioWhoProcess, 0, kIoprioClassIdle << kIoprioClassShift);
-    const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
-    if (fd < 0) return;
-    posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL);
     std::vector<u8> chunk(4u << 20);
-    for (u64 off = base_; off < size && !warm_stop_.load(std::memory_order_relaxed);) {
-        const ssize_t n = ::pread(fd, chunk.data(), chunk.size(), static_cast<off_t>(off));
-        if (n <= 0) break;
-        off += static_cast<u64>(n);
-        warmed_bytes_.fetch_add(static_cast<u64>(n), std::memory_order_relaxed);
+    for (const Part& p : parts_) {
+        if (p.start + p.size <= base_) continue;
+        const int fd = ::open(p.path.c_str(), O_RDONLY | O_CLOEXEC);
+        if (fd < 0) return;
+        posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL);
+        for (u64 off = base_ > p.start ? base_ - p.start : 0; off < p.size && !warm_stop_.load(std::memory_order_relaxed);) {
+            const ssize_t n = ::pread(fd, chunk.data(), chunk.size(), static_cast<off_t>(off));
+            if (n <= 0) break;
+            off += static_cast<u64>(n);
+            warmed_bytes_.fetch_add(static_cast<u64>(n), std::memory_order_relaxed);
+        }
+        ::close(fd);
     }
-    ::close(fd);
 #endif
 }
 

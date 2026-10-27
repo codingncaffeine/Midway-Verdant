@@ -112,6 +112,7 @@ public:
     // Puts a disc in the tray (before power-on: the kernel finds it at initialisation).
     void insert(std::unique_ptr<DvdImage> disc) { disc_ = std::move(disc); }
     bool has_disc() const { return disc_ != nullptr; }
+    const DvdImage* disc() const { return disc_.get(); }
     // The fast core (12c): a DMA read the host has not delivered by its completion time comes due again later instead
     // of holding the CPU thread, so frames and sound go on through a slow host read (a longer seek to the game). The
     // accurate core keeps waiting for it: its runs must repeat exactly.

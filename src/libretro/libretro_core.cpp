@@ -23,6 +23,7 @@
 
 #include "core/machine.h"
 #include "debug/trace.h"
+#include "ide/ata_disk.h"
 #include "ide/disk_image.h"
 #include "ide/dvd_image.h"
 #include "ide/hdd_format.h"
@@ -564,6 +565,12 @@ bool start_machine(const mv::MachineConfig& cfg) {
         cfg.mcpx_rom.parent_path().string().c_str());
     log(RETRO_LOG_INFO, "timeline: %s; one console frame per retro_run", machine->cpu()->clock_name().c_str());
     log(RETRO_LOG_INFO, "audio: %s", direct_audio ? "direct mix" : "console");
+    // The disc image as the drive reads it: its parts, and a split image missing its later parts (say so: a title then
+    // fails where its data runs past the end, one racing title waiting for ever on a loading screen).
+    if (const auto* drive = dynamic_cast<const mv::AtapiCdrom*>(machine->ide().primary().device(1)); drive && drive->disc()) {
+        if (drive->disc()->parts() > 1) log(RETRO_LOG_INFO, "disc image: %zu parts read as one", drive->disc()->parts());
+        if (!drive->disc()->note().empty()) log(RETRO_LOG_WARN, "disc image: %s", drive->disc()->note().c_str());
+    }
     if (hw_video && machine->renderer()) machine->renderer()->set_handoff(true);  // captures stay on the device (D38)
     frames_run = frames_capped = 0;
     frame_ms_sum = frame_ms_max = 0;
@@ -804,8 +811,22 @@ RETRO_API void retro_unload_game(void) {
         if (machine->nv2a().fifo_threaded()) log(RETRO_LOG_INFO, "gpu: the CPU side waited for the FIFO thread: %s", machine->nv2a().fifo_wait_report().c_str());
         log(RETRO_LOG_INFO, "gpu state: %s", machine->nv2a().state_report().c_str());
         log(RETRO_LOG_INFO, "gpu: what ended those runs' overlap (pusher time not hidden):%s", machine->nv2a().sync_reasons(8).c_str());
-        log(RETRO_LOG_INFO, "apu: %llu front-end memory fences written, %llu front-end traps raised", static_cast<unsigned long long>(machine->apu().fence_writes()),
-            static_cast<unsigned long long>(machine->apu().traps()));
+        log(RETRO_LOG_INFO, "apu: %llu front-end memory fences written, %llu front-end traps raised, %llu frames held by a trap", static_cast<unsigned long long>(machine->apu().fence_writes()),
+            static_cast<unsigned long long>(machine->apu().traps()), static_cast<unsigned long long>(machine->apu().held_frames()));
+        // The drives at the end: a command still in flight shows as BSY or DRQ set (a game waiting on a lost completion).
+        {
+            auto& ch = machine->ide().primary();
+            for (int d = 0; d < 2; ++d)
+                if (const mv::IdeDevice* dev = ch.device(d))
+                    log(RETRO_LOG_INFO, "ide %s: status %02x error %02x sector count %02x last command %02x%s", d == 0 ? "hdd" : "dvd", dev->tf().status, dev->tf().error,
+                        dev->tf().sector_count, ch.last_command(d), (dev->tf().status & (mv::ata::kStatusBsy | mv::ata::kStatusDrq)) ? " IN FLIGHT" : "");
+            log(RETRO_LOG_INFO, "ide bus master: command %02x status %02x%s; %llu commands", ch.bm_command(), ch.bm_status(), ch.dma_active() ? " DMA ACTIVE" : "",
+                static_cast<unsigned long long>(ch.commands()));
+            if (const auto* drive = dynamic_cast<const mv::AtapiCdrom*>(ch.device(1)); drive && drive->disc() && drive->disc()->past_end_reads())
+                log(RETRO_LOG_WARN, "disc image: %llu reads asked for sectors past its end (first at sector %llu of %llu): the image is incomplete",
+                    static_cast<unsigned long long>(drive->disc()->past_end_reads()), static_cast<unsigned long long>(drive->disc()->first_past_end_lba()),
+                    static_cast<unsigned long long>(drive->disc()->sectors()));
+        }
         // The renderer's share of the pusher: draws and their parts, submits and fence waits, copies back to RAM.
         if (const auto* r = machine->nv2a().renderer()) {
             const auto& st = r->stats();

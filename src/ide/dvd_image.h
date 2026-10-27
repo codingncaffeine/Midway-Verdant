@@ -18,6 +18,10 @@ namespace mv {
 // 0x18300000. Either is recognised by the XDVDFS volume descriptor ("MICROSOFT*XBOX*MEDIA") in sector 32 of the
 // partition. Read-only.
 //
+// A split image (cut under 4 GiB for FAT32 drives: NAME.1.iso, NAME.2.iso, ...) is read as one: opening NAME.1.iso takes
+// the parts that follow it in order. A first part with no second is still opened, with a note() saying the rest is
+// missing (one title's quick race then waited for ever on cars whose data lay past the end).
+//
 // The drive's reads run on a thread of the image's own (as the reference emulators of other consoles read their
 // discs): a read starts when the drive takes the command and is collected when its data phase begins, so the host's
 // seek overlaps the drive's modeled time instead of stalling the CPU's thread (a cold read from a spinning disk held
@@ -35,7 +39,14 @@ public:
     DvdImage& operator=(const DvdImage&) = delete;
 
     bool open(const std::filesystem::path& path, std::string& error);
-    bool is_open() const { return file_ != nullptr; }
+    bool is_open() const { return !parts_.empty(); }
+    // The files the image was read from, and a warning about it (empty when there is none).
+    std::size_t parts() const { return parts_.size(); }
+    const std::string& note() const { return note_; }
+    // Instrument: reads that asked for sectors past the image's end (an incomplete image), and the first such sector.
+    u64 past_end_reads() const { return past_end_reads_.load(std::memory_order_relaxed); }
+    u64 first_past_end_lba() const { return first_past_end_lba_.load(std::memory_order_relaxed); }
+    void note_past_end(u64 lba, u32 count) const;
     Kind kind() const { return kind_; }
     std::string_view kind_name() const { return kind_ == Kind::Xiso ? "XISO" : "full dump"; }
     // Sectors of the game partition.
@@ -57,11 +68,20 @@ private:
     bool read_at(u64 offset, u32 bytes, u8* out) const;
     bool has_volume_descriptor(u64 partition) const;
     void reader_main();
-    void warm_main(std::filesystem::path path, u64 size);
+    void warm_main();
 
     inline static std::atomic<u64> host_read_ns_{0};
-    std::FILE* file_{nullptr};
-    mutable std::mutex file_mutex_;  // one seek-and-read at a time on the stream
+    // The image's files in order, each with its byte offset in the whole image.
+    struct Part {
+        std::filesystem::path path;
+        std::FILE* file{nullptr};
+        u64 start{0}, size{0};
+    };
+    std::vector<Part> parts_;
+    u64 size_{0};  // all parts together
+    std::string note_;
+    mutable std::atomic<u64> past_end_reads_{0}, first_past_end_lba_{0};
+    mutable std::mutex file_mutex_;  // one seek-and-read at a time on the streams
     Kind kind_{Kind::Xiso};
     u64 base_{0};
     u64 sectors_{0};

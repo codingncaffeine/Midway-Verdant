@@ -319,6 +319,63 @@ TEST(DvdImage, RecognisesAnXisoAFullDumpAndRefusesOtherFiles) {
     std::filesystem::remove(plain);
 }
 
+TEST(DvdImage, ASplitImageIsReadAsOneDiscAndAFirstPartAloneSaysTheRestIsMissing) {
+    // NAME.1.iso + NAME.2.iso (cut for FAT32): the second part continues the first. Every sector carries its own
+    // number so a read across the cut can be checked byte for byte.
+    const auto dir = std::filesystem::temp_directory_path();
+    const auto one = dir / "mv-test-split.1.iso", two = dir / "mv-test-split.2.iso", lone = dir / "mv-test-lone.1.iso";
+    auto write_sectors = [](const std::filesystem::path& p, u32 first, u32 count, bool magic) {
+        std::FILE* f = std::fopen(p.string().c_str(), "wb");
+        ASSERT_NE(f, nullptr);
+        std::vector<u8> s(2048);
+        for (u32 i = 0; i < count; ++i) {
+            std::fill(s.begin(), s.end(), 0);
+            const u32 n = first + i;
+            std::memcpy(s.data() + 100, &n, 4);
+            if (magic && n == 32) std::memcpy(s.data(), "MICROSOFT*XBOX*MEDIA", 20);
+            std::fwrite(s.data(), 1, s.size(), f);
+        }
+        std::fclose(f);
+    };
+    write_sectors(one, 0, 40, true);
+    write_sectors(two, 40, 24, false);
+    write_sectors(lone, 0, 40, true);
+    {
+        std::string error;
+        DvdImage d;
+        ASSERT_TRUE(d.open(one, error)) << error;
+        EXPECT_EQ(d.parts(), 2u);
+        EXPECT_EQ(d.sectors(), 64u) << "both parts";
+        EXPECT_TRUE(d.note().empty());
+        std::vector<u8> buf(4 * 2048);
+        ASSERT_TRUE(d.read(38, 4, buf.data())) << "a read across the cut";
+        for (u32 i = 0; i < 4; ++i) {
+            u32 n = 0;
+            std::memcpy(&n, buf.data() + i * 2048 + 100, 4);
+            EXPECT_EQ(n, 38 + i) << "sector " << 38 + i;
+        }
+        d.begin_read(60, 4);  // the drive's threaded path, in the second part
+        std::vector<u8> out;
+        ASSERT_TRUE(d.end_read(out));
+        u32 last = 0;
+        std::memcpy(&last, out.data() + 3 * 2048 + 100, 4);
+        EXPECT_EQ(last, 63u);
+
+        DvdImage a;
+        ASSERT_TRUE(a.open(lone, error)) << error;
+        EXPECT_EQ(a.parts(), 1u);
+        EXPECT_EQ(a.sectors(), 40u);
+        EXPECT_NE(a.note().find("mv-test-lone.2.iso is not beside it"), std::string::npos) << a.note();
+        u8 sector[2048];
+        EXPECT_FALSE(a.read(40, 1, sector));
+        EXPECT_EQ(a.past_end_reads(), 1u);
+        EXPECT_EQ(a.first_past_end_lba(), 40u);
+    }
+    std::filesystem::remove(one);
+    std::filesystem::remove(two);
+    std::filesystem::remove(lone);
+}
+
 TEST(HddFormat, BlankDriveMatchesTheMeasuredRetailLayout) {
     // Where the data area starts, as measured on a working drive image (local-notes/hw/ide.md): 16-bit tables on
     // the cache partitions and C:, a 32-bit table on E:.
