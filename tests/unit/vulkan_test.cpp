@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <format>
 #include <memory>
@@ -20,6 +21,11 @@ using namespace mv;
 using namespace mv::pgraph;
 
 namespace {
+// setenv/unsetenv where MSVC has only _putenv_s (an empty value removes the variable there).
+#if defined(_WIN32)
+int setenv(const char* name, const char* value, int) { return _putenv_s(name, value); }
+int unsetenv(const char* name) { return _putenv_s(name, ""); }
+#endif
 
 u32 bits(float f) {
     u32 v;
