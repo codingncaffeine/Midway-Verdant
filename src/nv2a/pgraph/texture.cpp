@@ -354,11 +354,30 @@ bool decode_texture(const TextureStage& stage, u32 base, const MemoryView& memor
                 else if (format == 0x0E) decode_dxt3(src, w, h, img.data());
                 else decode_dxt5(src, w, h, img.data());
             } else {
+                // The swizzle interleaves each axis's bits independently, so a texel's offset is the OR of one table entry
+                // per axis (a per-texel bit loop made a 256x256 texture ~3 ms; Crimson Skies met 168 new ones in a frame).
+                std::vector<u32> sx(w), sy(h), sz(d);
+                for (u32 x = 0; x < w; ++x) sx[x] = swizzled_offset(x, 0, 0, lw, lh, ld);
+                for (u32 y = 0; y < h; ++y) sy[y] = swizzled_offset(0, y, 0, lw, lh, ld);
+                for (u32 z = 0; z < d; ++z) sz[z] = swizzled_offset(0, 0, z, lw, lh, ld);
+                const bool argb = format == 0x06 || format == 0x12, xrgb = format == 0x07 || format == 0x1E;
+                u8* dst = img.data();
                 for (u32 z = 0; z < d; ++z)
-                    for (u32 y = 0; y < h; ++y)
-                        for (u32 x = 0; x < w; ++x)
-                            decode_texel(format, src + swizzled_offset(x, y, z, lw, lh, ld) * f.bytes_per_pixel, palette, out.pixel,
-                                         &img[((static_cast<std::size_t>(z) * h + y) * w + x) * texel]);
+                    for (u32 y = 0; y < h; ++y) {
+                        const u32 row = sz[z] | sy[y];
+                        if (argb || xrgb) {
+                            // Bytes B G R A to R G B A, alpha forced for X8R8G8B8 (decode_texel's result, without its switch).
+                            for (u32 x = 0; x < w; ++x, dst += 4) {
+                                const u8* p = src + (row | sx[x]) * 4u;
+                                dst[0] = p[2];
+                                dst[1] = p[1];
+                                dst[2] = p[0];
+                                dst[3] = xrgb ? 255 : p[3];
+                            }
+                        } else {
+                            for (u32 x = 0; x < w; ++x, dst += texel) decode_texel(format, src + (row | sx[x]) * f.bytes_per_pixel, palette, out.pixel, dst);
+                        }
+                    }
             }
             out.images.push_back(std::move(img));
             offset += bytes;

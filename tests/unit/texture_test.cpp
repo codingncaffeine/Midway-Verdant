@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <cstring>
+#include <string>
 #include <vector>
 
 #include "nv2a/pgraph/texture.h"
@@ -65,6 +66,39 @@ TEST(Texture, DecodesASwizzledArgbImageWithMipLevels) {
     EXPECT_EQ(img[7 * 4 + 3], 0x80);
     EXPECT_EQ(d.image(0, 1)[0 * 4 + 0], 3) << "level 1 texel 0 red = byte 2";
     EXPECT_EQ(d.image(0, 1)[1 * 4 + 3], 8);
+}
+
+// The table-driven swizzle reads every texel where swizzled_offset says, in non-square images, volumes and the three
+// loops (A8R8G8B8, X8R8G8B8 and the generic one, here R5G6B5).
+TEST(Texture, SwizzledDecodesReadEachTexelAtItsInterleavedOffset) {
+    struct Shape { u32 lw, lh, ld; };
+    for (const Shape s : {Shape{5, 3, 0}, Shape{2, 6, 0}, Shape{3, 2, 2}})
+        for (const u32 format : {0x06u, 0x07u, 0x05u}) {
+            SCOPED_TRACE(std::to_string(format) + " " + std::to_string(s.lw) + "x" + std::to_string(s.lh) + "x" + std::to_string(s.ld));
+            const u32 bpp = format == 0x05 ? 2 : 4, w = 1u << s.lw, h = 1u << s.lh, d = 1u << s.ld;
+            std::vector<u8> ram(w * h * d * bpp + 64);
+            u32 seed = 12345;
+            for (auto& b : ram) b = static_cast<u8>((seed = seed * 1103515245u + 12345u) >> 16);
+            const TextureStage t = stage_of(fmt(format, s.lw, s.lh, 1, false, s.ld ? 3 : 2, s.ld));
+            DecodedTexture dec;
+            ASSERT_TRUE(decode_texture(t, 0, MemoryView{ram.data(), static_cast<u32>(ram.size())}, nullptr, dec)) << dec.error;
+            const auto& img = dec.image(0, 0);
+            for (u32 z = 0; z < d; ++z)
+                for (u32 y = 0; y < h; ++y)
+                    for (u32 x = 0; x < w; ++x) {
+                        const u8* p = &ram[swizzled_offset(x, y, z, s.lw, s.lh, s.ld) * bpp];
+                        const u8* q = &img[((static_cast<std::size_t>(z) * h + y) * w + x) * 4];
+                        u32 r = p[2], g = p[1], b = p[0], a = format == 0x07 ? 255u : p[3];
+                        if (format == 0x05) {
+                            const u32 v = p[0] | (p[1] << 8);
+                            r = ((v >> 11) << 3) | (v >> 13);
+                            g = (((v >> 5) & 63) << 2) | (((v >> 5) & 63) >> 4);
+                            b = ((v & 31) << 3) | ((v & 31) >> 2);
+                            a = 255;
+                        }
+                        ASSERT_EQ((u32{q[0]} << 24) | (u32{q[1]} << 16) | (u32{q[2]} << 8) | q[3], (r << 24) | (g << 16) | (b << 8) | a) << x << "," << y << "," << z;
+                    }
+        }
 }
 
 TEST(Texture, DecodesLinearFormatsWithPitchAndPalettes) {
