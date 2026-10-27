@@ -92,7 +92,7 @@ struct FrameSample {
     std::chrono::steady_clock::time_point at{};
     mv::u64 guest{0}, handlers{0}, events{0}, held{0}, pusher{0}, draw{0}, fetch{0}, texture{0}, upload{0}, flush{0}, write_back{0};
     mv::u64 setup_engine{0}, dsp_wait{0}, draws{0}, decodes{0}, write_backs{0}, waits{0}, flips{0}, io{0}, gpu_busy{0};
-    mv::u64 counted_out{0}, idle_spin{0}, warped{0}, halts{0}, exits{0}, mmio{0};
+    mv::u64 counted_out{0}, idle_spin{0}, warped{0}, halts{0}, exits{0}, mmio{0}, methods{0};
 };
 std::FILE* frame_log = nullptr;
 FrameSample frame_last;
@@ -678,7 +678,7 @@ RETRO_API bool retro_load_game(const retro_game_info* game) {
         }
         frame_log = std::fopen(path.string().c_str(), "w");
         frame_log_index = 0;
-        if (frame_log) std::fprintf(frame_log, "frame\tperiod\twait\tguest\thandlers\tevents\theld\tpusher\tdraw\tfetch\ttexture\tupload\tflush\twriteback\tsetup\tdspwait\tdraws\tdecodes\twritebacks\twaits\tflips\tio\tgpubusy\tcounted\tidlespin\twarp\thalts\texits\tmmio\n");
+        if (frame_log) std::fprintf(frame_log, "frame\tperiod\twait\tguest\thandlers\tevents\theld\tpusher\tdraw\tfetch\ttexture\tupload\tflush\twriteback\tsetup\tdspwait\tdraws\tdecodes\twritebacks\twaits\tflips\tio\tgpubusy\tcounted\tidlespin\twarp\thalts\texits\tmmio\tmethods\n");
     }
     if (const char* t = std::getenv("MV_TRACE"); t && *t) {
         mv::u32 mask = 0;
@@ -942,6 +942,7 @@ static FrameSample frame_sample() {
     s.gpu_busy = h.gpu_busy_guest_ns;
     s.counted_out = h.counted_out_ns, s.idle_spin = h.idle_spin_ns, s.warped = h.warped_cycles, s.halts = h.halts;
     s.exits = h.exits, s.mmio = h.mmio_exits;
+    s.methods = machine->nv2a().pushbuffer().methods_seen();
     s.pusher = machine->nv2a().pusher_wall_ns();
     if (const auto* r = machine->nv2a().renderer()) {
         const auto& st = r->stats();
@@ -959,14 +960,14 @@ static void frame_log_line(double wait_ms) {
     const FrameSample s = frame_sample();
     const auto ms = [](mv::u64 a, mv::u64 b) { return static_cast<double>(a - b) / 1e6; };
     const double period = frame_log_index ? std::chrono::duration<double, std::milli>(s.at - frame_last.at).count() : 0.0;
-    const std::string line = std::format("{}\t{:.2f}\t{:.2f}\t{:.2f}\t{:.2f}\t{:.2f}\t{:.2f}\t{:.2f}\t{:.2f}\t{:.2f}\t{:.2f}\t{:.2f}\t{:.2f}\t{:.2f}\t{:.2f}\t{:.2f}\t{}\t{}\t{}\t{}\t{}\t{:.2f}\t{:.2f}\t{:.2f}\t{:.2f}\t{:.2f}\t{}\t{}\t{}\n",
+    const std::string line = std::format("{}\t{:.2f}\t{:.2f}\t{:.2f}\t{:.2f}\t{:.2f}\t{:.2f}\t{:.2f}\t{:.2f}\t{:.2f}\t{:.2f}\t{:.2f}\t{:.2f}\t{:.2f}\t{:.2f}\t{:.2f}\t{}\t{}\t{}\t{}\t{}\t{:.2f}\t{:.2f}\t{:.2f}\t{:.2f}\t{:.2f}\t{}\t{}\t{}\t{}\n",
         frame_log_index, period, wait_ms, ms(s.guest, frame_last.guest), ms(s.handlers, frame_last.handlers), ms(s.events, frame_last.events),
         ms(s.held, frame_last.held), ms(s.pusher, frame_last.pusher), ms(s.draw, frame_last.draw), ms(s.fetch, frame_last.fetch),
         ms(s.texture, frame_last.texture), ms(s.upload, frame_last.upload), ms(s.flush, frame_last.flush), ms(s.write_back, frame_last.write_back),
         ms(s.setup_engine, frame_last.setup_engine), ms(s.dsp_wait, frame_last.dsp_wait), s.draws - frame_last.draws, s.decodes - frame_last.decodes,
         s.write_backs - frame_last.write_backs, s.waits - frame_last.waits, s.flips - frame_last.flips, ms(s.io, frame_last.io), ms(s.gpu_busy, frame_last.gpu_busy),
         ms(s.counted_out, frame_last.counted_out), ms(s.idle_spin, frame_last.idle_spin), static_cast<double>(s.warped - frame_last.warped) / 733333.333,
-        s.halts - frame_last.halts, s.exits - frame_last.exits, s.mmio - frame_last.mmio);
+        s.halts - frame_last.halts, s.exits - frame_last.exits, s.mmio - frame_last.mmio, s.methods - frame_last.methods);
     std::fputs(line.c_str(), frame_log);
     frame_last = s;
     ++frame_log_index;
