@@ -1092,6 +1092,71 @@ void draw_half_triangle(Kelvin& k) {
 
 }  // namespace
 
+// A target evicted by one overlapping it and made again takes a retired image of its shape, which still holds another
+// picture: it starts from what RAM holds, each pixel of the swizzled layout in its place (one title's bloom chain
+// evicts its targets every frame; their images are reused rather than made and freed).
+TEST(Vulkan, ATargetMadeAgainOnARetiredImageStartsFromWhatRamHolds) {
+    for (u32 scale : {1u, 2u}) {
+        SCOPED_TRACE(std::format("scale {}", scale));
+        ScaledFixture f;
+        std::string error;
+        if (!f.init(scale, error)) GTEST_SKIP() << "no Vulkan device: " << error;
+        Kelvin& k = f.k;
+        setup_target(k);
+        constexpr u32 kT = 0x40000;  // swizzled 16x16 A8R8G8B8: 1 KiB
+        auto bind = [&](u32 at) {
+            k.method(mthd::kSurfaceFormat, (4u << 24) | (4u << 16) | 0x200u | 0x8u);  // no depth
+            k.method(mthd::kSurfaceClipH, 16u << 16);
+            k.method(mthd::kSurfaceClipV, 16u << 16);
+            k.method(mthd::kSurfaceColorOffset, at);
+        };
+        auto clear_to = [&](u32 colour) {
+            k.method(mthd::kColorClear, colour);
+            k.method(mthd::kClearRectH, 15u << 16);
+            k.method(mthd::kClearRectV, 15u << 16);
+            k.method(mthd::kClearSurface, 0xF0);
+        };
+        bind(kT);
+        clear_to(0xFFFF0000u);
+        bind(kT + 512);  // over the second half: the first target is finished with, its images retired
+        clear_to(0xFF0000FFu);
+        f.renderer->write_back_all();
+        for (int i = 0; i < 4; ++i) {  // vblanks: the frames in flight that used them finish
+            f.renderer->write_back_at(0x10000);
+            f.renderer->end_frame();
+        }
+        // The CPU writes a picture with a value of its own in every pixel.
+        auto expected = [](u32 x, u32 y) { return 0xFF550000u | (y << 8) | x; };
+        for (u32 y = 0; y < 16; ++y)
+            for (u32 x = 0; x < 16; ++x) {
+                const u32 v = expected(x, y);
+                std::memcpy(&f.ram[kT + swizzled_offset(x, y, 0, 4, 4, 0) * 4], &v, 4);
+            }
+        f.renderer->invalidate(kT, 1024);
+        const u64 recycled = f.renderer->stats().images_recycled;
+        bind(kT);
+        k.method(mthd::kVertexDataArrayFormat + 12, 2u);
+        k.method(mthd::kDiffuse4ub, 0x00000000u);  // adds nothing: the target shows what it started from
+        k.method(mthd::kBlendEnable, 1);
+        k.method(mthd::kBlendSfactor, 1);  // ONE
+        k.method(mthd::kBlendDfactor, 1);  // ONE
+        k.method(mthd::kBlendEquation, 0x8006);
+        draw_full_triangle(k, f.ram);
+        f.renderer->write_back_all();
+        for (const auto& e : f.renderer->stats().errors) ADD_FAILURE() << "renderer: " << e;
+        EXPECT_GT(f.renderer->stats().images_recycled, recycled) << "the target took a retired image";
+        u32 wrong = 0;
+        for (u32 y = 0; y < 16; ++y)
+            for (u32 x = 0; x < 16; ++x) {
+                u32 v;
+                std::memcpy(&v, &f.ram[kT + swizzled_offset(x, y, 0, 4, 4, 0) * 4], 4);
+                if (v != expected(x, y) && wrong++ < 4) ADD_FAILURE() << std::format("pixel {},{}: {:08x}, RAM held {:08x}", x, y, v, expected(x, y));
+            }
+        EXPECT_EQ(wrong, 0u);
+        k.method(mthd::kBlendEnable, 0);
+    }
+}
+
 // What a scaled target leaves in RAM is what a 1x target would: clears in every format, a flat draw into a two-byte
 // format, and depth with its stencil.
 TEST(Vulkan, AScaledTargetReachesRamAsA1xTargetWould) {

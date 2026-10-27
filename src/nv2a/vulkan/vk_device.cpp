@@ -352,6 +352,8 @@ bool Device::create_image(VkFormat format, u32 width, u32 height, u32 depth, u32
     out.layers = layers;
     out.aspect = aspect;
     out.cube = cube;
+    out.usage = usage;
+    out.flags = ici.flags;
     return true;
 }
 

@@ -219,6 +219,7 @@ public:
         // Instrument: the CPU side of storing write-backs in RAM, by target: count and nanoseconds.
         std::map<std::string, std::pair<u64, u64>> store_cost;
         std::map<std::string, u64> relayouts;  // a target given up for one at its memory, by old -> new layout (relaid out or evicted)
+        u64 images_recycled{0}, images_made{0};  // target images from target_image: a spare reused, or a new one
         u64 surface_reloads{0};  // render targets reloaded from RAM after another engine wrote them  // textures whose pages were written but whose bytes hashed the same: kept
         // Write-backs by cause: frame end, a texture sampling the target, the scanout at vblank, a 2D or CPU range,
         // a target relaid out, the idle vblank (all).
@@ -373,6 +374,17 @@ private:
     void retire(vk::Image& image);
     void retire(VkImageView& view);
     void retire(VkFramebuffer& framebuffer);
+    // A target's 2D image (colour, depth, a stored-size copy): a retired one of the same shape when the GPU is done with
+    // it, else a new one. A title whose targets evict each other every frame (Fable's bloom chain) made and freed a
+    // dozen full-size images a frame, a tenth of the GPU thread at 6x. Its contents are undefined either way.
+    bool target_image(VkFormat format, u32 width, u32 height, VkImageUsageFlags usage, VkImageAspectFlags aspect, vk::Image& out, std::string& error);
+    // Retired target images whose frame has finished, for target_image; destroyed when unused for a while.
+    struct SpareImage {
+        vk::Image image;
+        u64 since{0};  // vblank_index_ when it became spare
+    };
+    std::vector<SpareImage> spare_images_;
+    void keep_or_destroy(vk::Image& image);
     void end_pass();
     Surface* target_for(const KelvinState& s);
     // B8 (R8) and G8B8 (R8G8) targets keep blue in the image's first channel: outputs, masks, clears and blend constants

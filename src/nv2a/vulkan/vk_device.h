@@ -30,6 +30,8 @@ struct Image {
     u32 width{0}, height{0}, depth{1}, levels{1}, layers{1};
     VkImageAspectFlags aspect{VK_IMAGE_ASPECT_COLOR_BIT};
     bool cube{false};
+    VkImageUsageFlags usage{0};
+    VkImageCreateFlags flags{0};
     // Placed in one of the device's shared texture blocks (create_image with pooled): which, where and how much;
     // memory is then the block's and is not freed with the image.
     u32 block{~0u};

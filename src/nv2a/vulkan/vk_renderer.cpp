@@ -241,6 +241,7 @@ VulkanRenderer::~VulkanRenderer() {
         for (VkImageView v : fr.dead_views) f.vkDestroyImageView(dev_.device(), v, nullptr);
         for (VkFramebuffer b : fr.dead_framebuffers) f.vkDestroyFramebuffer(dev_.device(), b, nullptr);
     }
+    for (SpareImage& sp : spare_images_) dev_.destroy_image(sp.image);
     for (auto& [k, s] : surfaces_) {
         destroy_surface_views(*s);
         if (s->framebuffer) f.vkDestroyFramebuffer(dev_.device(), s->framebuffer, nullptr);
@@ -419,7 +420,7 @@ void VulkanRenderer::begin_frame(u32 slot) {
         completed_ = fr.serial;
         ++stats_.waits;
     }
-    for (vk::Image& i : fr.dead_images) dev_.destroy_image(i);
+    for (vk::Image& i : fr.dead_images) keep_or_destroy(i);
     for (VkImageView v : fr.dead_views) f.vkDestroyImageView(dev_.device(), v, nullptr);
     for (VkFramebuffer b : fr.dead_framebuffers) f.vkDestroyFramebuffer(dev_.device(), b, nullptr);
     fr.dead_images.clear();
@@ -535,6 +536,41 @@ VulkanRenderer::DrawCounts VulkanRenderer::draw_counts(u64 ticket) {
 void VulkanRenderer::retire(vk::Image& image) {
     if (image.image) frames_[slot_].dead_images.push_back(image);
     image = vk::Image{};
+}
+
+bool VulkanRenderer::target_image(VkFormat format, u32 width, u32 height, VkImageUsageFlags usage, VkImageAspectFlags aspect, vk::Image& out, std::string& error) {
+    for (std::size_t i = spare_images_.size(); i-- > 0;) {  // the newest first
+        const vk::Image& c = spare_images_[i].image;
+        if (c.format != format || c.width != width || c.height != height || c.usage != usage || c.aspect != aspect) continue;
+        out = c;
+        spare_images_.erase(spare_images_.begin() + static_cast<std::ptrdiff_t>(i));
+        ++stats_.images_recycled;
+        return true;
+    }
+    ++stats_.images_made;
+    return dev_.create_image(format, width, height, 1, 1, 1, usage, aspect, false, out, error);
+}
+
+// A retired image whose frame has finished: kept for target_image when it is one of its shape (2D, one level and
+// layer, memory of its own), else destroyed. Spares unused for two seconds, or beyond the budget, are destroyed.
+void VulkanRenderer::keep_or_destroy(vk::Image& image) {
+    constexpr u64 kSpareVblanks = 120;
+    constexpr VkDeviceSize kSpareBudget = VkDeviceSize{1} << 30;
+    const bool target_shaped = image.memory && image.block == ~0u && image.depth == 1 && image.levels == 1 && image.layers == 1 && !image.cube && image.flags == 0 &&
+                               (image.usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT));
+    if (target_shaped) spare_images_.push_back({image, vblank_index_});
+    else dev_.destroy_image(image);
+    image = vk::Image{};
+    VkDeviceSize bytes = 0;
+    for (const SpareImage& sp : spare_images_) bytes += static_cast<VkDeviceSize>(sp.image.width) * sp.image.height * 4;
+    // Oldest first: over the budget, or unused too long.
+    std::size_t drop = 0;
+    while (drop < spare_images_.size() && (bytes > kSpareBudget || spare_images_[drop].since + kSpareVblanks < vblank_index_)) {
+        bytes -= static_cast<VkDeviceSize>(spare_images_[drop].image.width) * spare_images_[drop].image.height * 4;
+        dev_.destroy_image(spare_images_[drop].image);
+        ++drop;
+    }
+    spare_images_.erase(spare_images_.begin(), spare_images_.begin() + static_cast<std::ptrdiff_t>(drop));
 }
 
 void VulkanRenderer::retire(VkImageView& view) {
@@ -774,11 +810,11 @@ VulkanRenderer::Surface* VulkanRenderer::target_for(const KelvinState& s) {
     if (!noscale.empty() && ((t.swizzled && noscale.find("swizzled") != std::string::npos) || ((t.aa_x > 1 || t.aa_y > 1) && noscale.find("aa") != std::string::npos) ||
                              (t.color_bytes() == 2 && noscale.find("16bit") != std::string::npos)))
         t.sc = 1;
-    if (!dev_.create_image(cf, t.iw(), t.ih(), 1, 1, 1, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
-                           VK_IMAGE_ASPECT_COLOR_BIT, false, t.color, error) ||
-        !dev_.create_image(df, t.iw(), t.ih(), 1, 1, 1, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+    if (!target_image(cf, t.iw(), t.ih(), VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                           VK_IMAGE_ASPECT_COLOR_BIT, t.color, error) ||
+        !target_image(df, t.iw(), t.ih(), VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
                                ((t.zeta_format == 1 ? depth16_sampled_ : depth24_sampled_) ? static_cast<u32>(VK_IMAGE_USAGE_SAMPLED_BIT) : 0u),
-                           VK_IMAGE_ASPECT_DEPTH_BIT | (t.zeta_format == 1 ? 0u : static_cast<u32>(VK_IMAGE_ASPECT_STENCIL_BIT)), false, t.depth, error)) {
+                           VK_IMAGE_ASPECT_DEPTH_BIT | (t.zeta_format == 1 ? 0u : static_cast<u32>(VK_IMAGE_ASPECT_STENCIL_BIT)), t.depth, error)) {
         note("surface images: " + error);
         dev_.destroy_image(t.color);
         return nullptr;
@@ -834,11 +870,24 @@ void VulkanRenderer::upload_color_from_ram(Surface& t) {
     ++t.draw_serial;
     const u32 bpp = t.color_bytes();
     std::vector<u8> pixels(static_cast<std::size_t>(t.width) * t.height * bpp, 0), keep;
-    const u8* src = t.phys < ram_size_ ? ram_view(t.phys, std::min<u64>(t.bytes(), ram_size_ - t.phys), keep) : nullptr;
-    for (u32 y = 0; src && y < t.height; ++y) {
-        for (u32 x = 0; x < t.width; ++x) {
-            const u32 off = t.swizzled ? swizzled_offset(x, y, 0, t.log_w, t.log_h, 0) * bpp : y * t.pitch + x * bpp;
-            if (static_cast<u64>(t.phys) + off + bpp <= ram_size_) std::memcpy(&pixels[(static_cast<std::size_t>(y) * t.width + x) * bpp], src + off, bpp);
+    const u64 avail = t.phys < ram_size_ ? std::min<u64>(t.bytes(), ram_size_ - t.phys) : 0;
+    const u8* src = avail ? ram_view(t.phys, avail, keep) : nullptr;
+    if (src && t.swizzled) {
+        // The swizzle interleaves each axis's bits on its own, so a pixel's offset is the OR of one entry per axis (a
+        // Morton offset per pixel was most of a reload: Fable reloads its bloom chain's targets every frame).
+        std::vector<u32> sx(t.width), sy(t.height);
+        for (u32 x = 0; x < t.width; ++x) sx[x] = swizzled_offset(x, 0, 0, t.log_w, t.log_h, 0) * bpp;
+        for (u32 y = 0; y < t.height; ++y) sy[y] = swizzled_offset(0, y, 0, t.log_w, t.log_h, 0) * bpp;
+        u8* d = pixels.data();
+        for (u32 y = 0; y < t.height; ++y)
+            for (u32 x = 0; x < t.width; ++x, d += bpp)
+                if (const u32 off = sy[y] | sx[x]; off + bpp <= avail) std::memcpy(d, src + off, bpp);
+    } else if (src) {
+        const std::size_t row = static_cast<std::size_t>(t.width) * bpp;
+        for (u32 y = 0; y < t.height; ++y) {
+            const u64 off = static_cast<u64>(y) * t.pitch;
+            if (off >= avail) break;
+            std::memcpy(&pixels[y * row], src + off, std::min<u64>(row, avail - off) / bpp * bpp);
         }
     }
     VkDeviceSize offset = 0;
@@ -1126,9 +1175,9 @@ bool VulkanRenderer::park_for(Surface& t, u32 z) {
 bool VulkanRenderer::spare_depth(Surface& t, Surface::ParkedDepth& p) {
     std::string error;
     const VkFormat df = t.zeta_format == 1 ? VK_FORMAT_D16_UNORM : depth24_;
-    if (!dev_.create_image(df, t.iw(), t.ih(), 1, 1, 1, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+    if (!target_image(df, t.iw(), t.ih(), VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
                                ((t.zeta_format == 1 ? depth16_sampled_ : depth24_sampled_) ? static_cast<u32>(VK_IMAGE_USAGE_SAMPLED_BIT) : 0u),
-                           VK_IMAGE_ASPECT_DEPTH_BIT | (t.zeta_format == 1 ? 0u : static_cast<u32>(VK_IMAGE_ASPECT_STENCIL_BIT)), false, p.depth, error)) {
+                           VK_IMAGE_ASPECT_DEPTH_BIT | (t.zeta_format == 1 ? 0u : static_cast<u32>(VK_IMAGE_ASPECT_STENCIL_BIT)), p.depth, error)) {
         note("parked depth image: " + error);
         return false;
     }
@@ -4362,7 +4411,7 @@ u32 VulkanRenderer::scale_for(VkFormat color, u32 width, u32 height) const {
 bool VulkanRenderer::ensure_lo(Surface& s) {
     if (s.lo.image) return true;
     std::string error;
-    if (!dev_.create_image(s.color.format, s.width, s.height, 1, 1, 1, VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_IMAGE_ASPECT_COLOR_BIT, false, s.lo,
+    if (!target_image(s.color.format, s.width, s.height, VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_IMAGE_ASPECT_COLOR_BIT, s.lo,
                            error)) {
         note("stored-size copy of a scaled target: " + error);
         return false;
@@ -4402,7 +4451,7 @@ bool VulkanRenderer::ensure_zeta_lo(Surface& s) {
     if (!dev_.format_supports(d.format, VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT)) return false;
     retire(s.zeta_lo);
     std::string error;
-    if (!dev_.create_image(d.format, s.width, s.height, 1, 1, 1, VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, d.aspect, false, s.zeta_lo, error)) {
+    if (!target_image(d.format, s.width, s.height, VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, d.aspect, s.zeta_lo, error)) {
         note("stored-size copy of a scaled depth buffer: " + error);
         return false;
     }

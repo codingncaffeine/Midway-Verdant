@@ -847,6 +847,7 @@ RETRO_API void retro_unload_game(void) {
             log(RETRO_LOG_INFO, "gpu: waits for a frame slot %.3f s, for everything submitted %.3f s", static_cast<double>(st.ns_wait_slot) / 1e9, static_cast<double>(st.ns_wait_finish) / 1e9);
             if (st.cpu_written_depth) log(RETRO_LOG_INFO, "gpu: of the targets the CPU wrote, %llu were depth buffers let go", static_cast<unsigned long long>(st.cpu_written_depth));
             if (st.surface_reloads) log(RETRO_LOG_INFO, "gpu: %llu render targets reloaded from RAM after a 2D write", static_cast<unsigned long long>(st.surface_reloads));
+            log(RETRO_LOG_INFO, "gpu: target images: %llu reused from retired ones, %llu made", static_cast<unsigned long long>(st.images_recycled), static_cast<unsigned long long>(st.images_made));
             if (st.cube_assemblies) log(RETRO_LOG_INFO, "gpu: %llu cube maps put together on the GPU from their face targets", static_cast<unsigned long long>(st.cube_assemblies));
             if (st.depth_unparks || st.parked_samples || st.depth_loads_skipped || st.depth_borrows)
                 log(RETRO_LOG_INFO, "gpu: depth buffers: %llu parked images bound again, %llu sampled in place, %llu loads skipped for a whole clear, %llu drawn with a bigger target's image",
