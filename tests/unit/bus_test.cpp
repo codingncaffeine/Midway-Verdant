@@ -4,7 +4,9 @@
 #include <vector>
 
 #include "core/bus.h"
+#if defined(__linux__)
 #include "cpu/kvm/coalesced_ring.h"
+#endif
 #include "flash/flash.h"
 #include "pci/pci.h"
 
@@ -165,6 +167,7 @@ TEST(Bus, CoalescingZonesReachTheBackendsHook) {
     EXPECT_EQ(seen[2], std::make_tuple(PhysAddr{0xFD820000u}, 0x1000u, true));
 }
 
+#if defined(__linux__)  // the ring is KVM's
 // The coalesced MMIO ring is taken in the guest's order from `first` to `last`, across the end of the ring, and every
 // slot is handed back.
 TEST(Bus, TheCoalescedRingIsTakenInOrderAcrossItsEnd) {
@@ -195,3 +198,4 @@ TEST(Bus, TheCoalescedRingIsTakenInOrderAcrossItsEnd) {
     EXPECT_EQ(ring->first, 3u);
     EXPECT_EQ(kvm::drain_coalesced(ring, slots, [](u64, u32, const u8*) { ADD_FAILURE() << "an empty ring gave a write"; }), 0u);
 }
+#endif

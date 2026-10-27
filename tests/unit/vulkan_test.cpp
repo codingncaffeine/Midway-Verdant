@@ -1395,8 +1395,8 @@ TEST(Vulkan, ADxtTextureSampledAsBlocksMatchesTheDecoder) {
     };
     const std::array<std::array<u8, 8>, 4> blocks{block(0xF800, 0x001F, 0), block(0xF800, 0x001F, 2), block(0xF800, 0x001F, 3), block(0x001F, 0xF800, 3)};
     std::vector<u8> expect_rgba(8 * 8 * 4);
-    std::vector<u8> raw;
-    for (const auto& b : blocks) raw.insert(raw.end(), b.begin(), b.end());
+    std::vector<u8> raw(blocks.size() * 8);  // filled by copies (GCC 14 misreads a growing insert as an overflow)
+    for (std::size_t i = 0; i < blocks.size(); ++i) std::memcpy(raw.data() + i * 8, blocks[i].data(), 8);
     pgraph::decode_dxt1(raw.data(), 8, 8, expect_rgba.data());
     for (const bool native : {true, false}) {
         SCOPED_TRACE(native ? "as blocks" : "decoded on the CPU");
