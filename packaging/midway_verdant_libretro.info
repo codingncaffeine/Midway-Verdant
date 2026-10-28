@@ -8,7 +8,7 @@ corename = "Midway Verdant"
 categories = "Emulator"
 license = "GPLv3"
 permissions = ""
-display_version = "0.0.1"
+display_version = "0.0.2"
 
 # Hardware Information
 manufacturer = "Microsoft"

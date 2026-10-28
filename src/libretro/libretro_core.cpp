@@ -100,7 +100,13 @@ std::FILE* frame_log = nullptr;
 FrameSample frame_last;
 unsigned long long frame_log_index = 0;
 
-[[gnu::format(printf, 2, 3)]] void log(retro_log_level level, const char* fmt, ...) {
+// printf-style arguments checked by GCC and Clang; MSVC does not know the attribute (and warns as an error).
+#if defined(__GNUC__) || defined(__clang__)
+#define MV_PRINTF_FORMAT(fmt, args) [[gnu::format(printf, fmt, args)]]
+#else
+#define MV_PRINTF_FORMAT(fmt, args)
+#endif
+MV_PRINTF_FORMAT(2, 3) void log(retro_log_level level, const char* fmt, ...) {
     char buf[1024];
     va_list ap;
     va_start(ap, fmt);
