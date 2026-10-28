@@ -37,6 +37,27 @@ jobs:
       - name: Scan controls
         run: tests/tools/scan-controls.sh
 
+  # musl (Alpine): a C library that declares things differently from glibc (ioctl's request, sigevent's thread id),
+  # with the distribution's own GCC, glslang and SDL3. A user's build broke here before this job existed.
+  alpine:
+    name: Linux (Alpine, musl)
+    runs-on: ubuntu-24.04
+    container: alpine:latest
+    timeout-minutes: 30
+    env:
+      SDL_VIDEODRIVER: dummy
+      SDL_AUDIODRIVER: dummy
+    steps:
+      - name: Toolchain
+        run: apk add -q build-base cmake samurai git linux-headers glslang-dev sdl3-dev bash
+      - uses: actions/checkout@v7
+      - name: Configure
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DMV_WERROR=ON
+      - name: Build
+        run: cmake --build build
+      - name: Tests
+        run: tools/ci-test.sh build
+
   # Informational: Linux is the platform that counts and the work is the emulator core, so a Windows failure is
   # reported but does not fail the run (tools/push.sh lands a batch on main when Linux is green).
   windows:

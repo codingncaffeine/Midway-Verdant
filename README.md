@@ -108,6 +108,19 @@ Windows: a build with a hypervisor backend (Windows Hypervisor Platform) is in p
 
 Linux first: a C++23 compiler (GCC 14+ or Clang 18+), CMake 3.28+, Ninja, SDL3 (from the system or fetched), a Vulkan 1.1 driver, glslang (fetched when the system has none). KVM (`/dev/kvm`) runs the fast mode. Windows builds with MSVC as a secondary platform; it has no hypervisor backend yet, so only the interpreter runs there.
 
+The packages, per distribution (each line is what `tools/build-on-distros.sh` installs before building there):
+
+| Distribution | Install |
+|---|---|
+| Arch, Manjaro, EndeavourOS, CachyOS | `sudo pacman -S --needed base-devel cmake ninja git sdl3 glslang` |
+| Fedora | `sudo dnf install gcc-c++ cmake ninja-build git SDL3-devel glslang-devel` |
+| openSUSE Tumbleweed | `sudo zypper install gcc-c++ cmake ninja git SDL3-devel glslang-devel` |
+| Debian 13 | `sudo apt install build-essential cmake ninja-build git pkg-config libsdl3-dev glslang-dev glslang-tools` (Debian's glslang-dev needs glslang-tools beside it) |
+| Ubuntu 24.04, Mint 22, Pop!_OS 24.04 | `sudo apt install g++-14 cmake ninja-build git pkg-config`, then build with `CC=gcc-14 CXX=g++-14` and `-DMV_BUILD_SHELL=OFF` (GCC 13 is too old, and SDL3 is not packaged; the core needs neither) |
+| Alpine | `doas apk add build-base cmake samurai git linux-headers glslang-dev sdl3-dev` |
+
+Clang 18 or newer builds it too (`CC=clang CXX=clang++`). `-DMV_BUILD_SHELL=OFF` leaves out the SDL3 window on any distribution: the libretro core needs none of it.
+
 ```
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build
