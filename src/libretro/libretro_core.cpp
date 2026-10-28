@@ -570,8 +570,8 @@ bool start_machine(const mv::MachineConfig& cfg) {
                 rumble.set_rumble_state(p, RETRO_RUMBLE_WEAK, right);
             });
     }
-    log(RETRO_LOG_INFO, "booting %s with %u pad(s); files from %s", cfg.dvd_image ? cfg.dvd_image->string().c_str() : "no disc", pads_plugged,
-        cfg.mcpx_rom.parent_path().string().c_str());
+    log(RETRO_LOG_INFO, "Midway Verdant %s booting %s with %u pad(s); files from %s", MV_VERSION_STRING,  // which build ran
+        cfg.dvd_image ? cfg.dvd_image->string().c_str() : "no disc", pads_plugged, cfg.mcpx_rom.parent_path().string().c_str());
     log(RETRO_LOG_INFO, "timeline: %s; one console frame per retro_run", machine->cpu()->clock_name().c_str());
     log(RETRO_LOG_INFO, "audio: %s", direct_audio ? "direct mix" : "console");
     if (const auto* d = machine->gpu_device()) log(RETRO_LOG_INFO, "gpu: %s", d->name().c_str());  // which device draws (a software one is slow)

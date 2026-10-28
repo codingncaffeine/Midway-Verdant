@@ -22,6 +22,15 @@ It ships as a libretro core, `midway_verdant_libretro`, for libretro frontends; 
 
 Not yet: save states, memory units and the headset, network traffic, and Windows and macOS builds of the core. Compatibility is partial; the wiki's status page says what is open.
 
+## Reporting a problem
+
+Open an issue with what you saw (a crash, a freeze, a wrong picture or sound), the game, and the log:
+
+- **RetroArch:** start it from a terminal with `retroarch --verbose --log-file ~/retroarch-midway.log`, play until the problem happens, close RetroArch and attach `~/retroarch-midway.log`. Or *Settings → Logging*: *Logging Verbosity* and *Log to File* on, *Core Logging Level* to *Debug*; the file is in RetroArch's `logs` folder.
+- **Emutastic for Linux:** attach `emulator-host.log` from Emutastic's `Logs` folder.
+
+The core writes what it found at start-up (the firmware, the GPU it draws with), every error, and a report of the GPU and the guest clock when the game closes.
+
 ## Core options
 
 | Option | Values |
@@ -108,18 +117,18 @@ Windows: a build with a hypervisor backend (Windows Hypervisor Platform) is in p
 
 ## Building
 
-Linux first: a C++23 compiler (GCC 14+ or Clang 18+), CMake 3.28+, Ninja, SDL3 (from the system or fetched), a Vulkan 1.1 driver, glslang (fetched when the system has none). KVM (`/dev/kvm`) runs the fast mode. Windows builds with MSVC as a secondary platform; it has no hypervisor backend yet, so only the interpreter runs there.
+Linux first: a C++23 compiler (GCC 14+ or Clang 18+), CMake 3.28+, Ninja, git, SDL3 (from the system or fetched), a Vulkan 1.1 driver. glslang, the shader compiler, is not a package to install: the first configure fetches a pinned copy (so it needs the network) and builds it into the core, where a frontend carrying its own glslang cannot reach it. KVM (`/dev/kvm`) runs the fast mode. Windows builds with MSVC as a secondary platform; it has no hypervisor backend yet, so only the interpreter runs there.
 
 The packages, per distribution (each line is what `tools/build-on-distros.sh` installs before building there):
 
 | Distribution | Install |
 |---|---|
-| Arch, Manjaro, EndeavourOS, CachyOS | `sudo pacman -S --needed base-devel cmake ninja git sdl3 glslang` |
-| Fedora | `sudo dnf install gcc-c++ cmake ninja-build git SDL3-devel glslang-devel` |
-| openSUSE Tumbleweed | `sudo zypper install gcc-c++ cmake ninja git SDL3-devel glslang-devel` |
-| Debian 13 | `sudo apt install build-essential cmake ninja-build git pkg-config libsdl3-dev glslang-dev glslang-tools` (Debian's glslang-dev needs glslang-tools beside it) |
+| Arch, Manjaro, EndeavourOS, CachyOS | `sudo pacman -S --needed base-devel cmake ninja git sdl3` |
+| Fedora | `sudo dnf install gcc-c++ cmake ninja-build git SDL3-devel` |
+| openSUSE Tumbleweed | `sudo zypper install gcc-c++ cmake ninja git SDL3-devel` |
+| Debian 13 | `sudo apt install build-essential cmake ninja-build git pkg-config libsdl3-dev` |
 | Ubuntu 24.04, Mint 22, Pop!_OS 24.04 | `sudo apt install g++-14 cmake ninja-build git pkg-config`, then build with `CC=gcc-14 CXX=g++-14` and `-DMV_BUILD_SHELL=OFF` (GCC 13 is too old, and SDL3 is not packaged; the core needs neither) |
-| Alpine | `doas apk add build-base cmake samurai git linux-headers glslang-dev sdl3-dev` |
+| Alpine | `doas apk add build-base cmake samurai git linux-headers sdl3-dev` |
 
 Clang 18 or newer builds it too (`CC=clang CXX=clang++`). `-DMV_BUILD_SHELL=OFF` leaves out the SDL3 window on any distribution: the libretro core needs none of it.
 
@@ -137,7 +146,7 @@ build/src/midway-verdant --mcpx mcpx.bin --bios flash.bin --hdd disk.img --dvd g
 
 `--help` lists every option. `--create-hdd FILE` writes a blank retail-layout drive. The build also produces `midway_verdant_libretro` for libretro frontends.
 
-A release core is built with `tools/build-linux-core.sh` (podman or docker): in the manylinux_2_28 container (glibc 2.28, GCC 14) with `-DMV_PORTABLE=ON`, which builds glslang and the C++ runtime into the core and exports nothing but the libretro API. `tools/test-linux-distros.sh` then boots it in containers of other distributions.
+A release core is built with `tools/build-linux-core.sh` (podman or docker): in the manylinux_2_28 container (glibc 2.28, GCC 14) with `-DMV_PORTABLE=ON`, which builds the C++ runtime into the core as well (every build has its own glslang inside and exports nothing but the libretro API). `tools/test-linux-distros.sh` then boots it in containers of other distributions.
 
 ## License
 
