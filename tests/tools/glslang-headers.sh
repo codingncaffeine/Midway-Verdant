@@ -9,11 +9,19 @@ tree=$(cd "${2:?glslang source dir}" && pwd -P)/ || exit 1
 entry() { awk -v key="\"$1\":" '$1 == key {v = $0} /"file":.*glsl_compiler\.cpp"/ {print v; exit}' "$db"; }
 unquote() { sed -e 's/^ *"[a-z]*": "//' -e 's/",\{0,1\} *$//' -e 's/\\"/"/g' -e 's/\\\\/\\/g'; }
 dir=$(entry directory | unquote)
-cmd=$(entry command | unquote | sed -e 's/ -MD//' -e 's/ -MT [^ ]*//' -e 's/ -MF [^ ]*//' -e 's/ -o [^ ]*//' -e 's/ -c / /')
+# Without its output and dependency files (a module scan's -fdeps-* asks for -M, which preprocessing must not have).
+cmd=$(entry command | unquote | sed -e 's/ -MD//' -e 's/ -MT [^ ]*//' -e 's/ -MF [^ ]*//' -e 's/ -o [^ ]*//' -e 's/ -c / /' \
+    -e 's/ -fmodules-ts//' -e 's/ -fmodule-mapper=[^ ]*//' -e 's/ -fdeps-[a-z]*=[^ ]*//g')
 [ -n "$cmd" ] || { echo "FAIL: no compile command for glsl_compiler.cpp in $db"; exit 1; }
+err=$(mktemp) || exit 1
+(cd "$dir" && eval "$cmd -E -H -o /dev/null") 2> "$err"
+rc=$?
+if [ "$rc" -ne 0 ]; then
+    echo "FAIL: preprocessing glsl_compiler.cpp failed (exit $rc):"; grep -v '^\.' "$err" | head -5; rm -f "$err"; exit 1
+fi
 # Real paths (no "..", no symlinks), as the tree's is.
-opened=$(cd "$dir" && eval "$cmd -E -H -o /dev/null" 2>&1 >/dev/null | sed -n 's/^\.\.* //p' | grep -E '/(glslang|SPIRV)/' |
-    while IFS= read -r f; do realpath "$f"; done)
+opened=$(sed -n 's/^\.\.* //p' "$err" | grep -E '/(glslang|SPIRV)/' | while IFS= read -r f; do realpath "$f"; done)
+rm -f "$err"
 inside=$(printf '%s\n' "$opened" | awk -v t="$tree" 'index($0, t) == 1')
 outside=$(printf '%s\n' "$opened" | awk -v t="$tree" 'NF && index($0, t) != 1')
 echo "glslang headers from $tree: $(printf '%s' "$inside" | grep -c .), from elsewhere: $(printf '%s' "$outside" | grep -c .)"

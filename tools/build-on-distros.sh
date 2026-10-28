@@ -62,14 +62,20 @@ build_one() {
         cmake -S /src -B /out/build -G Ninja -DCMAKE_BUILD_TYPE=Release ${cmakeargs[$d]:-} || exit 4
         cmake --build /out/build -j $jobs_each || exit 5
         timeout 600 /out/build/tests/mv_tests --gtest_brief=1 2>&1 | tail -3
+        ctest --test-dir /out/build -R '^(core_symbols|glslang_headers)\$' --output-on-failure 2>&1 | grep -E 'tests (passed|failed)|glslang|FAIL'
         $bootcmd" > "$out/log" 2>&1
     local rc=$? what
     case $rc in 0) what=ok ;; 3) what="packages did not install" ;; 4) what="configure FAILED" ;; 5) what="build FAILED" ;; *) what="exit $rc" ;; esac
-    grep -qE 'FAILED TESTS?' "$out/log" && what="TESTS FAILED"
-    local os cxx tests first shown gpu bootres
+    grep -qE 'FAILED TESTS?|tests passed, [1-9][0-9]* tests failed' "$out/log" && what="TESTS FAILED"
+    local os cxx unit checks tests first shown gpu bootres
     os=$(grep -m1 PRETTY_NAME "$out/log" | cut -d'"' -f2)
     cxx=$(grep -m1 -E '^(g\+\+|c\+\+|clang|.*(GCC|clang version))' "$out/log" | cut -c1-40)
-    tests=$(grep -m1 -oE '\[  PASSED  \] [0-9]+ tests|[0-9]+ FAILED TESTS?' "$out/log")
+    # The unit tests, then the core's own checks (its glslang built in and hidden: core_symbols, glslang_headers).
+    unit=$(grep -m1 -oE '\[  PASSED  \] [0-9]+ tests|[0-9]+ FAILED TESTS?' "$out/log")
+    # ctest says "50% tests passed, 1 tests failed out of 2", or "100% tests passed out of 2" (newer CMake, none failed).
+    checks=$(grep -m1 -oE 'tests passed(, [0-9]+ tests failed)? out of [0-9]+' "$out/log" |
+        awk '{f = 0; for (i = 1; i <= NF; i++) if ($i == "failed") f = $(i - 2); print $NF - f " of " $NF}')
+    tests="${unit:-no tests run}, core checks ${checks:-not run}"
     first=$(grep -m1 -E '\.(c|cc|cpp|h|hpp):[0-9]+:[0-9]+: (fatal )?error:|CMake Error' "$out/log" | sed 's|^/src/||' | cut -c1-150)  # the compiler's or CMake's, not a package manager's
     shown=$(grep -m1 -oE '[0-9]+ displayed' "$out/log" | cut -d' ' -f1)
     gpu=$(grep -m1 -oE '\] gpu: .*' "$out/log" | cut -c8- | cut -c1-24)
