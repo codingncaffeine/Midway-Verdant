@@ -7,6 +7,8 @@
 #include <fcntl.h>
 #include <linux/kvm.h>
 #include <sys/ioctl.h>
+
+#include "cpu/kvm/kvm_ioctl.h"
 #include <sys/mman.h>
 #include <unistd.h>
 
@@ -91,7 +93,7 @@ struct Oracle::Impl {
         region.guest_phys_addr = guest_phys;
         region.memory_size = size;
         region.userspace_addr = reinterpret_cast<u64>(host);
-        if (ioctl(vm_fd, KVM_SET_USER_MEMORY_REGION, &region) < 0) {
+        if (kvm_ioctl(vm_fd, KVM_SET_USER_MEMORY_REGION, &region) < 0) {
             err = std::format("oracle: KVM_SET_USER_MEMORY_REGION slot {} failed: {}", slot, std::strerror(errno));
             return false;
         }
@@ -103,7 +105,7 @@ struct Oracle::Impl {
         region.slot = kSlotTopPage;
         region.memory_size = 0;
         region.guest_phys_addr = 0xFFFFF000u;
-        ioctl(vm_fd, KVM_SET_USER_MEMORY_REGION, &region);
+        kvm_ioctl(vm_fd, KVM_SET_USER_MEMORY_REGION, &region);
         std::string err;
         if (!set_slot(kSlotTopPage, 0xFFFFF000u, 4096, backing, true, err)) error = err;
     }
@@ -116,14 +118,14 @@ struct Oracle::Impl {
             err = std::format("oracle: cannot open /dev/kvm: {}", std::strerror(errno));
             return false;
         }
-        vm_fd = ioctl(kvm_fd, KVM_CREATE_VM, 0);
+        vm_fd = kvm_ioctl(kvm_fd, KVM_CREATE_VM, 0);
         if (vm_fd < 0) {
             err = std::format("oracle: KVM_CREATE_VM failed: {}", std::strerror(errno));
             return false;
         }
-        ioctl(vm_fd, KVM_SET_TSS_ADDR, 0xFFFBD000);
+        kvm_ioctl(vm_fd, KVM_SET_TSS_ADDR, 0xFFFBD000);
         u64 identity = 0xFFFBC000;
-        ioctl(vm_fd, KVM_SET_IDENTITY_MAP_ADDR, &identity);
+        kvm_ioctl(vm_fd, KVM_SET_IDENTITY_MAP_ADDR, &identity);
         Bus& bus = m.bus();
         Flash& flash = m.flash();
         if (!set_slot(kSlotRam, 0, bus.ram_size(), bus.ram(), false, err)) return false;
@@ -131,12 +133,12 @@ struct Oracle::Impl {
         if (!set_slot(kSlotFlash, Flash::kBase, Flash::kWindow - 4096, flash.window(), true, err)) return false;
         const void* top = flash.rom_visible() ? flash.overlay_page() : flash.window() + Flash::kWindow - 4096;
         if (!set_slot(kSlotTopPage, 0xFFFFF000u, 4096, top, true, err)) return false;
-        vcpu_fd = ioctl(vm_fd, KVM_CREATE_VCPU, 0);
+        vcpu_fd = kvm_ioctl(vm_fd, KVM_CREATE_VCPU, 0);
         if (vcpu_fd < 0) {
             err = std::format("oracle: KVM_CREATE_VCPU failed: {}", std::strerror(errno));
             return false;
         }
-        const int mmap_size = ioctl(kvm_fd, KVM_GET_VCPU_MMAP_SIZE, 0);
+        const int mmap_size = kvm_ioctl(kvm_fd, KVM_GET_VCPU_MMAP_SIZE, 0);
         if (mmap_size <= 0) {
             err = "oracle: KVM_GET_VCPU_MMAP_SIZE failed";
             return false;
@@ -156,18 +158,18 @@ struct Oracle::Impl {
         e[1].function = 1; e[1].eax = 0x0000068A; e[1].edx = 0x0383F9FF;
         e[2].function = 2; e[2].eax = 0x03020101; e[2].edx = 0x0C040841;
         e[3].function = 0x80000000;
-        if (ioctl(vcpu_fd, KVM_SET_CPUID2, cpuid.header()) < 0) {
+        if (kvm_ioctl(vcpu_fd, KVM_SET_CPUID2, cpuid.header()) < 0) {
             err = std::format("oracle: KVM_SET_CPUID2 failed: {}", std::strerror(errno));
             return false;
         }
         kvm_guest_debug dbg{};
         dbg.control = KVM_GUESTDBG_ENABLE | KVM_GUESTDBG_SINGLESTEP;
-        if (ioctl(vcpu_fd, KVM_SET_GUEST_DEBUG, &dbg) < 0) {
+        if (kvm_ioctl(vcpu_fd, KVM_SET_GUEST_DEBUG, &dbg) < 0) {
             err = std::format("oracle: KVM_SET_GUEST_DEBUG (single-step) failed: {}", std::strerror(errno));
             return false;
         }
 #if defined(KVM_CAP_SYNC_REGS) && defined(KVM_SYNC_X86_REGS)
-        const int caps = ioctl(kvm_fd, KVM_CHECK_EXTENSION, KVM_CAP_SYNC_REGS);
+        const int caps = kvm_ioctl(kvm_fd, KVM_CHECK_EXTENSION, KVM_CAP_SYNC_REGS);
         const u64 want = static_cast<u64>(KVM_SYNC_X86_REGS | KVM_SYNC_X86_SREGS);
         sync_regs = caps > 0 && (static_cast<u64>(caps) & want) == want;
 #endif
@@ -210,11 +212,11 @@ struct Oracle::Impl {
             return true;
 #endif
         }
-        if (ioctl(vcpu_fd, KVM_SET_SREGS, &sr) < 0) {
+        if (kvm_ioctl(vcpu_fd, KVM_SET_SREGS, &sr) < 0) {
             error = std::format("oracle: KVM_SET_SREGS failed: {}", std::strerror(errno));
             return false;
         }
-        if (ioctl(vcpu_fd, KVM_SET_REGS, &r) < 0) {
+        if (kvm_ioctl(vcpu_fd, KVM_SET_REGS, &r) < 0) {
             error = std::format("oracle: KVM_SET_REGS failed: {}", std::strerror(errno));
             return false;
         }
@@ -229,7 +231,7 @@ struct Oracle::Impl {
             return true;
 #endif
         }
-        if (ioctl(vcpu_fd, KVM_GET_REGS, &r) < 0 || ioctl(vcpu_fd, KVM_GET_SREGS, &sr) < 0) {
+        if (kvm_ioctl(vcpu_fd, KVM_GET_REGS, &r) < 0 || kvm_ioctl(vcpu_fd, KVM_GET_SREGS, &sr) < 0) {
             error = std::format("oracle: KVM_GET_REGS failed: {}", std::strerror(errno));
             return false;
         }
@@ -262,20 +264,20 @@ struct Oracle::Impl {
     bool set_fpu(const FpuState& f) {
         kvm_fpu k;
         fill_fpu(f, k);
-        if (ioctl(vcpu_fd, KVM_SET_FPU, &k) < 0) {
+        if (kvm_ioctl(vcpu_fd, KVM_SET_FPU, &k) < 0) {
             error = std::format("oracle: KVM_SET_FPU failed: {}", std::strerror(errno));
             return false;
         }
         return true;
     }
     bool get_fpu(kvm_fpu& k) {
-        if (ioctl(vcpu_fd, KVM_GET_FPU, &k) < 0) {
+        if (kvm_ioctl(vcpu_fd, KVM_GET_FPU, &k) < 0) {
             error = std::format("oracle: KVM_GET_FPU failed: {}", std::strerror(errno));
             return false;
         }
         // KVM_GET_FPU leaves MXCSR out; the XSAVE image carries it at byte 24 of the legacy region.
         kvm_xsave xs{};
-        if (ioctl(vcpu_fd, KVM_GET_XSAVE, &xs) == 0) k.mxcsr = xs.region[6];
+        if (kvm_ioctl(vcpu_fd, KVM_GET_XSAVE, &xs) == 0) k.mxcsr = xs.region[6];
         return true;
     }
     // RCPPS/RCPSS/RSQRTPS/RSQRTSS are approximations whose tables differ between processor models (the hypervisor
@@ -420,7 +422,7 @@ bool Oracle::step(Cpu& cpu) {
 run_again:
     for (;;) {
         im.run->immediate_exit = 0;
-        const int rc = ioctl(im.vcpu_fd, KVM_RUN, 0);
+        const int rc = kvm_ioctl(im.vcpu_fd, KVM_RUN, 0);
         if (rc < 0 && errno == EINTR) continue;
         if (rc < 0) {
             error_ = std::format("oracle: KVM_RUN failed: {}", std::strerror(errno));

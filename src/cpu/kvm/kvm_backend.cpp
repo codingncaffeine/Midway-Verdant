@@ -8,6 +8,16 @@
 #include <pthread.h>
 #include <signal.h>
 #include <sys/ioctl.h>
+
+#include "cpu/kvm/kvm_ioctl.h"
+
+// The thread a SIGEV_THREAD_ID timer signals: sigev_notify_thread_id in musl and glibc 2.35 on, only the internal
+// _sigev_un._tid before that (the release core builds on glibc 2.28).
+#if defined(sigev_notify_thread_id)
+#define MV_SIGEV_THREAD_ID sigev_notify_thread_id
+#else
+#define MV_SIGEV_THREAD_ID _sigev_un._tid
+#endif
 #include <sys/mman.h>
 #include <time.h>
 #include <sys/syscall.h>
@@ -125,7 +135,7 @@ bool KvmBackend::set_slot(u32 slot, u64 guest_phys, u64 size, void* host, bool r
     region.guest_phys_addr = guest_phys;
     region.memory_size = size;
     region.userspace_addr = reinterpret_cast<u64>(host);
-    if (ioctl(vm_fd_, KVM_SET_USER_MEMORY_REGION, &region) < 0) {
+    if (kvm_ioctl(vm_fd_, KVM_SET_USER_MEMORY_REGION, &region) < 0) {
         error = std::format("KVM_SET_USER_MEMORY_REGION slot {} at {:#x} failed: {}", slot, guest_phys, std::strerror(errno));
         return false;
     }
@@ -155,7 +165,7 @@ bool KvmBackend::setup_cpuid(std::string& error) {
     e[2].edx = 0x0C040841;
     e[3].function = 0x80000000;
     e[3].eax = 0;
-    if (ioctl(vcpu_fd_, KVM_SET_CPUID2, cpuid.header()) < 0) {
+    if (kvm_ioctl(vcpu_fd_, KVM_SET_CPUID2, cpuid.header()) < 0) {
         error = std::format("KVM_SET_CPUID2 failed: {}", std::strerror(errno));
         return false;
     }
@@ -169,34 +179,34 @@ bool KvmBackend::init(Machine& machine, std::string& error) {
         error = std::format("cannot open /dev/kvm: {}", std::strerror(errno));
         return false;
     }
-    const int version = ioctl(kvm_fd_, KVM_GET_API_VERSION, 0);
+    const int version = kvm_ioctl(kvm_fd_, KVM_GET_API_VERSION, 0);
     if (version != KVM_API_VERSION) {
         error = std::format("KVM API version {} (expected {})", version, KVM_API_VERSION);
         return false;
     }
-    if (ioctl(kvm_fd_, KVM_CHECK_EXTENSION, KVM_CAP_READONLY_MEM) <= 0) {
+    if (kvm_ioctl(kvm_fd_, KVM_CHECK_EXTENSION, KVM_CAP_READONLY_MEM) <= 0) {
         error = "KVM lacks read-only memory slots";
         return false;
     }
-    vm_fd_ = ioctl(kvm_fd_, KVM_CREATE_VM, 0);
+    vm_fd_ = kvm_ioctl(kvm_fd_, KVM_CREATE_VM, 0);
     if (vm_fd_ < 0) {
         error = std::format("KVM_CREATE_VM failed: {}", std::strerror(errno));
         return false;
     }
     // Intel hosts need these for real-mode guests; harmless elsewhere.
-    ioctl(vm_fd_, KVM_SET_TSS_ADDR, 0xFFFBD000);
+    kvm_ioctl(vm_fd_, KVM_SET_TSS_ADDR, 0xFFFBD000);
     u64 identity = 0xFFFBC000;
-    ioctl(vm_fd_, KVM_SET_IDENTITY_MAP_ADDR, &identity);
+    kvm_ioctl(vm_fd_, KVM_SET_IDENTITY_MAP_ADDR, &identity);
 
     // Selective dirty tracking: the log starts all set and KVM protects a page only when we clear its bit, so the RAM
     // keeps large pages except where a texture lies (KVM_CAP_MANUAL_DIRTY_LOG_PROTECT2).
     if (dirty_tracking_ && selective_requested_) {
-        const int caps = ioctl(kvm_fd_, KVM_CHECK_EXTENSION, KVM_CAP_MANUAL_DIRTY_LOG_PROTECT2);
+        const int caps = kvm_ioctl(kvm_fd_, KVM_CHECK_EXTENSION, KVM_CAP_MANUAL_DIRTY_LOG_PROTECT2);
         if (caps > 0 && (caps & KVM_DIRTY_LOG_MANUAL_PROTECT_ENABLE)) {
             kvm_enable_cap cap{};
             cap.cap = KVM_CAP_MANUAL_DIRTY_LOG_PROTECT2;
             cap.args[0] = static_cast<__u64>(static_cast<unsigned>(KVM_DIRTY_LOG_MANUAL_PROTECT_ENABLE) | (static_cast<unsigned>(caps) & static_cast<unsigned>(KVM_DIRTY_LOG_INITIALLY_SET)));
-            selective_ = ioctl(vm_fd_, KVM_ENABLE_CAP, &cap) == 0;
+            selective_ = kvm_ioctl(vm_fd_, KVM_ENABLE_CAP, &cap) == 0;
         }
     }
     Bus& bus = machine.bus();
@@ -209,12 +219,12 @@ bool KvmBackend::init(Machine& machine, std::string& error) {
     const void* top = flash.rom_visible() ? flash.overlay_page() : flash.window() + Flash::kWindow - 4096;
     if (!set_slot(kSlotTopPage, 0xFFFFF000u, 4096, const_cast<void*>(top), true, error)) return false;
 
-    vcpu_fd_ = ioctl(vm_fd_, KVM_CREATE_VCPU, 0);
+    vcpu_fd_ = kvm_ioctl(vm_fd_, KVM_CREATE_VCPU, 0);
     if (vcpu_fd_ < 0) {
         error = std::format("KVM_CREATE_VCPU failed: {}", std::strerror(errno));
         return false;
     }
-    const int mmap_size = ioctl(kvm_fd_, KVM_GET_VCPU_MMAP_SIZE, 0);
+    const int mmap_size = kvm_ioctl(kvm_fd_, KVM_GET_VCPU_MMAP_SIZE, 0);
     if (mmap_size <= 0) {
         error = "KVM_GET_VCPU_MMAP_SIZE failed";
         return false;
@@ -234,7 +244,7 @@ bool KvmBackend::init(Machine& machine, std::string& error) {
     // under its lock: before the access an exit stopped for, and before any device event). MV_COALESCE=0 keeps an
     // exit per write (the control).
     if (const char* c = std::getenv("MV_COALESCE"); !(c && *c == '0')) {
-        const int page = ioctl(kvm_fd_, KVM_CHECK_EXTENSION, KVM_CAP_COALESCED_MMIO);
+        const int page = kvm_ioctl(kvm_fd_, KVM_CHECK_EXTENSION, KVM_CAP_COALESCED_MMIO);
         const auto page_size = static_cast<std::size_t>(sysconf(_SC_PAGESIZE));
         if (page > 0 && (static_cast<std::size_t>(page) + 1) * page_size <= run_size_) {
             coalesced_ = reinterpret_cast<kvm_coalesced_mmio_ring*>(reinterpret_cast<u8*>(run_) + static_cast<std::size_t>(page) * page_size);
@@ -245,7 +255,7 @@ bool KvmBackend::init(Machine& machine, std::string& error) {
                 kvm_coalesced_mmio_zone zone{};
                 zone.addr = base;
                 zone.size = size;
-                if (ioctl(vm_fd_, on ? KVM_REGISTER_COALESCED_MMIO : KVM_UNREGISTER_COALESCED_MMIO, &zone) < 0) ++coalesce_failures_;
+                if (kvm_ioctl(vm_fd_, on ? KVM_REGISTER_COALESCED_MMIO : KVM_UNREGISTER_COALESCED_MMIO, &zone) < 0) ++coalesce_failures_;
                 else coalesced_zones_ += on ? 1 : -1;
             });
         }
@@ -269,15 +279,15 @@ bool KvmBackend::init(Machine& machine, std::string& error) {
     clock_.set_scale_milli(static_cast<u32>(std::lround(scale * 1000.0)));
     // The TSC counts 733.333 MHz of guest time; with the guest clock, guest time inside the guest runs `scale` times
     // faster than the host's, and so must the TSC.
-    if (ioctl(kvm_fd_, KVM_CHECK_EXTENSION, KVM_CAP_TSC_CONTROL) > 0) {
-        if (ioctl(vcpu_fd_, KVM_SET_TSC_KHZ, guest_clock_on_ ? clock_.tsc_khz() : 733333u) == 0) tsc_scaled_ = true;
+    if (kvm_ioctl(kvm_fd_, KVM_CHECK_EXTENSION, KVM_CAP_TSC_CONTROL) > 0) {
+        if (kvm_ioctl(vcpu_fd_, KVM_SET_TSC_KHZ, guest_clock_on_ ? clock_.tsc_khz() : 733333u) == 0) tsc_scaled_ = true;
     }
     if (!tsc_scaled_) trace::log(trace::Cat::Cpu, "TSC scaling unavailable: the guest TSC runs at host rate");
     {
         kvm_device_attr a{};
         a.group = KVM_VCPU_TSC_CTRL;
         a.attr = KVM_VCPU_TSC_OFFSET;
-        tsc_offset_ctl_ = ioctl(vcpu_fd_, KVM_HAS_DEVICE_ATTR, &a) == 0;
+        tsc_offset_ctl_ = kvm_ioctl(vcpu_fd_, KVM_HAS_DEVICE_ATTR, &a) == 0;
     }
     // Exact exits (D33) need the rewinds; MV_EXIT_COST=host keeps the old account (exits cost guest time at the
     // host's price), the control.
@@ -297,7 +307,7 @@ bool KvmBackend::init(Machine& machine, std::string& error) {
         filter.ranges[0].base = 0x10;
         filter.ranges[0].nmsrs = 1;
         filter.ranges[0].bitmap = &deny;
-        tsc_writes_trapped_ = ioctl(vm_fd_, KVM_ENABLE_CAP, &cap) == 0 && ioctl(vm_fd_, KVM_X86_SET_MSR_FILTER, &filter) == 0;
+        tsc_writes_trapped_ = kvm_ioctl(vm_fd_, KVM_ENABLE_CAP, &cap) == 0 && kvm_ioctl(vm_fd_, KVM_X86_SET_MSR_FILTER, &filter) == 0;
     }
 
     // The kick signal stays deliverable: its handler sets immediate_exit on the run area.
@@ -327,7 +337,7 @@ void KvmBackend::set_top_page(const void* backing) {
     region.slot = kSlotTopPage;
     region.memory_size = 0;
     region.guest_phys_addr = 0xFFFFF000u;
-    ioctl(vm_fd_, KVM_SET_USER_MEMORY_REGION, &region);
+    kvm_ioctl(vm_fd_, KVM_SET_USER_MEMORY_REGION, &region);
     if (!set_slot(kSlotTopPage, 0xFFFFF000u, 4096, const_cast<void*>(backing), true, error)) fail(Stop::InternalError, error);
 }
 
@@ -340,16 +350,16 @@ void KvmBackend::reset() {
     // from KVM_RUN before it is delivered): after the reset it would reach the boot code in real mode, through the old
     // kernel's vector table still in RAM, and the console never came back. A reset clears pending events.
     kvm_vcpu_events events{};
-    if (ioctl(vcpu_fd_, KVM_GET_VCPU_EVENTS, &events) == 0 &&
+    if (kvm_ioctl(vcpu_fd_, KVM_GET_VCPU_EVENTS, &events) == 0 &&
         (events.interrupt.injected || events.exception.injected || events.exception.pending || events.nmi.injected || events.nmi.pending))
         trace::log(trace::Cat::Cpu, "reset: dropped a pending event (interrupt {} vector {:02x}, exception {}, nmi {})", events.interrupt.injected, events.interrupt.nr,
                    events.exception.injected | events.exception.pending, events.nmi.injected | events.nmi.pending);
     events = {};
     events.flags = KVM_VCPUEVENT_VALID_NMI_PENDING | KVM_VCPUEVENT_VALID_SHADOW;
-    ioctl(vcpu_fd_, KVM_SET_VCPU_EVENTS, &events);
+    kvm_ioctl(vcpu_fd_, KVM_SET_VCPU_EVENTS, &events);
     if (run_) run_->request_interrupt_window = 0;
     kvm_sregs sregs{};
-    ioctl(vcpu_fd_, KVM_GET_SREGS, &sregs);
+    kvm_ioctl(vcpu_fd_, KVM_GET_SREGS, &sregs);
     auto seg = [](u16 selector, u64 base, u32 limit, u8 type) {
         kvm_segment s{};
         s.selector = selector;
@@ -383,13 +393,13 @@ void KvmBackend::reset() {
     sregs.cr4 = 0;
     sregs.efer = 0;
     sregs.apic_base = 0;
-    ioctl(vcpu_fd_, KVM_SET_SREGS, &sregs);
+    kvm_ioctl(vcpu_fd_, KVM_SET_SREGS, &sregs);
 
     kvm_regs regs{};
     regs.rip = 0xFFF0;
     regs.rflags = 0x2;
     regs.rdx = cpuid_signature_;
-    ioctl(vcpu_fd_, KVM_SET_REGS, &regs);
+    kvm_ioctl(vcpu_fd_, KVM_SET_REGS, &regs);
 
     // TSC starts at zero at power-on; the time until the first entry is not guest time.
     set_tsc(0);
@@ -403,7 +413,7 @@ u64 KvmBackend::read_tsc() {
     MsrsOne msrs{};
     msrs.header()->nmsrs = 1;
     msrs.entry()->index = 0x10;  // IA32_TIME_STAMP_COUNTER
-    return ioctl(vcpu_fd_, KVM_GET_MSRS, msrs.header()) == 1 ? msrs.entry()->data : 0;
+    return kvm_ioctl(vcpu_fd_, KVM_GET_MSRS, msrs.header()) == 1 ? msrs.entry()->data : 0;
 }
 
 bool KvmBackend::tsc_offset_add(i64 delta) {
@@ -414,7 +424,7 @@ bool KvmBackend::tsc_offset_add(i64 delta) {
     // The offset is read once and kept: only this thread moves it (exact exits rewind it at nearly every exit).
     a.addr = reinterpret_cast<u64>(&tsc_offset_);
     if (!tsc_offset_known_) {
-        if (ioctl(vcpu_fd_, KVM_GET_DEVICE_ATTR, &a) < 0) {
+        if (kvm_ioctl(vcpu_fd_, KVM_GET_DEVICE_ATTR, &a) < 0) {
             ++tsc_adjust_failures_;
             return false;
         }
@@ -422,7 +432,7 @@ bool KvmBackend::tsc_offset_add(i64 delta) {
     }
     const u64 offset = tsc_offset_ + static_cast<u64>(delta);
     a.addr = reinterpret_cast<u64>(&offset);
-    if (ioctl(vcpu_fd_, KVM_SET_DEVICE_ATTR, &a) < 0) {
+    if (kvm_ioctl(vcpu_fd_, KVM_SET_DEVICE_ATTR, &a) < 0) {
         ++tsc_adjust_failures_;
         return false;
     }
@@ -438,7 +448,7 @@ void KvmBackend::set_tsc(u64 value) {
     msrs.header()->nmsrs = 1;
     msrs.entry()->index = 0x10;
     msrs.entry()->data = value;
-    ioctl(vcpu_fd_, KVM_SET_MSRS, msrs.header());
+    kvm_ioctl(vcpu_fd_, KVM_SET_MSRS, msrs.header());
     tsc_offset_known_ = false;  // KVM moved the offset itself
 }
 
@@ -595,7 +605,7 @@ void KvmBackend::inject_interrupt_if_possible() {
     if (run_->ready_for_interrupt_injection && run_->if_flag) {
         kvm_interrupt irq{};
         irq.irq = static_cast<u32>(pic.acknowledge());
-        if (ioctl(vcpu_fd_, KVM_INTERRUPT, &irq) == 0) {
+        if (kvm_ioctl(vcpu_fd_, KVM_INTERRUPT, &irq) == 0) {
             ++stats_.irq_injections;
             at_idle_ = false;
             ++stats_.by_vector[irq.irq & 0xFF];
@@ -762,7 +772,7 @@ void KvmBackend::thread_main() {
         sigevent sev{};
         sev.sigev_notify = SIGEV_THREAD_ID;
         sev.sigev_signo = kProfileSignal;
-        sev._sigev_un._tid = static_cast<pid_t>(syscall(SYS_gettid));  // gettid() itself is glibc 2.30 on
+        sev.MV_SIGEV_THREAD_ID = static_cast<pid_t>(syscall(SYS_gettid));  // gettid() itself is glibc 2.30 on
         if (timer_create(CLOCK_THREAD_CPUTIME_ID, &sev, &profile_timer_) == 0) {
             profile_timer_ok_ = true;
             itimerspec its{};
@@ -783,7 +793,7 @@ void KvmBackend::thread_main() {
         sigevent sev{};
         sev.sigev_notify = SIGEV_THREAD_ID;
         sev.sigev_signo = kKickSignal;
-        sev._sigev_un._tid = static_cast<pid_t>(syscall(SYS_gettid));  // gettid() itself is glibc 2.30 on
+        sev.MV_SIGEV_THREAD_ID = static_cast<pid_t>(syscall(SYS_gettid));  // gettid() itself is glibc 2.30 on
         std::lock_guard lock(machine_->lock());
         backstop_ok_ = timer_create(CLOCK_MONOTONIC, &sev, &backstop_) == 0;
         backstop_at_ns_ = 0;
@@ -881,7 +891,7 @@ void KvmBackend::thread_main() {
         const bool sampling = profile_eip_ && vblank_seen_ >= profile_from_ && vblank_seen_ < profile_to_;
         const bool idle_run = at_idle_;
         const u64 guest_before = clock_.stats().in_guest_ns;
-        const int rc = ioctl(vcpu_fd_, KVM_RUN, 0);
+        const int rc = kvm_ioctl(vcpu_fd_, KVM_RUN, 0);
         if (guest_clock_on_) {
             const u64 wall = mono_ns();
             const u64 cpu = thread_cpu_ns();
@@ -903,7 +913,7 @@ void KvmBackend::thread_main() {
             ++stats_.intr_exits;
             if (sampling && (!profile_us_ || g_profile_tick.exchange(false, std::memory_order_relaxed))) {
                 kvm_regs r{};
-                if (ioctl(vcpu_fd_, KVM_GET_REGS, &r) == 0) {
+                if (kvm_ioctl(vcpu_fd_, KVM_GET_REGS, &r) == 0) {
                     ++eip_samples_[static_cast<u32>(r.rip)];
                     if (gpu_busy) ++eip_busy_samples_[static_cast<u32>(r.rip)];
                 }
@@ -984,9 +994,9 @@ void KvmBackend::thread_main() {
                     }
                     // Step over the breakpoint: the resume flag suppresses it for one instruction.
                     kvm_regs regs{};
-                    if (ioctl(vcpu_fd_, KVM_GET_REGS, &regs) == 0) {
+                    if (kvm_ioctl(vcpu_fd_, KVM_GET_REGS, &regs) == 0) {
                         regs.rflags |= 1u << 16;
-                        ioctl(vcpu_fd_, KVM_SET_REGS, &regs);
+                        kvm_ioctl(vcpu_fd_, KVM_SET_REGS, &regs);
                     }
                     break;
                 }
@@ -1002,7 +1012,7 @@ void KvmBackend::thread_main() {
                     if (++watch_hits_ >= watch_max_) {
                         watch_va_ = 0;
                         kvm_guest_debug off{};
-                        ioctl(vcpu_fd_, KVM_SET_GUEST_DEBUG, &off);
+                        kvm_ioctl(vcpu_fd_, KVM_SET_GUEST_DEBUG, &off);
                         breakpoints_armed_ = false;
                         arm_breakpoints();
                     }
@@ -1052,9 +1062,9 @@ void KvmBackend::thread_main() {
                     trace::log(trace::Cat::Boot, "break: eip {:08x} from {:08x} eax {:08x} args {:08x} {:08x} {:08x} names [{}] [{}] up{} esp {:08x} text [{}]", r.eip, rd32(r.esp),
                                r.eax, rd32(r.esp + 4), rd32(r.esp + 8), rd32(r.esp + 12), name_of(rd32(r.esp + 4)), name_of(rd32(r.esp + 12)), up, r.esp, text);
                     kvm_regs regs{};
-                    if (ioctl(vcpu_fd_, KVM_GET_REGS, &regs) == 0) {
+                    if (kvm_ioctl(vcpu_fd_, KVM_GET_REGS, &regs) == 0) {
                         regs.rflags |= 1u << 16;
-                        ioctl(vcpu_fd_, KVM_SET_REGS, &regs);
+                        kvm_ioctl(vcpu_fd_, KVM_SET_REGS, &regs);
                     }
                     continue;
                 }
@@ -1096,7 +1106,7 @@ void KvmBackend::thread_main() {
                 }
                 std::erase(break_eips_, r.eip);
                 kvm_guest_debug off{};
-                ioctl(vcpu_fd_, KVM_SET_GUEST_DEBUG, &off);
+                kvm_ioctl(vcpu_fd_, KVM_SET_GUEST_DEBUG, &off);
                 breakpoints_armed_ = false;
                 arm_breakpoints();
                 continue;
@@ -1153,7 +1163,7 @@ void KvmBackend::arm_breakpoints() {
                 dbg.arch.debugreg[7] |= 1u << (i * 2);  // Li, execution, one byte
             }
     }
-    if (ioctl(vcpu_fd_, KVM_SET_GUEST_DEBUG, &dbg) < 0) {
+    if (kvm_ioctl(vcpu_fd_, KVM_SET_GUEST_DEBUG, &dbg) < 0) {
         trace::log(trace::Cat::Boot, "break: KVM_SET_GUEST_DEBUG failed: {}", std::strerror(errno));
         return;
     }
@@ -1180,7 +1190,7 @@ void KvmBackend::take_dirty_pages(std::vector<u32>& pages) {
         kvm_dirty_log log{};
         log.slot = slot;
         log.dirty_bitmap = dirty_bitmap_.data();
-        if (ioctl(vm_fd_, KVM_GET_DIRTY_LOG, &log) < 0) continue;
+        if (kvm_ioctl(vm_fd_, KVM_GET_DIRTY_LOG, &log) < 0) continue;
         for (std::size_t i = 0; i < merged.size(); ++i) merged[i] |= dirty_bitmap_[i];
     }
     if (selective_)
@@ -1197,7 +1207,7 @@ void KvmBackend::take_dirty_pages(std::vector<u32>& pages) {
             clear.first_page = 0;
             clear.num_pages = static_cast<u32>(merged.size() * 64);
             clear.dirty_bitmap = merged.data();
-            ioctl(vm_fd_, KVM_CLEAR_DIRTY_LOG, &clear);
+            kvm_ioctl(vm_fd_, KVM_CLEAR_DIRTY_LOG, &clear);
         }
     for (std::size_t w = 0; w < merged.size(); ++w) {
         u64 bits = merged[w];
@@ -1244,7 +1254,7 @@ void KvmBackend::apply_watch(u32 first, u32 count, bool conservative) {
             kvm_dirty_log log{};
             log.slot = slot;
             log.dirty_bitmap = dirty_bitmap_.data();
-            if (ioctl(vm_fd_, KVM_GET_DIRTY_LOG, &log) < 0) continue;
+            if (kvm_ioctl(vm_fd_, KVM_GET_DIRTY_LOG, &log) < 0) continue;
             for (u32 p = first; p < first + count; ++p)
                 if ((dirty_bitmap_[p / 64] >> (p % 64)) & 1u) watch_reported_.push_back(p);
         }
@@ -1262,15 +1272,15 @@ void KvmBackend::apply_watch(u32 first, u32 count, bool conservative) {
         clear.first_page = static_cast<u64>(block0) * 64;
         clear.num_pages = static_cast<u32>(std::min<u64>(static_cast<u64>(bits.size()) * 64, slot_pages - clear.first_page));
         clear.dirty_bitmap = bits.data();
-        ioctl(vm_fd_, KVM_CLEAR_DIRTY_LOG, &clear);
+        kvm_ioctl(vm_fd_, KVM_CLEAR_DIRTY_LOG, &clear);
     }
 }
 
 bool KvmBackend::read_regs(Regs& out) {
     kvm_regs regs{};
     kvm_sregs sregs{};
-    if (ioctl(vcpu_fd_, KVM_GET_REGS, &regs) < 0) return false;
-    if (ioctl(vcpu_fd_, KVM_GET_SREGS, &sregs) < 0) return false;
+    if (kvm_ioctl(vcpu_fd_, KVM_GET_REGS, &regs) < 0) return false;
+    if (kvm_ioctl(vcpu_fd_, KVM_GET_SREGS, &sregs) < 0) return false;
     out.eax = static_cast<u32>(regs.rax);
     out.ebx = static_cast<u32>(regs.rbx);
     out.ecx = static_cast<u32>(regs.rcx);
@@ -1293,7 +1303,7 @@ bool KvmBackend::read_regs(Regs& out) {
     MsrsOne msrs{};
     msrs.header()->nmsrs = 1;
     msrs.entry()->index = 0x10;
-    out.tsc = ioctl(vcpu_fd_, KVM_GET_MSRS, msrs.header()) == 1 ? msrs.entry()->data : 0;
+    out.tsc = kvm_ioctl(vcpu_fd_, KVM_GET_MSRS, msrs.header()) == 1 ? msrs.entry()->data : 0;
     return true;
 }
 
@@ -1336,7 +1346,7 @@ void KvmBackend::find_idle_loop() {
     idle_eip_ = found[0];
     trace::log(trace::Cat::Cpu, "the kernel idle loops are at {:08x} {:08x}: their idle turns halt", found[0], found[1]);
     kvm_guest_debug off{};
-    ioctl(vcpu_fd_, KVM_SET_GUEST_DEBUG, &off);
+    kvm_ioctl(vcpu_fd_, KVM_SET_GUEST_DEBUG, &off);
     breakpoints_armed_ = false;
     arm_breakpoints();
 }
