@@ -1299,7 +1299,13 @@ bool KvmBackend::read_regs(Regs& out) {
 
 std::unique_ptr<CpuBackend> make_fast_backend(std::string& why_not) {
     if (access("/dev/kvm", R_OK | W_OK) != 0) {
-        why_not = std::format("/dev/kvm is not accessible: {}", std::strerror(errno));
+        // Said so a player knows what to do: the frontend shows it on screen.
+        if (errno == ENOENT)
+            why_not = "hardware virtualization is off or missing (no /dev/kvm). Switch on Intel VT-x or AMD-V (SVM) in your PC's firmware setup, then restart.";
+        else if (errno == EACCES || errno == EPERM)
+            why_not = "no permission to use /dev/kvm. Add yourself to the kvm group (sudo usermod -aG kvm $USER), then log out and back in.";
+        else
+            why_not = std::format("/dev/kvm is not accessible: {}", std::strerror(errno));
         return nullptr;
     }
     return std::make_unique<KvmBackend>();
