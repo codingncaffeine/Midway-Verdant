@@ -20,7 +20,8 @@ namespace mv::p6 {
 
 namespace {
 
-constexpr u32 kMxIE = 1u << 0, kMxDE = 1u << 1, kMxZE = 1u << 2, kMxOE = 1u << 3, kMxUE = 1u << 4, kMxPE = 1u << 5, kMxFlags = 0x3Fu;
+// The whole flag layout, named; not every flag is set by name here (Clang flags the unused ones).
+[[maybe_unused]] constexpr u32 kMxIE = 1u << 0, kMxDE = 1u << 1, kMxZE = 1u << 2, kMxOE = 1u << 3, kMxUE = 1u << 4, kMxPE = 1u << 5, kMxFlags = 0x3Fu;
 
 // The host SSE control under the guest's MXCSR: rounding and flush-to-zero from the guest, everything masked.
 class HostSse {
@@ -63,7 +64,7 @@ inline float u2f(u32 u) {
 inline bool is_nan32(u32 u) { return (u & 0x7F800000u) == 0x7F800000u && (u & 0x007FFFFFu) != 0; }
 inline bool is_snan32(u32 u) { return is_nan32(u) && (u & 0x00400000u) == 0; }
 inline bool is_denormal32(u32 u) { return (u & 0x7F800000u) == 0 && (u & 0x007FFFFFu) != 0; }
-constexpr u32 kQNanIndefinite = 0xFFC00000u;
+[[maybe_unused]] constexpr u32 kQNanIndefinite = 0xFFC00000u;  // the x86 default NaN, for reference
 
 struct V128 {
     u32 w[4];

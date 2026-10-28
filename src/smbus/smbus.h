@@ -86,7 +86,6 @@ private:
     bool irq_level_{false};
     TimerEvent completion_;
     Transaction pending_{};
-    u16 pending_result_{0};
     std::vector<Transaction> log_;
     u64 count_{0};
     std::function<void(const Transaction&)> cycle_hook_;

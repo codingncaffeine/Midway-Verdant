@@ -18,17 +18,17 @@ enum : u32 {
     kRhDescriptorA = 0x48, kRhDescriptorB = 0x4C, kRhStatus = 0x50, kRhPortStatus = 0x54,
 };
 // HcControl.
-constexpr u32 kCtlPle = 1u << 2, kCtlIe = 1u << 3, kCtlCle = 1u << 4, kCtlBle = 1u << 5, kCtlHcfsShift = 6, kCtlHcfs = 3u << 6;
+[[maybe_unused]] constexpr u32 kCtlPle = 1u << 2, kCtlIe = 1u << 3, kCtlCle = 1u << 4, kCtlBle = 1u << 5, kCtlHcfsShift = 6, kCtlHcfs = 3u << 6;
 constexpr u32 kCtlIr = 1u << 8, kCtlRwc = 1u << 9;
 enum : u32 { kUsbReset = 0, kUsbResume = 1, kUsbOperational = 2, kUsbSuspend = 3 };
 // HcCommandStatus.
 constexpr u32 kCmdHcr = 1u << 0, kCmdClf = 1u << 1, kCmdBlf = 1u << 2, kCmdOcr = 1u << 3;
 // HcInterruptStatus / Enable.
-constexpr u32 kIntSo = 1u << 0, kIntWdh = 1u << 1, kIntSf = 1u << 2, kIntFno = 1u << 5, kIntRhsc = 1u << 6, kIntOc = 1u << 30,
+[[maybe_unused]] constexpr u32 kIntSo = 1u << 0, kIntWdh = 1u << 1, kIntSf = 1u << 2, kIntFno = 1u << 5, kIntRhsc = 1u << 6, kIntOc = 1u << 30,
               kIntMie = 1u << 31, kIntAll = 0x4000007Fu;
 // HcRhPortStatus (read) and the write meanings of its low bits.
 constexpr u32 kPortCcs = 1u << 0, kPortPes = 1u << 1, kPortPss = 1u << 2, kPortPrs = 1u << 4, kPortPps = 1u << 8;
-constexpr u32 kPortCsc = 1u << 16, kPortPesc = 1u << 17, kPortPssc = 1u << 18, kPortPrsc = 1u << 20, kPortChanges = 0x001F0000u;
+[[maybe_unused]] constexpr u32 kPortCsc = 1u << 16, kPortPesc = 1u << 17, kPortPssc = 1u << 18, kPortPrsc = 1u << 20, kPortChanges = 0x001F0000u;
 // The root hub: four ports, no power switching (always powered), no over-current protection, 2 ms power-good.
 constexpr u32 kRhA = 0x02000000u | (1u << 12) | (1u << 9) | Ohci::kPorts;
 // Condition codes.

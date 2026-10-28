@@ -235,7 +235,7 @@ void hw_destroy() {
     hw_ready = false;
 }
 
-void core_log(retro_log_level, const char* fmt, ...) {
+[[gnu::format(printf, 2, 3)]] void core_log(retro_log_level, const char* fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
     std::vfprintf(stderr, fmt, ap);

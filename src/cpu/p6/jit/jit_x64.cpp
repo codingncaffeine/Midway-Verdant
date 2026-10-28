@@ -94,7 +94,7 @@ static_assert(offsetof(CpuState, lazy_size) == offsetof(CpuState, lazy_op) + 1 &
 constexpr i32 kCtxSt = static_cast<i32>(offsetof(JitCtx, st));
 constexpr i32 kCtxExit = static_cast<i32>(offsetof(JitCtx, exit));
 constexpr i32 kCtxScratch = static_cast<i32>(offsetof(JitCtx, scratch));
-constexpr i32 kCtxBase = static_cast<i32>(offsetof(JitCtx, base)), kCtxLimit = static_cast<i32>(offsetof(JitCtx, limit));
+[[maybe_unused]] constexpr i32 kCtxBase = static_cast<i32>(offsetof(JitCtx, base)), kCtxLimit = static_cast<i32>(offsetof(JitCtx, limit));
 constexpr i32 kCtxBlock = static_cast<i32>(offsetof(JitCtx, block)), kCtxChainLimit = static_cast<i32>(offsetof(JitCtx, chain_limit));
 constexpr i32 kCtxInsnsDone = static_cast<i32>(offsetof(JitCtx, insns_done)), kCtxProbeEip = static_cast<i32>(offsetof(JitCtx, probe_eip));
 constexpr i32 kCtxStores = static_cast<i32>(offsetof(JitCtx, stores)), kCtxMispredicts = static_cast<i32>(offsetof(JitCtx, mispredicts));

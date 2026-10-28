@@ -72,7 +72,7 @@ public:
         else if (m.disp >= -128 && m.disp <= 127) mod = 1;
         else mod = 2;
         byte(static_cast<u8>(mod << 6 | (reg & 7) << 3 | (sib ? 4 : base)));
-        if (sib) byte(static_cast<u8>(m.scale << 6 | ((m.index == 0xFF ? 4 : m.index) & 7) << 3 | base));
+        if (sib) byte(static_cast<u8>(static_cast<unsigned>(m.scale << 6 | ((m.index == 0xFF ? 4 : m.index) & 7) << 3) | base));
         if (mod == 1) byte(static_cast<u8>(m.disp));
         else if (mod == 2) dword(static_cast<u32>(m.disp));
     }

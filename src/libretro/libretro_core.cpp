@@ -39,7 +39,9 @@ namespace {
 
 retro_environment_t env_cb;
 retro_video_refresh_t video_cb;
-retro_audio_sample_t audio_sample_cb;
+[[maybe_unused]] retro_audio_sample_t audio_sample_cb;  // set by the frontend; the core sends its audio in batches
+// libretro's RETRO_HW_FRAME_BUFFER_VALID, ((void*)-1), without its C-style cast.
+const void* const kHwFrameBufferValid = reinterpret_cast<const void*>(~std::uintptr_t{0});
 retro_audio_sample_batch_t audio_batch_cb;
 retro_input_poll_t input_poll_cb;
 retro_input_state_t input_state_cb;
@@ -98,7 +100,7 @@ std::FILE* frame_log = nullptr;
 FrameSample frame_last;
 unsigned long long frame_log_index = 0;
 
-void log(retro_log_level level, const char* fmt, ...) {
+[[gnu::format(printf, 2, 3)]] void log(retro_log_level level, const char* fmt, ...) {
     char buf[1024];
     va_list ap;
     va_start(ap, fmt);
@@ -1087,7 +1089,7 @@ RETRO_API void retro_run(void) {
             image.image_layout = VK_IMAGE_LAYOUT_GENERAL;
             image.create_info = *h.info;
             vk_iface->set_image(vk_iface->handle, &image, 0, nullptr, VK_QUEUE_FAMILY_IGNORED);
-            video_cb(RETRO_HW_FRAME_BUFFER_VALID, h.width, h.height, 0);
+            video_cb(kHwFrameBufferValid, h.width, h.height, 0);
         } else {
             video_cb(nullptr, frame_w, frame_h, 0);  // the last picture again
         }

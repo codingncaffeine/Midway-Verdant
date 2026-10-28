@@ -36,7 +36,7 @@ struct Enc {
     Enc& out(u32 index, u32 mask) { t[3] |= 1u << 11; t[3] |= (index & 0xFF) << 3; t[3] |= (mask & 15) << 12; return *this; }
     Enc& fin() { t[3] |= 1u; return *this; }
 };
-constexpr u32 kX = 8, kY = 4, kZ = 2, kW = 1;
+[[maybe_unused]] constexpr u32 kX = 8, kY = 4, kZ = 2, kW = 1;
 }  // namespace
 
 TEST(VshInterpreter, RunsTheXdkScreenSpaceEpilogue) {

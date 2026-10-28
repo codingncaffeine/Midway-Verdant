@@ -12,7 +12,7 @@ namespace mv::dsp {
 namespace {
 
 constexpr u32 kWord = 0xFFFFFFu;
-constexpr i64 kAccMin = -(i64{1} << 55), kAccMax = (i64{1} << 55) - 1;
+[[maybe_unused]] constexpr i64 kAccMin = -(i64{1} << 55), kAccMax = (i64{1} << 55) - 1;  // the 56-bit accumulator's range
 
 i64 sext24(u32 v) { return static_cast<i64>(static_cast<i32>(v << 8) >> 8); }
 i32 sext_bits(u32 v, u32 bits) { return static_cast<i32>(v << (32 - bits)) >> (32 - bits); }

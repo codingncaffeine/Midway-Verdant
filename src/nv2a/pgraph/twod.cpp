@@ -71,7 +71,7 @@ bool TwoD::blit() {
         error_ = "rectangle outside its DMA object";
         return false;
     }
-    auto phys = [this](u64 a) { return a >= 0xF0000000ull ? a - 0xF0000000ull : a; };  // the GPU's RAM alias
+    auto phys = [](u64 a) { return a >= 0xF0000000ull ? a - 0xF0000000ull : a; };  // the GPU's RAM alias
     const u64 ps = phys(src.base + s0), pd = phys(dst.base + d0);
     if (ps + (s1 - s0) > ram_size_ || pd + (d1 - d0) > ram_size_) {
         error_ = "rectangle outside RAM";
