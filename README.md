@@ -102,6 +102,8 @@ The release core is also booted from a first start (only the MCPX ROM and the BI
 | Ubuntu 24.04 LTS | 2.39 | boots and draws |
 | Debian 12 (bookworm), Ubuntu 22.04 LTS | 2.36, 2.35 | the core loads, KVM runs and the console starts, but their software Vulkan driver (llvmpipe built with LLVM 15) stalls drawing; not yet tried with a hardware GPU driver |
 
+Built from source as well, on each one's own compiler and packages with warnings as errors (`tools/build-on-distros.sh`): Alpine (musl, GCC 15), Debian 13 (GCC 14), Ubuntu 24.04 (GCC 14), Fedora (GCC 16), openSUSE Tumbleweed (GCC 16), Arch (GCC 16) and Arch with Clang 23 all build, pass the unit tests, and boot a game under KVM from a first start with the core they built.
+
 Windows: a build with a hypervisor backend (Windows Hypervisor Platform) is in progress. macOS: not yet.
 
 ## Building
