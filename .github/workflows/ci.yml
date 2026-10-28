@@ -38,7 +38,8 @@ jobs:
         run: tests/tools/scan-controls.sh
 
   # musl (Alpine): a C library that declares things differently from glibc (ioctl's request, sigevent's thread id),
-  # with the distribution's own GCC, glslang and SDL3. A user's build broke here before this job existed.
+  # with the distribution's own GCC and SDL3. A user's build broke here before this job existed. glslang-dev is
+  # installed though the build no longer uses it: users have it, and glslang_headers proves the built-in copy wins.
   alpine:
     name: Linux (Alpine, musl)
     runs-on: ubuntu-24.04

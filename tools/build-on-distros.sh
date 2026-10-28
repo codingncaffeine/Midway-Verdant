@@ -2,7 +2,7 @@
 # Builds Midway Verdant FROM SOURCE on other distributions, each in a container with its own compiler, C library and
 # packages, with the default options (warnings as errors, the tests on), then runs the unit tests there. The other
 # half of tools/test-linux-distros.sh (which runs the release core): this one finds what breaks a user's own build
-# (musl's declarations, a newer GCC's warnings, Clang, a distribution's glslang or SDL3).
+# (musl's declarations, a newer GCC's warnings, Clang, a distribution's SDL3).
 #   [FW=FIRMWARE_DIR GAME=DISC.iso] tools/build-on-distros.sh [DISTRO...]   (default: every one below; PARALLEL=N, default 3)
 # Results: scratch/release/source-builds/DISTRO/{log,build/}, a line per distribution.
 set -uo pipefail
@@ -12,21 +12,21 @@ engine=$(command -v podman || command -v docker) || { echo "needs podman or dock
 # Each setup line is the README's install line for that distribution (keep them the same).
 declare -A image setup env cmakeargs
 image[alpine]=alpine:latest              # musl
-setup[alpine]="apk add -q build-base cmake samurai git linux-headers glslang-dev sdl3-dev"
+setup[alpine]="apk add -q build-base cmake samurai git linux-headers sdl3-dev"
 image[debian-13]=debian:13
-setup[debian-13]="apt-get update -qq && apt-get install -y -qq build-essential cmake ninja-build git pkg-config libsdl3-dev glslang-dev glslang-tools"
+setup[debian-13]="apt-get update -qq && apt-get install -y -qq build-essential cmake ninja-build git pkg-config libsdl3-dev"
 image[ubuntu-24.04]=ubuntu:24.04          # GCC 13 by default: the build needs 14; SDL3 is not packaged: the core alone
 setup[ubuntu-24.04]="apt-get update -qq && apt-get install -y -qq g++-14 cmake ninja-build git pkg-config"
 cmakeargs[ubuntu-24.04]="-DMV_BUILD_SHELL=OFF"
 env[ubuntu-24.04]="CC=gcc-14 CXX=g++-14"
 image[fedora]=fedora:latest               # the newest GCC
-setup[fedora]="dnf install -y -q gcc-c++ cmake ninja-build git SDL3-devel glslang-devel"
+setup[fedora]="dnf install -y -q gcc-c++ cmake ninja-build git SDL3-devel"
 image[opensuse]=opensuse/tumbleweed
-setup[opensuse]="zypper -q install -y gcc-c++ cmake ninja git SDL3-devel glslang-devel"
+setup[opensuse]="zypper -q install -y gcc-c++ cmake ninja git SDL3-devel"
 image[arch]=archlinux:latest
-setup[arch]="pacman -Sy --noconfirm --needed base-devel cmake ninja git sdl3 glslang >/dev/null"
+setup[arch]="pacman -Sy --noconfirm --needed base-devel cmake ninja git sdl3 >/dev/null"
 image[arch-clang]=archlinux:latest        # Clang with GCC's standard library
-setup[arch-clang]="pacman -Sy --noconfirm --needed base-devel clang cmake ninja git sdl3 glslang >/dev/null"
+setup[arch-clang]="pacman -Sy --noconfirm --needed base-devel clang cmake ninja git sdl3 >/dev/null"
 env[arch-clang]="CC=clang CXX=clang++"
 order=(alpine debian-13 ubuntu-24.04 fedora opensuse arch arch-clang)
 [ $# -gt 0 ] && order=("$@")
