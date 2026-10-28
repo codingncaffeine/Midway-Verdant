@@ -81,6 +81,9 @@ find_package(Threads REQUIRED)
 target_link_libraries(mvcore PUBLIC Threads::Threads)
 # The shader compiler is an implementation detail of the renderer; its headers stay out of our public includes.
 target_link_libraries(mvcore PRIVATE glslang::glslang glslang::SPIRV glslang::glslang-default-resource-limits)
+if(MV_GLSLANG_BUILT_IN)
+  set_source_files_properties(nv2a/shaders/glsl_compiler.cpp PROPERTIES COMPILE_DEFINITIONS MV_GLSLANG_BUILT_IN)  # its headers, not a package's
+endif()
 target_link_libraries(mvcore PUBLIC Vulkan::Headers)
 target_compile_definitions(mvcore PUBLIC VK_NO_PROTOTYPES)
 if(NOT WIN32)
@@ -124,10 +127,16 @@ target_link_libraries(mv-fatx PRIVATE mvcore)
 # window, the audio device and the controllers.
 add_library(midway_verdant_libretro SHARED libretro/libretro_core.cpp)
 target_link_libraries(midway_verdant_libretro PRIVATE mvcore)
-set_target_properties(midway_verdant_libretro PROPERTIES PREFIX "" CXX_VISIBILITY_PRESET hidden)
+set_target_properties(midway_verdant_libretro PROPERTIES PREFIX "" CXX_VISIBILITY_PRESET hidden VISIBILITY_INLINES_HIDDEN ON)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  # Only retro_* exported, and the static libraries' symbols (mvcore, glslang) the core's own: its calls into them bind
+  # inside the core, so a frontend exporting the same names (Alpine's RetroArch exports its glslang) cannot take them;
+  # -Bsymbolic-functions does the same for what cannot be hidden (the C++ library's template code the core emits).
+  target_link_options(midway_verdant_libretro PRIVATE -Wl,--exclude-libs,ALL -Wl,-Bsymbolic-functions)
+endif()
 if(MV_PORTABLE AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
-  # The C++ runtime inside the core, and only retro_* exported: the static libraries' symbols stay the core's own.
-  target_link_options(midway_verdant_libretro PRIVATE -static-libstdc++ -static-libgcc -Wl,--exclude-libs,ALL -Wl,--no-undefined)
+  # And the C++ runtime inside the core: one core for every distribution from its build baseline on.
+  target_link_options(midway_verdant_libretro PRIVATE -static-libstdc++ -static-libgcc -Wl,--no-undefined)
 endif()
 
 # mv-retro-host: a headless libretro frontend that drives the core frame by frame for tests (POSIX dlopen).

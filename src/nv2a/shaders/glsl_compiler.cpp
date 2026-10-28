@@ -1,12 +1,14 @@
 #include "nv2a/shaders/glsl_compiler.h"
 
-// The installed package nests SPIRV under glslang/; the source tree (a fetched build) keeps it at the top.
+// The headers of the glslang the core links. The built-in copy's source tree keeps SPIRV at the top; an installed package
+// nests it under glslang/, and one installed beside the built-in copy must not lend the build its GlslangToSpv.h (one
+// version's header over the other's code: tests/tools/glslang-headers.sh).
 #include <glslang/Public/ResourceLimits.h>
 #include <glslang/Public/ShaderLang.h>
-#if __has_include(<glslang/SPIRV/GlslangToSpv.h>)
-#include <glslang/SPIRV/GlslangToSpv.h>
-#else
+#if defined(MV_GLSLANG_BUILT_IN) || !__has_include(<glslang/SPIRV/GlslangToSpv.h>)
 #include <SPIRV/GlslangToSpv.h>
+#else
+#include <glslang/SPIRV/GlslangToSpv.h>
 #endif
 
 #include <mutex>

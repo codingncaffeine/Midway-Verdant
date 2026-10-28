@@ -47,6 +47,15 @@ target_compile_definitions(mv_tests PRIVATE MV_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 include(GoogleTest)
 gtest_discover_tests(mv_tests DISCOVERY_TIMEOUT 60 PROPERTIES TIMEOUT 120)
 
+# The core neither needs nor offers glslang by name (its own is built in and hidden), and compiles against that copy's
+# own headers even with a glslang package installed: a frontend exporting its own glslang took over a dynamically linked
+# core's shader compiles and crashed it (Alpine's RetroArch). Both hold for the built-in copy only (MV_SYSTEM_GLSLANG=ON
+# gives them up).
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND MV_GLSLANG_BUILT_IN)
+  add_test(NAME core_symbols COMMAND ${CMAKE_SOURCE_DIR}/tests/tools/core-symbols.sh $<TARGET_FILE:midway_verdant_libretro>)
+  add_test(NAME glslang_headers COMMAND ${CMAKE_SOURCE_DIR}/tests/tools/glslang-headers.sh ${CMAKE_BINARY_DIR}/compile_commands.json ${glslang_SOURCE_DIR})
+endif()
+
 # The emulator answers --version; a build that cannot is not a build.
 if(MV_BUILD_SHELL)
   add_test(NAME cli_version COMMAND midway-verdant --version)

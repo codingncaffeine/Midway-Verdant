@@ -1,13 +1,21 @@
-# glslang compiles the GLSL our translators emit into SPIR-V at run time. The system package is used where it
-# provides CMake targets (Arch, recent Debian/Ubuntu); otherwise, and always for a portable core (MV_PORTABLE), a pinned
-# copy is fetched and built in statically.
-if(NOT MV_PORTABLE)
+# glslang compiles the GLSL our translators emit into SPIR-V at run time. A pinned copy is fetched and built in statically,
+# and the libretro core hides its symbols (src/CMakeLists.txt), so its calls can never land in another glslang: a
+# frontend may carry its own and export it (Alpine's RetroArch exports 79 glslang symbols), and a core linked to the
+# shared system glslang then had its calls resolved to the frontend's copy, a different version, and crashed in its
+# first shader compile. MV_SYSTEM_GLSLANG=ON uses the system package instead, for packagers who must; the core is then
+# exposed to exactly that.
+if(MV_SYSTEM_GLSLANG AND NOT MV_PORTABLE)
   find_package(glslang CONFIG QUIET)
+  if(glslang_FOUND)
+    message(WARNING "MV_SYSTEM_GLSLANG: the core links the shared system glslang; in a frontend that carries its own (Alpine's RetroArch) its shader compiles run in the frontend's copy and crash")
+  endif()
 endif()
 if(glslang_FOUND AND TARGET glslang::glslang AND TARGET glslang::SPIRV)
   message(STATUS "glslang: system ${glslang_VERSION}")
+  set(MV_GLSLANG_BUILT_IN OFF)
 else()
   message(STATUS "glslang: fetching a pinned copy")
+  set(MV_GLSLANG_BUILT_IN ON)
   include(FetchContent)
   set(ENABLE_OPT OFF CACHE BOOL "" FORCE)
   set(ENABLE_HLSL OFF CACHE BOOL "" FORCE)
