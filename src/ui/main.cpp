@@ -17,6 +17,7 @@
 #include <sys/prctl.h>
 #endif
 
+#include "core/thread_stack.h"
 #include "core/clock.h"
 #include "core/machine.h"
 #include "core/version.h"
@@ -102,6 +103,7 @@ int press_button(const std::string& name) {
 }
 
 int main(int argc, char** argv) {
+    mv::ensure_thread_stack();
     // MV_ALLOW_PROFILER=1 lets a sampling profiler that is not our parent (eu-stack, gdb -p) attach under Yama's
     // ptrace_scope 1, which otherwise allows only ancestors.
 #if defined(__linux__)

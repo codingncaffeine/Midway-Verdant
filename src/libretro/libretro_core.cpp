@@ -21,6 +21,7 @@
 #include <thread>
 #include <vector>
 
+#include "core/thread_stack.h"
 #include "core/machine.h"
 #include "debug/trace.h"
 #include "ide/ata_disk.h"
@@ -624,7 +625,7 @@ RETRO_API void retro_set_audio_sample_batch(retro_audio_sample_batch_t cb) { aud
 RETRO_API void retro_set_input_poll(retro_input_poll_t cb) { input_poll_cb = cb; }
 RETRO_API void retro_set_input_state(retro_input_state_t cb) { input_state_cb = cb; }
 
-RETRO_API void retro_init(void) {}
+RETRO_API void retro_init(void) { mv::ensure_thread_stack(); }
 RETRO_API void retro_deinit(void) {}
 
 RETRO_API void retro_get_system_info(retro_system_info* info) {
@@ -646,6 +647,7 @@ RETRO_API void retro_get_system_av_info(retro_system_av_info* info) {
 RETRO_API void retro_set_controller_port_device(unsigned, unsigned) {}
 
 RETRO_API bool retro_load_game(const retro_game_info* game) {
+    mv::ensure_thread_stack();  // again, for a frontend that does not call retro_init (it only ever raises the default)
     retro_pixel_format fmt = RETRO_PIXEL_FORMAT_XRGB8888;
     if (!env_cb(RETRO_ENVIRONMENT_SET_PIXEL_FORMAT, &fmt)) {
         log(RETRO_LOG_ERROR, "the frontend has no XRGB8888");

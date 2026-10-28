@@ -2,6 +2,7 @@
 # It contains no window, input or audio code: those belong to the clients (the SDL3 shell, the libretro core).
 add_library(mvcore STATIC
   core/version.cpp
+  core/thread_stack.cpp
   core/clock.cpp
   core/guest_clock.cpp
   core/scheduler.cpp
