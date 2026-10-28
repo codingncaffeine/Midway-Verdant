@@ -17,8 +17,8 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 option(MV_WERROR "Treat warnings as errors" ON)
 option(MV_SANITIZE "Build with AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
 option(MV_BUILD_TESTS "Build the test suite" ON)
-# Release cores: glslang built in (no distribution's copy), the C++ runtime linked in and every symbol but the libretro
-# API hidden, so one core loads on any distribution from its build baseline on and never meets a frontend's own copies.
+# Release cores: the C++ runtime linked in as well (every build has its glslang built in and hidden), so one core loads
+# on any distribution from its build baseline on.
 option(MV_PORTABLE "Build a self-contained core for release" OFF)
 option(MV_SYSTEM_GLSLANG "Link the shared system glslang (a frontend carrying its own can then take over the core's calls)" OFF)
 option(MV_BUILD_SHELL "Build the SDL3 shell (midway-verdant); a release core needs none of it" ON)

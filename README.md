@@ -146,7 +146,7 @@ build/src/midway-verdant --mcpx mcpx.bin --bios flash.bin --hdd disk.img --dvd g
 
 `--help` lists every option. `--create-hdd FILE` writes a blank retail-layout drive. The build also produces `midway_verdant_libretro` for libretro frontends.
 
-A release core is built with `tools/build-linux-core.sh` (podman or docker): in the manylinux_2_28 container (glibc 2.28, GCC 14) with `-DMV_PORTABLE=ON`, which builds the C++ runtime into the core as well (every build has its own glslang inside and exports nothing but the libretro API). `tools/test-linux-distros.sh` then boots it in containers of other distributions.
+A release core is built with `tools/build-linux-core.sh` (podman or docker): in the manylinux_2_28 container (glibc 2.28, GCC 14) with `-DMV_PORTABLE=ON`, which builds the C++ runtime into the core as well (every build has its own glslang inside, hidden from the frontend). `tools/test-linux-distros.sh` then boots it in containers of other distributions.
 
 ## License
 

@@ -23,10 +23,13 @@ cp "$build/src/midway_verdant_libretro.so" "$out/"
 mkdir -p "$out/../test-host" && cp "$build/src/mv-retro-host" "$out/../test-host/"  # for tools/test-linux-distros.sh, not shipped
 strip --strip-unneeded "$out/midway_verdant_libretro.so"
 
-# What it asks of the system: shared libraries, the newest glibc symbol version, and nothing exported but the API.
+# What it asks of the system (shared libraries, the newest glibc symbol version) and what it offers besides the API: the
+# C++ library's template code it instantiates (weak W/V and unique u symbols, which the library's headers give default
+# visibility; the same in every module that has them), never glslang (core-symbols.sh fails the build if it does).
 so="$out/midway_verdant_libretro.so"
 needed=$(objdump -p "$so" | awk '/NEEDED/ { printf "%s ", $2 }')
 glibc=$(objdump -T "$so" | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1)
-exported=$(objdump -T "$so" | awk '$2 ~ /g/ && $4 == ".text" { print $NF }' | grep -vc '^retro_' || true)
-echo "core: $(du -h "$so" | cut -f1); needs: $needed; newest symbol: $glibc; exported besides retro_*: $exported"
+others=$(nm -D --defined-only "$so" | awk '$3 !~ /^retro_/ { n[$2]++ } END { s = ""; for (k in n) { printf "%s%d %s", s, n[k], k; s = ", " } }')
+echo "core: $(du -h "$so" | cut -f1); needs: $needed; newest symbol: $glibc; exported besides retro_*: ${others:-nothing}"
+tests/tools/core-symbols.sh "$so"
 [ "$exported" = 0 ] || { echo "the core exports symbols besides the libretro API"; exit 1; }
