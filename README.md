@@ -68,6 +68,9 @@ The computer: an x86-64 CPU with hardware virtualisation (Intel VT-x or AMD-V, s
 4. **Use the Vulkan video driver.** *Settings → Drivers → Video* → `vulkan`, then restart RetroArch. The core always draws with Vulkan; with RetroArch on Vulkan too, each frame is handed over on the GPU. Under another video driver it still runs, but every frame is copied back through the CPU, which costs speed at the higher internal resolutions.
 5. **Hardware virtualisation (usually nothing to do).** The core runs the console's CPU through the kernel's KVM, which every current distribution opens to all users. If the core says hardware virtualization is off, switch on Intel VT-x or AMD-V (often called SVM on AMD boards, and off by default on many) in your PC's firmware setup. On a system that restricts `/dev/kvm` to a group, the core says so; add yourself to it (`sudo usermod -aG kvm $USER`, then log out and back in). The Flatpak normally has device access already; if not, `flatpak override --user --device=all org.libretro.RetroArch`.
 6. **Play.** *Load Content*, pick a disc image, choose *Midway Verdant*. The console's boot animation plays first, then the game. *Quick Menu → Core Options* holds the settings below; the internal resolution changes while the game runs.
+7. **A playlist of your games (optional).** RetroArch's *Scan Directory* needs its game databases and cannot tell Xbox disc images apart by them. Use *Import Content → Manual Scan* instead: your games folder as the *Content Directory*, *System Name* "Microsoft - Xbox", *Default Core* "Midway Verdant", then *Start Scan*. It lists the games by file name.
+
+**Controllers.** The core takes RetroArch's RetroPad and gives the console a gamepad on each port, by position: the face buttons as they sit on the pad (the bottom one is the Xbox A), L and R as the White and Black buttons, L2 and R2 as the triggers, Select as Back, and both sticks with their clicks. RetroArch maps a pad automatically only when it has a profile for that model; if your pad does nothing, either fetch the profiles (*Main Menu → Online Updater → Update Controller Profiles*) or bind it once by hand (*Settings → Input → RetroPad Binds → Port 1 Controls → Set All Controls*). On a Wayland desktop (KDE Plasma, GNOME), if the pad still does not respond, set *Settings → Drivers → Input* to `wayland` and *Controller* to `sdl2` and restart RetroArch: its default pair, `x` and `udev`, can leave a pad detected but deaf (seen with a Razer pad on Plasma; `sdl2` reads it as an Xbox controller).
 
 The first start of each game compiles its shaders (a stutter or two the first time a scene appears); they are kept in `system/midway-verdant/shader-cache` for the next time.
 
@@ -75,7 +78,9 @@ RetroArch from Steam runs cores inside Steam's own container, which may not pass
 
 ### Tested distributions
 
-The release core is booted from a first start (only the MCPX ROM and the BIOS in the folder) in a container of each distribution with KVM and the distribution's own Vulkan loader and software driver (`tools/test-linux-distros.sh`), up to a game's first pictures. Day-to-day play is on Arch Linux with an NVIDIA GPU.
+In RetroArch 1.22.2 on Arch Linux (KDE Plasma, Wayland, NVIDIA): the core installed from the menu, started from an empty folder with only the MCPX ROM and the BIOS, and played with picture, sound and a pad (on the `sdl2` controller driver).
+
+The release core is also booted from a first start (only the MCPX ROM and the BIOS in the folder) in a container of each distribution with KVM and the distribution's own Vulkan loader and software driver (`tools/test-linux-distros.sh`), up to a game's first pictures. Day-to-day play is on Arch Linux with an NVIDIA GPU.
 
 | Distribution | glibc | Result |
 |---|---|---|
