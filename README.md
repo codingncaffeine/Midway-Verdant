@@ -42,7 +42,7 @@ Midway Verdant is written without leaked or proprietary source material of any k
 
 ## What you need
 
-Midway Verdant contains no Microsoft code or data. You supply dumps from your own console:
+Midway Verdant contains none of the console maker's code or data. You supply dumps from your own console:
 
 - the 512-byte MCPX boot ROM
 - a flash BIOS image (256 KiB, 512 KiB or 1 MiB)
@@ -52,6 +52,16 @@ Both are found by their size, whatever the files are called. On the first start 
 Game discs are read from XISO or full-dump (Redump-layout) images, including FAT32 copies split into `NAME.1.iso`, `NAME.2.iso`, ...
 
 The computer: an x86-64 CPU with hardware virtualisation (Intel VT-x or AMD-V, switched on in the firmware setup), Linux with KVM, and a GPU with a Vulkan 1.1 driver.
+
+## Playing in Emutastic for Linux (the easiest way)
+
+[Emutastic for Linux](https://github.com/codingncaffeine/Emutastic-For-Linux) has the original Xbox built in, running this core (from version 1.9.4).
+
+1. Install Emutastic: from its [releases page](https://github.com/codingncaffeine/Emutastic-For-Linux/releases/latest) (a tarball or a `.deb`), or from the AUR as `emutastic-bin`.
+2. *Preferences → System Files*: add your MCPX boot ROM and BIOS under Xbox. The EEPROM and the hard disk are made on the first start.
+3. Import your Xbox disc images and play.
+
+The core ships with Emutastic, and is also a downloadable core in *Preferences → Cores* (and in *Download All Recommended*): new versions of Midway Verdant arrive there as updates. Every core option is in *Preferences → Core Options → Midway Verdant*, and the internal resolution and anisotropic filtering are in the in-game overlay too.
 
 ## Playing in RetroArch (Linux)
 
@@ -78,9 +88,9 @@ RetroArch from Steam runs cores inside Steam's own container, which may not pass
 
 ### Tested distributions
 
-In RetroArch 1.22.2 on Arch Linux (KDE Plasma, Wayland, NVIDIA): the core installed from the menu, started from an empty folder with only the MCPX ROM and the BIOS, and played with picture, sound and a pad (on the `sdl2` controller driver).
+In RetroArch 1.22.2 on Arch Linux (KDE Plasma, Wayland): the core installed from the menu, started from an empty folder with only the MCPX ROM and the BIOS, and played with picture, sound and a pad (on the `sdl2` controller driver).
 
-The release core is also booted from a first start (only the MCPX ROM and the BIOS in the folder) in a container of each distribution with KVM and the distribution's own Vulkan loader and software driver (`tools/test-linux-distros.sh`), up to a game's first pictures. Day-to-day play is on Arch Linux with an NVIDIA GPU.
+The release core is also booted from a first start (only the MCPX ROM and the BIOS in the folder) in a container of each distribution with KVM and the distribution's own Vulkan loader and software driver (`tools/test-linux-distros.sh`), up to a game's first pictures. Day-to-day play is on Arch Linux.
 
 | Distribution | glibc | Result |
 |---|---|---|
