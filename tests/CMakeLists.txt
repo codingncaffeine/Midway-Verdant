@@ -63,8 +63,10 @@ if(MV_BUILD_SHELL)
 endif()
 
 # The boot smoke test runs only where the user's console dumps are (local-notes/user-files.env); elsewhere it skips.
-# It is a shell script around the KVM fast mode, so it exists on Linux only until the WHPX fast mode lands (Phase 8).
-if(NOT WIN32)
-  add_test(NAME boot_smoke COMMAND "${CMAKE_SOURCE_DIR}/tests/boot/boot-smoke.sh" "${CMAKE_BINARY_DIR}")
+# It is a bash script around the KVM fast mode, so it exists on Linux only until the WHPX fast mode lands (Phase 8), and
+# only where bash is (Alpine has none by default).
+find_program(MV_BASH bash)
+if(NOT WIN32 AND MV_BASH)
+  add_test(NAME boot_smoke COMMAND "${MV_BASH}" "${CMAKE_SOURCE_DIR}/tests/boot/boot-smoke.sh" "${CMAKE_BINARY_DIR}")
   set_tests_properties(boot_smoke PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
 endif()

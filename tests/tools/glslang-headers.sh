@@ -4,13 +4,16 @@
 # the mix the core's own glslang exists to prevent). Runs glsl_compiler.cpp's own compile command, preprocessing only,
 # and reads the headers it opened.
 set -u
-db=${1:?compile_commands.json} tree=${2:?glslang source dir}/  # POSIX sh: Alpine has no bash by default
+db=${1:?compile_commands.json}  # POSIX sh: Alpine has no bash by default
+tree=$(cd "${2:?glslang source dir}" && pwd -P)/ || exit 1
 entry() { awk -v key="\"$1\":" '$1 == key {v = $0} /"file":.*glsl_compiler\.cpp"/ {print v; exit}' "$db"; }
 unquote() { sed -e 's/^ *"[a-z]*": "//' -e 's/",\{0,1\} *$//' -e 's/\\"/"/g' -e 's/\\\\/\\/g'; }
 dir=$(entry directory | unquote)
 cmd=$(entry command | unquote | sed -e 's/ -MD//' -e 's/ -MT [^ ]*//' -e 's/ -MF [^ ]*//' -e 's/ -o [^ ]*//' -e 's/ -c / /')
 [ -n "$cmd" ] || { echo "FAIL: no compile command for glsl_compiler.cpp in $db"; exit 1; }
-opened=$(cd "$dir" && eval "$cmd -E -H -o /dev/null" 2>&1 >/dev/null | sed -n 's/^\.\.* //p' | grep -E '/(glslang|SPIRV)/')
+# Real paths (no "..", no symlinks), as the tree's is.
+opened=$(cd "$dir" && eval "$cmd -E -H -o /dev/null" 2>&1 >/dev/null | sed -n 's/^\.\.* //p' | grep -E '/(glslang|SPIRV)/' |
+    while IFS= read -r f; do realpath "$f"; done)
 inside=$(printf '%s\n' "$opened" | awk -v t="$tree" 'index($0, t) == 1')
 outside=$(printf '%s\n' "$opened" | awk -v t="$tree" 'NF && index($0, t) != 1')
 echo "glslang headers from $tree: $(printf '%s' "$inside" | grep -c .), from elsewhere: $(printf '%s' "$outside" | grep -c .)"
