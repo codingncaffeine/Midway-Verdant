@@ -1466,8 +1466,12 @@ bool VulkanRenderer::readback_alloc(VkDeviceSize bytes, VkDeviceSize& offset) {
     // Sixteen bytes keep every copy's offset a multiple of its texel size.
     const VkDeviceSize start = (readback_cursor_ + 15) / 16 * 16;
     if (start + bytes > readback_.size) {
-        finish_write_backs();  // the batch so far fills the buffer: store it, then start over
-        return readback_alloc(bytes, offset);
+        // The buffer is full: the batch so far is stored and a background batch still holding the rest lands, then it
+        // starts over. With nothing queued, finish_write_backs alone freed nothing and this retried for ever under the
+        // machine lock (a whole-target write-back at an idle vblank while a batch was in flight: the process froze).
+        finish_write_backs();
+        complete_write_backs(true);
+        return readback_alloc(bytes, offset);  // the cursor is 0 now
     }
     offset = start;
     readback_cursor_ = start + bytes;
