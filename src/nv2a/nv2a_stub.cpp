@@ -145,6 +145,7 @@ void Nv2aStub::reset() {
     pgraph_stalled_ = false;
     flip_stalled_ = false;
     report_handle_ = 0;
+    walker_.set_subroutine(0);
     ptimer_offset_ = 0;
     ctx_switch_subchannel_ = 8;
     sched_.cancel(alarm_);
@@ -964,6 +965,7 @@ u32 Nv2aStub::mmio_read(PhysAddr addr, unsigned size) {
         case kUser + 0x40: word = reg(kCache1DmaPut); break;
         case kUser + 0x44: word = timed_ ? visible_get() : reg(kCache1DmaGet); break;
         case kCache1DmaGet: word = timed_ ? visible_get() : reg(kCache1DmaGet); break;
+        case kCache1DmaSubroutine: word = walker_.subroutine(); break;
         case kPgraphStatus: word = (timed_ && gpu_busy()) ? (reg(key) | 1u) : reg(key); break;  // bit 0: the engine is busy
         case kUser + 0x48: word = reg(kCache1Ref); break;
         case kCache1DmaCtl: word = reg(key) | (1u << 31); break;  // the pushbuffer translation is always valid
@@ -1120,6 +1122,9 @@ void Nv2aStub::mmio_write(PhysAddr addr, unsigned size, u32 value) {
         case kCache1DmaPush:
             regs_[key] = word;
             run_pusher();
+            return;
+        case kCache1DmaSubroutine:
+            walker_.set_subroutine(word);
             return;
         default:
             regs_[key] = word;
@@ -1316,10 +1321,21 @@ void Nv2aStub::timed_wait_idle(std::unique_lock<std::mutex>& lock, u32 why) {
 std::string Nv2aStub::state_report() const {
     auto gpu = std::unique_lock(gpu_mutex_);
     std::string r = std::format("holds: software method {}, flip stall {}, walk stuck {}, FIFO busy {}; push {:08x} PUT {:08x} GET {:08x} ref {:08x}; PGRAPH intr {:08x} "
-                                "nsource {:08x} trapped {:08x} data {:08x} FIFO {:08x}; PGRAPH surface (flip read 26:24, write 22:20, modulo 30:28) {:08x}; {} software methods; last methods (oldest first):",
+                                "nsource {:08x} trapped {:08x} data {:08x} FIFO {:08x}; PGRAPH surface (flip read 26:24, write 22:20, modulo 30:28) {:08x}; {} software methods",
                                 pgraph_stalled_ ? 1 : 0, flip_stalled_ ? 1 : 0, stuck_ ? 1 : 0, fifo_busy_ ? 1 : 0, reg(kCache1DmaPush), reg(kCache1DmaPut), reg(kCache1DmaGet),
                                 reg(kCache1Ref), reg(kPgraphIntr), reg(kPgraphNsource), reg(kPgraphTrappedAddr), reg(kPgraphTrappedData), reg(kPgraphFifo),
                                 reg(kPgraphSurface), software_methods_);
+    if (walker_.errored()) r += std::format("; pusher error: {}", walker_.last_error());
+    if (walker_.stray_returns()) r += std::format("; {} returns outside a subroutine passed over", walker_.stray_returns());
+    // A walk that stopped short of PUT: the words it stands on say why (a header it cannot take, a jump loop).
+    if (const auto dma = dma_object(reg(kCache1DmaInstance) & 0xFFFFu); dma.valid && reg(kCache1DmaGet) != reg(kCache1DmaPut)) {
+        r += std::format("; subroutine {:08x}; words from GET-16:", walker_.subroutine());
+        for (u32 at = reg(kCache1DmaGet) - 16; at != reg(kCache1DmaGet) + 32; at += 4) {
+            u32 w = 0;
+            if (at <= dma.limit && bus_.read_ram(dma.base + at, &w, 4)) r += std::format(" {:08x}", w);
+        }
+    }
+    r += "; last methods (oldest first):";
     const u32 n = std::min<u32>(last_method_at_, static_cast<u32>(last_methods_.size()));
     for (u32 i = last_method_at_ - n; i != last_method_at_; ++i) {
         const PushbufferMethod& m = last_methods_[i % last_methods_.size()];

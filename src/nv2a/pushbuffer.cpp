@@ -78,24 +78,27 @@ u32 PushbufferWalker::run(const DmaObject& dma, u32 get, u32 put) {
             get = w & 0xFFFFFFFCu;
             continue;
         }
-        if ((w & 3u) == 2u) {  // call
-            if (call_stack_.size() > 64) {
+        if ((w & 3u) == 2u) {  // call: one level, kept in the SUBROUTINE register
+            if (subroutine_ & 1u) {
                 error_ = true;
-                last_error_ = "call stack overflow";
+                last_error_ = std::format("call at {:08x} while in a subroutine (return to {:08x})", get, subroutine_ & ~1u);
+                trace::log(trace::Cat::Gpu, "pushbuffer: {}", last_error_);
                 return get;
             }
-            call_stack_.push_back(get + 4);
+            subroutine_ = ((get + 4) & 0x1FFFFFFCu) | 1u;
             get = w & 0xFFFFFFFCu;
             continue;
         }
         if (w == 0x00020000u) {  // return
-            if (call_stack_.empty()) {
-                error_ = true;
-                last_error_ = std::format("return with an empty call stack at {:08x}", get);
-                return get + 4;
+            if (!(subroutine_ & 1u)) {
+                // A RETURN error on the hardware; the word is passed over, as the reference does (titles run on it).
+                ++stray_returns_;
+                trace::log(trace::Cat::Gpu, "pushbuffer: return outside a subroutine at {:08x}", get);
+                get += 4;
+                continue;
             }
-            get = call_stack_.back();
-            call_stack_.pop_back();
+            get = subroutine_ & 0x1FFFFFFCu;
+            subroutine_ &= ~1u;
             continue;
         }
         const u32 type = w & 0xE0030003u;

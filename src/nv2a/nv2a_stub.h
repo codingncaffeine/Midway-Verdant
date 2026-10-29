@@ -91,7 +91,7 @@ public:
     // current method's subchannel's copy in CTX_SWITCH1-5, where software-method handlers read the class.
     static constexpr u32 kPgraphCtxSwitch1 = 0x40014C, kPgraphCtxCache1 = 0x400160;
     static constexpr u32 kPfifoRunoutStatus = 0x002400, kCache1Status = 0x003214, kCache1DmaPush = 0x003220, kCache1DmaInstance = 0x00322C, kCache1DmaPut = 0x003240,
-                         kCache1DmaGet = 0x003244;
+                         kCache1DmaGet = 0x003244, kCache1DmaSubroutine = 0x00324C;
     static constexpr u32 kPramin = 0x700000, kUser = 0x800000;
     static constexpr u32 kPrmcioInputStatus1 = 0x6013DA;  // the VGA input status register: retrace bits
     static constexpr u32 kPrmcioCrtcIndex = 0x6013D4, kPrmcioCrtcData = 0x6013D5;  // the CRTC register file

@@ -2,7 +2,6 @@
 #include <array>
 #include <functional>
 #include <string>
-#include <vector>
 
 #include "core/bus.h"
 #include "core/types.h"
@@ -48,12 +47,18 @@ public:
     // A method executed outside a walk (the timed pusher's held method) may ask for a stop the next walk must not see.
     void clear_stop() { stop_requested_ = false; }
     bool mid_header() const { return pending_.remaining != 0; }
+    // PFIFO CACHE1_DMA_SUBROUTINE: the return offset (bits 28:2) and bit 0 "in a subroutine". The hardware has this one
+    // level, no stack: a call while the bit is set is a CALL error, and software may rewrite the register (Direct3D
+    // clears the bit from a software method before calling a segment that ends in a jump instead of a return).
+    u32 subroutine() const { return subroutine_; }
+    void set_subroutine(u32 v) { subroutine_ = v & 0x1FFFFFFDu; }
     // While a sink runs: the offset just past the data word it was handed (where GET stands once that method is done).
     u32 position() const { return position_; }
 
     u64 methods_seen() const { return methods_; }
     u64 words_fetched() const { return words_; }
     bool errored() const { return error_; }
+    u64 stray_returns() const { return stray_returns_; }
     std::string last_error() const { return last_error_; }
 
 private:
@@ -63,8 +68,8 @@ private:
     Bus& bus_;
     Sink sink_;
     BulkSink bulk_sink_;
-    std::vector<u32> call_stack_;
-    u64 methods_{0}, words_{0};
+    u32 subroutine_{0};
+    u64 methods_{0}, words_{0}, stray_returns_{0};
     bool error_{false};
     std::string last_error_;
     bool stop_requested_{false};

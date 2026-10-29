@@ -54,6 +54,48 @@ TEST(Pushbuffer, DecodesMethodsJumpsCallsAndReturns) {
     EXPECT_EQ(w.methods_seen(), 7u);
 }
 
+TEST(Pushbuffer, OneSubroutineLevelInTheRegisterThatSoftwareMayRewrite) {
+    // The hardware keeps one return offset in CACHE1_DMA_SUBROUTINE, no stack. Metal Gear Solid 2 calls segments that end in
+    // a jump back, so the bit stays set; a software method clears it before the next call. A 64-deep stack swallowed
+    // 64 such calls and then stopped the walk for good (the game hung on the Konami logo).
+    Bus bus(1u << 20);
+    PushbufferWalker w(bus);
+    std::vector<u32> values;
+    w.set_sink([&](const PushbufferMethod& m) { values.push_back(m.value); });
+    PushbufferWalker::DmaObject dma{0, (1u << 20) - 1, true};
+    // 0x1000: call 0x2000; the segment there sets one method and jumps back to 0x1004.
+    put(bus, 0x1000, 0x2000 | 2u);
+    put(bus, 0x1004, hdr(1, 0, 0x0200)); put(bus, 0x1008, 2);
+    put(bus, 0x2000, hdr(1, 0, 0x0200)); put(bus, 0x2004, 1); put(bus, 0x2008, 0x1004 | 1u);
+    EXPECT_EQ(w.run(dma, 0x1000, 0x100C), 0x100Cu);
+    EXPECT_FALSE(w.errored()) << w.last_error();
+    EXPECT_EQ(values, (std::vector<u32>{1, 2}));
+    EXPECT_EQ(w.subroutine(), 0x1004u | 1u);  // the return offset, still "in a subroutine"
+
+    // A second call while the bit is set is a CALL error: the walk stops on it.
+    put(bus, 0x100C, 0x2000 | 2u);
+    EXPECT_EQ(w.run(dma, 0x100C, 0x1010), 0x100Cu);
+    EXPECT_TRUE(w.errored());
+    // Software clears the bit (Direct3D writes the register from its software method): the call goes through.
+    w.set_subroutine(0x100C);
+    put(bus, 0x2008, 0x1010 | 1u);
+    EXPECT_EQ(w.run(dma, 0x100C, 0x1010), 0x1010u);
+    EXPECT_FALSE(w.errored()) << w.last_error();
+    EXPECT_EQ(w.subroutine(), 0x1010u | 1u);
+
+    // A return restores the offset and clears the bit; a return outside a subroutine is passed over.
+    put(bus, 0x1010, 0x3000 | 2u);
+    put(bus, 0x3000, 0x00020000u);
+    w.set_subroutine(0);
+    put(bus, 0x1014, 0x00020000u);
+    put(bus, 0x1018, hdr(1, 0, 0x0200)); put(bus, 0x101C, 3);
+    EXPECT_EQ(w.run(dma, 0x1010, 0x1020), 0x1020u);
+    EXPECT_FALSE(w.errored()) << w.last_error();
+    EXPECT_EQ(w.subroutine() & 1u, 0u);
+    EXPECT_EQ(w.stray_returns(), 1u);
+    EXPECT_EQ(values.back(), 3u);
+}
+
 TEST(Pushbuffer, StopsAtAnUnknownHeaderAndOutsideTheDmaObject) {
     Bus bus(1u << 20);
     PushbufferWalker w(bus);
