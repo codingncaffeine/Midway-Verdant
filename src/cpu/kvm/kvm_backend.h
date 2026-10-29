@@ -169,6 +169,16 @@ private:
     u64 backstop_shots_{0};
     bool halted_{false};    // HLT: the guest waits for an interrupt; guest time skips to each next event
     std::string stopped_at_;  // the first HLT with interrupts off: where, and the stack (for the unload report)
+    std::string idle_wait_;   // a halt with nothing scheduled and no interrupt pending: where (an unload during one reports it)
+    // The guest's last device accesses (port or MMIO, direction, value), kept for the unload report: where a guest that
+    // stopped making progress last talked to the hardware, without a trace that changes its timing.
+    struct Access {
+        u32 addr{0}, value{0};
+        u8 kind{0};  // 1 port in, 2 port out, 3 mmio read, 4 mmio write
+    };
+    std::array<Access, 64> last_access_{};
+    u32 last_access_at_{0};
+    void note_access();
     // The kernel's idle loop (fast mode with the guest clock): it spins with interrupts enabled instead of halting, so
     // an idle console burns host time. Found in RAM once the kernel is there, a hardware execution breakpoint on it
     // turns a full turn of the loop with no interrupt since (it has looked for work and found none) into a halt, which

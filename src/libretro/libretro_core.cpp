@@ -785,6 +785,15 @@ RETRO_API void retro_unload_game(void) {
             frames_run ? frame_ms_sum / static_cast<double>(frames_run) : 0.0, frame_ms_max,
             frames_capped ? std::format(", {} cut at 1 s without a vblank", frames_capped).c_str() : "",
             static_cast<unsigned long long>(machine->pit().ticks_delayed()), static_cast<unsigned long long>(machine->pit().ticks_dropped()));
+        {
+            // The interrupt controllers and the timer as they stand: a guest that no longer takes interrupts shows here.
+            const auto& m = machine->pic().master();
+            const auto& s = machine->pic().slave();
+            const auto& c0 = machine->pit().channel(0);
+            log(RETRO_LOG_INFO, "pic: master irr %02x isr %02x imr %02x base %02x lines %02x elcr %02x; slave irr %02x isr %02x imr %02x base %02x lines %02x elcr %02x; intr %d; pit ch0 mode %u reload %u counting %d, backlog %u; boots %u",
+                m.irr, m.isr, m.imr, m.vector_base, m.lines, m.elcr, s.irr, s.isr, s.imr, s.vector_base, s.lines, s.elcr, machine->pic().intr_asserted() ? 1 : 0,
+                c0.mode, c0.reload, c0.counting ? 1 : 0, machine->pit().tick_backlog(), machine->boots() + 1);
+        }
         log(RETRO_LOG_INFO, "retro_run: the CPU held at each vblank for the picture: noticed after %.3f ms (max %.1f), grabbed in %.3f ms (means)",
             frames_run ? hold_wake_ms_sum / static_cast<double>(frames_run) : 0.0, hold_wake_ms_max, frames_run ? hold_grab_ms_sum / static_cast<double>(frames_run) : 0.0);
         log(RETRO_LOG_INFO, "gpu: busiest register reads:%s", machine->nv2a().busiest_reads(6).c_str());

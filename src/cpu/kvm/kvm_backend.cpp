@@ -356,10 +356,14 @@ void KvmBackend::reset() {
                    events.exception.injected | events.exception.pending, events.nmi.injected | events.nmi.pending);
     events = {};
     events.flags = KVM_VCPUEVENT_VALID_NMI_PENDING | KVM_VCPUEVENT_VALID_SHADOW;
-    kvm_ioctl(vcpu_fd_, KVM_SET_VCPU_EVENTS, &events);
+    const auto check = [](int rc, const char* what) {
+        if (rc != 0) trace::log(trace::Cat::Cpu, "reset: {} failed: {}", what, std::strerror(errno));
+        return rc == 0;
+    };
+    check(kvm_ioctl(vcpu_fd_, KVM_SET_VCPU_EVENTS, &events), "KVM_SET_VCPU_EVENTS");
     if (run_) run_->request_interrupt_window = 0;
     kvm_sregs sregs{};
-    kvm_ioctl(vcpu_fd_, KVM_GET_SREGS, &sregs);
+    check(kvm_ioctl(vcpu_fd_, KVM_GET_SREGS, &sregs), "KVM_GET_SREGS");
     auto seg = [](u16 selector, u64 base, u32 limit, u8 type) {
         kvm_segment s{};
         s.selector = selector;
@@ -393,13 +397,27 @@ void KvmBackend::reset() {
     sregs.cr4 = 0;
     sregs.efer = 0;
     sregs.apic_base = 0;
-    kvm_ioctl(vcpu_fd_, KVM_SET_SREGS, &sregs);
+    check(kvm_ioctl(vcpu_fd_, KVM_SET_SREGS, &sregs), "KVM_SET_SREGS");
 
     kvm_regs regs{};
     regs.rip = 0xFFF0;
     regs.rflags = 0x2;
     regs.rdx = cpuid_signature_;
-    kvm_ioctl(vcpu_fd_, KVM_SET_REGS, &regs);
+    check(kvm_ioctl(vcpu_fd_, KVM_SET_REGS, &regs), "KVM_SET_REGS");
+
+    // The idle-loop skip starts over as at power-on: its breakpoints and its last hit belong to the kernel that ran. Kept,
+    // the new kernel's first pass through the loop (no interrupt yet: every line still masked) counted as a quiet turn
+    // and halted before the loop looked for its ready init thread, and nothing could end that halt (MGS2: a restart
+    // left a black screen, about half the time).
+    idle_eips_ = {};
+    idle_eip_ = 0;
+    idle_scans_ = 0;
+    idle_injections_at_hit_ = ~0ull;
+    at_idle_ = false;
+    kvm_guest_debug off{};
+    kvm_ioctl(vcpu_fd_, KVM_SET_GUEST_DEBUG, &off);
+    breakpoints_armed_ = false;
+    arm_breakpoints();  // the --break-eip ones, if any
 
     // TSC starts at zero at power-on; the time until the first entry is not guest time.
     set_tsc(0);
@@ -528,6 +546,24 @@ std::string KvmBackend::report() const {
                                            : std::format(" mmio {:08x} x{}", top[i].first, top[i].second);
     }
     if (!stopped_at_.empty()) r += "\nkvm: the guest stopped: " + stopped_at_;
+    if (!idle_wait_.empty()) r += "\nkvm: halted with nothing scheduled, waiting for an interrupt: " + idle_wait_;
+    {
+        r += "\nkvm: the last device accesses (oldest first):";
+        const u32 n = std::min<u32>(last_access_at_, static_cast<u32>(last_access_.size()));
+        for (u32 i = last_access_at_ - n; i != last_access_at_; ++i) {
+            const Access& a = last_access_[i % last_access_.size()];
+            static constexpr const char* kKinds[] = {"?", "in", "out", "rd", "wr"};
+            r += std::format(" {} {:x}={:x}", kKinds[a.kind], a.addr, a.value);
+        }
+    }
+    {
+        // Where the vCPU stands at unload: a guest that runs without touching a device (no exits) shows up only here.
+        kvm_regs regs{};
+        kvm_sregs sregs{};
+        if (kvm_ioctl(vcpu_fd_, KVM_GET_REGS, &regs) == 0 && kvm_ioctl(vcpu_fd_, KVM_GET_SREGS, &sregs) == 0)
+            r += std::format("\nkvm: the vCPU at unload: eip {:08x} cs {:04x} (base {:08x}) eflags {:08x} cr0 {:08x} esp {:08x}", static_cast<u32>(regs.rip), sregs.cs.selector,
+                             static_cast<u32>(sregs.cs.base), static_cast<u32>(regs.rflags), static_cast<u32>(sregs.cr0), static_cast<u32>(regs.rsp));
+    }
     if (idle_eip_) r += std::format("\nkvm: the kernel idle loops at {:08x} {:08x}: {} hits, {} turned into halts", idle_eips_[0], idle_eips_[1], idle_hits_, idle_halts_);
     else if (idle_skip_ && guest_clock_on_) r += std::format("\nkvm: the kernel idle loop was not found ({} scans): it spins", idle_scans_);
     if (!guest_clock_on_) return r;
@@ -729,6 +765,20 @@ void KvmBackend::drain_coalesced_writes() {
     });
 }
 
+void KvmBackend::note_access() {
+    Access a;
+    if (run_->exit_reason == KVM_EXIT_IO) {
+        a.kind = run_->io.direction == KVM_EXIT_IO_OUT ? 2 : 1;
+        a.addr = run_->io.port;
+        std::memcpy(&a.value, reinterpret_cast<const u8*>(run_) + run_->io.data_offset, std::min<u32>(run_->io.size, 4));
+    } else {
+        a.kind = run_->mmio.is_write ? 4 : 3;
+        a.addr = static_cast<u32>(run_->mmio.phys_addr);
+        std::memcpy(&a.value, run_->mmio.data, std::min<u32>(run_->mmio.len, 4));
+    }
+    last_access_[last_access_at_++ % last_access_.size()] = a;
+}
+
 void KvmBackend::handle_mmio() {
     Bus& bus = machine_->bus();
     const PhysAddr addr = static_cast<PhysAddr>(run_->mmio.phys_addr);
@@ -834,7 +884,12 @@ void KvmBackend::thread_main() {
                         if (const Cycles skipped = clock_.warp_to(sched.next_deadline())) tsc_offset_add(static_cast<i64>(skipped));
                         continue;
                     } else {
+                        // Nothing scheduled can raise an interrupt: only a device line from another thread ends this wait.
+                        Regs r{};
+                        idle_wait_ = read_regs(r) ? std::format("eip {:08x} cs {:04x} eflags {:08x} cr0 {:08x} (boot {})", r.eip, r.cs, r.eflags, r.cr0, machine_->boots() + 1) : "registers unreadable";
+                        trace::log(trace::Cat::Cpu, "halted with nothing scheduled: {}", idle_wait_);
                         wait_for_interrupt();
+                        if (!stop_requested_.load()) idle_wait_.clear();
                         continue;
                     }
                 }
@@ -946,10 +1001,12 @@ void KvmBackend::thread_main() {
         switch (run_->exit_reason) {
             case KVM_EXIT_IO:
                 handle_io();
+                note_access();
                 device_exit(run_->io.direction == KVM_EXIT_IO_OUT ? kPortIoCycles * run_->io.count : 0, false);
                 break;
             case KVM_EXIT_MMIO:
                 handle_mmio();
+                note_access();
                 device_exit(run_->mmio.is_write ? kDeviceStoreCycles : 0, true);
                 break;
             case KVM_EXIT_HLT:
@@ -988,7 +1045,7 @@ void KvmBackend::thread_main() {
                     at_idle_ = true;
                     const bool quiet = stats_.irq_injections == idle_injections_at_hit_;
                     idle_injections_at_hit_ = stats_.irq_injections;
-                    if (quiet && run_->if_flag && guest_clock_on_) {
+                    if (quiet && run_->if_flag && guest_clock_on_ && machine_->pic().master().imr != 0xFF) {  // an interrupt can end it
                         halted_ = true;
                         ++idle_halts_;
                     }
@@ -1130,6 +1187,12 @@ void KvmBackend::thread_main() {
                 break;
         }
     }
+    // A device access the guest stopped on (an MMIO or port read, a string I/O, a filtered MSR) is finished by KVM at the next
+    // KVM_RUN, from the instruction it decoded then: a reset that wrote the registers first had the old kernel's access
+    // finished on top of them (MGS2's restart jumped to 0 and the screen stayed black). One entry with immediate_exit set
+    // completes what is pending and returns before the guest runs (the KVM API's way to make the state consistent).
+    set_immediate_exit(run_, 1);
+    kvm_ioctl(vcpu_fd_, KVM_RUN, 0);  // -1 with EINTR, the pending access done
     vcpu_clock_known_.store(false, std::memory_order_release);
     {
         std::lock_guard lock(machine_->lock());
