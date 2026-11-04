@@ -1625,6 +1625,13 @@ void VulkanRenderer::snapshot_edges(PendingWriteBack& w) {
         if ((page + 1) * kPage > ram_size_ || std::any_of(w.edges.begin(), w.edges.end(), [&](const auto& e) { return e.first == page; })) return;
         w.edges.emplace_back(static_cast<u32>(page), std::vector<u8>(ram_ + page * kPage, ram_ + (page + 1) * kPage));
     };
+    // A small target (a texture drawn into) is kept whole: the pages the CPU wrote count from the last time they were
+    // collected, which can be before the copy was queued (Links writes a tree's memory before the GPU draws the tree).
+    constexpr u64 kWholeBytes = 256 * 1024;
+    if (a1 - a0 <= kWholeBytes) {
+        for (u64 p = a0 / kPage; p * kPage < a1; ++p) take(p);
+        return;
+    }
     if (a0 % kPage) take(a0 / kPage);
     if (a1 % kPage) take(a1 / kPage);
 }
@@ -1660,9 +1667,9 @@ bool VulkanRenderer::complete_write_backs(bool wait, const std::vector<u32>* cpu
     const u32 stream_generation = std::exchange(stream_generation_, async_tag_);
     store_write_backs(list);
     stream_generation_ = stream_generation;
-    // A page the target shares with other memory (Links 2004 packs its 64x64 tree textures back to back; the CPU reworks
-    // the last tree while the GPU draws the next): the bytes the CPU changed since the copy was queued stay, the rest
-    // take the copy. A page wholly inside the target keeps what the CPU wrote, as before.
+    // A page with its bytes from when the copy was queued (a small target's pages; a large one's ends it shares with other
+    // memory; Links 2004 packs its 64x64 tree textures back to back and the CPU reworks the last tree while the GPU draws
+    // the next): the bytes the CPU changed since stay, the rest take the copy. Any other page keeps what the CPU wrote.
     for (const auto& [page, bytes] : kept) {
         u8* const ram = ram_ + static_cast<std::size_t>(page) * kPage;
         const std::vector<u8>* before = nullptr;
