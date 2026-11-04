@@ -137,6 +137,7 @@ void Nv2aStub::reset() {
     bound_ = {};
     bound_handles_ = {};
     sync_ = {};
+    semaphore_held_.store(false, std::memory_order_relaxed);  // the old boot's: the new one never waits on it
     crtc_ = {};
     crtc_index_ = 0;
     for (u32 i = 0; i < 768; ++i) dac_[i] = static_cast<u8>(i / 3);
@@ -696,6 +697,21 @@ void Nv2aStub::execute_method(const PushbufferMethod& m) {
                 trace::log(trace::Cat::Gpu, "semaphore release with no object (handle {:08x})", s.semaphore_handle);
                 return;
             }
+            // The live GPU: textures the frame drew reach RAM before the semaphore says it is done. Links 2004 draws a
+            // distant tree into a 64x64 texture, then the CPU reworks its alpha and makes its mip levels as soon as the
+            // semaphore it polls in RAM moves: read before the pixels came, the trees were rainbow stripes. The copies go
+            // in the background and the semaphore is written when they land (land_write_backs): no wait here.
+            if (renderer_ && !render_thread_) {
+                if (semaphore_held_.load(std::memory_order_relaxed)) land_write_backs(true);  // the older one first
+                if (renderer_->store_drawn_textures()) {
+                    held_semaphore_addr_ = dma.base + s.semaphore_offset;
+                    held_semaphore_value_ = m.value;
+                    semaphore_held_.store(true, std::memory_order_release);
+                    ++semaphores_held_;
+                    ++semaphore_releases_;
+                    return;  // lands at the CPU's next exits (poll_write_backs) or its next progress read
+                }
+            }
             bus_.write_ram(dma.base + s.semaphore_offset, &m.value, 4);
             ++semaphore_releases_;
             trace::log(trace::Cat::Gpu, "semaphore release: {:08x} -> {:08x}", m.value, dma.base + s.semaphore_offset);
@@ -771,24 +787,35 @@ void Nv2aStub::land_write_backs(bool wait) {
         land_stores();
         return;
     }
-    if (!renderer_->write_backs_in_flight()) return;
+    if (!renderer_->write_backs_in_flight()) return release_held_semaphore();
     if (!wait && !renderer_->write_backs_ready()) return;
     // What the guest and the devices wrote since the copies were queued stays: it is newer than they are. The pages stay
     // harvested for the next run too (cpu_wrote reloads the targets they belong to).
     harvest_writes();
-    std::vector<u32> pages(dirty_pending_);
+    std::vector<u32> pages;
+    {
+        std::lock_guard dirty(dirty_mutex_);  // the 1D70 handler lands from the FIFO thread too
+        pages = dirty_pending_;
+    }
     std::sort(pages.begin(), pages.end());
     pages.erase(std::unique(pages.begin(), pages.end()), pages.end());
     renderer_->complete_write_backs(true, &pages);
+    if (!renderer_->write_backs_in_flight()) release_held_semaphore();
+}
+
+void Nv2aStub::release_held_semaphore() {
+    if (!semaphore_held_.load(std::memory_order_acquire)) return;
+    bus_.write_ram(held_semaphore_addr_, &held_semaphore_value_, 4);
+    semaphore_held_.store(false, std::memory_order_release);
 }
 
 bool Nv2aStub::write_backs_in_flight() const {
     if (render_thread_) return true;  // the render thread's state: poll_write_backs looks under its lock
-    return renderer_ && renderer_->write_backs_in_flight();
+    return renderer_ && (renderer_->write_backs_in_flight() || semaphore_held_.load(std::memory_order_relaxed));
 }
 
 void Nv2aStub::poll_write_backs() {
-    if (!renderer_ || (!render_thread_ && !renderer_->write_backs_in_flight())) return;
+    if (!renderer_ || (!render_thread_ && !write_backs_in_flight())) return;
     if (render_thread_) {
         land_write_backs(false);  // the renderer's lock and the journal's: the GPU's is not needed
         return;

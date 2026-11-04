@@ -334,6 +334,12 @@ private:
     };
     std::array<SyncState, 8> sync_{};
     u64 semaphore_releases_{0}, notifies_{0}, software_methods_{0};
+    // A semaphore released after a frame that drew into a texture: it reaches RAM once that texture has (the GPU
+    // writes the semaphore after the drawing before it is done). The guest polls it in RAM, with no register read.
+    u32 held_semaphore_addr_{0}, held_semaphore_value_{0};
+    std::atomic<bool> semaphore_held_{false};
+    u64 semaphores_held_{0};
+    void release_held_semaphore();
     u64 pusher_wall_ns_{0};
     std::chrono::steady_clock::time_point last_run_end_{};
     u64 last_run_ns_{0}, overlap_ns_{0}, sync_points_{0};
@@ -400,6 +406,7 @@ private:
     u64 vblank_waits_{0}, vblank_wait_ns_{0};  // vblanks that waited for the FIFO thread to finish what was queued
 public:
     u64 semaphore_releases() const { return semaphore_releases_; }
+    u64 semaphores_held() const { return semaphores_held_; }
     u64 pusher_wall_ns() const { return pusher_wall_ns_; }  // instrument: host time the vCPU spent inside the pusher (methods + renderer)
     // Instrument for a FIFO thread: of the pusher's time, how much the guest could have run alongside it — the host
     // time from the end of each run to the guest's next access that would need the GPU's result, capped at the run.

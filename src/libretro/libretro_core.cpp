@@ -779,8 +779,8 @@ RETRO_API void retro_unload_game(void) {
         std::string voices;
         for (const auto& s : machine->apu().setup_engine().handles_started())
             voices += std::format(" {:x}@{:.3f}", s.handle, static_cast<double>(s.at) / mv::clk::kCpuHz);
-        log(RETRO_LOG_INFO, "ran %.1f s of console time; %llu frames rendered, %llu displayed; voices started:%s", static_cast<double>(machine->scheduler().now()) / mv::clk::kCpuHz,
-            static_cast<unsigned long long>(machine->nv2a().semaphore_releases()), static_cast<unsigned long long>(machine->nv2a().display_flips()), voices.empty() ? " none" : voices.c_str());
+        log(RETRO_LOG_INFO, "ran %.1f s of console time; %llu frames rendered (%llu held for textures they drew), %llu displayed; voices started:%s", static_cast<double>(machine->scheduler().now()) / mv::clk::kCpuHz,
+            static_cast<unsigned long long>(machine->nv2a().semaphore_releases()), static_cast<unsigned long long>(machine->nv2a().semaphores_held()), static_cast<unsigned long long>(machine->nv2a().display_flips()), voices.empty() ? " none" : voices.c_str());
         log(RETRO_LOG_INFO, "retro_run: %llu frames, host time mean %.2f ms, max %.1f ms%s; pit late ticks delivered %llu, dropped %llu", frames_run,
             frames_run ? frame_ms_sum / static_cast<double>(frames_run) : 0.0, frame_ms_max,
             frames_capped ? std::format(", {} cut at 1 s without a vblank", frames_capped).c_str() : "",
@@ -859,7 +859,7 @@ RETRO_API void retro_unload_game(void) {
                 static_cast<unsigned long long>(st.compiles_queued), static_cast<unsigned long long>(st.pipelines_queued), static_cast<unsigned long long>(st.pending_skips), static_cast<unsigned long long>(st.pending_waits), static_cast<unsigned long long>(st.pipeline_cache_hits));
             // Draws the renderer could not draw, and why (the first of each distinct reason).
             if (st.skipped) log(RETRO_LOG_INFO, "gpu: %llu draws skipped", static_cast<unsigned long long>(st.skipped));
-            log(RETRO_LOG_INFO, "gpu: write-backs by cause: frame end %llu, texture %llu, scanout %llu, 2D/range %llu, relayout %llu, idle vblank %llu, drawn textures before a progress read %llu; %llu targets sampled in place, %llu snapshots for draws sampling their own target (%llu of depth), %llu depth buffers converted to colour, %llu targets the CPU wrote reloaded, %llu depth buffers handed between targets, %llu loaded from RAM; %llu targets evicted by an overlapping one, %llu retired unused, %llu rectangles of a region copied for a texture",
+            log(RETRO_LOG_INFO, "gpu: write-backs by cause: frame end %llu, texture %llu, scanout %llu, 2D/range %llu, relayout %llu, idle vblank %llu, drawn textures before a fence %llu; %llu targets sampled in place, %llu snapshots for draws sampling their own target (%llu of depth), %llu depth buffers converted to colour, %llu targets the CPU wrote reloaded, %llu depth buffers handed between targets, %llu loaded from RAM; %llu targets evicted by an overlapping one, %llu retired unused, %llu rectangles of a region copied for a texture",
                 static_cast<unsigned long long>(st.writebacks_by[0]), static_cast<unsigned long long>(st.writebacks_by[1]), static_cast<unsigned long long>(st.writebacks_by[2]),
                 static_cast<unsigned long long>(st.writebacks_by[3]), static_cast<unsigned long long>(st.writebacks_by[4]), static_cast<unsigned long long>(st.writebacks_by[5]), static_cast<unsigned long long>(st.writebacks_by[6]),
                 static_cast<unsigned long long>(st.surface_samples), static_cast<unsigned long long>(st.snapshots), static_cast<unsigned long long>(st.depth_snapshots), static_cast<unsigned long long>(st.zeta_conversions), static_cast<unsigned long long>(st.cpu_written_targets),
