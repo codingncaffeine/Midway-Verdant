@@ -178,6 +178,8 @@ VulkanRenderer::VulkanRenderer(vk::Device& device, const HandleResolver& handles
         debug_tex_log_ = s.find("texlog") != std::string::npos;
         // nofog: every draw as if fog were off (the pixel side reads the same switch).
         debug_no_fog_ = s.find("nofog") != std::string::npos;
+        // depthtails: a texture starting inside a depth buffer forces its copy as before (the control for depth_tails_left).
+        debug_depth_tails_ = s.find("depthtails") != std::string::npos;
         debug_vsh_dump_ = s.find("vshdump") != std::string::npos;
         if (debug_draw_id_) debug_flat_ = true;
     }
@@ -2642,6 +2644,14 @@ const VulkanRenderer::TextureEntry* VulkanRenderer::texture(const KelvinState& s
                 queue_write_back(*surf);
             }
             const u64 z0 = surf->zeta_phys, z1 = static_cast<u64>(surf->zeta_phys) + surf->zeta_bytes();
+            // A texture that starts inside a depth buffer, past its first byte, only shares its last rows by the guest's
+            // own layout (Links 2004's water reflection cube begins 35 rows before the end of the frame's depth buffer):
+            // it reads what RAM holds. A shadow map starts at the depth buffer. Each forced copy was a mid-frame GPU wait
+            // and a whole 6x depth buffer: the water at 20 fps while the ball flew.
+            if (surf->zeta_dirty && z0 < static_cast<u64>(phys) + length && static_cast<u64>(phys) < z1 && static_cast<u64>(phys) > z0 && !debug_depth_tails_) {
+                ++stats_.depth_tails_left;
+                continue;
+            }
             if (surf->zeta_dirty && z0 < static_cast<u64>(phys) + length && static_cast<u64>(phys) < z1) {
                 forced("depth");
                 queue_write_back_zeta(*surf);

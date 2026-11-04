@@ -208,6 +208,7 @@ public:
         u64 point_draws{0}, point_sprite_draws{0};  // POINTS draws; of them, point sprites (stage 3 reads the point)
         u64 depth_borrows{0};  // binds that drew with a bigger target's depth image of the same pitch (D37)
         u64 evicted{0}, retired_unused{0};  // targets another target overlapped; targets nothing used for 10 s
+        u64 depth_tails_left{0};  // textures starting inside a depth buffer that read RAM without forcing its copy
         u64 subrect_copies{0};  // rectangles of a pitch-linear region copied for a texture
         u64 cube_assemblies{0};  // cube maps put together on the GPU from six render targets (cube_texture)
         u64 mip_assemblies{0};  // mip chains put together on the GPU from their level targets (mip_texture)
@@ -863,6 +864,7 @@ private:
     u32 signed_half_{0};  // the half of a signed blend whose pipeline is asked for (psh::Key::signed_half)
     bool debug_tex_log_{false};
     bool debug_no_fog_{false};
+    bool debug_depth_tails_{false};
     bool debug_vsh_dump_{false};
     std::unordered_map<VkShaderModule, u32> vs_debug_ids_;  // drawid/vshdump: each vertex shader's dump number
     bool debug_roundtrip_{false};  // MV_RENDER_DEBUG=roundtrip: sampled targets go through RAM as before (an A/B control)
