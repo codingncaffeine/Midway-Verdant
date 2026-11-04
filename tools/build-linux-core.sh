@@ -32,4 +32,6 @@ glibc=$(objdump -T "$so" | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1)
 others=$(nm -D --defined-only "$so" | awk '$3 !~ /^retro_/ { n[$2]++ } END { s = ""; for (k in n) { printf "%s%d %s", s, n[k], k; s = ", " } }')
 echo "core: $(du -h "$so" | cut -f1); needs: $needed; newest symbol: $glibc; exported besides retro_*: ${others:-nothing}"
 tests/tools/core-symbols.sh "$so"
+# Strong code or data of its own besides the API (T/D/B/R) is a leak of the core's internals: the build fails on it.
+exported=$(nm -D --defined-only "$so" | awk '$3 !~ /^retro_/ && $2 ~ /^[TDBR]$/' | wc -l)
 [ "$exported" = 0 ] || { echo "the core exports symbols besides the libretro API"; exit 1; }
