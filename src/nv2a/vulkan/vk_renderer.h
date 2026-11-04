@@ -135,6 +135,10 @@ public:
     // With `in_background` the colour and depth copies go to the GPU without a wait and reach RAM later
     // (complete_write_backs), as the scanout's does above 1x.
     void write_back_all(bool in_background = false);
+    // A swizzled target (a texture the GPU drew) drawn since it last reached RAM starts on its way there, in the background
+    // (complete_write_backs lands it): the guest asked how far the GPU has come, as it does before the CPU reads what the
+    // GPU drew. True when one was queued.
+    bool store_drawn_textures();
     // Write-backs queued without a wait (an idle vblank's, the scanout's above 1x: the CPU and the GPU thread used to wait
     // there for the GPU to finish the whole frame, with both locks held). They reach RAM here: once the GPU is done with
     // them, or at once with `wait`. RAM pages in `cpu_pages` (sorted) were written by the CPU or a device since they were
@@ -224,7 +228,7 @@ public:
         u64 surface_reloads{0};  // render targets reloaded from RAM after another engine wrote them  // textures whose pages were written but whose bytes hashed the same: kept
         // Write-backs by cause: frame end, a texture sampling the target, the scanout at vblank, a 2D or CPU range,
         // a target relaid out, the idle vblank (all).
-        enum WriteBackWhy : unsigned { kWbFrameEnd, kWbTexture, kWbScanout, kWbRange, kWbRelayout, kWbAll, kWbWhyCount };
+        enum WriteBackWhy : unsigned { kWbFrameEnd, kWbTexture, kWbScanout, kWbRange, kWbRelayout, kWbAll, kWbProgress, kWbWhyCount };
         u64 writebacks_by[kWbWhyCount]{};
         // Where the time goes, in nanoseconds: the whole draw and its parts (the texture part includes the
         // write-backs a sample forces; the shader parts are the compiles, a lookup costs nothing measurable); the
@@ -704,6 +708,7 @@ private:
     VkFence async_fence_{VK_NULL_HANDLE};
     u64 async_serial_{0};
     std::atomic<bool> async_pending_{false};
+    bool swizzled_drawn_{false};  // a swizzled target was drawn into since store_drawn_textures last looked
     bool async_wb_on_{true};
     u32 descriptor_sets_used_{0};  // from the recording frame's pool
     // The vertex uniform block being built, and the last block of each kind uploaded in the recording frame.

@@ -1946,6 +1946,27 @@ void VulkanRenderer::write_back_all(bool in_background) {
     }
 }
 
+// The guest asks how far the GPU has come, which Direct3D does before the CPU reads a resource the GPU wrote: a
+// swizzled target (a texture drawn into) drawn since it last reached RAM goes there now, in the background, landed by the
+// caller's wait. On the hardware the pixels are in RAM once drawn; the reference emulator downloads a surface when the
+// CPU touches its memory. Links 2004 draws each distant tree into a 64x64 texture, then with the CPU reworks its alpha
+// and makes its mip levels from those pixels: read before they reached RAM, the trees came out as rainbow stripes.
+// Linear targets (the frame and its buffers) keep their own paths (scanout, idle vblank, textures, 2D, CPU writes).
+bool VulkanRenderer::store_drawn_textures() {
+    if (!swizzled_drawn_) return false;
+    swizzled_drawn_ = false;
+    wb_why_ = Stats::kWbProgress;
+    bool any = false;
+    for (auto& [k, s] : surfaces_)
+        if (s->dirty && s->swizzled) {
+            queue_write_back(*s);
+            any = true;
+        }
+    if (any) finish_write_backs_async();
+    wb_why_ = Stats::kWbAll;
+    return any;
+}
+
 void VulkanRenderer::write_back_range(u32 phys, u32 len) {
     complete_write_backs_over(phys, static_cast<u64>(phys) + len);
     wb_why_ = Stats::kWbRange;
@@ -3705,7 +3726,10 @@ void VulkanRenderer::clear(const KelvinState& s, u32 bits) {
         t->depth_target().zeta_dirty = true;
         if (t->borrow) ++t->borrow->draw_serial;  // the lender's depth-as-colour conversion is stale
     }
-    if (bits & 0xF0u) t->dirty = true;
+    if (bits & 0xF0u) {
+        t->dirty = true;
+        swizzled_drawn_ |= t->swizzled;
+    }
     ++t->clears_this_frame;
     ++t->draw_serial;
     VkClearAttachment att[2]{};
@@ -4216,7 +4240,10 @@ void VulkanRenderer::draw(const KelvinState& s, const DrawBatch& batch) {
         t->depth_target().zeta_dirty = true;
         if (t->borrow) ++t->borrow->draw_serial;  // the lender's depth-as-colour conversion is stale
     }
-    if (s.color_mask() != 0) t->dirty = true;
+    if (s.color_mask() != 0) {
+        t->dirty = true;
+        swizzled_drawn_ |= t->swizzled;
+    }
     ++t->draws_this_frame;
     ++t->draw_serial;
     fn_->vkCmdBindPipeline(cb_, VK_PIPELINE_BIND_POINT_GRAPHICS, p);

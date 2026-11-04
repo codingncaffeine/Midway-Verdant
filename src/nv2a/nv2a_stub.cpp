@@ -930,6 +930,8 @@ u32 Nv2aStub::mmio_read(PhysAddr addr, unsigned size) {
     if (render_thread_ && reports_progress(key)) {
         const auto drawn = own_renderer();
     }
+    // Textures the GPU drew reach RAM before the answer (the CPU reads them next): queued here, landed by the wait below.
+    if (reports_progress(key) && renderer_ && !render_thread_) renderer_->store_drawn_textures();
     if (reports_progress(key)) land_write_backs(true);
     if (off == kPrmcioInputStatus1 && size == 1) {
         // Bit 3: vertical retrace in progress; bit 0: display inactive (blanking).
