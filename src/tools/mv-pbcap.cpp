@@ -369,8 +369,11 @@ struct TextureDumpSink : mv::pgraph::RenderSink {
         done = true;
         using namespace mv::pgraph;
         for (mv::u32 t = 0; t < 4; ++t) {
-            const TextureStage ts = s.texture(t);
+            TextureStage ts = s.texture(t);
             if (!ts.enabled() || s.shader_stage_program(t) == 0) continue;
+            // MV_PBCAP_AS=FMT (hex): decode every stage's memory as that colour format instead (is it the format, or the bytes?).
+            if (const char* as = std::getenv("MV_PBCAP_AS"); as && *as)
+                ts.format = (ts.format & ~0xFF00u) | ((static_cast<mv::u32>(std::strtoul(as, nullptr, 16)) & 0xFFu) << 8);
             const DmaObject dma = replay->resolve(s.dma_handle(ts.dma_select() == 2 ? mthd::kDmaB : mthd::kDmaA));
             const mv::u32 phys = dma.base + ts.offset;
             DecodedTexture d;
@@ -410,6 +413,50 @@ struct TextureDumpSink : mv::pgraph::RenderSink {
         }
     }
 };
+
+// pages FILE ADDR LEN: every frame whose page records (the CPU's writes) or 2D blits touch [ADDR, ADDR + LEN), with a hash of
+// the range after it (where a texture's bytes came from, and when).
+int pages(const char* path, mv::u32 addr, mv::u32 len) {
+    mv::pgraph::Replay r;
+    std::string error;
+    if (!r.open(path, error)) {
+        std::fprintf(stderr, "mv-pbcap: %s\n", error.c_str());
+        return 1;
+    }
+    struct Obs : mv::pgraph::Replay::Observer {
+        mv::pgraph::Replay* r{nullptr};
+        mv::u32 addr{0}, len{0}, frame{0}, cpu{0}, blit{0};
+        void frame_end(mv::u32 index, mv::u32) override {
+            frame = index + 1;
+            if (!cpu && !blit) return;
+            const mv::u8* p = r->memory().at(addr, len);
+            mv::u64 h = 1469598103934665603ull;
+            for (mv::u32 i = 0; p && i < len; ++i) h = (h ^ p[i]) * 1099511628211ull;
+            std::printf("frame %u: %u page records, %u blit writes; range hash %016llx; first bytes %02x %02x %02x %02x\n", index, cpu, blit,
+                        static_cast<unsigned long long>(h), p ? p[0] : 0, p ? p[1] : 0, p ? p[2] : 0, p ? p[3] : 0);
+            cpu = blit = 0;
+        }
+    } obs;
+    obs.r = &r;
+    obs.addr = addr;
+    obs.len = len;
+    auto hits = [&](mv::u32 a0, mv::u32 a1) { return a0 < addr + len && addr < a1; };
+    r.set_page_observer([&](mv::u32 first, mv::u32 count) {
+        if (!hits(first * 4096u, (first + count) * 4096u)) return;
+        ++obs.cpu;
+        if (std::getenv("MV_PBCAP_PAGES_VERBOSE")) {
+            const mv::u8* q = r.memory().at(obs.addr, 16);
+            std::printf("  frame %u: pages %05x+%u; at %08x:", obs.frame, first, count, obs.addr);
+            for (int i = 0; q && i < 16; ++i) std::printf(" %02x", q[i]);
+            std::printf("\n");
+        }
+    });
+    r.set_blit_hooks(nullptr, [&](mv::u32 a, mv::u32 n) { if (hits(a, a + n)) ++obs.blit; });
+    mv::pgraph::Kelvin kelvin;
+    r.run(kelvin, &obs, error, 0);
+    if (!error.empty()) std::fprintf(stderr, "mv-pbcap: %s\n", error.c_str());
+    return 0;
+}
 
 int textures(const char* path, mv::u32 frame, mv::u32 draw_index, const char* dir) {
     mv::pgraph::Replay r;
@@ -642,6 +689,8 @@ int main(int argc, char** argv) {
     if (std::strcmp(argv[1], "draws") == 0 && argc >= 4) return draws(argv[2], static_cast<mv::u32>(std::atoi(argv[3])));
     if (std::strcmp(argv[1], "textures") == 0 && argc >= 6)
         return textures(argv[2], static_cast<mv::u32>(std::atoi(argv[3])), static_cast<mv::u32>(std::atoi(argv[4])), argv[5]);
+    if (std::strcmp(argv[1], "pages") == 0 && argc >= 5)
+        return pages(argv[2], static_cast<mv::u32>(std::strtoul(argv[3], nullptr, 16)), static_cast<mv::u32>(std::strtoul(argv[4], nullptr, 16)));
     if (std::strcmp(argv[1], "summary") == 0) return summary(argv[2]);
     if (std::strcmp(argv[1], "methods") == 0) return methods(argv[2]);
     if (std::strcmp(argv[1], "replay") == 0) return replay(argv[2], argc > 3 ? static_cast<mv::u32>(std::atoi(argv[3])) : 0u);
