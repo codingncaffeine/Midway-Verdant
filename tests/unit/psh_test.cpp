@@ -49,6 +49,26 @@ TEST(Psh, ModulateTextureByDiffuseCompiles) {
     EXPECT_TRUE(c.ok()) << c.log << "\n" << t.glsl;
 }
 
+TEST(Psh, PointSpritesReadThePositionInsideThePointOnStageThree) {
+    KelvinState s;
+    s.r[mthd::kShaderStageProgram >> 2] = 1u << 15;            // stage 3: 2D projective
+    s.r[(mthd::kTextureBase + 3 * mthd::kTextureStride + 4) >> 2] = 0x0001002a;
+    s.r[(mthd::kTextureBase + 3 * mthd::kTextureStride + 0xC) >> 2] = 0x40000000;  // enabled
+    Key k = key_from_state(s);
+    EXPECT_EQ(k.point_sprite, 0u) << "the renderer sets it per draw (points + SET_POINT_SMOOTH_ENABLE)";
+    const Translation plain = translate(k);
+    EXPECT_NE(plain.glsl.find("vtx_t3 = vtx_t3_in;"), std::string::npos) << plain.glsl;
+    k.point_sprite = 1;
+    const Translation sprite = translate(k);
+    ASSERT_TRUE(sprite.error.empty()) << sprite.error;
+    EXPECT_NE(sprite.glsl.find("vtx_t3 = vec4(gl_PointCoord, 1.0, 1.0);"), std::string::npos) << sprite.glsl;
+    EXPECT_NE(sprite.glsl.find("tex3, vec3(vtx_t3.xy"), std::string::npos) << "stage 3 samples at the sprite's coordinate\n" << sprite.glsl;
+    for (const Translation* t : {&plain, &sprite}) {
+        const CompiledShader c = compile_glsl(ShaderStage::Fragment, t->glsl, "point sprite");
+        EXPECT_TRUE(c.ok()) << c.log << "\n" << t->glsl;
+    }
+}
+
 TEST(Psh, UniformsDecodeFactorsFogAndAlphaReference) {
     KelvinState s;
     s.r[mthd::kCombinerFactor0 >> 2] = 0x80FF4020;

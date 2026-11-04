@@ -872,6 +872,9 @@ RETRO_API void retro_unload_game(void) {
             if (st.depth_unparks || st.parked_samples || st.depth_loads_skipped || st.depth_borrows)
                 log(RETRO_LOG_INFO, "gpu: depth buffers: %llu parked images bound again, %llu sampled in place, %llu loads skipped for a whole clear, %llu drawn with a bigger target's image",
                     static_cast<unsigned long long>(st.depth_unparks), static_cast<unsigned long long>(st.parked_samples), static_cast<unsigned long long>(st.depth_loads_skipped), static_cast<unsigned long long>(st.depth_borrows));
+            if (st.point_draws)
+                log(RETRO_LOG_INFO, "gpu: %llu point draws, %llu of them point sprites", static_cast<unsigned long long>(st.point_draws),
+                    static_cast<unsigned long long>(st.point_sprite_draws));
             if (st.mip_assemblies) log(RETRO_LOG_INFO, "gpu: %llu mip chains put together on the GPU from their level targets", static_cast<unsigned long long>(st.mip_assemblies));
             if (!st.forced_by.empty()) {
                 // The write-backs a texture forced, most first: what is sampled through RAM instead of in place.

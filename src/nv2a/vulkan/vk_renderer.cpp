@@ -2200,6 +2200,7 @@ VkShaderModule VulkanRenderer::vertex_shader(const KelvinState& s, std::string& 
     options.smooth_shading = s.reg(mthd::kShadeModel) != 0x1D00;
     options.fog = fog;
     options.fog_mode = fog_mode;
+    options.fixed_function = !vp;
     const vsh::Translation t = vp ? vsh::translate(program, options) : vsh::fixed_function_translate(s, options);
     if (debug_ff_dump_ && !vp) {
         static int dumped = 0;
@@ -3937,6 +3938,14 @@ void VulkanRenderer::draw(const KelvinState& s, const DrawBatch& batch) {
     const u32 equation = s.reg(mthd::kBlendEquation);
     const bool signed_blend = s.blend() && !debug_noblend_ && !counting && (equation == 0xF005 || equation == 0xF006);  // counted: one draw, one count
     if (signed_blend) pkey.signed_half = 1;
+    // A point sprite (SET_POINT_SMOOTH_ENABLE on a POINTS draw): texture stage 3 reads the position inside the point.
+    if (v.primitive == Primitive::Points) {
+        ++stats_.point_draws;
+        if (s.reg(0x031C) & 1u) {
+            pkey.point_sprite = 1;
+            ++stats_.point_sprite_draws;
+        }
+    }
     if (debug_shadow_pass_) pkey.shadow_compare_func = 7;  // every shadow lookup lit
     // The console's exact depth from the pixel shader for every draw that tests or writes depth: what one draw stores and
     // what a later one compares must be on the same step (the host's own depth for the stored side drew a grid over a

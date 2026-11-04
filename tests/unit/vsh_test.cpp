@@ -284,5 +284,44 @@ TEST(Vsh, TheFixedFunctionUniformsCarryTheLightsWhereTheShaderReadsThem) {
     EXPECT_NE(tr.glsl.find("ff_light[28].xyz * (attenuation * nDotVP)"), std::string::npos) << tr.glsl;
     EXPECT_NE(tr.glsl.find("VP = ff_light[30].xyz"), std::string::npos) << tr.glsl;
     EXPECT_NE(tr.glsl.find("dot(ff_light[35].xyz, VP) + ff_light[35].w"), std::string::npos) << tr.glsl;
-    EXPECT_EQ(vsh::kUniformBytes, (kConstantSlots + 2 + 4 + 8 * 9) * 16);
+    EXPECT_EQ(vsh::kUniformBytes, (kConstantSlots + 2 + 4 + 8 * 9 + 3) * 16);
+}
+
+TEST(Vsh, PointsTakeSetPointSizeOrTheDistanceAttenuationOfSetPointParams) {
+    KelvinState s;
+    auto setf = [&](u32 method, float v) { std::memcpy(&s.r[method >> 2], &v, 4); };
+    s.r[0x043C >> 2] = 20;  // SET_POINT_SIZE: 2.5 pixels (eighths)
+    setf(0x0A30 + 4 * 3, 7.0f);  // SET_POINT_PARAMS[3]
+    setf(0x0A30 + 4 * 7, 1.5f);  // SET_POINT_PARAMS[7]
+    std::vector<float> u(kFixedFunctionVectors * 4, -1.0f);
+    fixed_function_uniforms(s, u.data());
+    const std::size_t p = (4 + kLights * kLightVectors) * 4;
+    EXPECT_EQ(u[p + 0], 2.5f) << "point_params[0].x = the size in pixels";
+    EXPECT_EQ(u[p + 1], 0.0f) << "point_params[0].y = SET_POINT_PARAMS_ENABLE off";
+    EXPECT_EQ(u[p + 4 + 3], 7.0f) << "point_params[1].w = SET_POINT_PARAMS[3]";
+    EXPECT_EQ(u[p + 4 + 7], 1.5f) << "point_params[2].w = SET_POINT_PARAMS[7]";
+    s.r[0x043C >> 2] = 0;
+    fixed_function_uniforms(s, u.data());
+    EXPECT_EQ(u[p + 0], 1.0f) << "a size of 0 draws one pixel";
+
+    // The fixed function: SET_POINT_SIZE, or the attenuation curve with SET_POINT_PARAMS_ENABLE; each compiles.
+    Translation fixed_size = fixed_function_translate(s, Options{});
+    EXPECT_NE(fixed_size.glsl.find("oPts.x = max(point_params[0].x, 1.0);"), std::string::npos) << fixed_size.glsl;
+    s.r[0x0318 >> 2] = 1;
+    fixed_function_uniforms(s, u.data());
+    EXPECT_EQ(u[p + 1], 1.0f);
+    EXPECT_NE(fixed_function_key(s), fixed_function_key(KelvinState{})) << "the enable shapes the shader";
+    Translation attenuated = fixed_function_translate(s, Options{});
+    EXPECT_NE(attenuated.glsl.find("inversesqrt(point_params[1].x + point_params[1].y * d_e"), std::string::npos) << attenuated.glsl;
+    for (const Translation* t : {&fixed_size, &attenuated}) {
+        const CompiledShader c = compile_glsl(ShaderStage::Vertex, t->glsl, "points");
+        EXPECT_TRUE(c.ok()) << c.log << "\n" << t->glsl;
+    }
+    // A program's oPts counts only with SET_POINT_PARAMS_ENABLE (decided per draw from the uniform).
+    Program program;
+    program.instructions.push_back(Instruction{});
+    program.instructions.back().final = true;
+    const Translation prog = translate(program, Options{});
+    EXPECT_NE(prog.glsl.find("if (point_params[0].y == 0.0) oPts.x = point_params[0].x;"), std::string::npos) << prog.glsl;
+    EXPECT_TRUE(compile_glsl(ShaderStage::Vertex, prog.glsl, "program points").ok());
 }

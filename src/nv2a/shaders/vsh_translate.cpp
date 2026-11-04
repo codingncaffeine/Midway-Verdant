@@ -1,5 +1,6 @@
 #include "nv2a/shaders/vsh_translate.h"
 
+#include <algorithm>
 #include <format>
 
 #include "nv2a/shaders/fsh_interface.h"
@@ -250,6 +251,7 @@ void append_head(std::string& g) {
         "    vec4 ff_specular;        // fixed function: the specular power curve (L, M, N) of SET_SPECULAR_PARAMS\n"
         "    vec4 fog_params;         // SET_FOG_PARAMS (the factor = f(distance) coefficients)\n"
         "    vec4 ff_light[72];       // fixed function: nine per light (see vsh_translate.h)\n"
+        "    vec4 point_params[3];    // x: SET_POINT_SIZE in pixels, y: 1 = SET_POINT_PARAMS_ENABLE; then SET_POINT_PARAMS 0-3, 4-7\n"
         "}};\n\n",
         kConstantSlots);
     g += std::format("layout(location = {}) out vec4 vtx_d0;\n", kVaryingD0);
@@ -318,6 +320,8 @@ void append_head(std::string& g) {
 }
 
 void append_tail(std::string& g, const Options& options) {
+    // A program's points take SET_POINT_SIZE unless SET_POINT_PARAMS_ENABLE lets the program's oPts through.
+    if (!options.fixed_function) g += "    if (point_params[0].y == 0.0) oPts.x = point_params[0].x;\n";
     if (options.fog) {
         // The transform turns the fog distance it left in oFog.x into the fog factor (1 clear, 0 fogged) per
         // SET_FOG_MODE, with SET_FOG_PARAMS holding the curve's coefficients (the reference emulator's reading).
@@ -354,7 +358,7 @@ void append_tail(std::string& g, const Options& options) {
         "    // hardware does; with |w| their mirrored positions drew large wedges over the picture.\n"
         "    float wa = oPos.w;\n"
         "    gl_Position = vec4(ndc * wa, zndc * wa, wa);\n"
-        "    gl_PointSize = max(oPts.x, 1.0) * surface_size.z;\n"
+        "    gl_PointSize = clamp(oPts.x, 1.0, 63.875) * surface_size.z;\n"
         "    vtx_d0 = clamp(oD0, 0.0, 1.0);\n"
         "    vtx_d1 = clamp(oD1, 0.0, 1.0);\n"
         "    vtx_b0 = clamp(oB0, 0.0, 1.0);\n"
@@ -454,6 +458,8 @@ namespace ff {
 constexpr u32 kLightControl = 0x0294, kColorMaterial = 0x0298, kFogGenMode = 0x02A0, kFogEnable = 0x02A4, kSkinMode = 0x0328,
               kNormalizationEnable = 0x03A4, kSpecularEnable = 0x03B8, kTexgen = 0x03C0, kTextureMatrixEnable = 0x0420,
               kTexgenViewModel = 0x09CC, kFogParams = 0x09C0, kSpecularParams = 0x09E0, kLight = 0x1000, kLightStride = 0x80;
+// Points: SET_POINT_PARAMS_ENABLE, SET_POINT_SIZE (pixels in 1/8, at most 0x1FF), SET_POINT_PARAMS (eight floats).
+constexpr u32 kPointParamsEnable = 0x0318, kPointSize = 0x043C, kPointParams = 0x0A30, kPointSizeMax = 0x1FF;
 // Within a light's block: colours (three floats each), range, infinite half vector and direction, spot falloff
 // (three) and direction (four), local position and attenuation (three).
 constexpr u32 kLightAmbient = 0x00, kLightDiffuse = 0x0C, kLightSpecular = 0x18, kLightRange = 0x24, kLightHalfVector = 0x28,
@@ -495,7 +501,8 @@ const char* colour_source(u32 src) { return src == 1 ? "v3" : "v4"; }
 std::vector<u32> fixed_function_key(const KelvinState& s) {
     std::vector<u32> k{s.reg(ff::kLightControl), s.reg(ff::kColorMaterial), s.reg(ff::kFogGenMode), s.reg(ff::kFogEnable) & 1u,
                        s.reg(mthd::kLightingEnable) & 1u, s.reg(ff::kSkinMode), s.reg(ff::kNormalizationEnable) & 1u,
-                       s.reg(ff::kSpecularEnable) & 1u, s.reg(mthd::kLightEnableMask), s.reg(ff::kTexgenViewModel)};
+                       s.reg(ff::kSpecularEnable) & 1u, s.reg(mthd::kLightEnableMask), s.reg(ff::kTexgenViewModel),
+                       s.reg(ff::kPointParamsEnable) & 1u};
     for (u32 i = 0; i < 16; ++i) k.push_back(s.reg(ff::kTexgen + 4 * i));
     for (u32 i = 0; i < 4; ++i) k.push_back(s.reg(ff::kTextureMatrixEnable + 4 * i) & 1u);
     return k;
@@ -567,6 +574,12 @@ void fixed_function_uniforms(const KelvinState& s, float* out) {
         curve(base + ff::kLightSpotFalloff, v + 28);
         for (u32 i = 0; i < 4; ++i) v[32 + i] = s.regf(base + ff::kLightSpotDirection + 4 * i);
     }
+    float* pt = out + (4 + kLights * kLightVectors) * 4;
+    const u32 size = s.reg(ff::kPointSize);
+    // A point size of 0 draws one pixel; a value past the largest is not taken by the hardware (here: the largest).
+    pt[0] = size == 0 ? 1.0f : static_cast<float>(std::min(size, ff::kPointSizeMax)) / 8.0f;
+    pt[1] = (s.reg(ff::kPointParamsEnable) & 1u) ? 1.0f : 0.0f;
+    for (u32 i = 0; i < 8; ++i) pt[4 + i] = s.regf(ff::kPointParams + 4 * i);
 }
 
 Translation fixed_function_translate(const KelvinState& s, const Options& options) {
@@ -714,6 +727,19 @@ Translation fixed_function_translate(const KelvinState& s, const Options& option
     // and the viewport offset, as the XDK's program epilogue leaves it.
     g += std::format("    vec4 p = {};\n", xf(skin.matrices == 0 ? "v0" : "tPosition", ff::kComposite));
     g += std::format("    oPos = vec4(p.xyz * vp_rcc(vec4(p.w)).x + c[{}].xyz, p.w);\n", ff::kViewportOffset);
+    // The point size: SET_POINT_SIZE, or with SET_POINT_PARAMS_ENABLE the distance attenuation of the eight
+    // SET_POINT_PARAMS as the XDK packs them (0-2: the a + b d + c d^2 curve, 3: the size range, 6: a bias, 7: the
+    // smallest size), d the eye-space distance; the reference emulator's reading [verify on hardware].
+    if (s.reg(ff::kPointParamsEnable) & 1u)
+        g += "    {\n"
+             "        float d_e = length(tPosition.xyz);\n"
+             "        float pt_min = min(point_params[2].w, 63.875);\n"
+             "        float pt_max = min(point_params[1].w + pt_min, 63.875);\n"
+             "        float pt = inversesqrt(point_params[1].x + point_params[1].y * d_e + point_params[1].z * d_e * d_e) + point_params[2].z;\n"
+             "        oPts.x = clamp(pt * point_params[1].w + point_params[2].w, pt_min, pt_max);\n"
+             "    }\n";
+    else
+        g += "    oPts.x = max(point_params[0].x, 1.0);\n";
     append_tail(g, options);
     t.inputs_read = inputs;
     t.glsl = std::move(g);

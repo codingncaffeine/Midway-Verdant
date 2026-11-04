@@ -32,6 +32,9 @@ struct Key {
     // draws such a draw twice, 1: the bytes below 128 as they are (others 0), 2: the magnitude 256 - S of the bytes from
     // 128 up (others 0), each pass under the operation that adds or takes away that half.
     u32 signed_half{0};
+    // 1: a point-sprite draw (a POINTS draw with SET_POINT_SMOOTH_ENABLE): texture stage 3 reads the position inside the
+    // point, (0, 0) at its top left to (1, 1) at its bottom right, in place of the vertex's coordinate 3.
+    u32 point_sprite{0};
     std::array<bool, 4> texture_enabled{};
     bool alpha_test{false};
     bool smooth_shading{true};

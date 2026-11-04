@@ -201,6 +201,7 @@ public:
         u64 depth_handovers{0}, depth_uploads{0};  // depth buffers moved between targets sharing an address; loaded from RAM
         u64 depth_unparks{0}, parked_samples{0};  // parked depth images bound again; sampled in place
         u64 depth_loads_skipped{0};  // depth buffers bound for a clear of the whole buffer: nothing loaded
+        u64 point_draws{0}, point_sprite_draws{0};  // POINTS draws; of them, point sprites (stage 3 reads the point)
         u64 depth_borrows{0};  // binds that drew with a bigger target's depth image of the same pitch (D37)
         u64 evicted{0}, retired_unused{0};  // targets another target overlapped; targets nothing used for 10 s
         u64 subrect_copies{0};  // rectangles of a pitch-linear region copied for a texture

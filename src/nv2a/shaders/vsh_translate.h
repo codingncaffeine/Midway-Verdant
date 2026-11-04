@@ -58,6 +58,9 @@ struct Options {
     // the factor the pixel side blends with.
     bool fog{false};
     u32 fog_mode{0x2601};
+    // A program's point size: with SET_POINT_PARAMS_ENABLE off the hardware draws points at SET_POINT_SIZE, not at
+    // the program's oPts (the tail picks per draw from the uniforms); the fixed function computes its own first.
+    bool fixed_function{false};
 };
 
 // GLSL (Vulkan 1.0, version 450) for the program: inputs v0..v15 at locations 0..15, one std140 uniform block
@@ -74,7 +77,7 @@ Translation translate(const Program& program, const Options& options);
 // The uniform block layout shared with the backend: the constant file, then surface_size, clip_range and the
 // fixed function's block (fixed_function_uniforms).
 constexpr u32 kConstantSlots = 192, kLights = 8, kLightVectors = 9;
-constexpr u32 kFixedFunctionVectors = 4 + kLights * kLightVectors;
+constexpr u32 kFixedFunctionVectors = 4 + kLights * kLightVectors + 3;  // + the point size and SET_POINT_PARAMS
 constexpr u32 kUniformBytes = (kConstantSlots + 2 + kFixedFunctionVectors) * 16;
 
 // The fixed-function vertex pipeline (execution mode 0) as GLSL with the same interface as a translated program:
@@ -92,7 +95,8 @@ std::vector<u32> fixed_function_key(const KelvinState& state);
 bool fixed_function_supported(const KelvinState& state, std::string& why);
 // The fixed function's uniforms after the constant file: material emission + alpha, scene ambient, specular
 // curve, fog params (SET_FOG_PARAMS, for programs too), then nine per light: ambient, diffuse, specular, local position (w = range), attenuation,
-// infinite direction, infinite half vector, spot falloff, spot direction. Writes kUniformBytes - 16 * kConstantSlots
+// infinite direction, infinite half vector, spot falloff, spot direction; then the point size (x: SET_POINT_SIZE in pixels,
+// y: 1 when SET_POINT_PARAMS_ENABLE) and the eight SET_POINT_PARAMS. Writes kUniformBytes - 16 * kConstantSlots
 // - 32 bytes (everything after surface_size and clip_range).
 void fixed_function_uniforms(const KelvinState& state, float* out);
 

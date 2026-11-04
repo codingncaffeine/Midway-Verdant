@@ -347,7 +347,9 @@ Translation translate(const Key& key) {
     g += std::format("layout(location = {}) {}in vec4 vtx_d1;\n", kVaryingD1, flat);
     g += std::format("layout(location = {}) {}in vec4 vtx_b0;\n", kVaryingB0, flat);
     g += std::format("layout(location = {}) {}in vec4 vtx_b1;\n", kVaryingB1, flat);
-    for (u32 i = 0; i < 4; ++i) g += std::format("layout(location = {}) in vec4 vtx_t{};\n", kVaryingT0 + i, i);
+    for (u32 i = 0; i < 3; ++i) g += std::format("layout(location = {}) in vec4 vtx_t{};\n", kVaryingT0 + i, i);
+    // Stage 3's coordinate: the vertex's, or the position inside a point sprite (set first thing in main).
+    g += std::format("layout(location = {}) in vec4 vtx_t3_in;\nvec4 vtx_t3;\n", kVaryingT0 + 3);
     g += std::format("layout(location = {}) in float vtx_fog;\n", kVaryingFog);
     g += std::format("layout(location = {}) in vec4 vtx_pos;\n", kVaryingPos);
     g += std::format("layout(location = {}) noperspective in float vtx_z;\n", kVaryingZ);
@@ -382,6 +384,7 @@ Translation translate(const Key& key) {
     if (dots || bumps) g += kDotMapFunctions;
     g += "\nlayout(location = 0) out vec4 frag_color;\n\n";
     g += "void main() {\n";
+    g += key.point_sprite ? "    vtx_t3 = vec4(gl_PointCoord, 1.0, 1.0);\n" : "    vtx_t3 = vtx_t3_in;\n";
     // The depth in the console's units and its slope, taken before anything can discard (derivatives need every pixel
     // of the quad), from the screen-space z the vertex side passes (interpolated linearly across the screen).
     // In the w-buffer mode (exact_depth bit 1) the depth is w itself, recovered from the linear 1/w, and the polygon
