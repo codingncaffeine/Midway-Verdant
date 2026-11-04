@@ -1499,6 +1499,7 @@ void VulkanRenderer::queue_write_back(Surface& s) {
     }
     ++stats_.writebacks_by[wb_why_];
     write_backs_.push_back({&s, false, offset});
+    snapshot_edges(write_backs_.back());
     write_backs_.back().serial = s.draw_serial;
 }
 
@@ -1536,6 +1537,7 @@ void VulkanRenderer::queue_write_back_zeta(Surface& s) {
     }
     ++stats_.writebacks_by[wb_why_];
     write_backs_.push_back({&s, true, offset});
+    snapshot_edges(write_backs_.back());
     write_backs_.back().rows = rows;
     write_backs_.back().serial = s.draw_serial;
 }
@@ -1614,6 +1616,19 @@ bool VulkanRenderer::write_backs_ready() {
     return true;
 }
 
+void VulkanRenderer::snapshot_edges(PendingWriteBack& w) {
+    if (deferred_) return;  // the render thread's journal keeps its own bases
+    constexpr u32 kPage = 4096;
+    const Surface& s = *w.surface;
+    const u64 a0 = w.zeta ? s.zeta_phys : s.phys, a1 = a0 + (w.zeta ? s.zeta_bytes() : s.bytes());
+    const auto take = [&](u64 page) {
+        if ((page + 1) * kPage > ram_size_ || std::any_of(w.edges.begin(), w.edges.end(), [&](const auto& e) { return e.first == page; })) return;
+        w.edges.emplace_back(static_cast<u32>(page), std::vector<u8>(ram_ + page * kPage, ram_ + (page + 1) * kPage));
+    };
+    if (a0 % kPage) take(a0 / kPage);
+    if (a1 % kPage) take(a1 / kPage);
+}
+
 bool VulkanRenderer::complete_write_backs(bool wait, const std::vector<u32>* cpu_pages) {
     if (async_wb_.empty()) return true;
     if (!write_backs_ready()) {
@@ -1645,7 +1660,23 @@ bool VulkanRenderer::complete_write_backs(bool wait, const std::vector<u32>* cpu
     const u32 stream_generation = std::exchange(stream_generation_, async_tag_);
     store_write_backs(list);
     stream_generation_ = stream_generation;
-    for (const auto& [page, bytes] : kept) std::memcpy(ram_ + static_cast<std::size_t>(page) * kPage, bytes.data(), kPage);
+    // A page the target shares with other memory (Links 2004 packs its 64x64 tree textures back to back; the CPU reworks
+    // the last tree while the GPU draws the next): the bytes the CPU changed since the copy was queued stay, the rest
+    // take the copy. A page wholly inside the target keeps what the CPU wrote, as before.
+    for (const auto& [page, bytes] : kept) {
+        u8* const ram = ram_ + static_cast<std::size_t>(page) * kPage;
+        const std::vector<u8>* before = nullptr;
+        for (const PendingWriteBack& w : list)  // the earliest queued: every CPU write since it counts
+            for (const auto& e : w.edges)
+                if (!before && e.first == page) before = &e.second;
+        if (!before) {
+            std::memcpy(ram, bytes.data(), kPage);
+            continue;
+        }
+        for (u32 i = 0; i < kPage; ++i)
+            if (bytes[i] != (*before)[i]) ram[i] = bytes[i];
+        ++stats_.edge_pages_merged;
+    }
     stats_.background_pages_kept += kept.size();
     async_pending_.store(false, std::memory_order_release);
     if (write_backs_.empty()) readback_cursor_ = 0;

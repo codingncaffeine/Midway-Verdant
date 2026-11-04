@@ -208,7 +208,8 @@ public:
         u64 point_draws{0}, point_sprite_draws{0};  // POINTS draws; of them, point sprites (stage 3 reads the point)
         u64 depth_borrows{0};  // binds that drew with a bigger target's depth image of the same pitch (D37)
         u64 evicted{0}, retired_unused{0};  // targets another target overlapped; targets nothing used for 10 s
-        u64 depth_tails_left{0};  // textures starting inside a depth buffer that read RAM without forcing its copy
+        u64 depth_tails_left{0};
+        u64 edge_pages_merged{0};  // pages a write-back shared with memory the CPU wrote: merged byte by byte  // textures starting inside a depth buffer that read RAM without forcing its copy
         u64 subrect_copies{0};  // rectangles of a pitch-linear region copied for a texture
         u64 cube_assemblies{0};  // cube maps put together on the GPU from six render targets (cube_texture)
         u64 mip_assemblies{0};  // mip chains put together on the GPU from their level targets (mip_texture)
@@ -698,7 +699,11 @@ private:
         VkDeviceSize offset{0};  // where its copy lands in the read-back buffer
         bool rows{false};  // a scaled depth buffer read back a row per region: thinned when stored
         u64 serial{0};     // the target's draw serial when queued: drawn into since, it stays dirty once stored
+        // The pages at its ends it shares with other memory, as RAM held them when queued: a CPU write there since keeps
+        // only the bytes it changed (complete_write_backs), not the whole page over the target's own.
+        std::vector<std::pair<u32, std::vector<u8>>> edges;
     };
+    void snapshot_edges(PendingWriteBack& w);
     std::vector<PendingWriteBack> write_backs_;
     void store_write_backs(const std::vector<PendingWriteBack>& list);
     unsigned wb_why_{Stats::kWbAll};  // the cause the write-backs being queued count under
