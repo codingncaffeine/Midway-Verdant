@@ -45,6 +45,7 @@ add_library(mvcore STATIC
   nv2a/gpu_timing.cpp
   nv2a/overlay.cpp
   nv2a/scanout.cpp
+  nv2a/pgraph/census.cpp
   nv2a/pgraph/kelvin.cpp
   nv2a/pgraph/replay.cpp
   nv2a/pgraph/texture.cpp
@@ -86,6 +87,9 @@ if(MV_GLSLANG_BUILT_IN)
 endif()
 target_link_libraries(mvcore PUBLIC Vulkan::Headers)
 target_compile_definitions(mvcore PUBLIC VK_NO_PROTOTYPES)
+if(MV_STATE_CENSUS)
+  target_compile_definitions(mvcore PUBLIC MV_STATE_CENSUS)
+endif()
 if(NOT WIN32)
   target_link_libraries(mvcore PUBLIC ${CMAKE_DL_LIBS})
   # timer_create and friends were in librt until glibc 2.34 (an empty stub from then on).

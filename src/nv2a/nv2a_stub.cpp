@@ -557,6 +557,9 @@ void Nv2aStub::execute_method(const PushbufferMethod& m) {
         ++method_log_lines_;
         trace::log(trace::Cat::Gpu, "fifo: [{:04x}] {:04x} <- {:08x}", bound_[m.subchannel], m.method, m.value);
     }
+#ifdef MV_STATE_CENSUS
+    if (bound_[m.subchannel] != 0x97) pgraph::census::class_write(bound_[m.subchannel], m.method, m.value);
+#endif
     // A no-operation carrying data is a software method: a legal method with data the engine cannot take, so it
     // raises ERROR with the DATA_ERROR source, holds its FIFO, and the host reads the trapped method and data
     // (the kernel queues its display flips this way; an illegal-method source would only be acknowledged).
@@ -940,6 +943,9 @@ void Nv2aStub::run_pusher_inline() {
 u32 Nv2aStub::mmio_read(PhysAddr addr, unsigned size) {
     const u32 off = addr - mapped_at_;
     const u32 key = off & ~3u;
+#ifdef MV_STATE_CENSUS
+    pgraph::census::mmio(key, false, 0);
+#endif
     if (key == kPfbWbc) {
         wbc_accesses_.fetch_add(1, std::memory_order_relaxed);
         const u32 word = wbc_.load(std::memory_order_relaxed);
@@ -1022,6 +1028,9 @@ u32 Nv2aStub::mmio_read(PhysAddr addr, unsigned size) {
 void Nv2aStub::mmio_write(PhysAddr addr, unsigned size, u32 value) {
     const u32 off = addr - mapped_at_;
     const u32 key = off & ~3u;
+#ifdef MV_STATE_CENSUS
+    pgraph::census::mmio(key, true, value);
+#endif
     if (key == kPfbWbc) {
         // Bit 16 starts a frame-buffer cache operation and clears when it is done; done at once here.
         wbc_accesses_.fetch_add(1, std::memory_order_relaxed);

@@ -5,6 +5,7 @@
 #include <vector>
 
 #include "core/types.h"
+#include "nv2a/pgraph/census.h"
 
 // The state of the Kelvin 3D class (0x97) as its methods leave it, and the decoders of its packed fields.
 // Method numbers and fields are documented in local-notes/hw/nv2a-pgraph.md (public nxdk header, envytools,
@@ -166,7 +167,10 @@ struct KelvinState {
     // 0x1FF leaves it as it was.
     u32 line_width{8};
 
-    u32 reg(u32 method) const { return r[(method >> 2) & 0x7FFu]; }
+    u32 reg(u32 method) const {
+        MV_CENSUS_KELVIN_READ(method >> 2);
+        return r[(method >> 2) & 0x7FFu];
+    }
     float regf(u32 method) const {
         float f;
         const u32 v = reg(method);

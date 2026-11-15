@@ -227,6 +227,9 @@ void Kelvin::method(u32 method, u32 value) {
     ++histogram_[method >> 2];
     state_.r[method >> 2] = value;
     const Decoded& d = decoded_methods()[method >> 2];
+#ifdef MV_STATE_CENSUS
+    census::kelvin_write(method, value, d.op != Op::Plain);
+#endif
     switch (d.op) {
         case Op::Plain: return;
         case Op::Program:

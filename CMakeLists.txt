@@ -21,6 +21,7 @@ option(MV_BUILD_TESTS "Build the test suite" ON)
 # on any distribution from its build baseline on.
 option(MV_PORTABLE "Build a self-contained core for release" OFF)
 option(MV_SYSTEM_GLSLANG "Link the shared system glslang (a frontend carrying its own can then take over the core's calls)" OFF)
+option(MV_STATE_CENSUS "Record every GPU method, value and register a title uses, and whether this code reads it (an audit build)" OFF)
 option(MV_BUILD_SHELL "Build the SDL3 shell (midway-verdant); a release core needs none of it" ON)
 
 include(cmake/Warnings.cmake)

@@ -4404,6 +4404,25 @@ void VulkanRenderer::draw(const KelvinState& s, const DrawBatch& batch) {
     scissor.extent.width *= sc;
     scissor.extent.height *= sc;
     fn_->vkCmdSetScissor(cb_, 0, 1, &scissor);
+#ifdef MV_STATE_CENSUS
+    {
+        // What the method table cannot show: settings met in one draw.
+        if (s.reg(0x17C4) & 1u) census::draw_fact(s.cull_face() ? "two-sided lighting with culling on; lighting, program mode" : "two-sided lighting with culling OFF; lighting, program mode", (s.reg(mthd::kLightingEnable) & 1u) | (s.transform_mode() << 4));
+        if ((s.reg(mthd::kControl0) >> 28) != 0)
+            for (u32 i = 0; i < 4; ++i)
+                if (s.texture(i).enabled()) census::draw_fact("output color conversion on (CONTROL0 31:28) with a texture of format, stage", s.texture(i).color_format() | (i << 8) | ((s.reg(mthd::kControl0) >> 28) << 12));
+        if ((s.reg(0x0310) & 1u) && sd.color_bytes() == 2) census::draw_fact("dither on into a 16-bit target of color format", sd.color_format());
+        for (u32 i = 0; i < 4; ++i) {
+            const TextureStage ts = s.texture(i);
+            if (ts.enabled() && (ts.min_filter() == 7 || ts.mag_filter() == 4)) census::draw_fact("convolution filter: kernel, scale", ((ts.filter >> 13) & 7u) | (sc << 4));
+            if (ts.enabled() && (ts.control0 & 4u)) census::draw_fact("alpha kill; blend, depth write", (s.blend() ? 1u : 0u) | (s.depth_write() ? 2u : 0u));
+            if (ts.enabled() && (ts.control0 & 3u)) census::draw_fact("color key mode", ts.control0 & 3u);
+        }
+        if (s.reg(mthd::kStippleControl) & 1u) census::draw_fact("stipple on; primitive", static_cast<u32>(v.primitive));
+        if ((s.reg(0x1D7C) & 0x110u) != 0) census::draw_fact("alpha to coverage or alpha to one", s.reg(0x1D7C) & 0x111u);
+        if (s.reg(0x17BC) & 1u) census::draw_fact("logic op", s.reg(0x17C0));
+    }
+#endif
     // A line's width (KelvinState::line_width, eighths of a surface pixel; under one pixel draws one) at the internal
     // resolution.
     if (draws_lines(s, topology)) {
