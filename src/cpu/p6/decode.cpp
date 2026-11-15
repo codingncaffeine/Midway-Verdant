@@ -192,7 +192,7 @@ constexpr GroupEntry kGroups[][8] = {
     /* G11b */ {{Op::Mov, F::EbIb}, {Op::Invalid, F::None}, {Op::Invalid, F::None}, {Op::Invalid, F::None}, {Op::Invalid, F::None}, {Op::Invalid, F::None}, {Op::Invalid, F::None}, {Op::Invalid, F::None}},
     /* G11v */ {{Op::Mov, F::EvIz}, {Op::Invalid, F::None}, {Op::Invalid, F::None}, {Op::Invalid, F::None}, {Op::Invalid, F::None}, {Op::Invalid, F::None}, {Op::Invalid, F::None}, {Op::Invalid, F::None}},
     /* G15 */ {{Op::Fxsave, F::Mb}, {Op::Fxrstor, F::Mb}, {Op::Ldmxcsr, F::Md}, {Op::Stmxcsr, F::Md}, {Op::Invalid, F::None}, {Op::Invalid, F::None}, {Op::Invalid, F::None}, {Op::Sfence, F::None}},
-    /* G16 */ {{Op::Prefetch, F::Mb}, {Op::Prefetch, F::Mb}, {Op::Prefetch, F::Mb}, {Op::Prefetch, F::Mb}, {Op::NopEv, F::Ev}, {Op::NopEv, F::Ev}, {Op::NopEv, F::Ev}, {Op::NopEv, F::Ev}},
+    /* G16 */ {{Op::Prefetch, F::Ev}, {Op::Prefetch, F::Ev}, {Op::Prefetch, F::Ev}, {Op::Prefetch, F::Ev}, {Op::NopEv, F::Ev}, {Op::NopEv, F::Ev}, {Op::NopEv, F::Ev}, {Op::NopEv, F::Ev}},
     /* G12 */ {{Op::Invalid, F::None}, {Op::Invalid, F::None}, {Op::Simd, F::SimdIb}, {Op::Invalid, F::None}, {Op::Simd, F::SimdIb}, {Op::Invalid, F::None}, {Op::Simd, F::SimdIb}, {Op::Invalid, F::None}},
     /* G13 */ {{Op::Invalid, F::None}, {Op::Invalid, F::None}, {Op::Simd, F::SimdIb}, {Op::Invalid, F::None}, {Op::Simd, F::SimdIb}, {Op::Invalid, F::None}, {Op::Simd, F::SimdIb}, {Op::Invalid, F::None}},
     /* G14 */ {{Op::Invalid, F::None}, {Op::Invalid, F::None}, {Op::Simd, F::SimdIb}, {Op::Invalid, F::None}, {Op::Invalid, F::None}, {Op::Invalid, F::None}, {Op::Simd, F::SimdIb}, {Op::Invalid, F::None}},

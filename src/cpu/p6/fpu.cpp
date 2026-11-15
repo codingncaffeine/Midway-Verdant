@@ -1445,9 +1445,42 @@ void X87::run() {
 // ---------------------------------------------------------------------------------------------------------------
 // The Cpu entry points
 
+namespace {
+// The second encodings of the escape space that the manual's opcode map leaves reserved, and every x87 since the 387
+// runs as the documented instruction: FSTP ST(i) at D9 D8+i, DF D0+i and DF D8+i; FXCH ST(i) at DD C8+i and DF C8+i;
+// FCOMP ST(i) at DE D0+i. True with `as` holding the documented form.
+bool x87_second_encoding(const Insn& in, Insn& as) {
+    if (in.mem) return false;
+    u8 opcode = 0, modrm = 0;
+    const u8 i = in.rm;
+    if (in.opcode == 0xD9 && in.reg == 3) opcode = 0xDD, modrm = static_cast<u8>(0xD8 | i);
+    else if (in.opcode == 0xDF && (in.reg == 2 || in.reg == 3)) opcode = 0xDD, modrm = static_cast<u8>(0xD8 | i);
+    else if ((in.opcode == 0xDD || in.opcode == 0xDF) && in.reg == 1) opcode = 0xD9, modrm = static_cast<u8>(0xC8 | i);
+    else if (in.opcode == 0xDE && in.reg == 2) opcode = 0xD8, modrm = static_cast<u8>(0xD8 | i);
+    else return false;
+    as = in;
+    as.opcode = opcode;
+    as.modrm = modrm;
+    as.mod = 3;
+    as.reg = (modrm >> 3) & 7u;
+    as.rm = modrm & 7u;
+    return true;
+}
+}  // namespace
+
 void Cpu::exec_x87(const Insn& in) {
     if (st_.cr0 & cr0::EM) raise(kNM);
     if (st_.cr0 & cr0::TS) raise(kNM);
+    // FENI, FDISI (the 8087's interrupt switch) and FSETPM (the 287's) do nothing on a 387 or later.
+    if (in.opcode == 0xDB && !in.mem && (in.modrm == 0xE0 || in.modrm == 0xE1 || in.modrm == 0xE4)) return;
+    Insn as;
+    if (x87_second_encoding(in, as)) {
+        X87 unit(*this, as);
+        unit.run();
+        // The opcode register holds the encoding that ran.
+        st_.fpu.fop = static_cast<u16>(((in.opcode & 7) << 8) | in.modrm);
+        return;
+    }
     X87 unit(*this, in);
     unit.run();
 }
