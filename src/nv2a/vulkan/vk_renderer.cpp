@@ -4070,9 +4070,7 @@ void VulkanRenderer::draw(const KelvinState& s, const DrawBatch& batch) {
     u32 window_clip = 0;  // 0 none, 1 the scissor, 2 the shader
     if (s.window_clip_set) {
         const bool outside = (s.reg(mthd::kWindowClipType) & 1u) != 0;
-        bool one = !outside;
-        const u32 h0 = s.reg(mthd::kWindowClipHorizontal), v0 = s.reg(mthd::kWindowClipVertical);
-        for (u32 i = 1; i < 8 && one; ++i) one = s.reg(mthd::kWindowClipHorizontal + 4 * i) == h0 && s.reg(mthd::kWindowClipVertical + 4 * i) == v0;
+        const bool one = !outside && s.window_clip_one;
         window_clip = one ? 1 : 2;
         if (!one) {
             pkey.window_clip = outside ? 2 : 1;

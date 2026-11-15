@@ -294,13 +294,15 @@ TEST(Vsh, TheFixedFunctionUniformsCarryTheLightsWhereTheShaderReadsThem) {
     setf(0x17AC, 0.5f);                 // back material alpha
     setf(0x17A0 + 4, 0.375f);           // back scene ambient green
     setf(0x0C00 + 3 * 0x40 + 0x0C, 0.625f);  // light 3's back diffuse red
-    fixed_function_uniforms(s, u.data());
     const std::size_t back = (4 + 8 * 9 + 3) * 4;
+    fixed_function_uniforms(s, u.data());
+    EXPECT_EQ(u[back + 3], 0.0f) << "without two-sided lighting the back side is not read";
+    s.r[0x17C4 >> 2] = 1;
+    fixed_function_uniforms(s, u.data());
     EXPECT_EQ(u[back + 3], 0.5f) << "ff_back[0].w = back material alpha";
     EXPECT_EQ(u[back + 4 + 1], 0.375f) << "ff_back[1] = back scene ambient";
     EXPECT_FLOAT_EQ(u[back + 8 + 1], -0.494592f) << "an unset back specular curve takes the reset values";
     EXPECT_EQ(u[back + (3 + 3 * 3 + 1) * 4], 0.625f) << "ff_back[3 + 3 l + 1] = light l's back diffuse";
-    s.r[0x17C4 >> 2] = 1;
     const Translation two = fixed_function_translate(s, Options{});
     EXPECT_NE(two.glsl.find("ff_back[13].xyz * (attenuation * bDotVP)"), std::string::npos) << two.glsl;
 }

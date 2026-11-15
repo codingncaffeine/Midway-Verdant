@@ -586,6 +586,8 @@ void fixed_function_uniforms(const KelvinState& s, float* out) {
     pt[0] = size == 0 ? 1.0f : static_cast<float>(std::min(size, ff::kPointSizeMax)) / 8.0f;
     pt[1] = (s.reg(ff::kPointParamsEnable) & 1u) ? 1.0f : 0.0f;
     for (u32 i = 0; i < 8; ++i) pt[4 + i] = s.regf(ff::kPointParams + 4 * i);
+    // The back side's registers are read only under two-sided lighting (zero otherwise: every draw pays for this block).
+    if (!(s.reg(ff::kTwoSideEnable) & 1u)) return;
     float* back = pt + 12;
     back[3] = s.regf(ff::kBackMaterialAlpha);
     put3(ff::kBackSceneAmbient, back + 4);

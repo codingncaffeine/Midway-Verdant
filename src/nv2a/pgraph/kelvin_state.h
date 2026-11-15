@@ -163,6 +163,7 @@ struct KelvinState {
     // The stream has written the window clip (its type or a rectangle): until it has, nothing is clipped by it (what
     // the registers hold at power-on is not known; all zero would leave one pixel).
     bool window_clip_set{false};
+    bool window_clip_one{true};  // all eight rectangles are the same one (kept by the state machine at each write)
     // SET_LINE_WIDTH as the hardware holds it, in eighths of a pixel: one pixel until a program sets it, and a value past
     // 0x1FF leaves it as it was.
     u32 line_width{8};

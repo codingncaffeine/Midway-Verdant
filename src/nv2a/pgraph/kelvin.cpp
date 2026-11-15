@@ -341,6 +341,11 @@ void Kelvin::method(u32 method, u32 value) {
                 const u32 end = (method < mthd::kWindowClipVertical ? mthd::kWindowClipHorizontal : mthd::kWindowClipVertical) + 0x20;
                 for (u32 m = method + 4; m < end; m += 4) state_.r[m >> 2] = value;
             }
+            // Whether the eight are one rectangle is decided here, at the write, not at every draw.
+            state_.window_clip_one = true;
+            for (u32 i = 1; i < 8; ++i)
+                state_.window_clip_one = state_.window_clip_one && state_.r[(mthd::kWindowClipHorizontal >> 2) + i] == state_.r[mthd::kWindowClipHorizontal >> 2] &&
+                                         state_.r[(mthd::kWindowClipVertical >> 2) + i] == state_.r[mthd::kWindowClipVertical >> 2];
             return;
     }
 }
