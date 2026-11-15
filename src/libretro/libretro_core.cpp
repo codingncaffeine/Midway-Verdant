@@ -875,6 +875,10 @@ RETRO_API void retro_unload_game(void) {
             if (st.point_draws)
                 log(RETRO_LOG_INFO, "gpu: %llu point draws, %llu of them point sprites", static_cast<unsigned long long>(st.point_draws),
                     static_cast<unsigned long long>(st.point_sprite_draws));
+            if (st.line_draws || st.stippled_draws || st.window_clipped_draws || st.window_clip_shader_draws)
+                log(RETRO_LOG_INFO, "gpu: %llu line draws, %llu draws under the polygon stipple, %llu cut by the window clip's rectangle, %llu under a window clip of several rectangles or the outside kind",
+                    static_cast<unsigned long long>(st.line_draws), static_cast<unsigned long long>(st.stippled_draws), static_cast<unsigned long long>(st.window_clipped_draws),
+                    static_cast<unsigned long long>(st.window_clip_shader_draws));
             if (st.mip_assemblies) log(RETRO_LOG_INFO, "gpu: %llu mip chains put together on the GPU from their level targets", static_cast<unsigned long long>(st.mip_assemblies));
             if (!st.forced_by.empty()) {
                 // The write-backs a texture forced, most first: what is sampled through RAM instead of in place.

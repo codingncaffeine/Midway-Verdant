@@ -203,7 +203,8 @@ TEST(Vsh, TheFixedFunctionPipelineIsGeneratedForEveryValidState) {
     ASSERT_TRUE(c.ok()) << c.log << "\n" << tr.glsl;
 
     // A sweep over the features: every light type in every slot, the color sources, local eye and separate
-    // specular, skinning, normalization, every texgen mode, texture matrices and fog generation. Each compiles.
+    // specular, two-sided lighting, skinning, normalization, every texgen mode, texture matrices and fog generation.
+    // Each compiles.
     const u32 texgens[] = {0, 0x2400, 0x2401, 0x2402, 0x8512, 0x8511};
     const u32 fog_modes[] = {0, 1, 2, 3, 6};
     for (u32 n = 0; n < 24; ++n) {
@@ -214,6 +215,7 @@ TEST(Vsh, TheFixedFunctionPipelineIsGeneratedForEveryValidState) {
         if (n % 4 == 3) f.r[mthd::kColorMaterial >> 2] = 0xAA;              // ...or all from the vertex specular
         f.r[0x0294 >> 2] = (n & 1u) | ((n & 2u) ? (1u << 16) : 0u);           // separate specular, local eye
         f.r[0x03B8 >> 2] = n % 5 != 0;                                         // specular enable
+        f.r[0x17C4 >> 2] = (n >> 2) & 1u;                                      // two-sided lighting
         f.r[0x0328 >> 2] = n % 7;                                              // skin mode
         f.r[0x03A4 >> 2] = n & 1u;                                             // normalization
         f.r[0x09CC >> 2] = (n >> 1) & 1u;                                      // infinite viewer
@@ -234,6 +236,8 @@ TEST(Vsh, TheFixedFunctionPipelineIsGeneratedForEveryValidState) {
         ASSERT_TRUE(c.ok()) << n << ": " << c.log << "\n" << tr.glsl;
         if (f.r[mthd::kLightingEnable >> 2] && f.r[mthd::kLightEnableMask >> 2]) {
             EXPECT_NE(tr.glsl.find("// light "), std::string::npos) << n;
+            // The back colors are lit only under two-sided lighting; otherwise they are the vertex's.
+            EXPECT_EQ(tr.glsl.find("bDotVP") != std::string::npos, f.r[0x17C4 >> 2] != 0) << n;
         }
     }
 
@@ -284,7 +288,21 @@ TEST(Vsh, TheFixedFunctionUniformsCarryTheLightsWhereTheShaderReadsThem) {
     EXPECT_NE(tr.glsl.find("ff_light[28].xyz * (attenuation * nDotVP)"), std::string::npos) << tr.glsl;
     EXPECT_NE(tr.glsl.find("VP = ff_light[30].xyz"), std::string::npos) << tr.glsl;
     EXPECT_NE(tr.glsl.find("dot(ff_light[35].xyz, VP) + ff_light[35].w"), std::string::npos) << tr.glsl;
-    EXPECT_EQ(vsh::kUniformBytes, (kConstantSlots + 2 + 4 + 8 * 9 + 3) * 16);
+    EXPECT_EQ(vsh::kUniformBytes, (kConstantSlots + 2 + 4 + 8 * 9 + 3 + 3 + 8 * 3) * 16);
+    // Two-sided lighting's back side follows the point parameters: the material's alpha, the scene ambient, the specular
+    // curve, then three colors a light.
+    setf(0x17AC, 0.5f);                 // back material alpha
+    setf(0x17A0 + 4, 0.375f);           // back scene ambient green
+    setf(0x0C00 + 3 * 0x40 + 0x0C, 0.625f);  // light 3's back diffuse red
+    fixed_function_uniforms(s, u.data());
+    const std::size_t back = (4 + 8 * 9 + 3) * 4;
+    EXPECT_EQ(u[back + 3], 0.5f) << "ff_back[0].w = back material alpha";
+    EXPECT_EQ(u[back + 4 + 1], 0.375f) << "ff_back[1] = back scene ambient";
+    EXPECT_FLOAT_EQ(u[back + 8 + 1], -0.494592f) << "an unset back specular curve takes the reset values";
+    EXPECT_EQ(u[back + (3 + 3 * 3 + 1) * 4], 0.625f) << "ff_back[3 + 3 l + 1] = light l's back diffuse";
+    s.r[0x17C4 >> 2] = 1;
+    const Translation two = fixed_function_translate(s, Options{});
+    EXPECT_NE(two.glsl.find("ff_back[13].xyz * (attenuation * bDotVP)"), std::string::npos) << two.glsl;
 }
 
 TEST(Vsh, PointsTakeSetPointSizeOrTheDistanceAttenuationOfSetPointParams) {

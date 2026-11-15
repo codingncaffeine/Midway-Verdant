@@ -35,6 +35,17 @@ struct Key {
     // 1: a point-sprite draw (a POINTS draw with SET_POINT_SMOOTH_ENABLE): texture stage 3 reads the position inside the
     // point, (0, 0) at its top left to (1, 1) at its bottom right, in place of the vertex's coordinate 3.
     u32 point_sprite{0};
+    // 1: the polygon stipple is on for this draw (SET_STIPPLE_CONTROL on a filled polygon): a pixel whose bit of the
+    // 32x32 pattern is clear is not drawn.
+    u32 stipple{0};
+    // A bit per texture stage: the stage's alpha kill is on (SET_TEXTURE_CONTROL0 bit 2), and a pixel whose texel there
+    // has an alpha of zero is not drawn.
+    u32 alpha_kill{0};
+    // The window clip when the scissor cannot take it (set per draw by the renderer): 1 = a pixel is drawn inside any of
+    // the eight rectangles, 2 = outside all of them.
+    u32 window_clip{0};
+    // 1: two-sided lighting (SET_LIGHT_TWO_SIDE_ENABLE): a back-facing polygon's pixels take the back colors.
+    u32 two_sided{0};
     std::array<bool, 4> texture_enabled{};
     bool alpha_test{false};
     bool smooth_shading{true};
@@ -61,8 +72,14 @@ struct Uniforms {
     // offset), [1] = (offset factor x the internal resolution's scale, format: 0 D16, 1 D24, 2 float; 1 = cull outside the
     // clip range, else clamp; 0).
     float depth[2][4];
+    // The polygon stipple (set per draw by the renderer when the key asks): 32 rows, the last one the surface's row 0; pixel x of a row is bit (x ^ 7).
+    u32 stipple[32];
+    // x = image pixels per surface pixel (the internal resolution's scale), yz = the surface's origin in the image.
+    float raster[4];
+    // The window clip's rectangles in surface pixels, both ends included: first x, first y, last x, last y.
+    i32 clip_rect[8][4];
 };
-static_assert(sizeof(Uniforms) == 35 * 16);
+static_assert(sizeof(Uniforms) == 52 * 16);
 void uniforms_from_state(const KelvinState& state, const std::array<std::array<float, 2>, 4>& texture_scale, Uniforms& out);
 
 enum class SamplerKind : u8 { None, Sampler2D, SamplerCube, Sampler3D, Shadow2D };

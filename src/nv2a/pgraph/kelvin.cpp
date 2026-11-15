@@ -108,7 +108,7 @@ namespace {
 enum class Op : u8 {
     Plain, Program, Constant, XfContext, ArrayFormat, ArrayOffset, Data4f, Data2f, Data2s, Data4ub, Data4s, NamedFloat,
     NamedS16, NamedUb4, FogCoord, ProgramLoad, ConstantLoad, BeginEnd, Element16, Element32, DrawArrays, InlineArray,
-    ClearSurface, SemaphoreRelease
+    ClearSurface, SemaphoreRelease, WindowClip, LineWidth
 };
 struct Decoded {
     Op op{Op::Plain};
@@ -123,6 +123,7 @@ Decoded decode(u32 method) {
     using namespace mthd;
     Decoded d;
     auto in = [&](u32 base, u32 bytes) { return method >= base && method < base + bytes; };
+    if (method == kWindowClipType || in(kWindowClipHorizontal, 0x20) || in(kWindowClipVertical, 0x20)) return {Op::WindowClip};
     if (in(kTransformProgram, 0x80)) return {Op::Program};
     if (in(kTransformConstant, 0x80)) return {Op::Constant};
     if (u32 slot_word; xf_context_slot(method, slot_word)) {
@@ -188,6 +189,7 @@ Decoded decode(u32 method) {
         case kInlineArray: return {Op::InlineArray};
         case kClearSurface: return {Op::ClearSurface};
         case kSemaphoreRelease: return {Op::SemaphoreRelease};
+        case kLineWidth: return {Op::LineWidth};
         default: return {Op::Plain};
     }
 }
@@ -322,6 +324,20 @@ void Kelvin::method(u32 method, u32 value) {
             return;
         case Op::SemaphoreRelease:
             if (sink_) sink_->semaphore_release(state_, value);
+            return;
+        // A width past the largest (63.875 pixels) is not taken: the hardware's picture of 64.0 is that of the width before.
+        case Op::LineWidth:
+            if (value <= 0x1FFu) state_.line_width = value;
+            return;
+        case Op::WindowClip:
+            // The hardware's pictures: a rectangle's word also lands in every rectangle after it. A program that sets the
+            // first has set all eight (the console's Direct3D does just that); the second set after the first leaves two
+            // in force, and the first set after the second leaves only the first.
+            state_.window_clip_set = true;
+            if (method != mthd::kWindowClipType) {
+                const u32 end = (method < mthd::kWindowClipVertical ? mthd::kWindowClipHorizontal : mthd::kWindowClipVertical) + 0x20;
+                for (u32 m = method + 4; m < end; m += 4) state_.r[m >> 2] = value;
+            }
             return;
     }
 }

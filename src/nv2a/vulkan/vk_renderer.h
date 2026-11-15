@@ -138,7 +138,7 @@ public:
     // A swizzled target (a texture the GPU drew) drawn since it last reached RAM starts on its way there, in the background
     // (complete_write_backs lands it): the guest asked how far the GPU has come, as it does before the CPU reads what the
     // GPU drew. True when one was queued.
-    bool store_drawn_textures();
+    bool store_drawn_textures(bool every_target = false);
     // Write-backs queued without a wait (an idle vblank's, the scanout's above 1x: the CPU and the GPU thread used to wait
     // there for the GPU to finish the whole frame, with both locks held). They reach RAM here: once the GPU is done with
     // them, or at once with `wait`. RAM pages in `cpu_pages` (sorted) were written by the CPU or a device since they were
@@ -206,6 +206,10 @@ public:
         u64 depth_unparks{0}, parked_samples{0};  // parked depth images bound again; sampled in place
         u64 depth_loads_skipped{0};  // depth buffers bound for a clear of the whole buffer: nothing loaded
         u64 point_draws{0}, point_sprite_draws{0};  // POINTS draws; of them, point sprites (stage 3 reads the point)
+        u64 line_draws{0};                           // draws of lines (line primitives, or triangles in the line polygon mode)
+        u64 stippled_draws{0};                       // draws under the polygon stipple
+        u64 window_clipped_draws{0};                 // draws the window clip cut smaller than the surface clip
+        u64 window_clip_shader_draws{0};             // draws under a window clip of several rectangles or the outside type
         u64 depth_borrows{0};  // binds that drew with a bigger target's depth image of the same pitch (D37)
         u64 evicted{0}, retired_unused{0};  // targets another target overlapped; targets nothing used for 10 s
         u64 depth_tails_left{0};
@@ -688,7 +692,7 @@ private:
     // a texture inside the frame (a racing title's dips) and uploaded four to eight times the bytes.
     bool native_dxt_requested_{true}, native_dxt_{false};
     std::unordered_map<u64, VkSampler> samplers_;
-    std::map<std::pair<u64, u32>, VkSampler> border_samplers_;  // samplers that read the stage's border color, by it
+    std::map<std::pair<u64, u64>, VkSampler> special_samplers_;  // samplers with a border color or their own level clamps, by them
     VkDescriptorSetLayout set_layout_{VK_NULL_HANDLE};
     VkPipelineLayout pipeline_layout_{VK_NULL_HANDLE};
     Ring vertex_ring_, index_ring_, uniform_ring_, staging_;

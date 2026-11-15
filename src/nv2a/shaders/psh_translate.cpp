@@ -10,7 +10,7 @@ namespace mv::pgraph::psh {
 
 namespace {
 
-constexpr u32 kShadowCompareFunc = 0x1E6C, kFogEnable = 0x02A4, kFogColor = 0x02A8, kSpecularFogFactor = 0x1E20;
+constexpr u32 kShadowCompareFunc = 0x1E6C, kFogEnable = 0x02A4, kFogColor = 0x02A8, kSpecularFogFactor = 0x1E20, kLightTwoSideEnable = 0x17C4;
 
 bool depth_format(u32 color_format) {
     switch (color_format) {
@@ -137,7 +137,8 @@ SamplerKind sampler_kind(const Key& key, u32 stage) {
         case kModeProject3D:
         case kModeCube:
             if (mode == kModeCube || cube) return SamplerKind::SamplerCube;
-            if (mode == kModeProject3D && depth_format(color)) return SamplerKind::Shadow2D;
+            // A depth texture is compared, not read, in the 2D mode as well (there against zero: see translate).
+            if (depth_format(color)) return SamplerKind::Shadow2D;
             return dim == 3 ? SamplerKind::Sampler3D : SamplerKind::Sampler2D;
         // The dependent modes read the kind of texture they are made for; another kind makes the stage inconsistent
         // (NV_texture_shader), which reads as none. A 2D texture in the 3D mode is a volume one texel deep.
@@ -281,7 +282,9 @@ Key key_from_state(const KelvinState& s) {
         const TextureStage ts = s.texture(t);
         k.texture_format[t] = ts.format & 0xFFFFu;
         k.texture_enabled[t] = ts.enabled();
+        if (ts.enabled() && (ts.control0 & 4u)) k.alpha_kill |= 1u << t;
     }
+    k.two_sided = s.reg(kLightTwoSideEnable) & 1u;
     k.alpha_test = s.alpha_test();
     k.alpha_func = s.reg(mthd::kAlphaFunc);
     k.smooth_shading = s.reg(mthd::kShadeModel) != 0x1D00;
@@ -365,6 +368,9 @@ Translation translate(const Key& key) {
         "    vec4 bump_mat[4];\n"
         "    vec4 bump_lum[4];\n"
         "    vec4 depth[2];\n"
+        "    uvec4 stipple[8];\n"
+        "    vec4 raster;\n"
+        "    ivec4 clip_rect[8];\n"
         "};\n";
     // Texture stages: which sampler each needs.
     for (u32 i = 0; i < 4; ++i) {
@@ -396,11 +402,15 @@ Translation translate(const Key& key) {
     else if (key.exact_depth && !depth_replaced)
         g += "    float nv_z = vtx_z;\n"
              "    float nv_slope = max(abs(dFdx(nv_z)), abs(dFdy(nv_z)));\n";
-    g += "    vec4 v0 = vtx_d0;\n    vec4 v1 = vtx_d1;\n";
+    g += key.two_sided ? "    vec4 v0 = gl_FrontFacing ? vtx_d0 : vtx_b0;\n    vec4 v1 = gl_FrontFacing ? vtx_d1 : vtx_b1;\n"
+                       : "    vec4 v0 = vtx_d0;\n    vec4 v1 = vtx_d1;\n";
     g += std::format("    vec4 fog = vec4(fog_color.rgb, {});\n", key.fog_enable ? "clamp(vtx_fog, 0.0, 1.0)" : "1.0");
     // A stage without a result (mode none, a disabled texture) reads (0, 0, 0, 0), as NV_texture_shader's NONE does.
     for (u32 i = 0; i < 4; ++i) g += std::format("    vec4 t{} = vec4(0.0);\n", i);
     if (dots) g += "    float dot0 = 0.0, dot1 = 0.0, dot2 = 0.0, dot3 = 0.0;\n";
+    // Alpha kill: decided where each stage's texel is read, acted on with the alpha test at the end (a pixel given up
+    // early would take its neighbors' texture derivatives with it).
+    if (key.alpha_kill) g += "    bool nv_kill = false;\n";
     for (u32 i = 0; i < 4; ++i) {
         const u32 mode = mode_valid_at(stage_mode(key, i), i) ? stage_mode(key, i) : kModeNone;
         const SamplerKind kind = t.samplers[i];
@@ -414,7 +424,8 @@ Translation translate(const Key& key) {
                 if (kind == SamplerKind::None) break;
                 if (kind == SamplerKind::Shadow2D) {
                     // The stored depth is the left operand: t = (texel FUNC r), with r = z/w clamped to the
-                    // format's depth range (raw units, like the texel).
+                    // format's depth range (raw units, like the texel). The 2D mode has no r: the hardware's
+                    // pictures show the comparison made against zero there (the reference emulator's reading too).
                     g += std::format(
                         "    {{\n"
                         "        vec3 p = vtx_t{0}.xyz / vtx_t{0}.w;\n"
@@ -424,7 +435,8 @@ Translation translate(const Key& key) {
                         i,
                         key.shadow_compare_func == 0 ? std::string("false")
                         : key.shadow_compare_func == 7 ? std::string("true")
-                                                       : std::format("texel {} clamp(p.z, 0.0, tex_scale[{}].z)", compare_op(key.shadow_compare_func), i));
+                        : mode == kModeProject2D ? std::format("texel {} 0.0", compare_op(key.shadow_compare_func))
+                                                 : std::format("texel {} clamp(p.z, 0.0, tex_scale[{}].z)", compare_op(key.shadow_compare_func), i));
                 } else if (kind == SamplerKind::Sampler3D) {
                     g += std::format("    t{0} = textureProj(tex{0}, vtx_t{0});\n", i);
                 } else if (kind == SamplerKind::SamplerCube) {
@@ -549,6 +561,8 @@ Translation translate(const Key& key) {
                 if (t.error.empty()) t.error = std::format("texture stage {} mode {} is reserved", i, mode);
                 break;
         }
+        // A stage that read a texel and has the alpha kill on: no pixel where that texel's alpha is zero.
+        if (((key.alpha_kill >> i) & 1u) && mode != kModeNone && kind != SamplerKind::None) g += std::format("    nv_kill = nv_kill || t{}.a == 0.0;\n", i);
     }
     // MV_RENDER_DEBUG=white:N / gray:N (a bit per stage, 1-15): those stages' results replaced by white (mid gray),
     // to find which stage carries an artifact.
@@ -647,6 +661,27 @@ Translation translate(const Key& key) {
         else if (func != 7)
             g += std::format("    if (!(round(clamp(final_color.a, 0.0, 1.0) * 255.0) {} round(alpha_ref.x * 255.0))) discard;\n", compare_op(func));
     }
+    if (key.alpha_kill) g += "    if (nv_kill) discard;\n";
+    // The window clip's general form: the pixel against all eight rectangles (the hardware's pictures: both ends of a
+    // rectangle are inside it).
+    if (key.window_clip)
+        g += std::format("    {{\n"
+                         "        ivec2 wp = ivec2(floor((gl_FragCoord.xy - raster.yz) / raster.x));\n"
+                         "        bool inside = false;\n"
+                         "        for (int i = 0; i < 8; ++i) inside = inside || (all(greaterThanEqual(wp, clip_rect[i].xy)) && all(lessThanEqual(wp, clip_rect[i].zw)));\n"
+                         "        if ({}inside) discard;\n"
+                         "    }}\n",
+                         key.window_clip == 2 ? "" : "!");
+    // The polygon stipple, in the surface's own pixels (a block of the internal resolution's scale is one pixel). A row's
+    // word is four bytes of eight pixels each, the first byte the leftmost eight and each byte's top bit its leftmost
+    // pixel; the pattern's last row is the surface's first (the hardware's pictures of column, border, checkered and
+    // asymmetric patterns).
+    if (key.stipple)
+        g += "    {\n"
+             "        ivec2 sp = ivec2(floor((gl_FragCoord.xy - raster.yz) / raster.x)) & 31;\n"
+             "        sp.y = 31 - sp.y;\n"
+             "        if (((stipple[sp.y >> 2][sp.y & 3] >> uint(sp.x ^ 7)) & 1u) == 0u) discard;\n"
+             "    }\n";
     g += "    frag_color = clamp(final_color, 0.0, 1.0);\n";
     if (g.find("vec4 debug_show") != std::string::npos) g += "    frag_color = debug_show;\n";
     // A signed blend's half (see Key::signed_half): the byte the console blends, split at its sign bit.

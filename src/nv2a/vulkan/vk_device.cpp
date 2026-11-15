@@ -152,6 +152,12 @@ VkDevice Device::create_logical(const Functions& fn, VkPhysicalDevice gpu, u32& 
     enabled.depth_clamp = available.depthClamp;
     features.independentBlend = available.independentBlend;
     features.largePoints = available.largePoints;
+    features.wideLines = available.wideLines;
+    if (available.wideLines) {
+        VkPhysicalDeviceProperties limits{};
+        fn.vkGetPhysicalDeviceProperties(gpu, &limits);
+        enabled.line_width_max = limits.limits.lineWidthRange[1];
+    }
     features.occlusionQueryPrecise = available.occlusionQueryPrecise;
     enabled.occlusion_precise = available.occlusionQueryPrecise;
     VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};

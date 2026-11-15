@@ -77,7 +77,10 @@ Translation translate(const Program& program, const Options& options);
 // The uniform block layout shared with the backend: the constant file, then surface_size, clip_range and the
 // fixed function's block (fixed_function_uniforms).
 constexpr u32 kConstantSlots = 192, kLights = 8, kLightVectors = 9;
-constexpr u32 kFixedFunctionVectors = 4 + kLights * kLightVectors + 3;  // + the point size and SET_POINT_PARAMS
+// + the point size and SET_POINT_PARAMS (3), and two-sided lighting's back side: the material's alpha, the scene
+// ambient, the specular curve and each light's three back colors.
+constexpr u32 kBackVectors = 3 + kLights * 3;
+constexpr u32 kFixedFunctionVectors = 4 + kLights * kLightVectors + 3 + kBackVectors;
 constexpr u32 kUniformBytes = (kConstantSlots + 2 + kFixedFunctionVectors) * 16;
 
 // The fixed-function vertex pipeline (execution mode 0) as GLSL with the same interface as a translated program:

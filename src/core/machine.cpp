@@ -232,11 +232,14 @@ bool Machine::init(std::string& error) {
         bus_.set_dirty_tracking(true);
     }
     // The live GPU sees the CPU's writes to its textures and surfaces through the same logs.
-    // MV_DIRTY_TRACKING=0 (a timing control only: CPU-written textures go stale) leaves the CPU's RAM untracked.
+    // MV_DIRTY_TRACKING=0 (a timing control only: CPU-written textures go stale) leaves the CPU's RAM untracked;
+    // MV_DIRTY_TRACKING=all logs every page as a capture does (slower in the guest; the control for a fault that only
+    // the selective tracking shows).
     const char* dt = std::getenv("MV_DIRTY_TRACKING");
     if (config_.gpu && !(dt && *dt == '0')) {
         cpu_->set_dirty_tracking(true);
-        if (!capture_) cpu_->request_selective_tracking();  // only the pages under textures (a capture records them all)
+        const bool every_page = capture_ || (dt && std::string_view(dt) == "all");
+        if (!every_page) cpu_->request_selective_tracking();  // only the pages under textures (a capture records them all)
         bus_.set_dirty_tracking(true);
     }
     if (!cpu_->init(*this, error)) return false;

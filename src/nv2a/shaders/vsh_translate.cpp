@@ -252,6 +252,8 @@ void append_head(std::string& g) {
         "    vec4 fog_params;         // SET_FOG_PARAMS (the factor = f(distance) coefficients)\n"
         "    vec4 ff_light[72];       // fixed function: nine per light (see vsh_translate.h)\n"
         "    vec4 point_params[3];    // x: SET_POINT_SIZE in pixels, y: 1 = SET_POINT_PARAMS_ENABLE; then SET_POINT_PARAMS 0-3, 4-7\n"
+        "    vec4 ff_back[27];        // two-sided lighting: w of [0] the back material alpha, [1] the back scene ambient, [2] the back\n"
+        "                             // specular curve, then per light its back ambient, diffuse and specular colors\n"
         "}};\n\n",
         kConstantSlots);
     g += std::format("layout(location = {}) out vec4 vtx_d0;\n", kVaryingD0);
@@ -465,6 +467,10 @@ constexpr u32 kPointParamsEnable = 0x0318, kPointSize = 0x043C, kPointParams = 0
 constexpr u32 kLightAmbient = 0x00, kLightDiffuse = 0x0C, kLightSpecular = 0x18, kLightRange = 0x24, kLightHalfVector = 0x28,
               kLightDirection = 0x34, kLightSpotFalloff = 0x40, kLightSpotDirection = 0x4C, kLightPosition = 0x5C, kLightAttenuation = 0x68;
 constexpr u32 kSeparateSpecular = 1u << 0, kLocalEye = 1u << 16;
+// Two-sided lighting: the enable, and the back side's own registers (a light's back colors sit at kBackLight + 0x40 per
+// light: ambient, diffuse, specular, three floats each).
+constexpr u32 kTwoSideEnable = 0x17C4, kBackLight = 0x0C00, kBackLightStride = 0x40, kBackSceneAmbient = 0x17A0, kBackMaterialAlpha = 0x17AC,
+              kBackSpecularParams = 0x1E28;
 // SET_TEXGEN_* values.
 constexpr u32 kTexgenOff = 0, kEyeLinear = 0x2400, kObjectLinear = 0x2401, kSphereMap = 0x2402, kNormalMap = 0x8511, kReflectionMap = 0x8512;
 // XF context slots.
@@ -502,7 +508,7 @@ std::vector<u32> fixed_function_key(const KelvinState& s) {
     std::vector<u32> k{s.reg(ff::kLightControl), s.reg(ff::kColorMaterial), s.reg(ff::kFogGenMode), s.reg(ff::kFogEnable) & 1u,
                        s.reg(mthd::kLightingEnable) & 1u, s.reg(ff::kSkinMode), s.reg(ff::kNormalizationEnable) & 1u,
                        s.reg(ff::kSpecularEnable) & 1u, s.reg(mthd::kLightEnableMask), s.reg(ff::kTexgenViewModel),
-                       s.reg(ff::kPointParamsEnable) & 1u};
+                       s.reg(ff::kPointParamsEnable) & 1u, s.reg(ff::kTwoSideEnable) & 1u};
     for (u32 i = 0; i < 16; ++i) k.push_back(s.reg(ff::kTexgen + 4 * i));
     for (u32 i = 0; i < 4; ++i) k.push_back(s.reg(ff::kTextureMatrixEnable + 4 * i) & 1u);
     return k;
@@ -580,6 +586,12 @@ void fixed_function_uniforms(const KelvinState& s, float* out) {
     pt[0] = size == 0 ? 1.0f : static_cast<float>(std::min(size, ff::kPointSizeMax)) / 8.0f;
     pt[1] = (s.reg(ff::kPointParamsEnable) & 1u) ? 1.0f : 0.0f;
     for (u32 i = 0; i < 8; ++i) pt[4 + i] = s.regf(ff::kPointParams + 4 * i);
+    float* back = pt + 12;
+    back[3] = s.regf(ff::kBackMaterialAlpha);
+    put3(ff::kBackSceneAmbient, back + 4);
+    curve(ff::kBackSpecularParams, back + 8);
+    for (u32 l = 0; l < kLights; ++l)
+        for (u32 c = 0; c < 3; ++c) put3(ff::kBackLight + ff::kBackLightStride * l + 0x0C * c, back + 12 + (l * 3 + c) * 4);
 }
 
 Translation fixed_function_translate(const KelvinState& s, const Options& options) {
@@ -653,6 +665,15 @@ Translation fixed_function_translate(const KelvinState& s, const Options& option
             g += std::format("    oD0 = vec4({}.xyz + {}.xyz * ff_emission_alpha.xyz, {});\n", color_source(emission), color_source(ambient), alpha);
         }
         g += "    oD1 = vec4(0.0, 0.0, 0.0, v4.w);\n";
+        // Two-sided lighting (the hardware's picture of it): a back-facing polygon takes the back colors, lit with the
+        // normal turned round by each light's back colors over the back scene ambient, with the back material's alpha;
+        // the front scene ambient is no part of it. A vertex color named as a source is the back one of its kind.
+        const bool two_sided = (s.reg(ff::kTwoSideEnable) & 1u) != 0;
+        auto back_source = [](u32 src) { return src == 1 ? "v7" : "v8"; };
+        if (two_sided) {
+            g += std::format("    oB0 = vec4(ff_back[1].xyz, {});\n", diffuse == 0 ? std::string("ff_back[0].w") : std::format("{}.w", back_source(diffuse)));
+            g += "    oB1 = vec4(0.0, 0.0, 0.0, v8.w);\n";
+        }
         const bool local_eye = (s.reg(ff::kLightControl) & ff::kLocalEye) != 0;
         if (local_eye) g += std::format("    vec3 VPeye = normalize(c[{0}].xyz / c[{0}].w - tPosition.xyz / tPosition.w);\n", ff::kEye);
         const u32 mask = s.reg(mthd::kLightEnableMask);
@@ -696,10 +717,26 @@ Translation fixed_function_translate(const KelvinState& s, const Options& option
             g += std::format("        oD0.xyz += {};\n", scaled(ambient, std::format("ff_light[{}].xyz * attenuation", b + 0)));
             g += std::format("        oD0.xyz += {};\n", scaled(diffuse, std::format("ff_light[{}].xyz * (attenuation * nDotVP)", b + 1)));
             g += std::format("        oD1.xyz += {};\n", scaled(specular, std::format("ff_light[{}].xyz * (attenuation * pf)", b + 2)));
+            if (two_sided) {
+                // The same light on the other side: the dot products with the normal reversed.
+                auto back_scaled = [&](u32 src, const std::string& light) { return src == 0 ? light : std::format("{}.xyz * {}", back_source(src), light); };
+                g += type == 1 ? std::format("        float bDotVP = max(0.0, -dot(tNormal, direction));\n        float bDotHV = max(0.0, -dot(tNormal, {}));\n",
+                                             local_eye ? "normalize(direction + VPeye)" : std::format("ff_light[{}].xyz", b + 6))
+                               : std::format("        float bDotVP = attenuation > 0.0 ? max(0.0, -dot(tNormal, VP)) : 0.0;\n"
+                                             "        float bDotHV = attenuation > 0.0 ? max(0.0, -dot(tNormal, normalize(VP{}))) : 0.0;\n",
+                                             local_eye ? " + VPeye" : "");
+                g += "        float bpf = 0.0;\n";
+                g += "        if (bDotVP > 0.0 && bDotHV > -ff_back[2].x) {\n            float den = ff_back[2].y * bDotHV + ff_back[2].z;\n";
+                g += "            if (den == 0.0) bpf = 10000.0;\n            else if (den > 0.0) bpf = clamp((bDotHV + ff_back[2].x) / den, 0.0, 10000.0);\n        }\n";
+                const u32 bl = 3 + l * 3;
+                g += std::format("        oB0.xyz += {};\n", back_scaled(ambient, std::format("ff_back[{}].xyz * attenuation", bl + 0)));
+                g += std::format("        oB0.xyz += {};\n", back_scaled(diffuse, std::format("ff_back[{}].xyz * (attenuation * bDotVP)", bl + 1)));
+                g += std::format("        oB1.xyz += {};\n", back_scaled(specular, std::format("ff_back[{}].xyz * (attenuation * bpf)", bl + 2)));
+            }
             g += "    }\n";
         }
-        // Two-sided lighting is not modeled: the back colors are the vertex's [verify].
-        g += "    oB0 = v7;\n    oB1 = v8;\n";
+        // Without two-sided lighting the back colors are the vertex's (no pixel reads them).
+        if (!two_sided) g += "    oB0 = v7;\n    oB1 = v8;\n";
     }
     if (!(s.reg(ff::kSpecularEnable) & 1u)) {
         g += "    oD1 = vec4(0.0, 0.0, 0.0, 1.0);\n    oB1 = vec4(0.0, 0.0, 0.0, 1.0);\n";

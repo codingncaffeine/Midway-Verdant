@@ -46,6 +46,7 @@ struct Enabled {
     bool depth_clamp{false};  // depthClamp: primitives are not clipped at the near and far planes (the console clamps or culls per pixel)
     bool bc_textures{false};  // textureCompressionBC: DXT textures sampled as BC1-3 blocks
     bool cache_control{false};  // pipelines can be asked of the cache alone (FAIL_ON_PIPELINE_COMPILE_REQUIRED)
+    float line_width_max{1.0f};  // wideLines: the widest line the device draws (1 without the feature)
 };
 
 // A device a libretro frontend owns (the Vulkan hardware-render interface, PLAN D38): its handles, the lock it
@@ -96,6 +97,7 @@ public:
     bool anisotropy() const { return enabled_.anisotropy; }  // samplerAnisotropy enabled
     bool depth_clamp() const { return enabled_.depth_clamp; }
     bool bc_textures() const { return enabled_.bc_textures; }
+    float line_width_max() const { return enabled_.line_width_max; }
     bool cache_control() const { return enabled_.cache_control; }  // pipeline creation from the cache alone
     bool external() const { return external_; }  // a frontend's device (adopt)
 

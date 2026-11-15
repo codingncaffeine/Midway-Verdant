@@ -114,7 +114,8 @@ namespace mv::vk {
     X(vkCmdBlitImage)               \
     X(vkCmdSetStencilReference)     \
     X(vkCmdSetBlendConstants)       \
-    X(vkCmdSetDepthBias)
+    X(vkCmdSetDepthBias)            \
+    X(vkCmdSetLineWidth)
 
 struct Functions {
     PFN_vkGetInstanceProcAddr vkGetInstanceProcAddr{nullptr};

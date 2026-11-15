@@ -30,6 +30,13 @@ constexpr u32 kAlphaTestEnable = 0x0300, kBlendEnable = 0x0304, kCullFaceEnable 
 // The polygon offset: an enable per front polygon mode (point, line, fill), the slope factor and the bias (floats).
 constexpr u32 kPolyOffsetPointEnable = 0x0330, kPolyOffsetLineEnable = 0x0334, kPolyOffsetFillEnable = 0x0338,
               kPolygonOffsetFactor = 0x0384, kPolygonOffsetBias = 0x0388, kFrontPolygonMode = 0x038C;
+// The window clip: a type (0 draws inside the rectangles, 1 outside) and eight rectangles, each a horizontal and a
+// vertical word holding the first pixel in bits 11:0 and the last in bits 27:16, in the surface's pixels. A word
+// written to one rectangle is also written to every rectangle after it (Kelvin::method).
+constexpr u32 kWindowClipType = 0x02B4, kWindowClipHorizontal = 0x02C0, kWindowClipVertical = 0x02E0;
+constexpr u32 kLineWidth = 0x0380;  // in eighths of a pixel
+// The polygon stipple: an enable and 32 rows of 32 bits, a set bit drawing its pixel.
+constexpr u32 kStippleControl = 0x147C, kStipplePattern = 0x1480;
 constexpr u32 kViewportOffset = 0x0A20, kCombinerFactor0 = 0x0A60, kCombinerFactor1 = 0x0A80, kCombinerAlphaOcw = 0x0AA0,
               kCombinerColorIcw = 0x0AC0, kViewportScale = 0x0AF0;
 constexpr u32 kTransformProgram = 0x0B00, kTransformConstant = 0x0B80;  // 32 words each
@@ -152,6 +159,12 @@ struct KelvinState {
     // named setters), or what the last array draw left (latch_current_values). A disabled array attribute and an
     // immediate vertex that does not set the attribute read it.
     std::array<std::array<float, 4>, kAttributes> immediate{};
+    // The stream has written the window clip (its type or a rectangle): until it has, nothing is clipped by it (what
+    // the registers hold at power-on is not known; all zero would leave one pixel).
+    bool window_clip_set{false};
+    // SET_LINE_WIDTH as the hardware holds it, in eighths of a pixel: one pixel until a program sets it, and a value past
+    // 0x1FF leaves it as it was.
+    u32 line_width{8};
 
     u32 reg(u32 method) const { return r[(method >> 2) & 0x7FFu]; }
     float regf(u32 method) const {

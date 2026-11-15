@@ -2441,3 +2441,220 @@ TEST(Vulkan, AB8TargetKeepsTheBlueByteOfADrawThatWritesBlueAlone) {
         EXPECT_EQ(f.ram[kB8 + 60 * 64 + 60], 0x11u) << "outside the triangle: the clear's blue byte";
     }
 }
+
+namespace {
+// A green triangle over the whole target after a clear to opaque blue.
+void clear_blue_and_draw_green(Kelvin& k, std::vector<u8>& ram) {
+    k.method(mthd::kColorClear, 0xFF0000FF);
+    k.method(mthd::kClearRectH, 63u << 16);
+    k.method(mthd::kClearRectV, 63u << 16);
+    k.method(mthd::kClearSurface, 0xF0);
+    k.method(mthd::kVertexDataArrayFormat + 12, 2u);
+    k.method(mthd::kDiffuse4f + 0, bits(0.0f));
+    k.method(mthd::kDiffuse4f + 4, bits(1.0f));
+    k.method(mthd::kDiffuse4f + 8, bits(0.0f));
+    k.method(mthd::kDiffuse4f + 12, bits(1.0f));
+    draw_full_triangle(k, ram);
+}
+constexpr u32 kBlue = 0xFF0000FFu, kGreen = 0xFF00FF00u;
+}  // namespace
+
+// The window clip as the hardware's pictures show it: a pixel is drawn inside any of the eight rectangles (both ends of
+// a rectangle included), or with the other type outside all of them; a rectangle's write also sets every rectangle
+// after it; until a program writes it nothing is clipped.
+TEST(Vulkan, TheWindowClipDrawsInsideOrOutsideItsRectangles) {
+    TextureShaderFixture f;
+    std::string error;
+    if (!f.init(error)) GTEST_SKIP() << "no Vulkan device: " << error;
+    Kelvin& k = f.k;
+    load_passthrough_program(k);
+    load_passthrough_combiners(k);
+    clear_blue_and_draw_green(k, f.ram);
+    f.renderer->end_frame();
+    EXPECT_EQ(pixel_at(f.ram, 2, 2), kGreen) << "no window clip written: the whole triangle";
+    // Pixels 16..47 across, 8..39 down, both ends included.
+    k.method(mthd::kWindowClipType, 0);
+    k.method(mthd::kWindowClipHorizontal, (47u << 16) | 16u);
+    k.method(mthd::kWindowClipVertical, (39u << 16) | 8u);
+    clear_blue_and_draw_green(k, f.ram);
+    f.renderer->end_frame();
+    for (const auto& e : f.renderer->stats().errors) ADD_FAILURE() << "renderer: " << e;
+    EXPECT_EQ(pixel_at(f.ram, 16, 8), kGreen) << "the first pixel inside";
+    EXPECT_EQ(pixel_at(f.ram, 47, 8), kGreen) << "the last column is inside";
+    EXPECT_EQ(pixel_at(f.ram, 16, 39), kGreen) << "the last row is inside";
+    EXPECT_EQ(pixel_at(f.ram, 15, 8), kBlue) << "left of the rectangle";
+    EXPECT_EQ(pixel_at(f.ram, 48, 8), kBlue) << "right of it";
+    EXPECT_EQ(pixel_at(f.ram, 16, 7), kBlue) << "above it";
+    EXPECT_EQ(pixel_at(f.ram, 16, 40), kBlue) << "below it";
+    EXPECT_EQ(f.renderer->stats().window_clipped_draws, 1u);
+    EXPECT_EQ(f.renderer->stats().window_clip_shader_draws, 0u);
+    // The other type: outside the rectangle (the write of the first set all eight).
+    k.method(mthd::kWindowClipType, 1);
+    clear_blue_and_draw_green(k, f.ram);
+    f.renderer->end_frame();
+    for (const auto& e : f.renderer->stats().errors) ADD_FAILURE() << "renderer: " << e;
+    EXPECT_EQ(pixel_at(f.ram, 16, 8), kBlue) << "inside the first rectangle";
+    EXPECT_EQ(pixel_at(f.ram, 47, 39), kBlue) << "its last pixel";
+    EXPECT_EQ(pixel_at(f.ram, 15, 8), kGreen) << "left of it";
+    EXPECT_EQ(pixel_at(f.ram, 48, 39), kGreen) << "right of it";
+    EXPECT_EQ(pixel_at(f.ram, 16, 40), kGreen) << "below it";
+    EXPECT_EQ(pixel_at(f.ram, 0, 0), kGreen) << "no rectangle is left at the origin";
+    EXPECT_EQ(f.renderer->stats().window_clip_shader_draws, 1u);
+    // Inside again, with a second rectangle set after the first: both are drawn (the second's write filled the rest).
+    k.method(mthd::kWindowClipType, 0);
+    k.method(mthd::kWindowClipHorizontal + 4, (5u << 16) | 4u);
+    k.method(mthd::kWindowClipVertical + 4, (51u << 16) | 50u);
+    clear_blue_and_draw_green(k, f.ram);
+    f.renderer->end_frame();
+    EXPECT_EQ(pixel_at(f.ram, 20, 20), kGreen) << "the first rectangle";
+    EXPECT_EQ(pixel_at(f.ram, 4, 50), kGreen) << "the second";
+    EXPECT_EQ(pixel_at(f.ram, 5, 51), kGreen);
+    EXPECT_EQ(pixel_at(f.ram, 6, 51), kBlue) << "outside both";
+    EXPECT_EQ(pixel_at(f.ram, 0, 0), kBlue);
+    // The first set after the second: it overwrites the second, and alone is in force.
+    k.method(mthd::kWindowClipHorizontal, (47u << 16) | 16u);
+    k.method(mthd::kWindowClipVertical, (39u << 16) | 8u);
+    clear_blue_and_draw_green(k, f.ram);
+    f.renderer->end_frame();
+    EXPECT_EQ(pixel_at(f.ram, 20, 20), kGreen);
+    EXPECT_EQ(pixel_at(f.ram, 4, 50), kBlue) << "the second rectangle is gone";
+}
+
+// The polygon stipple: a pixel is drawn where its bit of the 32x32 pattern is set; a row's word is four bytes of eight
+// pixels, the first byte the leftmost eight, each byte's top bit its leftmost pixel, and the pattern's last row is the
+// surface's first (the hardware's pictures).
+TEST(Vulkan, ThePolygonStippleDrawsThePatternsSetBits) {
+    TextureShaderFixture f;
+    std::string error;
+    if (!f.init(error)) GTEST_SKIP() << "no Vulkan device: " << error;
+    Kelvin& k = f.k;
+    load_passthrough_program(k);
+    load_passthrough_combiners(k);
+    // Even rows: the left pixel of each pair; odd rows: nothing but pixel 31 of each 32; row 2 is an asymmetric word.
+    for (u32 row = 0; row < 32; ++row) k.method(mthd::kStipplePattern + 4 * (31 - row), row % 2 == 0 ? 0xAAAAAAAAu : 0x01000000u);
+    k.method(mthd::kStipplePattern + 4 * (31 - 2), 0x000000C0u);
+    k.method(mthd::kStippleControl, 1);
+    clear_blue_and_draw_green(k, f.ram);
+    f.renderer->end_frame();
+    for (const auto& e : f.renderer->stats().errors) ADD_FAILURE() << "renderer: " << e;
+    EXPECT_EQ(pixel_at(f.ram, 0, 0), kGreen);
+    EXPECT_EQ(pixel_at(f.ram, 1, 0), kBlue);
+    EXPECT_EQ(pixel_at(f.ram, 6, 4), kGreen);
+    EXPECT_EQ(pixel_at(f.ram, 7, 4), kBlue);
+    EXPECT_EQ(pixel_at(f.ram, 31, 1), kGreen) << "the last byte's low bit is the last pixel of the 32";
+    EXPECT_EQ(pixel_at(f.ram, 30, 1), kBlue);
+    EXPECT_EQ(pixel_at(f.ram, 0, 1), kBlue);
+    EXPECT_EQ(pixel_at(f.ram, 0, 2), kGreen) << "the first byte's two top bits are the first two pixels";
+    EXPECT_EQ(pixel_at(f.ram, 1, 2), kGreen);
+    EXPECT_EQ(pixel_at(f.ram, 2, 2), kBlue);
+    EXPECT_EQ(pixel_at(f.ram, 4, 34), kBlue) << "the pattern repeats every 32 rows (row 34 is row 2)";
+    EXPECT_EQ(pixel_at(f.ram, 33, 34), kGreen) << "and every 32 pixels across";
+    EXPECT_EQ(f.renderer->stats().stippled_draws, 1u);
+    // Off again: every pixel.
+    k.method(mthd::kStippleControl, 0);
+    clear_blue_and_draw_green(k, f.ram);
+    f.renderer->end_frame();
+    EXPECT_EQ(pixel_at(f.ram, 1, 0), kGreen);
+}
+
+// A stage's alpha kill gives up the pixel where its texel's alpha is zero, with or without blending.
+TEST(Vulkan, AlphaKillDropsPixelsWhoseTexelHasNoAlpha) {
+    TextureShaderFixture f;
+    std::string error;
+    if (!f.init(error)) GTEST_SKIP() << "no Vulkan device: " << error;
+    Kelvin& k = f.k;
+    // A 2x2 texture: the left column opaque green, the right column green with an alpha of zero.
+    load_texture(k, f.ram, 0, 0x200000, 1, [](u32 x, u32) { return x == 0 ? 0xFF00FF00u : 0x0000FF00u; });
+    k.method(mthd::kShaderStageProgram, 1u);
+    output_texture_stage(k, 0);
+    k.method(mthd::kColorClear, 0xFF0000FF);
+    k.method(mthd::kClearRectH, 63u << 16);
+    k.method(mthd::kClearRectV, 63u << 16);
+    k.method(mthd::kClearSurface, 0xF0);
+    texcoord(k, 0, 0.75f, 0.25f, 0.0f, 1.0f);  // the right column
+    draw_full_triangle(k, f.ram);
+    f.renderer->end_frame();
+    EXPECT_EQ(pixel_at(f.ram, 8, 8), 0x0000FF00u) << "without the kill the texel is drawn, alpha zero and all";
+    k.method(mthd::kTextureBase + 0xC, 0x40000004);  // enabled, alpha kill
+    k.method(mthd::kClearSurface, 0xF0);
+    draw_full_triangle(k, f.ram);
+    f.renderer->end_frame();
+    for (const auto& e : f.renderer->stats().errors) ADD_FAILURE() << "renderer: " << e;
+    EXPECT_EQ(pixel_at(f.ram, 8, 8), kBlue) << "with it the pixel is not drawn";
+    texcoord(k, 0, 0.25f, 0.25f, 0.0f, 1.0f);  // the left column: opaque
+    draw_full_triangle(k, f.ram);
+    f.renderer->end_frame();
+    EXPECT_EQ(pixel_at(f.ram, 8, 8), kGreen) << "a texel with alpha is drawn";
+}
+
+// A line is as wide as SET_LINE_WIDTH says (eighths of a pixel), and a triangle in the line polygon mode is its edges.
+TEST(Vulkan, LinesTakeTheirWidthAndTrianglesTheirPolygonMode) {
+    TextureShaderFixture f;
+    std::string error;
+    if (!f.init(error)) GTEST_SKIP() << "no Vulkan device: " << error;
+    Kelvin& k = f.k;
+    load_passthrough_program(k);
+    load_passthrough_combiners(k);
+    k.method(mthd::kColorClear, 0xFF0000FF);
+    k.method(mthd::kClearRectH, 63u << 16);
+    k.method(mthd::kClearRectV, 63u << 16);
+    k.method(mthd::kClearSurface, 0xF0);
+    k.method(mthd::kVertexDataArrayFormat + 12, 2u);
+    k.method(mthd::kDiffuse4f + 0, bits(0.0f));
+    k.method(mthd::kDiffuse4f + 4, bits(1.0f));
+    k.method(mthd::kDiffuse4f + 8, bits(0.0f));
+    k.method(mthd::kDiffuse4f + 12, bits(1.0f));
+    // A horizontal line through the middle of row 20's pixels, from x = 4 to x = 60.
+    const float line[2][4] = {{4.0f, 20.5f, 0.0f, 1.0f}, {60.0f, 20.5f, 0.0f, 1.0f}};
+    std::memcpy(&f.ram[0x30000], line, sizeof line);
+    k.method(mthd::kVertexDataArrayFormat + 0, (16u << 8) | (4u << 4) | 2u);
+    k.method(mthd::kVertexDataArrayOffset + 0, 0x30000);
+    auto draw_line = [&] {
+        k.method(mthd::kBeginEnd, 2);
+        k.method(mthd::kDrawArrays, (1u << 24) | 0u);
+        k.method(mthd::kBeginEnd, 0);
+        f.renderer->end_frame();
+    };
+    k.method(mthd::kLineWidth, 8);  // one pixel
+    draw_line();
+    for (const auto& e : f.renderer->stats().errors) ADD_FAILURE() << "renderer: " << e;
+    EXPECT_EQ(pixel_at(f.ram, 30, 20), kGreen);
+    EXPECT_EQ(pixel_at(f.ram, 30, 19), kBlue);
+    EXPECT_EQ(pixel_at(f.ram, 30, 21), kBlue);
+    EXPECT_EQ(f.renderer->stats().line_draws, 1u);
+    if (f.device.line_width_max() >= 5.0f) {
+        k.method(mthd::kLineWidth, 40);  // five pixels: rows 18 to 22
+        draw_line();
+        EXPECT_EQ(pixel_at(f.ram, 30, 18), kGreen);
+        EXPECT_EQ(pixel_at(f.ram, 30, 22), kGreen);
+        EXPECT_EQ(pixel_at(f.ram, 30, 16), kBlue);
+        EXPECT_EQ(pixel_at(f.ram, 30, 24), kBlue);
+    }
+    // A width past the largest (63.875 pixels) is not taken: the line stays as wide as before.
+    k.method(mthd::kLineWidth, 8);
+    k.method(mthd::kLineWidth, 0x200);
+    k.method(mthd::kClearSurface, 0xF0);
+    draw_line();
+    EXPECT_EQ(pixel_at(f.ram, 30, 20), kGreen);
+    EXPECT_EQ(pixel_at(f.ram, 30, 18), kBlue) << "one pixel wide still";
+    // A triangle in the line mode: its edges, not its inside.
+    k.method(mthd::kLineWidth, 8);
+    k.method(mthd::kClearSurface, 0xF0);
+    k.method(mthd::kFrontPolygonMode, 0x1B01);
+    const float tri[3][4] = {{4.5f, 4.5f, 0.0f, 1.0f}, {60.5f, 4.5f, 0.0f, 1.0f}, {4.5f, 60.5f, 0.0f, 1.0f}};
+    std::memcpy(&f.ram[0x30000], tri, sizeof tri);
+    k.method(mthd::kBeginEnd, 5);
+    k.method(mthd::kDrawArrays, (2u << 24) | 0u);
+    k.method(mthd::kBeginEnd, 0);
+    f.renderer->end_frame();
+    for (const auto& e : f.renderer->stats().errors) ADD_FAILURE() << "renderer: " << e;
+    EXPECT_EQ(pixel_at(f.ram, 30, 4), kGreen) << "the top edge";
+    EXPECT_EQ(pixel_at(f.ram, 4, 30), kGreen) << "the left edge";
+    EXPECT_EQ(pixel_at(f.ram, 16, 16), kBlue) << "the inside is not filled";
+    k.method(mthd::kFrontPolygonMode, 0x1B02);
+    k.method(mthd::kBeginEnd, 5);
+    k.method(mthd::kDrawArrays, (2u << 24) | 0u);
+    k.method(mthd::kBeginEnd, 0);
+    f.renderer->end_frame();
+    EXPECT_EQ(pixel_at(f.ram, 16, 16), kGreen) << "filled again in the fill mode";
+}

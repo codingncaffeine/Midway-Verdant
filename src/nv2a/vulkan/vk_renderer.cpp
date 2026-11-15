@@ -206,8 +206,8 @@ struct VulkanRenderer::PipelineBuild {
     VkPipelineDepthStencilStateCreateInfo ds{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
     VkPipelineColorBlendAttachmentState cb{};
     VkPipelineColorBlendStateCreateInfo blend{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
-    VkDynamicState dynamics[5]{VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_BLEND_CONSTANTS, VK_DYNAMIC_STATE_STENCIL_REFERENCE,
-                               VK_DYNAMIC_STATE_DEPTH_BIAS};
+    VkDynamicState dynamics[6]{VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_BLEND_CONSTANTS, VK_DYNAMIC_STATE_STENCIL_REFERENCE,
+                               VK_DYNAMIC_STATE_DEPTH_BIAS, VK_DYNAMIC_STATE_LINE_WIDTH};  // the last only on pipelines that draw lines
     VkPipelineDynamicStateCreateInfo dyn{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
     VkGraphicsPipelineCreateInfo gpi{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
     std::atomic<bool> done{false};
@@ -276,7 +276,7 @@ VulkanRenderer::~VulkanRenderer() {
         dev_.destroy_image(c.image);
     }
     for (auto& [k, s] : samplers_) f.vkDestroySampler(dev_.device(), s, nullptr);
-    for (auto& [k, s] : border_samplers_) f.vkDestroySampler(dev_.device(), s, nullptr);
+    for (auto& [k, s] : special_samplers_) f.vkDestroySampler(dev_.device(), s, nullptr);
     if (dummy_sampler_) f.vkDestroySampler(dev_.device(), dummy_sampler_, nullptr);
     dev_.destroy_image(dummy2d_);
     dev_.destroy_image(dummycube_);
@@ -1991,17 +1991,25 @@ void VulkanRenderer::write_back_all(bool in_background) {
 // caller's wait. On the hardware the pixels are in RAM once drawn; the reference emulator downloads a surface when the
 // CPU touches its memory. Links 2004 draws each distant tree into a 64x64 texture, then with the CPU reworks its alpha
 // and makes its mip levels from those pixels: read before they reached RAM, the trees came out as rainbow stripes.
-// Linear targets (the frame and its buffers) keep their own paths (scanout, idle vblank, textures, 2D, CPU writes).
-bool VulkanRenderer::store_drawn_textures() {
-    if (!swizzled_drawn_) return false;
+// Linear targets (the frame and its buffers) keep their own paths (scanout, idle vblank, textures, 2D, CPU writes),
+// except with `every_target`: the guest asked the graphics engine itself whether it is idle (PGRAPH's status register,
+// which pbkit programs poll before they read a frame back, and few titles read at all), and then every target drawn
+// since it last reached RAM goes there, depth included.
+bool VulkanRenderer::store_drawn_textures(bool every_target) {
+    if (!swizzled_drawn_ && !every_target) return false;
     swizzled_drawn_ = false;
     wb_why_ = Stats::kWbProgress;
     bool any = false;
-    for (auto& [k, s] : surfaces_)
-        if (s->dirty && s->swizzled) {
+    for (auto& [k, s] : surfaces_) {
+        if (s->dirty && (every_target || s->swizzled)) {
             queue_write_back(*s);
             any = true;
         }
+        if (every_target && s->zeta_dirty && s->depth_holds == s->zeta_phys) {
+            queue_write_back_zeta(*s);
+            any = true;
+        }
+    }
     if (any) finish_write_backs_async();
     wb_why_ = Stats::kWbAll;
     return any;
@@ -2357,6 +2365,20 @@ VkShaderModule VulkanRenderer::fragment_shader(const psh::Key& key, std::array<p
     return m;
 }
 
+namespace {
+// How triangles are filled (SET_FRONT_POLYGON_MODE: 0x1B00 their corners as points, 0x1B01 their edges as lines, else
+// whole), as the host's polygon mode; lines and points are what they are. The back mode is taken to be the same.
+u32 polygon_mode(const KelvinState& s, VkPrimitiveTopology topology) {
+    if (topology != VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST && topology != VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP && topology != VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN)
+        return VK_POLYGON_MODE_FILL;
+    const u32 mode = s.reg(mthd::kFrontPolygonMode);
+    return mode == 0x1B00 ? VK_POLYGON_MODE_POINT : (mode == 0x1B01 ? VK_POLYGON_MODE_LINE : VK_POLYGON_MODE_FILL);
+}
+bool draws_lines(const KelvinState& s, VkPrimitiveTopology topology) {
+    return topology == VK_PRIMITIVE_TOPOLOGY_LINE_LIST || topology == VK_PRIMITIVE_TOPOLOGY_LINE_STRIP || polygon_mode(s, topology) == VK_POLYGON_MODE_LINE;
+}
+}  // namespace
+
 VkPipeline VulkanRenderer::pipeline(const KelvinState& s, VkShaderModule vs, VkShaderModule fs, VkPrimitiveTopology topology, Surface& t, u32 vertex_layout, u32 depth_mode, std::string& error) {
     struct RasterKey {
         VkShaderModule vs, fs;
@@ -2364,7 +2386,7 @@ VkPipeline VulkanRenderer::pipeline(const KelvinState& s, VkShaderModule vs, VkS
         u32 topology, blend_enable, sfactor, dfactor, equation, depth_test, depth_func, depth_write, cull_enable, cull_face, front_face,
             color_mask, stencil_enable, stencil_func, stencil_mask, stencil_write_mask, op_fail, op_zfail, op_zpass;
         u32 vertex_layout;  // the attributes with per-vertex data (also fills the last eight bytes: the key is its bytes)
-    } k{vs, fs, t.pass, static_cast<u32>(topology) | (debug_nocull_ ? 0x100u : 0u) | (debug_nodepth_ ? 0x200u : 0u) | (debug_noblend_ ? 0x400u : 0u) | (depth_mode << 11), s.blend(), s.reg(mthd::kBlendSfactor), s.reg(mthd::kBlendDfactor), s.reg(mthd::kBlendEquation) | (signed_half_ << 16),
+    } k{vs, fs, t.pass, static_cast<u32>(topology) | (debug_nocull_ ? 0x100u : 0u) | (debug_nodepth_ ? 0x200u : 0u) | (debug_noblend_ ? 0x400u : 0u) | (depth_mode << 11) | (polygon_mode(s, topology) << 16), s.blend(), s.reg(mthd::kBlendSfactor), s.reg(mthd::kBlendDfactor), s.reg(mthd::kBlendEquation) | (signed_half_ << 16),
         s.depth_test(), s.reg(mthd::kDepthFunc), s.depth_write(), s.cull_face(), s.reg(mthd::kCullFace), s.reg(mthd::kFrontFace), s.color_mask(),
         s.stencil_test(), s.reg(mthd::kStencilFunc), s.reg(mthd::kStencilFuncMask), s.reg(mthd::kStencilMask), s.reg(mthd::kStencilOpFail),
         s.reg(mthd::kStencilOpZfail), s.reg(mthd::kStencilOpZpass), vertex_layout};
@@ -2423,7 +2445,7 @@ VkPipeline VulkanRenderer::pipeline(const KelvinState& s, VkShaderModule vs, VkS
     vp.viewportCount = 1;
     vp.scissorCount = 1;
     auto& rs = build->rs;
-    rs.polygonMode = VK_POLYGON_MODE_FILL;
+    rs.polygonMode = static_cast<VkPolygonMode>(polygon_mode(s, topology));
     rs.lineWidth = 1.0f;
     if (s.cull_face() && !debug_nocull_) {
         const u32 face = s.reg(mthd::kCullFace);
@@ -2480,7 +2502,7 @@ VkPipeline VulkanRenderer::pipeline(const KelvinState& s, VkShaderModule vs, VkS
     blend.pAttachments = &cb;
     auto& dynamics = build->dynamics;
     auto& dyn = build->dyn;
-    dyn.dynamicStateCount = 5;
+    dyn.dynamicStateCount = draws_lines(s, topology) ? 6 : 5;
     dyn.pDynamicStates = dynamics;
     auto& gpi = build->gpi;
     gpi.stageCount = 2;
@@ -3641,9 +3663,14 @@ VkSampler VulkanRenderer::sampler(const TextureStage& ts, u32 levels) {
     const FormatInfo fi = format_info(ts.color_format());
     const bool color_texture = !fi.depth && ts.color_format() != 0x32 && ts.color_format() != 0x35;
     const bool border = color_texture && (ts.wrap_u() == 4 || ts.wrap_v() == 4 || ts.wrap_p() == 4);
-    if (!border) {
+    // The stage's level-of-detail clamps (TEXCTL0: the lowest level in bits 29:18, the highest in 17:6, in 1/256 of a
+    // level). The usual pair, 0 and the largest value, goes the short way with no border.
+    const u32 lod_clamps = (ts.control0 >> 6) & 0xFFFFFFu;
+    const bool plain = !border && lod_clamps == 0x000FFFu;
+    const std::pair<u64, u64> special{key, (static_cast<u64>(border ? 1u : 0u) << 56) | (static_cast<u64>(lod_clamps) << 32) | (border ? ts.border_color : 0u)};
+    if (plain) {
         if (auto it = samplers_.find(key); it != samplers_.end()) return it->second;
-    } else if (auto it = border_samplers_.find({key, ts.border_color}); it != border_samplers_.end()) {
+    } else if (auto it = special_samplers_.find(special); it != special_samplers_.end()) {
         return it->second;
     }
     VkSamplerCreateInfo sci{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
@@ -3673,7 +3700,19 @@ VkSampler VulkanRenderer::sampler(const TextureStage& ts, u32 levels) {
     sci.addressModeU = wrap_mode(ts.wrap_u());
     sci.addressModeV = wrap_mode(ts.wrap_v());
     sci.addressModeW = wrap_mode(ts.wrap_p());
-    sci.maxLod = (min >= 3 && min <= 6) ? static_cast<float>(levels) : 0.25f;
+    // Mip-mapped: the levels between the stage's clamps, and its bias (TEXFILTER bits 12:0, signed, in 1/256 of a level),
+    // as the reference emulator reads them. Otherwise the base level alone (0.25 keeps the choice of magnification).
+    if (min >= 3 && min <= 6) {
+        const float top = static_cast<float>(levels > 0 ? levels - 1 : 0);
+        const float lo = std::min(static_cast<float>(ts.min_lod()) / 256.0f, top);
+        sci.minLod = lo;
+        sci.maxLod = std::max(lo, std::min(static_cast<float>(ts.max_lod()) / 256.0f, static_cast<float>(levels)));
+        const i32 raw = static_cast<i32>(ts.filter & 0x1FFFu);
+        const float bias = static_cast<float>(raw & 0x1000 ? raw - 0x2000 : raw) / 256.0f;
+        sci.mipLodBias = std::clamp(bias, -dev_.limits().maxSamplerLodBias, dev_.limits().maxSamplerLodBias);
+    } else {
+        sci.maxLod = 0.25f;
+    }
     if (aniso > 1) {
         sci.anisotropyEnable = VK_TRUE;
         sci.maxAnisotropy = static_cast<float>(aniso);
@@ -3684,8 +3723,8 @@ VkSampler VulkanRenderer::sampler(const TextureStage& ts, u32 levels) {
     static const bool log_samplers = [] { const char* e = std::getenv("MV_DEBUG_SAMPLERS"); return e && *e == '1'; }();
     if ((border || aniso > 1) && log_samplers)
         std::fprintf(stderr, "sampler: border %s color %08x anisotropy %u address %08x format %08x filter %08x\n", border ? "yes" : "no", ts.border_color, aniso, ts.address, ts.format, ts.filter);
-    if (border) border_samplers_[{key, ts.border_color}] = sm;
-    else samplers_[key] = sm;
+    if (plain) samplers_[key] = sm;
+    else special_samplers_[special] = sm;
     return sm;
 }
 
@@ -3806,8 +3845,9 @@ void VulkanRenderer::clear(const KelvinState& s, u32 bits) {
             ++n;
         }
     }
+    // Within the view, in the image's pixels (the internal resolution's). The window clip is not applied to a clear:
+    // no hardware picture shows a clear under one, and the reference emulator does not apply it either [verify].
     VkClearRect rect{};
-    // Within the view, in the image's pixels (the internal resolution's).
     const u32 sc = t->sc;
     rect.rect = {{static_cast<i32>((view_.x + x0) * sc), static_cast<i32>((view_.y + y0) * sc)}, {(x1 - x0 + 1) * sc, (y1 - y0 + 1) * sc}};
     rect.layerCount = 1;
@@ -4018,6 +4058,27 @@ void VulkanRenderer::draw(const KelvinState& s, const DrawBatch& batch) {
             ++stats_.point_sprite_draws;
         }
     }
+    // The polygon stipple applies to filled polygons only.
+    if ((s.reg(mthd::kStippleControl) & 1u) && v.primitive >= Primitive::Triangles && polygon_mode(s, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST) == VK_POLYGON_MODE_FILL) {
+        pkey.stipple = 1;
+        ++stats_.stippled_draws;
+    }
+    // The window clip. Titles set its first rectangle to the viewport (the console's Direct3D clips a viewport smaller
+    // than its target this way), which sets all eight, and draw inside: the scissor takes that. Drawing outside the
+    // rectangles, or inside rectangles that differ, goes to the pixel shader. Until the stream writes the window clip
+    // nothing is clipped by it.
+    u32 window_clip = 0;  // 0 none, 1 the scissor, 2 the shader
+    if (s.window_clip_set) {
+        const bool outside = (s.reg(mthd::kWindowClipType) & 1u) != 0;
+        bool one = !outside;
+        const u32 h0 = s.reg(mthd::kWindowClipHorizontal), v0 = s.reg(mthd::kWindowClipVertical);
+        for (u32 i = 1; i < 8 && one; ++i) one = s.reg(mthd::kWindowClipHorizontal + 4 * i) == h0 && s.reg(mthd::kWindowClipVertical + 4 * i) == v0;
+        window_clip = one ? 1 : 2;
+        if (!one) {
+            pkey.window_clip = outside ? 2 : 1;
+            ++stats_.window_clip_shader_draws;
+        }
+    }
     if (debug_shadow_pass_) pkey.shadow_compare_func = 7;  // every shadow lookup lit
     // The console's exact depth from the pixel shader for every draw that tests or writes depth: what one draw stores and
     // what a later one compares must be on the same step (the host's own depth for the stored side drew a grid over a
@@ -4196,6 +4257,21 @@ void VulkanRenderer::draw(const KelvinState& s, const DrawBatch& batch) {
         vsh::fixed_function_uniforms(s, u + kConstants * 4 + 8);
         psh::Uniforms pu{};
         psh::uniforms_from_state(s, scales, pu);
+        if (pkey.stipple)
+            for (u32 row = 0; row < 32; ++row) pu.stipple[row] = s.reg(mthd::kStipplePattern + 4 * row);
+        if (pkey.stipple || pkey.window_clip) {
+            pu.raster[0] = static_cast<float>(t->sc);
+            pu.raster[1] = static_cast<float>(view_.x * t->sc);
+            pu.raster[2] = static_cast<float>(view_.y * t->sc);
+        }
+        if (pkey.window_clip)
+            for (u32 i = 0; i < 8; ++i) {
+                const u32 wh = s.reg(mthd::kWindowClipHorizontal + 4 * i), wv = s.reg(mthd::kWindowClipVertical + 4 * i);
+                pu.clip_rect[i][0] = static_cast<i32>((wh & 0xFFFu) * t->aa_x);
+                pu.clip_rect[i][1] = static_cast<i32>((wv & 0xFFFu) * t->aa_y);
+                pu.clip_rect[i][2] = static_cast<i32>((((wh >> 16) & 0xFFFu) + 1) * t->aa_x) - 1;
+                pu.clip_rect[i][3] = static_cast<i32>((((wv >> 16) & 0xFFFu) + 1) * t->aa_y) - 1;
+            }
         {
             // The depth the pixel shader writes as the console does: the format's range (the vertex side's z scale), the
             // clip range, the polygon offset for triangle-class primitives with the front mode's enable (its slope term
@@ -4310,11 +4386,31 @@ void VulkanRenderer::draw(const KelvinState& s, const DrawBatch& batch) {
     VkRect2D scissor{{static_cast<i32>(std::min(cx, vw.w - 1)), static_cast<i32>(std::min(cy, vw.h - 1))},
                      {std::max(1u, std::min(cw, vw.w - std::min(cx, vw.w - 1))), std::max(1u, std::min(ch, vw.h - std::min(cy, vw.h - 1)))}};
     if (sd.clip_width() == 0 || sd.clip_height() == 0) scissor = {{0, 0}, {vw.w, vw.h}};
+    // The window clip's one rectangle (see where the pixel shader's key is made).
+    {
+        if (window_clip == 1) {
+            const u32 wh = s.reg(mthd::kWindowClipHorizontal), wv = s.reg(mthd::kWindowClipVertical);
+            const u32 x0 = (wh & 0xFFFu) * t->aa_x, x1 = (((wh >> 16) & 0xFFFu) + 1) * t->aa_x;
+            const u32 y0 = (wv & 0xFFFu) * t->aa_y, y1 = (((wv >> 16) & 0xFFFu) + 1) * t->aa_y;
+            const u32 sx0 = static_cast<u32>(scissor.offset.x), sy0 = static_cast<u32>(scissor.offset.y);
+            const u32 nx0 = std::max(sx0, x0), ny0 = std::max(sy0, y0);
+            const u32 nx1 = std::min(sx0 + scissor.extent.width, x1), ny1 = std::min(sy0 + scissor.extent.height, y1);
+            if (nx0 != sx0 || ny0 != sy0 || nx1 != sx0 + scissor.extent.width || ny1 != sy0 + scissor.extent.height) ++stats_.window_clipped_draws;
+            scissor = {{static_cast<i32>(std::min(nx0, vw.w)), static_cast<i32>(std::min(ny0, vw.h))}, {nx1 > nx0 ? nx1 - nx0 : 0u, ny1 > ny0 ? ny1 - ny0 : 0u}};
+        }
+    }
     scissor.offset.x = (scissor.offset.x + static_cast<i32>(vw.x)) * static_cast<i32>(sc);
     scissor.offset.y = (scissor.offset.y + static_cast<i32>(vw.y)) * static_cast<i32>(sc);
     scissor.extent.width *= sc;
     scissor.extent.height *= sc;
     fn_->vkCmdSetScissor(cb_, 0, 1, &scissor);
+    // A line's width (KelvinState::line_width, eighths of a surface pixel; under one pixel draws one) at the internal
+    // resolution.
+    if (draws_lines(s, topology)) {
+        const float width = std::max(1.0f, static_cast<float>(s.line_width) / 8.0f) * static_cast<float>(sc);
+        fn_->vkCmdSetLineWidth(cb_, std::clamp(width, 1.0f, dev_.line_width_max()));
+        ++stats_.line_draws;
+    }
     const u32 bc = s.reg(mthd::kBlendColor);
     float constants[4] = {static_cast<float>((bc >> 16) & 0xFFu) / 255.0f, static_cast<float>((bc >> 8) & 0xFFu) / 255.0f,
                                 static_cast<float>(bc & 0xFFu) / 255.0f, static_cast<float>(bc >> 24) / 255.0f};
