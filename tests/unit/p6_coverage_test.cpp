@@ -163,10 +163,12 @@ TEST(P6Coverage, TheX87EscapesAreThePentiumIIIs) {
 TEST(P6Coverage, X87SecondEncodingsRunAsTheDocumentedForms) {
     Machine m;
     auto run2 = [&](std::initializer_list<u8> second) {
-        // fld1; fldz; then the instruction under test: ST(0) = 0, ST(1) = 1 before it.
-        std::vector<u8> code{0xD9, 0xE8, 0xD9, 0xEE};
+        // fninit (every exception masked, as programs run); fld1; fldz; then the instruction under test: ST(0) = 0,
+        // ST(1) = 1 before it.
+        std::vector<u8> code{0xDB, 0xE3, 0xD9, 0xE8, 0xD9, 0xEE};
         code.insert(code.end(), second);
         m.run(code);
+        m.cpu.step();
         m.cpu.step();
         m.cpu.step();
     };
