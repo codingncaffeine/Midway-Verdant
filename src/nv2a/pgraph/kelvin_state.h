@@ -8,7 +8,7 @@
 
 // The state of the Kelvin 3D class (0x97) as its methods leave it, and the decoders of its packed fields.
 // Method numbers and fields are documented in local-notes/hw/nv2a-pgraph.md (public nxdk header, envytools,
-// behaviour read from xemu); nothing here is copied code.
+// behavior read from xemu); nothing here is copied code.
 namespace mv::pgraph {
 
 namespace mthd {
@@ -124,7 +124,7 @@ struct SurfaceState {
     u32 log_height() const { return (format >> 24) & 0xFFu; }
     u32 color_pitch() const { return pitch & 0xFFFFu; }
     u32 zeta_pitch() const { return pitch >> 16; }
-    // Bytes per pixel of the colour surface (0 = unknown format).
+    // Bytes per pixel of the color surface (0 = unknown format).
     u32 color_bytes() const {
         switch (color_format()) {
             case 1: case 2: case 3: return 2;

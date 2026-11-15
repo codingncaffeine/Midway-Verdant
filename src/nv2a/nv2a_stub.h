@@ -32,7 +32,7 @@ namespace pgraph {
 class VulkanRenderer;
 }
 
-// PCI 1:0.0, the NV2A, as a register store with the few behaviours the boot chain polls for: the chip identity,
+// PCI 1:0.0, the NV2A, as a register store with the few behaviors the boot chain polls for: the chip identity,
 // the PFB command bit that clears itself, the PTIMER counting on the master clock, the vertical-blank interrupt
 // through PCRTC and PMC. Every other register is remembered and read back, every access logged. The real engines
 // replace this block by block in Phase 4.
@@ -63,7 +63,7 @@ public:
     // INCREMENT advances the read index (the display has moved on to the next buffer) and releases a FLIP_STALL.
     static constexpr u32 kPgraphSurface = 0x400710, kPgraphIncrement = 0x40071C;
     // PRAMDAC +0x6A0: the kernel's display-mode set toggles bit 0 and waits until bit 4 reads the same — the
-    // hardware mirrors the request bit at the next frame boundary (measured from the kernel's behaviour).
+    // hardware mirrors the request bit at the next frame boundary (measured from the kernel's behavior).
     static constexpr u32 kPramdacModeLatch = 0x6806A0;
     // PGRAPH: interrupt status (NOTIFY bit 0, MISSING_HW 4, CONTEXT_SWITCH 12, ERROR 20), the error source, the
     // trapped method and its data, and the FIFO access bit software clears to hold the engine and sets to resume.
@@ -164,8 +164,8 @@ public:
     u32 framebuffer_start() const { return reg(kPcrtcStart); }
     // The video overlay as it stands, when a buffer is in use (read under the machine lock).
     std::optional<Overlay> overlay() const;
-    // The RAMDAC's colour table, written through the VGA-style DAC ports (a write index, then red, green, blue
-    // bytes; the index advances after each triple). In the console's direct-colour modes it is the gamma ramp every
+    // The RAMDAC's color table, written through the VGA-style DAC ports (a write index, then red, green, blue
+    // bytes; the index advances after each triple). In the console's direct-color modes it is the gamma ramp every
     // scanout pixel goes through. Empty while it is the identity (the kernel's default), so callers skip the work.
     std::optional<std::array<u8, 768>> gamma_lut() const;
     static constexpr u32 kDacReadIndex = 0x6813C7, kDacWriteIndex = 0x6813C8, kDacData = 0x6813C9;
@@ -326,7 +326,7 @@ private:
     std::array<u32, 8> bound_{};
     std::array<u32, 8> bound_handles_{};
     u64 method_log_lines_{0};
-    // The synchronisation state the CPU side observes: per subchannel, the notifier and semaphore DMA objects.
+    // The synchronization state the CPU side observes: per subchannel, the notifier and semaphore DMA objects.
     struct SyncState {
         u32 notifier_handle{0};
         u32 semaphore_handle{0};
@@ -454,7 +454,7 @@ public:
     // Reads of `offset` always return `value` (status bits the firmware waits for).
     void set_fixed(u32 offset, u32 value) { fixed_[offset] = value; }
     // Bits of `offset` (a byte offset; the mask is in that byte's position) that clear as soon as they are
-    // written: command bits hardware finishes at once at this level of modelling.
+    // written: command bits hardware finishes at once at this level of modeling.
     void set_self_clearing(u32 offset, u32 mask) { self_clearing_[offset & ~3u] |= mask << (8u * (offset & 3u)); }
     // An interrupt status register (write one to clear) and its enable register; the line follows status & enable.
     void set_interrupt_pair(u32 status_offset, u32 enable_offset, std::function<void(bool)> irq) {

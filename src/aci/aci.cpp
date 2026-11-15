@@ -141,7 +141,7 @@ u32 Aci::read_byte(u32 offset) {
         if (rel >= kChannelOffset[c] && rel < kChannelOffset[c] + 0x10) return channel_read_byte(static_cast<Channel>(c), rel - kChannelOffset[c]);
     if (rel >= kGlobCnt && rel < kGlobCnt + 4) return (glob_cnt_ >> (8u * (rel - kGlobCnt))) & 0xFFu;
     if (rel >= kGlobSta && rel < kGlobSta + 4) return (glob_sta() >> (8u * (rel - kGlobSta))) & 0xFFu;
-    if (rel == kCas) return 0;  // the codec access semaphore: never busy at this level of modelling
+    if (rel == kCas) return 0;  // the codec access semaphore: never busy at this level of modeling
     return 0;
 }
 

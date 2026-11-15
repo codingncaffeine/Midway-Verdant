@@ -12,7 +12,7 @@
 // DMA engine, and the few peripheral registers the Xbox adds in the DSP's I/O space: $FFFFC4 halt (bit 0 stops
 // the core until the next frame), $FFFFC5 interrupt status (bit 1 start of frame, bit 7 DMA end of list; writes
 // clear), $FFFFD4-$FFFFD7 the DMA registers. The boot ROM's work on reset: program memory loaded from the first
-// 0x800 words of scratch. Behaviour per the public reference emulator and the xboxdevwiki DSP page.
+// 0x800 words of scratch. Behavior per the public reference emulator and the xboxdevwiki DSP page.
 namespace mv::apu {
 
 class Processor : public dsp::Peripherals {

@@ -113,7 +113,7 @@ void AtaDisk::set_lba(u64 v) {
 }
 
 Cycles AtaDisk::transfer_time(u32 sectors) const {
-    // Ultra DMA mode 2 (33 MB/s) plus command overhead; rotational and seek time are not modelled yet [plan: Phase 11].
+    // Ultra DMA mode 2 (33 MB/s) plus command overhead; rotational and seek time are not modeled yet [plan: Phase 11].
     return kCommandLatency + cycles_from_ns(static_cast<u64>(sectors) * 512u * 1000u / 33u);
 }
 
@@ -254,7 +254,7 @@ Cycles AtaDisk::start_command(u8 command) {
             trace::log(trace::Cat::Pio, "hdd read dma {} sectors at lba {}", sectors_left_, current_lba_);
             pending_ = Pending::DmaRead;
             drop_read();
-            image_.begin_read(current_lba_, sectors_left_);  // the host reads while the drive's modelled time runs
+            image_.begin_read(current_lba_, sectors_left_);  // the host reads while the drive's modeled time runs
             read_in_flight_ = true;
             return transfer_time(sectors_left_);
         case 0xCA:
@@ -782,7 +782,7 @@ void AtapiCdrom::run_packet() {
 }
 
 // Mode pages describe the drive, so they answer with or without a disc. The console's kernel reads page 0x3E, the
-// drive's security page (layout per the community documentation in local-notes/hw/dvd.md), at initialisation and
+// drive's security page (layout per the community documentation in local-notes/hw/dvd.md), at initialization and
 // insists on its byte 3 reading 1; page 0x2A is the standard capabilities page.
 void AtapiCdrom::mode_sense10() {
     const u8 page = static_cast<u8>(cdb_[2] & 0x3F);

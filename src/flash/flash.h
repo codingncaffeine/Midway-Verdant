@@ -50,7 +50,7 @@ public:
     u32 mmio_read(PhysAddr addr, unsigned size) override;
     void mmio_write(PhysAddr addr, unsigned size, u32 value) override;
 
-    // Reads honouring the overlay, for tools and the interpreter.
+    // Reads honoring the overlay, for tools and the interpreter.
     u8 read8(PhysAddr addr) const;
 
 private:

@@ -158,7 +158,7 @@ VkDevice Device::create_logical(const Functions& fn, VkPhysicalDevice gpu, u32& 
     dci.queueCreateInfoCount = 1;
     dci.pQueueCreateInfos = &qci;
     dci.pEnabledFeatures = &features;
-    // Custom sampler border colours, where the device offers them.
+    // Custom sampler border colors, where the device offers them.
     std::vector<const char*> extensions;
     VkPhysicalDeviceCustomBorderColorFeaturesEXT border{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_FEATURES_EXT};
     {

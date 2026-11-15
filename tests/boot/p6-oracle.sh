@@ -10,7 +10,7 @@
 #        GOLDEN=DIR: with no golden in DIR yet, the full comparison runs and, when it passes, its reference (the block
 #        interpreter's deliveries, final hashes and pictures) is kept there; with one, only the recompiler runs and is
 #        compared with it (a speed change must leave the guest's run unchanged: minutes instead of the interpreter's
-#        hour). Delete the golden when the guest's behaviour is meant to change.
+#        hour). Delete the golden when the guest's behavior is meant to change.
 set -uo pipefail
 cd "$(dirname "$0")/../.."
 [[ $# -ge 4 ]] || { sed -n '2,9p' "$0"; exit 2; }

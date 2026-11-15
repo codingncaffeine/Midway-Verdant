@@ -189,7 +189,7 @@ TEST(Vsh, TranslatesTheBootAnimationsOwnProgram) {
 
 TEST(Vsh, TheFixedFunctionPipelineIsGeneratedForEveryValidState) {
     // The firmware's state (mode 0, unlit): the position through the composite matrix and the viewport offset,
-    // the colours passed through, and with specular off the specular colour is black.
+    // the colors passed through, and with specular off the specular color is black.
     KelvinState s;
     std::string why;
     ASSERT_TRUE(fixed_function_supported(s, why)) << why;
@@ -202,8 +202,8 @@ TEST(Vsh, TheFixedFunctionPipelineIsGeneratedForEveryValidState) {
     CompiledShader c = compile_glsl(ShaderStage::Vertex, tr.glsl, "fixed-function");
     ASSERT_TRUE(c.ok()) << c.log << "\n" << tr.glsl;
 
-    // A sweep over the features: every light type in every slot, the colour sources, local eye and separate
-    // specular, skinning, normalisation, every texgen mode, texture matrices and fog generation. Each compiles.
+    // A sweep over the features: every light type in every slot, the color sources, local eye and separate
+    // specular, skinning, normalization, every texgen mode, texture matrices and fog generation. Each compiles.
     const u32 texgens[] = {0, 0x2400, 0x2401, 0x2402, 0x8512, 0x8511};
     const u32 fog_modes[] = {0, 1, 2, 3, 6};
     for (u32 n = 0; n < 24; ++n) {
@@ -215,7 +215,7 @@ TEST(Vsh, TheFixedFunctionPipelineIsGeneratedForEveryValidState) {
         f.r[0x0294 >> 2] = (n & 1u) | ((n & 2u) ? (1u << 16) : 0u);           // separate specular, local eye
         f.r[0x03B8 >> 2] = n % 5 != 0;                                         // specular enable
         f.r[0x0328 >> 2] = n % 7;                                              // skin mode
-        f.r[0x03A4 >> 2] = n & 1u;                                             // normalisation
+        f.r[0x03A4 >> 2] = n & 1u;                                             // normalization
         f.r[0x09CC >> 2] = (n >> 1) & 1u;                                      // infinite viewer
         for (u32 t = 0; t < 4; ++t) {
             f.r[(0x0420 >> 2) + t] = (n + t) & 1u;

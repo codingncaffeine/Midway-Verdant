@@ -177,7 +177,7 @@ const std::vector<OpInfo>& op_table() {
     return t;
 }
 
-// The compiled form's field slots: letters that share a pattern get different slots (a greedy colouring over the
+// The compiled form's field slots: letters that share a pattern get different slots (a greedy coloring over the
 // opcode table and the parallel move formats), so a pattern's fields never collide; compile() checks it anyway.
 constexpr const char* kMoveFormats[] = {"1wmmeeffWrrMMRRRoooooooo", "0100L0LLW1MMMRRRoooooooo", "0100L0LLW0aaaaaaoooooooo", "01ddsdddW1MMMRRRoooooooo",
                                         "01ddsdddW0aaaaaaoooooooo", "001dddddiiiiiiiioooooooo", "00100000010MMRRRoooooooo", "001000eeeeedddddoooooooo",
@@ -185,7 +185,7 @@ constexpr const char* kMoveFormats[] = {"1wmmeeffWrrMMRRRoooooooo", "0100L0LLW1M
 
 constexpr std::size_t letter_index(char c) { return static_cast<std::size_t>((c >= 'a' && c <= 'z') ? c - 'a' : 26 + (c - 'A')); }
 
-constexpr std::array<u8, 52> slot_colouring() {
+constexpr std::array<u8, 52> slot_coloring() {
     std::array<std::array<bool, 52>, 52> together{};
     // Cheap enough for every compiler's constant-evaluation budget: a pattern's few letters, then their pairs.
     auto note = [&](const char* pattern) {
@@ -216,7 +216,7 @@ constexpr std::array<u8, 52> slot_colouring() {
     }
     return slot;
 }
-constexpr std::array<u8, 52> kSlot = slot_colouring();
+constexpr std::array<u8, 52> kSlot = slot_coloring();
 constexpr u8 max_slot() {
     u8 m = 0;
     for (u8 v : kSlot) m = v > m ? v : m;
@@ -441,7 +441,7 @@ bool add_overflows(i64 a, i64 b, i64 r) { return ((a < 0) == (b < 0)) && ((((r <
 }  // namespace
 
 // The standard condition codes of an arithmetic result. C is written only where the instruction defines it
-// (carry_in_known); the multiplies, NEG, ABS, RND, CLR, TST and the normalisations leave it as it was (Chapter 13).
+// (carry_in_known); the multiplies, NEG, ABS, RND, CLR, TST and the normalizations leave it as it was (Chapter 13).
 void Core::set_ccr_result(i64 result, bool carry_in_known, bool carry, bool overflow) {
     const i64 v = sext56(result);
     u32 sr = r_.sr & ~(E | U | N | Z | V | (carry_in_known ? C : 0u));
@@ -1058,7 +1058,7 @@ void Core::execute_op(const Insn& d, u32 ext, u32 at) {
         }
         case Op::Illegal: fail(std::format("ILLEGAL at P:{:04x}", at)); return;
         case Op::Stop: case Op::Wait: halted_ = true; return;
-        case Op::Trap: fail(std::format("TRAP at P:{:04x} (software interrupts are not modelled)", at)); return;
+        case Op::Trap: fail(std::format("TRAP at P:{:04x} (software interrupts are not modeled)", at)); return;
         case Op::JmpEa: jump_sub(ea_address(mmmrrr(), ext, used_ext, true), false); return;
         case Op::JmpShort: jump_sub(d.f('a'), false); return;
         case Op::JsrEa: jump_sub(ea_address(mmmrrr(), ext, used_ext, true), true); return;
@@ -1420,7 +1420,7 @@ void Core::execute_op(const Insn& d, u32 ext, u32 at) {
             return;
         }
         case Op::Norm: {
-            // One normalisation step from the E, U and Z bits as they stand.
+            // One normalization step from the E, U and Z bits as they stand.
             i64& D = acc(d.f('d'));
             const u32 rn = d.f('R') & 7u;
             bool v = false;
@@ -1525,7 +1525,7 @@ void Core::execute_op(const Insn& d, u32 ext, u32 at) {
             }
             return;
         case Op::Trapcc:
-            if (condition(d.f('C'))) fail(std::format("TRAPcc at P:{:04x} (software interrupts are not modelled)", at));
+            if (condition(d.f('C'))) fail(std::format("TRAPcc at P:{:04x} (software interrupts are not modeled)", at));
             return;
         case Op::Nop2:  // DEBUGcc and the instruction-cache controls: no debugger, no cache
             return;

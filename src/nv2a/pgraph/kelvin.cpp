@@ -152,9 +152,9 @@ Decoded decode(u32 method) {
         d = {Op::NamedFloat, static_cast<u8>(attr), static_cast<u8>((method - base) >> 2), static_cast<u8>(count)};
         return true;
     };
-    auto named_s16x2 = [&](u32 base, u32 attr, u32 words, bool normalised) {
+    auto named_s16x2 = [&](u32 base, u32 attr, u32 words, bool normalized) {
         if (!in(base, words * 4)) return false;
-        d = {Op::NamedS16, static_cast<u8>(attr), static_cast<u8>((method - base) >> 2), static_cast<u8>(words), normalised};
+        d = {Op::NamedS16, static_cast<u8>(attr), static_cast<u8>((method - base) >> 2), static_cast<u8>(words), normalized};
         return true;
     };
     auto named_ub4 = [&](u32 base, u32 attr) {
@@ -280,7 +280,7 @@ void Kelvin::method(u32 method, u32 value) {
             immediate_component(d.attr, d.a * 2u + 1, s16_plain(value >> 16), d.a == 1);
             return;
         // A short float form sets the components it leaves out as well, to those of (x, 0, 0, 1): a 2F texture
-        // coordinate after a 4F one has z = 0 and w = 1 again (a projective lookup divides by that w), a 3F colour
+        // coordinate after a 4F one has z = 0 and w = 1 again (a projective lookup divides by that w), a 3F color
         // has alpha 1, a 1F weight is (w, 0, 0, 1).
         case Op::NamedFloat:
             for (u32 c = d.b; c < 4; ++c) state_.immediate[d.attr][c] = c == 3 ? 1.0f : 0.0f;
@@ -340,7 +340,7 @@ void decode_attribute(const VertexAttribute& a, const u8* p, float out[4]) {
             for (u32 i = 0; i < n; ++i) out[i] = static_cast<float>(p[i]) / 255.0f;
             break;
         case AttribType::UbD3d: {
-            // D3D colour bytes in memory are B G R A; the attribute reads as R G B A.
+            // D3D color bytes in memory are B G R A; the attribute reads as R G B A.
             float tmp[4] = {0.0f, 0.0f, 0.0f, 1.0f};
             for (u32 i = 0; i < n; ++i) tmp[i] = static_cast<float>(p[i]) / 255.0f;
             out[0] = tmp[2];
@@ -510,7 +510,7 @@ bool fetch_vertices(const KelvinState& state, const HandleResolver& handles, con
         float* d = dst.data();
         const u32 comps = std::min<u32>(fmt.size, 4);
         // The common forms in a loop of their own, as decode_attribute reads them: floats (missing components 0, w 1)
-        // and D3D colours (B G R A bytes read as R G B A); the rest element by element.
+        // and D3D colors (B G R A bytes read as R G B A); the rest element by element.
         if (fmt.type == AttribType::Float) {
             for (u32 v = 0; v < out.count; ++v, d += 4) {
                 d[0] = 0.0f, d[1] = 0.0f, d[2] = 0.0f, d[3] = 1.0f;

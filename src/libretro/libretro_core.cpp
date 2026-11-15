@@ -54,7 +54,7 @@ std::unique_ptr<mv::Machine> machine;
 std::vector<mv::u32> frame(640 * 480, 0);
 mv::u32 frame_w = 640, frame_h = 480;
 // What video_cb gets: `frame`, or at an internal resolution above 1x the GPU's finished picture where it lies (read back
-// already converted, the colour table applied). That one is the frontend's from grab_frame to picture_done: its copy
+// already converted, the color table applied). That one is the frontend's from grab_frame to picture_done: its copy
 // may still be landing (frame_pic.ready, waited for after the CPU is let go), and no vblank writes it meanwhile (D36).
 const void* frame_ptr = nullptr;
 std::size_t frame_pitch = 0;
@@ -273,7 +273,7 @@ void grab_frame() {
     mv::u8* out = reinterpret_cast<mv::u8*>(frame.data());
     const auto lut = gpu.gamma_lut();
     const bool rgb565 = gpu.scanout_rgb565();
-    // The colour table as three tables of finished channel bits: a pixel is three lookups OR-ed.
+    // The color table as three tables of finished channel bits: a pixel is three lookups OR-ed.
     std::array<mv::u32, 256> lut_b{}, lut_g{}, lut_r{};
     if (lut)
         for (mv::u32 i = 0; i < 256; ++i) {
@@ -282,7 +282,7 @@ void grab_frame() {
             lut_r[i] = static_cast<mv::u32>((*lut)[i * 3u]) << 16;
         }
     if (rendered) {
-        // The rendered picture into the frame where it lies, in bands on a few threads, the colour table applied and the
+        // The rendered picture into the frame where it lies, in bands on a few threads, the color table applied and the
         // alpha byte cleared in the same pass (at 6x a frame is 44 MB; three passes on one thread took 8 ms).
         parallel_rows(fh, [&](mv::u32 y0, mv::u32 y1) {
             for (mv::u32 y = y0; y < y1; ++y) {
@@ -307,7 +307,7 @@ void grab_frame() {
         });
         renderer->picture_done();
     } else if (sc > 1) {
-        // RAM's picture finished at its own size (colour table, the video overlay: a movie samples its nearest texel
+        // RAM's picture finished at its own size (color table, the video overlay: a movie samples its nearest texel
         // either way), then each pixel widened to a block on a few threads, a block row built once and copied down.
         // Done at the internal resolution on one thread this took 50 ms a frame at 6x (a title's intro movie).
         composed.resize(static_cast<std::size_t>(w) * h * 4);
@@ -501,7 +501,7 @@ void hw_context_reset() {
     e.negotiated = negotiated;
     e.enabled = negotiated_enabled;
     cfg.gpu_external = e;
-    if (!negotiated) log(RETRO_LOG_WARN, "Vulkan: the frontend made the device without our negotiation; optional features (border colours, anisotropy) are off");
+    if (!negotiated) log(RETRO_LOG_WARN, "Vulkan: the frontend made the device without our negotiation; optional features (border colors, anisotropy) are off");
     if (start_machine(cfg)) pending_cfg.reset();
 }
 
@@ -859,7 +859,7 @@ RETRO_API void retro_unload_game(void) {
                 static_cast<unsigned long long>(st.compiles_queued), static_cast<unsigned long long>(st.pipelines_queued), static_cast<unsigned long long>(st.pending_skips), static_cast<unsigned long long>(st.pending_waits), static_cast<unsigned long long>(st.pipeline_cache_hits));
             // Draws the renderer could not draw, and why (the first of each distinct reason).
             if (st.skipped) log(RETRO_LOG_INFO, "gpu: %llu draws skipped", static_cast<unsigned long long>(st.skipped));
-            log(RETRO_LOG_INFO, "gpu: write-backs by cause: frame end %llu, texture %llu, scanout %llu, 2D/range %llu, relayout %llu, idle vblank %llu, drawn textures before a fence %llu; %llu targets sampled in place, %llu snapshots for draws sampling their own target (%llu of depth), %llu depth buffers converted to colour, %llu targets the CPU wrote reloaded, %llu depth buffers handed between targets, %llu loaded from RAM; %llu targets evicted by an overlapping one, %llu retired unused, %llu rectangles of a region copied for a texture, %llu textures inside a depth buffer read from RAM without its copy, %llu shared pages merged byte by byte",
+            log(RETRO_LOG_INFO, "gpu: write-backs by cause: frame end %llu, texture %llu, scanout %llu, 2D/range %llu, relayout %llu, idle vblank %llu, drawn textures before a fence %llu; %llu targets sampled in place, %llu snapshots for draws sampling their own target (%llu of depth), %llu depth buffers converted to color, %llu targets the CPU wrote reloaded, %llu depth buffers handed between targets, %llu loaded from RAM; %llu targets evicted by an overlapping one, %llu retired unused, %llu rectangles of a region copied for a texture, %llu textures inside a depth buffer read from RAM without its copy, %llu shared pages merged byte by byte",
                 static_cast<unsigned long long>(st.writebacks_by[0]), static_cast<unsigned long long>(st.writebacks_by[1]), static_cast<unsigned long long>(st.writebacks_by[2]),
                 static_cast<unsigned long long>(st.writebacks_by[3]), static_cast<unsigned long long>(st.writebacks_by[4]), static_cast<unsigned long long>(st.writebacks_by[5]), static_cast<unsigned long long>(st.writebacks_by[6]),
                 static_cast<unsigned long long>(st.surface_samples), static_cast<unsigned long long>(st.snapshots), static_cast<unsigned long long>(st.depth_snapshots), static_cast<unsigned long long>(st.zeta_conversions), static_cast<unsigned long long>(st.cpu_written_targets),

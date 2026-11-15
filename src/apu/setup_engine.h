@@ -19,7 +19,7 @@
 // the host (method 0x8000 with the voice handle as parameter) when the kernel asked for idle-voice traps.
 // Written from the xboxdevwiki APU page (voice lists, pitch, envelopes, MIXBUF), the xboxdevwiki Xbox ADPCM page,
 // the public register listing (method numbers and voice-structure fields), traces of the kernel's method stream,
-// and the reference emulator's voice processor read for behaviour (volume scale, headroom, envelope stepping).
+// and the reference emulator's voice processor read for behavior (volume scale, headroom, envelope stepping).
 namespace mv::apu {
 
 class SetupEngineHost {

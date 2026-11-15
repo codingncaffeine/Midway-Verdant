@@ -96,7 +96,7 @@ if(NOT WIN32)
   set_source_files_properties(nv2a/vulkan/vk_device.cpp nv2a/vulkan/vk_renderer.cpp tools/mv-retro-host.cpp PROPERTIES COMPILE_OPTIONS "-Wno-missing-field-initializers;-Wno-old-style-cast")
 endif()
 # The x87 and SSE units run host floating point under the guest's rounding mode and read the exception flags back:
-# MSVC may move or fold float operations across those control-word changes unless the environment is honoured.
+# MSVC may move or fold float operations across those control-word changes unless the environment is honored.
 if(MSVC)
   set_source_files_properties(cpu/p6/fpu.cpp cpu/p6/simd.cpp PROPERTIES COMPILE_OPTIONS "/fp:strict")
 endif()

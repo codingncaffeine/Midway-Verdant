@@ -92,7 +92,7 @@ struct MachineConfig {
     std::string cpu{"kvm"};
     bool oracle{false};
     // The fast mode's timeline (D16): "cputime" = the guest clock (the work the virtual CPU did), "wall" = the host
-    // clock (the old behaviour, a control). MV_GUEST_CLOCK overrides it.
+    // clock (the old behavior, a control). MV_GUEST_CLOCK overrides it.
     std::string guest_clock{"cputime"};
     // How much faster than the host time it took guest time runs inside the guest (a host core is many times a
     // 733 MHz Pentium III); the guest's TSC runs as much faster. MV_FAST_CPU_SCALE overrides it.
@@ -115,7 +115,7 @@ struct MachineConfig {
 };
 
 // The console: every device on one bus and one timeline, a CPU backend running the firmware against them, and
-// the lock that serialises the two threads that touch devices (the CPU's exits and the io thread's timers).
+// the lock that serializes the two threads that touch devices (the CPU's exits and the io thread's timers).
 class Machine {
 public:
     explicit Machine(const MachineConfig& config);
@@ -213,7 +213,7 @@ public:
     // Host time the io thread spent firing device events (an instrument: device work off the CPU thread).
     u64 io_event_ns() const { return io_event_ns_; }
 
-    // Boot milestones recognised from behaviour (times on the master timeline, or nullopt).
+    // Boot milestones recognized from behavior (times on the master timeline, or nullopt).
     struct Milestones {
         std::optional<Cycles> rom_hidden, smc_challenge_answered, bootloader_magic, kernel_header, power_off;
     };

@@ -49,7 +49,7 @@ public:
     // size (1-8), RAM still at the console's. A change takes effect at the next vblank, where every target is written
     // back and dropped (each comes back from RAM at the new scale), or at once while there are no targets yet.
     void set_resolution_scale(u32 s) { requested_scale_.store(std::clamp(s, 1u, 8u), std::memory_order_relaxed); }
-    // The RAMDAC's colour table for the picture the next vblank captures (none: the identity), applied on the GPU as the
+    // The RAMDAC's color table for the picture the next vblank captures (none: the identity), applied on the GPU as the
     // scaled picture is read back (the vblank's thread, before write_back_at).
     void set_display_lut(const std::optional<std::array<u8, 768>>& lut) {
         display_lut_on_ = lut.has_value();
@@ -71,7 +71,7 @@ public:
     struct ScaledPicture {
         const u8* pixels{nullptr};
         u32 pitch{0}, sc{1};
-        bool xrgb{false};  // finished XRGB8888 (the colour table applied, alpha clear), not the frame buffer's format
+        bool xrgb{false};  // finished XRGB8888 (the color table applied, alpha clear), not the frame buffer's format
         bool overlaid{false};  // the video overlay drawn in on the GPU (set_display_overlay)
         VkFence ready{VK_NULL_HANDLE};
         // Where it lies on the device (with set_handoff the buffer is device memory and `pixels` is null): the
@@ -123,16 +123,16 @@ public:
     };
     DrawCounts draw_counts(u64 ticket);
     bool write_back_at(u32 phys);
-    // Every render target overlapping [phys, phys + len) reaches RAM (colour and depth): the 2D engine reads there.
+    // Every render target overlapping [phys, phys + len) reaches RAM (color and depth): the 2D engine reads there.
     void write_back_range(u32 phys, u32 len);
     // The 2D engine's copy of a rectangle (w x h pixels of bpp bytes, rows src_pitch / dst_pitch bytes apart) when both
     // sides lie inside render targets whose images are current: an image copy on the GPU, the destination left newer than
     // RAM. False (nothing done) when RAM has to carry it: the caller copies there.
     bool copy_rect(u32 src_phys, u32 src_pitch, u32 dst_phys, u32 dst_pitch, u32 w, u32 h, u32 bpp);
-    // Every dirty render target reaches RAM (colour and depth). The live machine calls it when the GPU has been idle
+    // Every dirty render target reaches RAM (color and depth). The live machine calls it when the GPU has been idle
     // for a whole frame: the hardware wrote those pixels when it drew them, and RAM a program reuses later must not
     // receive them then (a title launched after the boot animation got the animation's targets over its own data).
-    // With `in_background` the colour and depth copies go to the GPU without a wait and reach RAM later
+    // With `in_background` the color and depth copies go to the GPU without a wait and reach RAM later
     // (complete_write_backs), as the scanout's does above 1x.
     void write_back_all(bool in_background = false);
     // A swizzled target (a texture the GPU drew) drawn since it last reached RAM starts on its way there, in the background
@@ -199,7 +199,7 @@ public:
         u64 pending_waits{0};
         u64 textures_native_dxt{0};  // DXT textures uploaded as blocks  // short waits for background compiles (wait_a_little)
         u64 depth_snapshots{0};  // the same for draws that sample the depth buffer of the target they draw into
-        u64 zeta_conversions{0};  // depth buffers converted on the GPU for a colour texture at their address
+        u64 zeta_conversions{0};  // depth buffers converted on the GPU for a color texture at their address
         u64 cpu_written_targets{0};  // render targets whose memory the CPU wrote: reloaded from RAM
         u64 cpu_written_depth{0};    // of them, depth buffers (held or parked) let go because the CPU wrote their memory
         u64 depth_handovers{0}, depth_uploads{0};  // depth buffers moved between targets sharing an address; loaded from RAM
@@ -234,7 +234,7 @@ public:
         u64 writebacks_by[kWbWhyCount]{};
         // Where the time goes, in nanoseconds: the whole draw and its parts (the texture part includes the
         // write-backs a sample forces; the shader parts are the compiles, a lookup costs nothing measurable); the
-        // submits and the fence waits; the copies back to RAM, colour and depth (and the wait for the device copy
+        // submits and the fence waits; the copies back to RAM, color and depth (and the wait for the device copy
         // inside them).
         u64 ns_draw{0}, ns_fetch{0}, ns_texture{0}, ns_pipeline{0}, ns_flush{0}, ns_write_back{0}, ns_write_back_gpu{0};
         u64 ns_wait_slot{0}, ns_wait_finish{0};  // waits for a frame slot the GPU still runs, and for everything submitted (finish)
@@ -256,7 +256,7 @@ private:
         u32 palette_phys{0};
         u64 content{0};          // a hash of the texels and palette in RAM when decoded
         // The texels' hash per 4 KiB page of RAM they lie in (each clipped to the texels) and the palette's: a write to
-        // some pages rehashes those alone (a title rewriting a texture's neighbours had whole textures rehashed ~24 times
+        // some pages rehashes those alone (a title rewriting a texture's neighbors had whole textures rehashed ~24 times
         // a frame).
         std::vector<u64> page_hashes;
         u64 palette_hash{0};
@@ -269,11 +269,11 @@ private:
         u32 log_w{0}, log_h{0};
         u32 aa_x{1}, aa_y{1};  // the anti-aliasing scale from logical to stored pixels
         // The internal resolution's scale from stored pixels (RAM's) to the images' (D34): width and height stay the
-        // stored size, the colour and depth images are iw() x ih().
+        // stored size, the color and depth images are iw() x ih().
         u32 sc{1};
         u32 iw() const { return width * sc; }
         u32 ih() const { return height * sc; }
-        // At sc > 1: a stored-size copy of the colour image, between the image and RAM (blitted down for a write-back,
+        // At sc > 1: a stored-size copy of the color image, between the image and RAM (blitted down for a write-back,
         // up after a load).
         vk::Image lo;
         bool lo_linear{false};  // the device filters the format: the way down is a box filter, not one sample in sc x sc
@@ -286,8 +286,8 @@ private:
         vk::Image color, depth;
         VkRenderPass pass{VK_NULL_HANDLE};
         VkFramebuffer framebuffer{VK_NULL_HANDLE};
-        bool dirty{false};           // colour rendered since the last write-back
-        // Each page of its colour memory hashed when the image and RAM last agreed (loaded from RAM or written back):
+        bool dirty{false};           // color rendered since the last write-back
+        // Each page of its color memory hashed when the image and RAM last agreed (loaded from RAM or written back):
         // a page the write log reports is the CPU's only if its bytes changed since (cpu_wrote).
         std::vector<u64> page_hashes;
         bool zeta_dirty{false};      // depth rendered since the last write-back of the zeta surface
@@ -300,7 +300,7 @@ private:
         // entries a draw binds.
         VkImageView x8_view{VK_NULL_HANDLE}, depth_view{VK_NULL_HANDLE};
         TextureEntry color_tex, color_x8_tex, depth_tex;
-        // A copy of the colour image for draws that sample the target they draw into (a blur done in place): it holds
+        // A copy of the color image for draws that sample the target they draw into (a blur done in place): it holds
         // what the draws before them left, as RAM would; retaken whenever the target was drawn into since.
         vk::Image snap;
         VkImageView snap_x8_view{VK_NULL_HANDLE};
@@ -321,7 +321,7 @@ private:
             u64 serial{~0ull};
         };
         std::unordered_map<u64, SubCopy> subs;
-        // The depth buffer read as a colour texture at its address (the Z24S8 words as A8R8G8B8 texels), converted on
+        // The depth buffer read as a color texture at its address (the Z24S8 words as A8R8G8B8 texels), converted on
         // the GPU; retaken whenever the target was drawn into or cleared since.
         vk::Image zcolor;
         VkImageView zcolor_x8_view{VK_NULL_HANDLE};
@@ -347,7 +347,7 @@ private:
         // Drawing with another target's depth image (D37): a pitch-linear depth buffer is memory, and a smaller target of
         // the same zeta pitch binding it uses the top-left rectangle of the image that holds it, as on the hardware
         // (Gauntlet Seven Sorrows' 720x480 frame buffers test the stencil of a 768x512 target's depth buffer each frame).
-        // borrow_fb pairs this colour image with that depth image; it holds while the lender's bound image is the same.
+        // borrow_fb pairs this color image with that depth image; it holds while the lender's bound image is the same.
         Surface* borrow{nullptr};
         VkFramebuffer borrow_fb{VK_NULL_HANDLE};
         VkImage borrow_image{VK_NULL_HANDLE};
@@ -358,7 +358,7 @@ private:
         // target drawn this frame or the last, with nothing written over it, still holds what RAM holds.
         u64 last_rendered_frame{0};
         bool ram_newer{false};
-        bool color_ram_newer{false};  // another engine wrote the colour memory: reload it before drawing into it
+        bool color_ram_newer{false};  // another engine wrote the color memory: reload it before drawing into it
         // The guest memory each image covers: a pitch is already in bytes.
         u32 bytes() const { return swizzled ? color_bytes() * width * height : pitch * height; }
         u32 color_bytes() const;
@@ -381,7 +381,7 @@ private:
     void retire(vk::Image& image);
     void retire(VkImageView& view);
     void retire(VkFramebuffer& framebuffer);
-    // A target's 2D image (colour, depth, a stored-size copy): a retired one of the same shape when the GPU is done with
+    // A target's 2D image (color, depth, a stored-size copy): a retired one of the same shape when the GPU is done with
     // it, else a new one. A title whose targets evict each other every frame (Fable's bloom chain) made and freed a
     // dozen full-size images a frame, a tenth of the GPU thread at 6x. Its contents are undefined either way.
     bool target_image(VkFormat format, u32 width, u32 height, VkImageUsageFlags usage, VkImageAspectFlags aspect, vk::Image& out, std::string& error);
@@ -403,7 +403,7 @@ private:
     struct View {
         u32 x{0}, y{0}, w{0}, h{0};
     } view_;
-    // writes_color: the draw or clear writes the colour image; a pass that does not leaves a colour reload from RAM for
+    // writes_color: the draw or clear writes the color image; a pass that does not leaves a color reload from RAM for
     // later (the boot animation's depth-only target sat over kernel memory the CPU writes every frame).
     bool ensure_pass(Surface& t, bool writes_color = true);
     void upload_color_from_ram(Surface& t);
@@ -418,7 +418,7 @@ private:
     void finish_write_backs_async();
     // A batch in flight that covers [b0, b1) is stored first (anything about to read that RAM).
     void complete_write_backs_over(u64 b0, u64 b1);
-    void write_back(Surface& s);       // one surface's colour, queued and finished
+    void write_back(Surface& s);       // one surface's color, queued and finished
     void write_back_zeta(Surface& s);  // one surface's depth, queued and finished
     void store_color(Surface& s, const u8* pixels);
     void store_zeta(Surface& s, const u8* pixels);
@@ -433,7 +433,7 @@ private:
     VkShaderModule vertex_shader(const KelvinState& s, std::string& error);
     VkShaderModule fragment_shader(const psh::Key& key, std::array<psh::SamplerKind, 4>& kinds, std::string& error);
     VkPipeline pipeline(const KelvinState& s, VkShaderModule vs, VkShaderModule fs, VkPrimitiveTopology topology, Surface& t, u32 vertex_layout, u32 depth_mode, std::string& error);
-    // The pipeline of a clear that writes only some colour channels (the colour comes in as the blend constants).
+    // The pipeline of a clear that writes only some color channels (the color comes in as the blend constants).
     VkPipeline clear_pipeline(VkRenderPass pass, VkColorComponentFlags mask, std::string& error);
     const TextureEntry* texture(const KelvinState& s, u32 stage, std::string& error);
     // A render target the stage can sample in place (same address and size, a format of the same bytes), or null.
@@ -500,7 +500,7 @@ private:
     TextureEntry* zeta_color_texture(Surface& s, const TextureStage& ts, u32 phys, u32 w, u32 h, bool linear, bool x8, bool abgr = false);
     bool init_zeta_convert();
     bool zc_buffers(u32 texels = 0);
-    // The depth-to-colour conversion: a compute pass over two device buffers (the copied depth words and stencil
+    // The depth-to-color conversion: a compute pass over two device buffers (the copied depth words and stencil
     // bytes in, the Z24S8 words out), made on first use.
     static constexpr u32 kZetaConvertMaxTexels = 1024 * 1024;
     VkDescriptorSetLayout zc_set_layout_{VK_NULL_HANDLE};
@@ -672,7 +672,7 @@ private:
         TextureEntry* entry{nullptr};
     };
     std::array<StageCache, 4> stage_cache_{};
-    // The guest memory every target's images may stand for (colour, its depth address, the depth its image holds, the
+    // The guest memory every target's images may stand for (color, its depth address, the depth its image holds, the
     // parked ones), gathered once per draw: a texture that overlaps none of it cannot be a target, so its lookup skips
     // the scans of every target (three per stage per draw before, most of the texture time in heavy frames).
     std::vector<std::pair<u64, u64>> target_ranges_;
@@ -688,7 +688,7 @@ private:
     // a texture inside the frame (a racing title's dips) and uploaded four to eight times the bytes.
     bool native_dxt_requested_{true}, native_dxt_{false};
     std::unordered_map<u64, VkSampler> samplers_;
-    std::map<std::pair<u64, u32>, VkSampler> border_samplers_;  // samplers that read the stage's border colour, by it
+    std::map<std::pair<u64, u32>, VkSampler> border_samplers_;  // samplers that read the stage's border color, by it
     VkDescriptorSetLayout set_layout_{VK_NULL_HANDLE};
     VkPipelineLayout pipeline_layout_{VK_NULL_HANDLE};
     Ring vertex_ring_, index_ring_, uniform_ring_, staging_;
@@ -767,10 +767,10 @@ private:
     std::atomic<u32> requested_scale_{1};
     // At the vblank, or before the first target: every target written back and dropped, the new scale taken.
     void apply_scale();
-    // The scale a new target of this colour format and stored size gets: the renderer's, or less where the device cannot
+    // The scale a new target of this color format and stored size gets: the renderer's, or less where the device cannot
     // blit the format or make an image that large.
     u32 scale_for(VkFormat color, u32 width, u32 height) const;
-    // Colour between the scaled image and its stored-size copy (lo): down before a write-back, up after a load.
+    // Color between the scaled image and its stored-size copy (lo): down before a write-back, up after a load.
     bool ensure_lo(Surface& s);
     // The stored-size depth copy: false when the device cannot blit the format (the rows are read back instead).
     bool ensure_zeta_lo(Surface& s);
@@ -789,7 +789,7 @@ private:
     struct Capture {
         u32 phys{0}, width{0}, height{0}, pitch{0}, bpp{0}, sc{1};
         bool valid{false};         // the buffer holds (once its fence signals) the picture these describe
-        bool xrgb{false};          // converted on the GPU to XRGB8888 with the colour table applied (else the target's bytes)
+        bool xrgb{false};          // converted on the GPU to XRGB8888 with the color table applied (else the target's bytes)
         bool overlaid{false};      // the video overlay drawn in by the same pass
         bool submitted{false};     // its fence was submitted since it was last reset
         bool retired{false};       // the scale changed while the frontend held it: it goes once let go
@@ -807,7 +807,7 @@ private:
     void destroy_capture(Capture& c);        // waits for its copy, then frees it
     mutable std::mutex display_mutex_;
     // The capture's conversion on the GPU: a compute pass from the target image to XRGB8888 words in the capture's
-    // buffer, the colour table applied (made on first use; failing that, captures copy the target's bytes).
+    // buffer, the color table applied (made on first use; failing that, captures copy the target's bytes).
     bool init_display_convert();
     VkDescriptorSetLayout dc_set_layout_{VK_NULL_HANDLE};
     VkPipelineLayout dc_layout_{VK_NULL_HANDLE};
@@ -821,7 +821,7 @@ private:
     // The picture conversion's push constants (init_display_convert's shader): the image size, then the video overlay:
     // on, the scanout's origin in the image, its rectangle relative to that (scaled pixels, end exclusive), the source
     // start split into whole texels and the 20-bit fraction, the steps per scaled pixel, the source's size and pitch, its
-    // byte order, the colour key.
+    // byte order, the color key.
     struct DisplayConvertPush {
         u32 width, height, ov_on, ox, oy, x0, y0, x1, y1;
         u32 s_hi, s_lo, t_hi, t_lo, dsdx, dtdy, in_w, in_h, pitch, yuy2, key_on, key;
@@ -848,7 +848,7 @@ private:
     vk::Buffer dc_ov_;        // the overlay's source bytes, copied from RAM for the pass
     u32 scan_phys_{0};        // the scanout's start (write_back_at): the overlay's rectangle is relative to it
     bool display_lut_on_{false};
-    u32 zc_capacity_{0};  // texels the depth-to-colour buffers hold
+    u32 zc_capacity_{0};  // texels the depth-to-color buffers hold
     std::unordered_map<std::string, std::shared_ptr<PendingShader>> vs_pending_, fs_pending_;
     std::unordered_map<std::string, std::shared_ptr<PipelineBuild>> pipelines_pending_;
     std::vector<std::thread> workers_;

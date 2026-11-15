@@ -10,7 +10,7 @@
 // samples between the DSP's X/Y/P memories and a buffer in the APU's scratch space (plain or circular) or one of
 // the processor's FIFOs, converting between 24-bit words and the buffer's sample format. Documented by the
 // public xboxdevwiki DSP page (command block words, control word fields, format conversions); register
-// behaviour per the public reference emulator.
+// behavior per the public reference emulator.
 namespace mv::dsp {
 
 class DmaMemory {

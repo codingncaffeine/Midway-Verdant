@@ -5,11 +5,11 @@
 #include "nv2a/pgraph/kelvin.h"
 
 // The 2D engine as the console's software drives it: the 2D surfaces object (class 0x62: a source and a destination
-// surface, each a DMA object, an offset and a pitch, one colour format for both) and the image blit (class 0x9F:
+// surface, each a DMA object, an offset and a pitch, one color format for both) and the image blit (class 0x9F:
 // copy a rectangle from a point in the source to a point in the destination). The kernel's boot animation copies its
 // finished logo render into a texture this way and shows the copy for the closing logo.
-// Method numbers per nxdk's pbkit nv_objects.h (MIT); the colour formats per nouveau's list of the NV04 2D surface
-// formats [verify]. Only SRCCOPY is modelled; the other operations, the clip rectangle and the colour key are not.
+// Method numbers per nxdk's pbkit nv_objects.h (MIT); the color formats per nouveau's list of the NV04 2D surface
+// formats [verify]. Only SRCCOPY is modeled; the other operations, the clip rectangle and the color key are not.
 namespace mv::pgraph {
 
 class TwoD {
@@ -40,7 +40,7 @@ public:
 
     // A method of either class; true when the engine took it. The blit runs on SIZE.
     bool method(u32 cls, u32 method, u32 value);
-    // Bytes per pixel of a 2D surface colour format (0 = unknown).
+    // Bytes per pixel of a 2D surface color format (0 = unknown).
     static u32 bytes_per_pixel(u32 format);
 
     u64 blits() const { return blits_; }

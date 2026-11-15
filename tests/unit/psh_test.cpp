@@ -33,7 +33,7 @@ TEST(Psh, ModulateTextureByDiffuseCompiles) {
     s.r[mthd::kCombinerSpecFogCw0 >> 2] = icw(in(12), in(0, 1), in(0), in(0));
     s.r[mthd::kCombinerSpecFogCw1 >> 2] = icw(in(0), in(0), in(12, 0, true), 0);
     s.r[mthd::kShaderStageProgram >> 2] = 1;  // stage 0: 2D projective
-    s.r[(mthd::kTextureBase + 4) >> 2] = 0x0001002a;           // 2D, A8R8G8B8 swizzled... colour 0 (Y8) is fine too
+    s.r[(mthd::kTextureBase + 4) >> 2] = 0x0001002a;           // 2D, A8R8G8B8 swizzled... color 0 (Y8) is fine too
     s.r[(mthd::kTextureBase + 0xC) >> 2] = 0x40000000;         // enabled
     s.r[mthd::kAlphaTestEnable >> 2] = 1;
     s.r[mthd::kAlphaFunc >> 2] = 0x204;  // greater
@@ -73,7 +73,7 @@ TEST(Psh, UniformsDecodeFactorsFogAndAlphaReference) {
     KelvinState s;
     s.r[mthd::kCombinerFactor0 >> 2] = 0x80FF4020;
     s.r[(mthd::kCombinerFactor1 + 28) >> 2] = 0x01020304;
-    s.r[0x02A8 >> 2] = 0xFF0000C0;  // fog colour register: A B G R from the top
+    s.r[0x02A8 >> 2] = 0xFF0000C0;  // fog color register: A B G R from the top
     s.r[mthd::kAlphaRef >> 2] = 0x7F;
     s.r[(mthd::kTextureBase + 4) >> 2] = 0x00003000;  // depth Y16 format on stage 0
     Uniforms u{};
@@ -141,14 +141,14 @@ TEST(Psh, TranslatesTheBootAnimationsCombiners) {
 TEST(Psh, ShadowCompareTakesTheStoredDepthAsTheLeftOperand) {
     // A depth texture in a 3D-projective stage is a shadow lookup: t = (stored depth FUNC r). The function numbering
     // and the operand order are two sources' conventions that only agree this way round (nxdk: 4 = LESS on r OP
-    // texel; the behaviour reference: 4 = GREATER on texel OP r); the reverse lit every shadowed face and darkened
+    // texel; the behavior reference: 4 = GREATER on texel OP r); the reverse lit every shadowed face and darkened
     // every lit one.
     KelvinState s;
     s.r[mthd::kCombinerControl >> 2] = 1;
     s.r[mthd::kCombinerColorIcw >> 2] = icw(in(8), in(0, 1), in(0), in(0));
     s.r[mthd::kCombinerColorOcw >> 2] = 12u << 4;
     s.r[mthd::kShaderStageProgram >> 2] = 2;               // stage 0: 3D projective
-    s.r[(mthd::kTextureBase + 4) >> 2] = 0x0001302a;       // 2D, colour 0x30 (16-bit depth)
+    s.r[(mthd::kTextureBase + 4) >> 2] = 0x0001302a;       // 2D, color 0x30 (16-bit depth)
     s.r[(mthd::kTextureBase + 0xC) >> 2] = 0x40000000;     // enabled
     s.r[0x1E6C >> 2] = 4;                                  // SET_SHADOW_COMPARE_FUNC
     const Translation t = translate(key_from_state(s));
@@ -160,7 +160,7 @@ TEST(Psh, ShadowCompareTakesTheStoredDepthAsTheLeftOperand) {
 }
 
 namespace {
-// One stage of combiners whose final colour is texture stage `stage` (A = t, B = one; G = t.a).
+// One stage of combiners whose final color is texture stage `stage` (A = t, B = one; G = t.a).
 KelvinState output_texture(u32 stage) {
     KelvinState s;
     s.r[mthd::kCombinerControl >> 2] = 1;

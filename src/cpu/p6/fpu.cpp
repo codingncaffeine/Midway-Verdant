@@ -142,7 +142,7 @@ long double indefinite() {
     return from_f80(f);
 }
 
-// A quiet NaN made from a signalling one.
+// A quiet NaN made from a signaling one.
 long double quieten(long double v) {
     F80 f = to_f80(v);
     f.bytes[7] |= 0x40;
@@ -211,7 +211,7 @@ struct X87 {
         f.set_top((top() + 1) & 7);
     }
 
-    // Operand checks: a signalling NaN or an unsupported operand raises IE; a denormal raises DE.
+    // Operand checks: a signaling NaN or an unsupported operand raises IE; a denormal raises DE.
     bool check_operands(long double a, long double b, bool with_b, bool ordered_compare = false) {
         const Class ca = classify(a), cb = classify(b);
         u16 flags = 0;
@@ -429,7 +429,7 @@ struct X87 {
     void compare_cc(long double a, long double b, bool unordered_quiet) {
         const Class ca = classify(a), cb = classify(b);
         if (ca.nan || cb.nan || ca.unsupported || cb.unsupported) {
-            // FCOM raises IE on any NaN; FUCOM only on a signalling one or an unsupported operand.
+            // FCOM raises IE on any NaN; FUCOM only on a signaling one or an unsupported operand.
             const bool signal = !unordered_quiet || ca.snan || cb.snan || ca.unsupported || cb.unsupported;
             if (signal) raise_flags(kSwIE);
             if (signal && !masked(kSwIE)) return;
@@ -447,7 +447,7 @@ struct X87 {
     // ZF PF CF from a compare (FCOMI family).
     void compare_flags(long double a, long double b, bool unordered_quiet) {
         const Class ca = classify(a), cb = classify(b);
-        st.materialise();
+        st.materialize();
         u32 fl = st.flags & ~(fl::ZF | fl::PF | fl::CF);
         if (ca.nan || cb.nan || ca.unsupported || cb.unsupported) {
             const bool signal = !unordered_quiet || ca.snan || cb.snan || ca.unsupported || cb.unsupported;
@@ -1101,7 +1101,7 @@ void X87::run_db() {
     if (in.reg == 5 || in.reg == 6) {  // FUCOMI / FCOMI ST(0), ST(i)
         if (empty(0) || empty(i)) {
             if (!underflow()) return;
-            st.materialise();
+            st.materialize();
             st.flags |= fl::ZF | fl::PF | fl::CF;
             return;
         }
@@ -1266,7 +1266,7 @@ void X87::run_df() {
         case 5: case 6: {                              // FUCOMIP / FCOMIP
             if (empty(0) || empty(i)) {
                 if (!underflow()) return;
-                st.materialise();
+                st.materialize();
                 st.flags |= fl::ZF | fl::PF | fl::CF;
                 pop();
                 return;

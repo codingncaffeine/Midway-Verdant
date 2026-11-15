@@ -25,7 +25,7 @@ public:
             (void)offset;
             (void)value;
         }
-        // A method of a class other than Kelvin (the 2D classes); not modelled yet.
+        // A method of a class other than Kelvin (the 2D classes); not modeled yet.
         virtual void other_method(u32 cls, u32 subchannel, u32 method, u32 value) {
             (void)cls;
             (void)subchannel;

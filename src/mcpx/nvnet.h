@@ -12,7 +12,7 @@
 // device answers every register with all ones, so the management interface never reports its transfer finished;
 // this one completes each transfer at once and reports a PHY at address 1 whose link is down. Frames are never
 // sent or received. Register layout from the public forcedeth driver's names for this family and xemu's model, read
-// for behaviour; the PHY registers are the IEEE 802.3 clause 22 set.
+// for behavior; the PHY registers are the IEEE 802.3 clause 22 set.
 namespace mv {
 
 class NvNet : public PciDevice, public MmioHandler, public PioHandler {

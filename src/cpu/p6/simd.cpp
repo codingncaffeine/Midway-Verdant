@@ -244,7 +244,7 @@ struct Simd {
     bool compare_pred(u32 a, u32 b, unsigned pred, u32& flags) {
         const bool unordered = is_nan32(a) || is_nan32(b);
         // EQ, LT, LE, UNORD, NEQ, NLT, NLE, ORD; the ordered predicates signal on quiet NaNs (LT/LE/NLT/NLE),
-        // the others only on signalling NaNs.
+        // the others only on signaling NaNs.
         const bool signals_quiet = pred == 1 || pred == 2 || pred == 5 || pred == 6;
         if ((unordered && signals_quiet) || is_snan32(a) || is_snan32(b)) flags |= kMxIE;
         if (is_denormal32(a) || is_denormal32(b)) flags |= kMxDE;
@@ -690,7 +690,7 @@ void Simd::run_sse() {
             if (is_snan32(a) || is_snan32(b) || (op == 0x2F && unordered)) flags |= kMxIE;
             if (is_denormal32(a) || is_denormal32(b)) flags |= kMxDE;
             report(flags);
-            st.materialise();
+            st.materialize();
             u32 fl = st.flags & ~(fl::ZF | fl::PF | fl::CF | fl::OF | fl::SF | fl::AF);
             if (unordered) fl |= fl::ZF | fl::PF | fl::CF;
             else {

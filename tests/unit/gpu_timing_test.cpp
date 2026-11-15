@@ -25,7 +25,7 @@ TEST(GpuTiming, VerticesFromEveryBatchForm) {
     b.indices = {0, 1, 2, 3, 4, 5};
     b.ranges = {{10, 9}, {40, 3}};
     b.immediate_count = 4;
-    // Inline vertices: a float3 position and a 4-byte colour = 4 words each; 8 words = 2 vertices.
+    // Inline vertices: a float3 position and a 4-byte color = 4 words each; 8 words = 2 vertices.
     s.attributes[0].type = AttribType::Float;
     s.attributes[0].size = 3;
     s.attributes[3].type = AttribType::UbD3d;
@@ -65,11 +65,11 @@ TEST(GpuTiming, APixelCostsItsPipelineOrItsMemoryTime) {
     // 16 bytes a pixel: 400 x 16 x 7 / 192 = 233.3 -> 234 clocks (longer than the pipeline's 100) -> 276.
     EXPECT_EQ(gpu_timing::pixel_clocks(400, 1, 16), 276u);
     KelvinState s;
-    s.r[(mthd::kSurfaceFormat >> 2) & 0x7FF] = 0x5 | (0x2 << 4);  // A8R8G8B8 colour, Z24S8 depth
+    s.r[(mthd::kSurfaceFormat >> 2) & 0x7FF] = 0x5 | (0x2 << 4);  // A8R8G8B8 color, Z24S8 depth
     s.r[(mthd::kColorMask >> 2) & 0x7FF] = 0x01010101;
     s.r[(mthd::kDepthTestEnable >> 2) & 0x7FF] = 1;
     s.r[(mthd::kDepthMask >> 2) & 0x7FF] = 1;
-    EXPECT_EQ(gpu_timing::pixel_bytes(s), 4u + 4u + 4u) << "colour written, depth read and written";
+    EXPECT_EQ(gpu_timing::pixel_bytes(s), 4u + 4u + 4u) << "color written, depth read and written";
     s.r[(mthd::kBlendEnable >> 2) & 0x7FF] = 1;
-    EXPECT_EQ(gpu_timing::pixel_bytes(s), 8u + 4u + 4u) << "blending reads the colour too";
+    EXPECT_EQ(gpu_timing::pixel_bytes(s), 8u + 4u + 4u) << "blending reads the color too";
 }

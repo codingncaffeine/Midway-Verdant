@@ -4,9 +4,9 @@
 #include "core/types.h"
 
 // The NV2A video overlay (PVIDEO): a YUV 4:2:2 buffer in RAM scaled onto a rectangle of the screen, over the
-// frame buffer or only where the frame buffer shows the colour key. Games play their full-motion video through
+// frame buffer or only where the frame buffer shows the color key. Games play their full-motion video through
 // it. Registers per the nouveau / envytools PVIDEO block (two buffers: BASE, LIMIT, OFFSET, SIZE_IN, POINT_IN,
-// DS_DX, DT_DY, POINT_OUT, SIZE_OUT, FORMAT), behaviour cross-checked against xemu (read, never copied).
+// DS_DX, DT_DY, POINT_OUT, SIZE_OUT, FORMAT), behavior cross-checked against xemu (read, never copied).
 namespace mv {
 
 struct Overlay {
@@ -15,12 +15,12 @@ struct Overlay {
     u32 s0{0}, t0{0};          // source start, 12.4 fixed point
     u32 dsdx{1u << 20}, dtdy{1u << 20};  // source step per screen pixel, 12.20 fixed point
     u32 out_x{0}, out_y{0}, out_w{0}, out_h{0};
-    bool yuy2{false};          // byte order Y0 U Y1 V (format colour 1); else U Y0 V Y1
+    bool yuy2{false};          // byte order Y0 U Y1 V (format color 1); else U Y0 V Y1
     bool color_key{false};
-    u32 key{0};                // the frame-buffer colour the overlay replaces, 0x00RRGGBB
+    u32 key{0};                // the frame-buffer color the overlay replaces, 0x00RRGGBB
 };
 
-// Passes every pixel of an XRGB8888 picture through the RAMDAC's colour table (red, green, blue per entry).
+// Passes every pixel of an XRGB8888 picture through the RAMDAC's color table (red, green, blue per entry).
 void apply_gamma(const std::array<u8, 768>& lut, u8* xrgb, u32 pitch, u32 w, u32 h);
 
 // Draws the overlay into an XRGB8888 picture of the frame buffer (w x h, pitch bytes per line); rows y_from to y_to

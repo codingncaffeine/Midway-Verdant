@@ -43,7 +43,7 @@ struct Rig {
 
 TEST(Aci, PcmOutWalksItsDescriptorsAtTheSampleClockAndInterruptsOnCompletion) {
     Rig r;
-    // Two buffers: 64 samples at 0x4000 and 32 at 0x5000, both interrupting; patterns to recognise in the sink.
+    // Two buffers: 64 samples at 0x4000 and 32 at 0x5000, both interrupting; patterns to recognize in the sink.
     for (u32 i = 0; i < 128; ++i) r.bus.ram()[0x4000 + i] = static_cast<u8>(i);
     for (u32 i = 0; i < 64; ++i) r.bus.ram()[0x5000 + i] = static_cast<u8>(0x80 + i);
     r.descriptor(0x1000, 0, 0x4000, 64, true);

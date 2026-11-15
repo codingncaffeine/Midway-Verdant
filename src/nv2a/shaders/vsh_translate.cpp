@@ -338,11 +338,11 @@ void append_tail(std::string& g, const Options& options) {
     }
     g +=
         "\n    // The program leaves oPos in screen space (x, y in pixels and z in depth units, all already divided by w,\n"
-        "    // w kept for perspective-correct interpolation); the host rasteriser wants clip space, so undo that.\n"
+        "    // w kept for perspective-correct interpolation); the host rasterizer wants clip space, so undo that.\n"
         "    // Snapped to the hardware's 1/16 pixel, in the image's pixels (finer at an internal resolution above 1x).\n"
         "    oPos.xy = trunc(oPos.xy * (16.0 * surface_size.z)) / (16.0 * surface_size.z);\n"
         "    // A screen-space 2D draw (w = 1: post-processing and interface quads) with an edge within the hardware's 1/16\n"
-        "    // pixel of a pixel centre covers that pixel whole at 1x (left and top edges) or not at all (right and bottom); above\n"
+        "    // pixel of a pixel center covers that pixel whole at 1x (left and top edges) or not at all (right and bottom); above\n"
         "    // 1x the edge moves to the first sample of the pixel's block, so the block is covered whole or not at all too\n"
         "    // (the gap of half a pixel left a blur buffer's first column holding whatever the memory had). surface_size.w is 1\n"
         "    // above 1x on a target without anti-aliasing, else 0. 3D geometry (w not 1) keeps its sub-pixel edges.\n"
@@ -460,7 +460,7 @@ constexpr u32 kLightControl = 0x0294, kColorMaterial = 0x0298, kFogGenMode = 0x0
               kTexgenViewModel = 0x09CC, kFogParams = 0x09C0, kSpecularParams = 0x09E0, kLight = 0x1000, kLightStride = 0x80;
 // Points: SET_POINT_PARAMS_ENABLE, SET_POINT_SIZE (pixels in 1/8, at most 0x1FF), SET_POINT_PARAMS (eight floats).
 constexpr u32 kPointParamsEnable = 0x0318, kPointSize = 0x043C, kPointParams = 0x0A30, kPointSizeMax = 0x1FF;
-// Within a light's block: colours (three floats each), range, infinite half vector and direction, spot falloff
+// Within a light's block: colors (three floats each), range, infinite half vector and direction, spot falloff
 // (three) and direction (four), local position and attenuation (three).
 constexpr u32 kLightAmbient = 0x00, kLightDiffuse = 0x0C, kLightSpecular = 0x18, kLightRange = 0x24, kLightHalfVector = 0x28,
               kLightDirection = 0x34, kLightSpotFalloff = 0x40, kLightSpotDirection = 0x4C, kLightPosition = 0x5C, kLightAttenuation = 0x68;
@@ -493,8 +493,8 @@ bool skin_mode(u32 v, Skin& s) {
     }
 }
 
-// A colour source of SET_COLOR_MATERIAL (0 material, 1 the vertex diffuse, 2 the vertex specular).
-const char* colour_source(u32 src) { return src == 1 ? "v3" : "v4"; }
+// A color source of SET_COLOR_MATERIAL (0 material, 1 the vertex diffuse, 2 the vertex specular).
+const char* color_source(u32 src) { return src == 1 ? "v3" : "v4"; }
 
 }  // namespace
 
@@ -518,7 +518,7 @@ bool fixed_function_supported(const KelvinState& s, std::string& why) {
         const u32 cm = s.reg(ff::kColorMaterial);
         for (u32 shift = 0; shift < 8; shift += 2)
             if (((cm >> shift) & 3u) == 3u) {
-                why = std::format("fixed-function colour material {:x} names an invalid source", cm);
+                why = std::format("fixed-function color material {:x} names an invalid source", cm);
                 return false;
             }
     }
@@ -635,29 +635,29 @@ Translation fixed_function_translate(const KelvinState& s, const Options& option
         if (s.reg(ff::kTextureMatrixEnable + 4 * tex) & 1u) g += std::format("    oT{} = {};\n", tex, xf(std::format("oT{}", tex), ff::kTextureMatrix + 8 * tex));
     }
 
-    // Colours.
+    // Colors.
     if (!lit) {
         g += "    oD0 = v3;\n    oD1 = v4;\n    oB0 = v7;\n    oB1 = v8;\n";
     } else {
         inputs |= 1u << 2;
         const u32 cm = s.reg(ff::kColorMaterial);
         const u32 emission = cm & 3u, ambient = (cm >> 2) & 3u, diffuse = (cm >> 4) & 3u, specular = (cm >> 6) & 3u;
-        const std::string alpha = diffuse == 0 ? "ff_emission_alpha.w" : std::format("{}.w", colour_source(diffuse));
-        // The XDK folds the material's emission and ambient into the scene ambient; a vertex colour named as the
+        const std::string alpha = diffuse == 0 ? "ff_emission_alpha.w" : std::format("{}.w", color_source(diffuse));
+        // The XDK folds the material's emission and ambient into the scene ambient; a vertex color named as the
         // emission or ambient source is scaled by the emission register instead [reference emulator's reading].
         if (emission == 0 || ambient == 0) {
             g += std::format("    oD0 = vec4(ff_scene_ambient.xyz, {});\n", alpha);
             const u32 added = emission != 0 ? emission : ambient;
-            if (added != 0) g += std::format("    oD0.xyz += {}.xyz * ff_emission_alpha.xyz;\n", colour_source(added));
+            if (added != 0) g += std::format("    oD0.xyz += {}.xyz * ff_emission_alpha.xyz;\n", color_source(added));
         } else {
-            g += std::format("    oD0 = vec4({}.xyz + {}.xyz * ff_emission_alpha.xyz, {});\n", colour_source(emission), colour_source(ambient), alpha);
+            g += std::format("    oD0 = vec4({}.xyz + {}.xyz * ff_emission_alpha.xyz, {});\n", color_source(emission), color_source(ambient), alpha);
         }
         g += "    oD1 = vec4(0.0, 0.0, 0.0, v4.w);\n";
         const bool local_eye = (s.reg(ff::kLightControl) & ff::kLocalEye) != 0;
         if (local_eye) g += std::format("    vec3 VPeye = normalize(c[{0}].xyz / c[{0}].w - tPosition.xyz / tPosition.w);\n", ff::kEye);
         const u32 mask = s.reg(mthd::kLightEnableMask);
         auto scaled = [&](u32 src, const std::string& light) {
-            return src == 0 ? light : std::format("{}.xyz * {}", colour_source(src), light);
+            return src == 0 ? light : std::format("{}.xyz * {}", color_source(src), light);
         };
         for (u32 l = 0; l < kLights; ++l) {
             const u32 type = (mask >> (2 * l)) & 3u;  // 1 infinite, 2 local, 3 spot
@@ -698,13 +698,13 @@ Translation fixed_function_translate(const KelvinState& s, const Options& option
             g += std::format("        oD1.xyz += {};\n", scaled(specular, std::format("ff_light[{}].xyz * (attenuation * pf)", b + 2)));
             g += "    }\n";
         }
-        // Two-sided lighting is not modelled: the back colours are the vertex's [verify].
+        // Two-sided lighting is not modeled: the back colors are the vertex's [verify].
         g += "    oB0 = v7;\n    oB1 = v8;\n";
     }
     if (!(s.reg(ff::kSpecularEnable) & 1u)) {
         g += "    oD1 = vec4(0.0, 0.0, 0.0, 1.0);\n    oB1 = vec4(0.0, 0.0, 0.0, 1.0);\n";
     } else if (!(s.reg(ff::kLightControl) & ff::kSeparateSpecular)) {
-        // Specular summed into the diffuse colour by the transform; the specular register then carries the vertex's.
+        // Specular summed into the diffuse color by the transform; the specular register then carries the vertex's.
         if (lit) g += "    oD0.xyz += oD1.xyz;\n    oB0.xyz += oB1.xyz;\n";
         g += "    oD1 = v4;\n    oB1 = v8;\n";
     }

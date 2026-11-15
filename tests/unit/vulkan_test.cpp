@@ -68,7 +68,7 @@ void load_passthrough_program(K& k) {
     k.method(mthd::kClipMax, std::bit_cast<u32>(16777215.0f));
 }
 
-// Combiners: final colour = v0 (diffuse), alpha = v0.a.
+// Combiners: final color = v0 (diffuse), alpha = v0.a.
 template <class K>
 void load_passthrough_combiners(K& k) {
     k.method(mthd::kCombinerControl, 1);
@@ -121,7 +121,7 @@ u32 pixel_at(const std::vector<u8>& ram, u32 x, u32 y) {
 
 }  // namespace
 
-// Pooled images share a block without overlapping; a freed range is the first fit for the next, and freed neighbours
+// Pooled images share a block without overlapping; a freed range is the first fit for the next, and freed neighbors
 // merge back into one range.
 TEST(Vulkan, PooledImagesShareABlockAndTheirFreedRangesAreReused) {
     vk::Device device;
@@ -150,7 +150,7 @@ TEST(Vulkan, PooledImagesShareABlockAndTheirFreedRangesAreReused) {
     vk::Image big;
     ASSERT_TRUE(device.create_image(VK_FORMAT_R8G8B8A8_UNORM, 256, 256, 1, 1, 1, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
                                     VK_IMAGE_ASPECT_COLOR_BIT, false, big, error, 0, true)) << error;
-    EXPECT_EQ(big.offset, a_at) << "the three freed neighbours merged into one range a bigger image fits";
+    EXPECT_EQ(big.offset, a_at) << "the three freed neighbors merged into one range a bigger image fits";
     device.destroy_image(big);
     make(e);
     device.destroy_image(e);
@@ -217,12 +217,12 @@ TEST(Vulkan, RendersATriangleIntoGuestRam) {
         map += '\n';
     }
     std::printf("%s", map.c_str());
-    EXPECT_EQ(pixel(4, 4) & 0x00FFFFFFu, 0x000080u) << "top-left keeps the clear colour";
+    EXPECT_EQ(pixel(4, 4) & 0x00FFFFFFu, 0x000080u) << "top-left keeps the clear color";
     EXPECT_EQ(pixel(60, 60) & 0x00FFFFFFu, 0x00FF00u) << "bottom-right is inside the green triangle";
     EXPECT_EQ(pixel(60, 60) >> 24, 0xFFu);
     EXPECT_EQ(pixel(2, 52) & 0x00FFFFFFu, 0x000080u) << "bottom-left is outside the triangle";
     EXPECT_EQ(pixel(52, 2) & 0x00FFFFFFu, 0x000080u) << "top-right is outside the triangle";
-    EXPECT_EQ(pixel(40, 40) & 0x00FFFFFFu, 0x00FF00u) << "centre-right is inside";
+    EXPECT_EQ(pixel(40, 40) & 0x00FFFFFFu, 0x00FF00u) << "center-right is inside";
     EXPECT_EQ(ram[0x10000 + 64 * 256], 0) << "nothing written past the surface";
     const auto surfaces = renderer.surfaces();
     ASSERT_EQ(surfaces.size(), 1u);
@@ -395,7 +395,7 @@ void load_texcoord_program(Kelvin& k) {
     k.method(mthd::kTransformExecutionMode, 2);
 }
 
-// Combiners whose output is texture stage `stage`: colour = t (A = t, B = one), alpha = t.a.
+// Combiners whose output is texture stage `stage`: color = t (A = t, B = one), alpha = t.a.
 void output_texture_stage(Kelvin& k, u32 stage) {
     k.method(mthd::kCombinerControl, 1);
     k.method(mthd::kCombinerColorIcw, ((8u + stage) << 24) | ((1u << 5) << 16));
@@ -466,7 +466,7 @@ TEST(Vulkan, DotSTLooksUpTheTwoDotProducts) {
     k.method(mthd::kDotRgbMapping, 0x033);
     output_texture_stage(k, 2);
     texcoord(k, 0, 0.5f, 0.5f, 0.0f, 1.0f);
-    // dot1 = (0.875, 0.5, 7) . (1, -1, 0) = 0.375 and dot2 = (1.125, 0.5, 3) . (1, -1, 0) = 0.625: the centre of
+    // dot1 = (0.875, 0.5, 7) . (1, -1, 0) = 0.375 and dot2 = (1.125, 0.5, 3) . (1, -1, 0) = 0.625: the center of
     // texel (1, 2) of the 4x4 texture. (Read as 0..1 instead, the normal would give texel (2, 3).)
     texcoord(k, 1, 0.875f, 0.5f, 7.0f, 1.0f);
     texcoord(k, 2, 1.125f, 0.5f, 3.0f, 1.0f);
@@ -504,7 +504,7 @@ TEST(Vulkan, DotZWWritesTheRatioOfTheTwoDotProductsAsTheDepth) {
     u32 word;
     std::memcpy(&word, &f.ram[0x20000 + 8 * 256 + 8 * 4], 4);
     EXPECT_NEAR(static_cast<double>(word >> 8), 0.25 * 16777215.0, 1.0) << std::hex << word;
-    EXPECT_EQ(pixel_at(f.ram, 8, 8), 0xFF7F8100u) << "the colour still draws";
+    EXPECT_EQ(pixel_at(f.ram, 8, 8), 0xFF7F8100u) << "the color still draws";
 }
 
 TEST(Vulkan, DependentGBLooksUpTheSourcesGreenAndBlue) {
@@ -556,7 +556,7 @@ TEST(Vulkan, BumpEnvOffsetsTheLookupByTheMatrixTimesDuDv) {
         draw_full_triangle(k, f.ram);
     };
     draw_into(6, 0x100000);
-    draw_into(7, 0x110000);  // the texel's colour times 0.5 x 1 + 0.25
+    draw_into(7, 0x110000);  // the texel's color times 0.5 x 1 + 0.25
     k.method(mthd::kBumpEnvScale + mthd::kTextureStride, bits(2.0f));
     k.method(mthd::kBumpEnvOffset + mthd::kTextureStride, bits(0.0f));
     draw_into(7, 0x120000);  // a factor of 2 clamps to 1
@@ -683,13 +683,13 @@ TEST(Vulkan, TheDepthWrittenIsTheConsolesClampedOrCulledToTheClipRangeAndOnItsSt
     clear();
     triangle(4000000.25f);
     EXPECT_EQ(stored_depth(), 4000000u) << "on the nearest step below";
-    // A colour draw that writes depth takes the exact path too; one that only tests keeps the host's depth.
+    // A color draw that writes depth takes the exact path too; one that only tests keeps the host's depth.
     k.method(mthd::kColorMask, 0x01010101);
     k.method(kZminMaxControlForTest, 0x01);
     k.method(mthd::kClipMax, bits(16777215.0f));
     clear();
     triangle(4000000.75f);
-    EXPECT_EQ(stored_depth(), 4000001u) << "a colour draw lands on the same step";
+    EXPECT_EQ(stored_depth(), 4000001u) << "a color draw lands on the same step";
     EXPECT_EQ(pixel_at(ram, 8, 8) & 0x00FFFFFFu, 0x00FF00u);
     for (const auto& e : renderer.stats().errors) ADD_FAILURE() << "renderer: " << e;
 }
@@ -997,7 +997,7 @@ TEST(Vulkan, ACpuWriteAfterTheTargetWasDrawnIsKeptAndDrawnOver) {
 
 // A clamp-to-border stage shows its BORDER_COLOR (0x1B24, A8R8G8B8) outside the texture, as the hardware captures show
 // (nxdk_pgraph_tests TextureBorderColor); it was always opaque black.
-TEST(Vulkan, AClampToBorderStageShowsItsBorderColour) {
+TEST(Vulkan, AClampToBorderStageShowsItsBorderColor) {
     TextureShaderFixture f;
     std::string error;
     if (!f.init(error)) GTEST_SKIP() << "no Vulkan device: " << error;
@@ -1005,7 +1005,7 @@ TEST(Vulkan, AClampToBorderStageShowsItsBorderColour) {
     load_texture(k, f.ram, 0, 0x200000, 0, [](u32, u32) { return 0xFFFFFFFFu; });
     const u32 b = mthd::kTextureBase;
     k.method(b + 0x8, 0x00030404);   // border in u and v
-    k.method(b + 0x24, 0x80FF2200);  // the border colour
+    k.method(b + 0x24, 0x80FF2200);  // the border color
     k.method(mthd::kShaderStageProgram, 1u);  // stage 0: 2D
     output_texture_stage(k, 0);
     texcoord(k, 0, 2.0f, 2.0f, 0.0f, 1.0f);  // outside the texture
@@ -1013,7 +1013,7 @@ TEST(Vulkan, AClampToBorderStageShowsItsBorderColour) {
     f.renderer->end_frame();
     for (const auto& e : f.renderer->stats().errors) ADD_FAILURE() << "renderer: " << e;
     if (!f.device.custom_border()) {
-        EXPECT_EQ(pixel_at(f.ram, 8, 8), 0xFF000000u) << "no custom border colours: the nearest built-in one (opaque black)";
+        EXPECT_EQ(pixel_at(f.ram, 8, 8), 0xFF000000u) << "no custom border colors: the nearest built-in one (opaque black)";
         return;
     }
     EXPECT_EQ(pixel_at(f.ram, 8, 8), 0x80FF2200u);
@@ -1110,8 +1110,8 @@ TEST(Vulkan, ATargetMadeAgainOnARetiredImageStartsFromWhatRamHolds) {
             k.method(mthd::kSurfaceClipV, 16u << 16);
             k.method(mthd::kSurfaceColorOffset, at);
         };
-        auto clear_to = [&](u32 colour) {
-            k.method(mthd::kColorClear, colour);
+        auto clear_to = [&](u32 color) {
+            k.method(mthd::kColorClear, color);
             k.method(mthd::kClearRectH, 15u << 16);
             k.method(mthd::kClearRectV, 15u << 16);
             k.method(mthd::kClearSurface, 0xF0);
@@ -1215,7 +1215,7 @@ TEST(Vulkan, AScaledTargetReachesRamAsA1xTargetWould) {
 }
 
 // A scaled target loads what RAM holds (each pixel widened to a block) and writes back exactly those bytes around
-// what it drew: colour and depth.
+// what it drew: color and depth.
 TEST(Vulkan, AScaledTargetKeepsRamsPixelsAroundADraw) {
     for (u32 scale : {2u, 3u, 4u, 8u}) {
         SCOPED_TRACE(std::format("scale {}", scale));
@@ -1247,17 +1247,17 @@ TEST(Vulkan, AScaledTargetKeepsRamsPixelsAroundADraw) {
         f.renderer->end_frame();
         f.renderer->write_back_all();
         for (const auto& e : f.renderer->stats().errors) ADD_FAILURE() << "renderer: " << e;
-        u32 colour_misses = 0, depth_misses = 0;
+        u32 color_misses = 0, depth_misses = 0;
         for (u32 y = 0; y < 64; ++y)
             for (u32 x = 0; x < 64; ++x) {
                 if (x + y < 20) continue;  // the triangle and its edge
                 u32 c, z;
                 std::memcpy(&c, &f.ram[0x10000 + y * 256 + x * 4], 4);
                 std::memcpy(&z, &f.ram[0x20000 + y * 256 + x * 4], 4);
-                colour_misses += c != pattern(x, y);
+                color_misses += c != pattern(x, y);
                 depth_misses += z != zpattern(x, y);
             }
-        EXPECT_EQ(colour_misses, 0u);
+        EXPECT_EQ(color_misses, 0u);
         EXPECT_EQ(depth_misses, 0u);
         EXPECT_EQ(pixel_at(f.ram, 2, 2), 0xFF00FF00u) << "inside the triangle";
         u32 z;
@@ -1473,13 +1473,13 @@ TEST(Vulkan, ACubeMapOfSixRenderTargetsIsPutTogetherOnTheGpu) {
         f.renderer->set_resolution_scale(scale);
         Kelvin& k = f.k;
         constexpr u32 kCube = 0x200000, kFace = 16 * 16 * 4;
-        const u32 colours[6] = {0xFFFF0000u, 0xFF00FF00u, 0xFF0000FFu, 0xFFFFFF00u, 0xFF00FFFFu, 0xFFFF00FFu};
+        const u32 colors[6] = {0xFFFF0000u, 0xFF00FF00u, 0xFF0000FFu, 0xFFFFFF00u, 0xFF00FFFFu, 0xFFFF00FFu};
         for (u32 face = 0; face < 6; ++face) {
             k.method(mthd::kSurfaceFormat, (4u << 24) | (4u << 16) | 0x200u | 0x8u);  // swizzled 16x16 A8R8G8B8, no depth
             k.method(mthd::kSurfaceClipH, 16u << 16);
             k.method(mthd::kSurfaceClipV, 16u << 16);
             k.method(mthd::kSurfaceColorOffset, kCube + face * kFace);
-            k.method(mthd::kColorClear, colours[face]);
+            k.method(mthd::kColorClear, colors[face]);
             k.method(mthd::kClearRectH, 15u << 16);
             k.method(mthd::kClearRectV, 15u << 16);
             k.method(mthd::kClearSurface, 0xF0);
@@ -1499,7 +1499,7 @@ TEST(Vulkan, ACubeMapOfSixRenderTargetsIsPutTogetherOnTheGpu) {
             texcoord(k, 0, dirs[face][0], dirs[face][1], dirs[face][2], 1.0f);
             draw_full_triangle(k, f.ram);
             f.renderer->end_frame();
-            EXPECT_EQ(pixel_at(f.ram, 8, 8), colours[face]) << "face " << face;
+            EXPECT_EQ(pixel_at(f.ram, 8, 8), colors[face]) << "face " << face;
         }
         for (const auto& e : f.renderer->stats().errors) ADD_FAILURE() << "renderer: " << e;
         EXPECT_GE(f.renderer->stats().cube_assemblies, 1u);
@@ -1516,9 +1516,9 @@ TEST(Vulkan, A2DCopyBetweenTwoTargetsStaysOnTheGpu) {
         std::string error;
         if (!f.init(scale, error)) GTEST_SKIP() << "no Vulkan device: " << error;
         Kelvin& k = f.k;
-        auto fill = [&](u32 offset, u32 colour) {
+        auto fill = [&](u32 offset, u32 color) {
             setup_target(k, 8, offset);
-            k.method(mthd::kColorClear, colour);
+            k.method(mthd::kColorClear, color);
             k.method(mthd::kClearRectH, 63u << 16);
             k.method(mthd::kClearRectV, 63u << 16);
             k.method(mthd::kClearSurface, 0xF0);
@@ -1547,10 +1547,10 @@ TEST(Vulkan, A2DCopyBetweenTwoTargetsStaysOnTheGpu) {
     }
 }
 
-// A screen-space quad whose left and top edges lie on pixel centres (a blur pass on the half-pixel convention) covers the
+// A screen-space quad whose left and top edges lie on pixel centers (a blur pass on the half-pixel convention) covers the
 // first column and row whole at 1x; at 6x it must cover their whole blocks, not half of them (Fable's blur buffers kept
 // three image columns of stale memory, shown as green squares along the picture's edges).
-TEST(Vulkan, AScreenSpaceEdgeOnAPixelCentreCoversWholeBlocksAboveOneX) {
+TEST(Vulkan, AScreenSpaceEdgeOnAPixelCenterCoversWholeBlocksAboveOneX) {
     ScaledFixture f;
     std::string error;
     if (!f.init(6, error)) GTEST_SKIP() << "no Vulkan device: " << error;
@@ -1562,7 +1562,7 @@ TEST(Vulkan, AScreenSpaceEdgeOnAPixelCentreCoversWholeBlocksAboveOneX) {
     k.method(mthd::kClearSurface, 0xF0);
     k.method(mthd::kBeginEnd, 5);
     k.method(mthd::kDiffuse4ub, 0xFF00FF00);
-    // Two triangles from (0.49, 0.49) to (64.5, 64.5): a hair off the centres, as the vertex maths leaves them.
+    // Two triangles from (0.49, 0.49) to (64.5, 64.5): a hair off the centers, as the vertex maths leaves them.
     for (const auto& p : {std::array<float, 2>{0.49f, 0.49f}, std::array<float, 2>{64.5f, 0.49f}, std::array<float, 2>{0.49f, 64.5f},
                           std::array<float, 2>{64.5f, 0.49f}, std::array<float, 2>{64.5f, 64.5f}, std::array<float, 2>{0.49f, 64.5f}}) {
         k.method(mthd::kVertexData4fM + 0, bits(p[0]));
@@ -1629,10 +1629,10 @@ TEST(Vulkan, A16BitTargetIsSampledInPlace) {
     }
 }
 
-// A DXT1 texture uploaded as its blocks (BC1) reads as the CPU decoder reads it: the four-colour blocks, and the
-// three-colour ones with index 3 transparent black. Checked against the decoder with MV_NATIVE_DXT=0 as well.
+// A DXT1 texture uploaded as its blocks (BC1) reads as the CPU decoder reads it: the four-color blocks, and the
+// three-color ones with index 3 transparent black. Checked against the decoder with MV_NATIVE_DXT=0 as well.
 TEST(Vulkan, ADxtTextureSampledAsBlocksMatchesTheDecoder) {
-    // Four 4x4 blocks (an 8x8 texture): four-colour red/blue at index 0, 2 and 3, and a three-colour block at index 3.
+    // Four 4x4 blocks (an 8x8 texture): four-color red/blue at index 0, 2 and 3, and a three-color block at index 3.
     const auto block = [](u16 c0, u16 c1, u8 index) {
         std::array<u8, 8> b{static_cast<u8>(c0), static_cast<u8>(c0 >> 8), static_cast<u8>(c1), static_cast<u8>(c1 >> 8)};
         const u8 row = static_cast<u8>(index | (index << 2) | (index << 4) | (index << 6));
@@ -1697,7 +1697,7 @@ TEST(Vulkan, AMipChainOfRenderTargetsIsPutTogetherOnTheGpu) {
         f.renderer->set_resolution_scale(scale);
         Kelvin& k = f.k;
         constexpr u32 kChain = 0x200000;
-        const u32 colours[3] = {0xFFFF0000u, 0xFF00FF00u, 0xFF0000FFu};
+        const u32 colors[3] = {0xFFFF0000u, 0xFF00FF00u, 0xFF0000FFu};
         u32 at = kChain;
         for (u32 level = 0; level < 3; ++level) {
             const u32 log = 4 - level;
@@ -1705,7 +1705,7 @@ TEST(Vulkan, AMipChainOfRenderTargetsIsPutTogetherOnTheGpu) {
             k.method(mthd::kSurfaceClipH, (1u << log) << 16);
             k.method(mthd::kSurfaceClipV, (1u << log) << 16);
             k.method(mthd::kSurfaceColorOffset, at);
-            k.method(mthd::kColorClear, colours[level]);
+            k.method(mthd::kColorClear, colors[level]);
             k.method(mthd::kClearRectH, ((1u << log) - 1) << 16);
             k.method(mthd::kClearRectV, ((1u << log) - 1) << 16);
             k.method(mthd::kClearSurface, 0xF0);
@@ -1725,7 +1725,7 @@ TEST(Vulkan, AMipChainOfRenderTargetsIsPutTogetherOnTheGpu) {
         draw_full_triangle(k, f.ram);
         f.renderer->end_frame();
         for (const auto& e : f.renderer->stats().errors) ADD_FAILURE() << "renderer: " << e;
-        EXPECT_EQ(pixel_at(f.ram, 8, 8), colours[0]) << "level 0, magnified";
+        EXPECT_EQ(pixel_at(f.ram, 8, 8), colors[0]) << "level 0, magnified";
         EXPECT_GE(f.renderer->stats().mip_assemblies, 1u);
         EXPECT_EQ(f.renderer->stats().writebacks_by[VulkanRenderer::Stats::kWbTexture], 0u) << "no level went through RAM";
     }
@@ -1767,8 +1767,8 @@ TEST(Vulkan, AScanoutWrittenBackInTheBackgroundLandsUnderTheCpusPages) {
     EXPECT_GE(f.renderer->stats().background_write_back_batches, 1u);
 }
 
-// Above 1x the picture is converted on the GPU as it is read back: XRGB8888, the RAMDAC's colour table applied.
-TEST(Vulkan, TheScaledPictureComesBackThroughTheColourTable) {
+// Above 1x the picture is converted on the GPU as it is read back: XRGB8888, the RAMDAC's color table applied.
+TEST(Vulkan, TheScaledPictureComesBackThroughTheColorTable) {
     ScaledFixture f;
     std::string error;
     if (!f.init(2, error)) GTEST_SKIP() << "no Vulkan device: " << error;
@@ -1940,9 +1940,9 @@ TEST(Vulkan, ADrawSamplingItsOwnDepthBufferReadsACopyOnTheGpu) {
     }
 }
 
-// A depth buffer read as a colour texture gets the Z24S8 words' bytes: as A8R8G8B8 (blue first) or A8B8G8R8 (red
+// A depth buffer read as a color texture gets the Z24S8 words' bytes: as A8R8G8B8 (blue first) or A8B8G8R8 (red
 // first, a racing title reads its scene depth so), converted on the GPU where the device holds D24S8, never through RAM.
-TEST(Vulkan, ADepthBufferReadAsColourGivesItsBytesInEitherOrder) {
+TEST(Vulkan, ADepthBufferReadAsColorGivesItsBytesInEitherOrder) {
     TextureShaderFixture f;
     std::string error;
     if (!f.init(error)) GTEST_SKIP() << "no Vulkan device: " << error;
@@ -2052,7 +2052,7 @@ TEST(Vulkan, ASmallerTargetDrawsIntoTheDepthImageOfABiggerOneOfTheSamePitch) {
 
 // Above 1x the video overlay is drawn in by the pass that finishes the picture on the GPU (a movie over a rendered
 // picture cost 20 ms a frame at 6x on the CPU): the result is what grab_frame draws on the CPU over the same picture,
-// pixel for pixel, for both byte orders, with and without the colour key and the colour table.
+// pixel for pixel, for both byte orders, with and without the color key and the color table.
 TEST(Vulkan, TheVideoOverlayDrawnOnTheGpuIsTheOneTheCpuDraws) {
     for (u32 scale : {2u, 3u}) {
         for (u32 variant = 0; variant < 4; ++variant) {
@@ -2067,7 +2067,7 @@ TEST(Vulkan, TheVideoOverlayDrawnOnTheGpuIsTheOneTheCpuDraws) {
             k.method(mthd::kClearRectH, 63u << 16);
             k.method(mthd::kClearRectV, 63u << 16);
             k.method(mthd::kClearSurface, 0xF0);
-            k.method(mthd::kColorClear, 0xFF00FF00u);  // the key colour over part of the overlay's rectangle
+            k.method(mthd::kColorClear, 0xFF00FF00u);  // the key color over part of the overlay's rectangle
             k.method(mthd::kClearRectH, (30u << 16) | 10u);
             k.method(mthd::kClearRectV, (40u << 16) | 12u);
             k.method(mthd::kClearSurface, 0xF0);
@@ -2095,7 +2095,7 @@ TEST(Vulkan, TheVideoOverlayDrawnOnTheGpuIsTheOneTheCpuDraws) {
             ov.key = 0x0000FF00u;
             std::array<u8, 768> lut{};
             for (u32 i = 0; i < 768; ++i) lut[i] = static_cast<u8>(i / 3 ^ (variant * 17));
-            // The key is compared with the finished pixel: the key colour through the table.
+            // The key is compared with the finished pixel: the key color through the table.
             ov.key = variant ? (static_cast<u32>(lut[0]) << 16) | (static_cast<u32>(lut[255 * 3 + 1]) << 8) | lut[2] : 0x0000FF00u;
             // The picture without the overlay, then the CPU's overlay over it as grab_frame draws it.
             f.renderer->set_display_lut(variant ? std::optional(lut) : std::nullopt);
@@ -2147,7 +2147,7 @@ TEST(Vulkan, TheVideoOverlayDrawnOnTheGpuIsTheOneTheCpuDraws) {
             // The overlay drew (inside the key's area when keyed), and a keyed one left the rest of its rectangle alone.
             const auto at = [&](u32 x, u32 y) { return want[static_cast<std::size_t>(y * scale) * fw + x * scale]; };
             EXPECT_NE(at(15, 20), at(60, 60)) << "drawn";
-            if (keyed) EXPECT_EQ(at(6, 8), at(60, 60)) << "not the key colour: kept";
+            if (keyed) EXPECT_EQ(at(6, 8), at(60, 60)) << "not the key color: kept";
             else EXPECT_NE(at(6, 8), at(60, 60)) << "drawn";
         }
     }
@@ -2193,7 +2193,7 @@ void handoff_scene(Kelvin& k) {
 }  // namespace
 
 // The picture handed to a libretro frontend on the GPU (D38): with set_handoff the capture stays in device memory and
-// hand_over copies it into the frontend's image, which holds exactly what the host read-back holds (the colour table
+// hand_over copies it into the frontend's image, which holds exactly what the host read-back holds (the color table
 // applied); a CPU-made picture goes in through staging unchanged. The image's view reads alpha as one.
 TEST(Vulkan, AHandedOverPictureIsTheOneTheHostWouldHaveRead) {
     std::array<u8, 768> lut{};
@@ -2238,7 +2238,7 @@ TEST(Vulkan, AHandedOverPictureIsTheOneTheHostWouldHaveRead) {
     u32 differ = 0;
     for (std::size_t i = 0; i < got.size(); ++i) differ += got[i] != want[i];
     EXPECT_EQ(differ, 0u) << std::format("first pixels {:08x} vs {:08x}", got[0], want[0]);
-    EXPECT_NE(got[static_cast<std::size_t>(30 * 3) * 192 + 20 * 3], got[5]) << "the scene has two colours";
+    EXPECT_NE(got[static_cast<std::size_t>(30 * 3) * 192 + 20 * 3], got[5]) << "the scene has two colors";
     // A picture made on the CPU, into another sync index's image, at another size.
     std::vector<u32> cpu(100 * 70);
     for (std::size_t i = 0; i < cpu.size(); ++i) cpu[i] = static_cast<u32>(i * 2654435761u) & 0x00FFFFFFu;
@@ -2332,7 +2332,7 @@ TEST(Vulkan, ACubeMapOfSix16BitTargetsIsPutTogetherOnTheGpu) {
         Kelvin& k = f.k;
         constexpr u32 kCube = 0x200000, kFace = 16 * 16 * 2;
         const u32 clears[6] = {0xF800u, 0x07E0u, 0x001Fu, 0xFFE0u, 0x07FFu, 0xF81Fu};  // 5-6-5: red green blue yellow cyan magenta
-        const u32 colours[6] = {0xFFFF0000u, 0xFF00FF00u, 0xFF0000FFu, 0xFFFFFF00u, 0xFF00FFFFu, 0xFFFF00FFu};
+        const u32 colors[6] = {0xFFFF0000u, 0xFF00FF00u, 0xFF0000FFu, 0xFFFFFF00u, 0xFF00FFFFu, 0xFFFF00FFu};
         for (u32 face = 0; face < 6; ++face) {
             k.method(mthd::kSurfaceFormat, (4u << 24) | (4u << 16) | 0x200u | 0x3u);  // swizzled 16x16 R5G6B5, no depth
             k.method(mthd::kSurfaceClipH, 16u << 16);
@@ -2358,7 +2358,7 @@ TEST(Vulkan, ACubeMapOfSix16BitTargetsIsPutTogetherOnTheGpu) {
             texcoord(k, 0, dirs[face][0], dirs[face][1], dirs[face][2], 1.0f);
             draw_full_triangle(k, f.ram);
             f.renderer->end_frame();
-            EXPECT_EQ(pixel_at(f.ram, 8, 8), colours[face]) << "face " << face;
+            EXPECT_EQ(pixel_at(f.ram, 8, 8), colors[face]) << "face " << face;
         }
         for (const auto& e : f.renderer->stats().errors) ADD_FAILURE() << "renderer: " << e;
         EXPECT_GE(f.renderer->stats().cube_assemblies, 1u);
@@ -2406,7 +2406,7 @@ TEST(Vulkan, AB8TargetSampledAsY8IsReadInPlace) {
     }
 }
 
-// A B8 target stores the colour's blue byte (the hardware's single channel): a draw writing blue alone (colour mask B)
+// A B8 target stores the color's blue byte (the hardware's single channel): a draw writing blue alone (color mask B)
 // lands it in RAM, and red is not what it keeps. Its R8 image swaps red and blue on the way in and out.
 TEST(Vulkan, AB8TargetKeepsTheBlueByteOfADrawThatWritesBlueAlone) {
     for (u32 scale : {1u, 2u}) {

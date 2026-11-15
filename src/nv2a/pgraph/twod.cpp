@@ -50,12 +50,12 @@ bool TwoD::blit() {
     const u32 xin = point_in_ & 0xFFFFu, yin = point_in_ >> 16, xout = point_out_ & 0xFFFFu, yout = point_out_ >> 16;
     if (w == 0 || h == 0) return true;
     if (operation_ != kOperationSrcCopy) {
-        error_ = std::format("operation {} (only SRCCOPY is modelled)", operation_);
+        error_ = std::format("operation {} (only SRCCOPY is modeled)", operation_);
         return false;
     }
     const u32 bpp = bytes_per_pixel(format_);
     if (bpp == 0) {
-        error_ = std::format("colour format {:02x}", format_);
+        error_ = std::format("color format {:02x}", format_);
         return false;
     }
     const DmaObject src = resolver_.resolve(dma_source_), dst = resolver_.resolve(dma_destination_);

@@ -185,7 +185,7 @@ TEST(Kelvin, ImmediateVerticesCompleteOnPosition) {
     RecordingSink sink;
     k.set_sink(&sink);
     k.method(mthd::kBeginEnd, 5);
-    k.method(mthd::kDiffuse4ub, 0xFF0000FF);  // sticky colour: red, alpha 1
+    k.method(mthd::kDiffuse4ub, 0xFF0000FF);  // sticky color: red, alpha 1
     k.method(mthd::kTexcoord0_2f, bits(0.5f));
     k.method(mthd::kTexcoord0_2f + 4, bits(0.75f));
     k.method(mthd::kVertex3f, bits(1.0f));
@@ -210,7 +210,7 @@ TEST(Kelvin, ImmediateVerticesCompleteOnPosition) {
     EXPECT_FLOAT_EQ(out.attribute[0][4], 4.0f);
     EXPECT_FLOAT_EQ(out.attribute[0][8], 7.0f);
     EXPECT_FLOAT_EQ(out.attribute[0][9], -2.0f);
-    EXPECT_FLOAT_EQ(out.attribute[3][0], 1.0f) << "colour stays for every vertex";
+    EXPECT_FLOAT_EQ(out.attribute[3][0], 1.0f) << "color stays for every vertex";
     EXPECT_FLOAT_EQ(out.attribute[3][8], 1.0f);
     EXPECT_FLOAT_EQ(out.attribute[9][5], 0.75f);
 }
@@ -247,7 +247,7 @@ TEST(Kelvin, ShortNamedSettersFillTheComponentsTheyLeaveOut) {
     }
     for (u32 c = 0; c < 4; ++c) k.method(mthd::kDiffuse4f + 4 * c, bits(0.5f));
     for (u32 c = 0; c < 3; ++c) k.method(mthd::kDiffuse3f + 4 * c, bits(0.25f));
-    EXPECT_FLOAT_EQ(k.state().immediate[3][3], 1.0f) << "a 3F colour is opaque";
+    EXPECT_FLOAT_EQ(k.state().immediate[3][3], 1.0f) << "a 3F color is opaque";
     for (u32 c = 0; c < 4; ++c) k.method(mthd::kWeight4f + 4 * c, bits(0.75f));
     k.method(mthd::kWeight1f, bits(0.125f));
     EXPECT_EQ(k.state().immediate[1], (std::array<float, 4>{0.125f, 0.0f, 0.0f, 1.0f})) << "attribute 1 is the weight";
@@ -270,8 +270,8 @@ TEST(Kelvin, ConstantAttributesReadTheirOneValue) {
         const float xyz[3] = {static_cast<float>(v), 0.0f, 0.0f};
         std::memcpy(&ram[0x1000 + v * 12], xyz, 12);
     }
-    const u8 colours[8] = {10, 20, 30, 40, 50, 60, 70, 80};  // the second element must never be read
-    std::memcpy(&ram[0x1800], colours, 8);
+    const u8 colors[8] = {10, 20, 30, 40, 50, 60, 70, 80};  // the second element must never be read
+    std::memcpy(&ram[0x1800], colors, 8);
     k.method(mthd::kDmaVertexA, 3);
     k.method(mthd::kVertexDataArrayFormat + 0, (12u << 8) | (3u << 4) | 2u);
     k.method(mthd::kVertexDataArrayOffset + 0, 0x1000);
@@ -315,7 +315,7 @@ TEST(Kelvin, ConstantAttributesReadTheirOneValue) {
     ASSERT_EQ(sink.draws.size(), 3u);
     ASSERT_TRUE(fetch_vertices(k.state(), handles, memory, sink.draws[2], out)) << out.error;
     EXPECT_EQ(out.enabled, 1u);
-    EXPECT_FLOAT_EQ(out.constant[3][0], 10.0f / 255.0f) << "an immediate batch keeps the colour set before it";
+    EXPECT_FLOAT_EQ(out.constant[3][0], 10.0f / 255.0f) << "an immediate batch keeps the color set before it";
     EXPECT_FLOAT_EQ(out.constant[4][0], 1.0f);
 
     // Inline data latches too: its last vertex.

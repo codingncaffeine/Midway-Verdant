@@ -186,7 +186,7 @@ TEST(DspCore, RegisterFormPeripheralMovesWriteWithWSetAndReadWithWClear) {
     EXPECT_EQ(m.core.regs().a, i64{0x00123456000000}) << "the peripheral word lands in A1";
 }
 
-TEST(DspCore, CountLeadingBitsThenNormaliseFastAsTheManualShows) {
+TEST(DspCore, CountLeadingBitsThenNormalizeFastAsTheManualShows) {
     Machine m;
     m.core.regs().a = i64{0x20} << 48;  // A = $20:000000:000000
     m.emit(0x0C1E01);                   // CLB A,B: two leading zeros -> 9 - 2 = 7 in B1

@@ -372,7 +372,7 @@ TEST(P6Exec, RealModeInterruptAndIret) {
     EXPECT_EQ(r.s().reg16(kEsp), 0x8000u);
 }
 
-TEST(P6Exec, ExternalInterruptHonoursIfAndTheStiShadow) {
+TEST(P6Exec, ExternalInterruptHonorsIfAndTheStiShadow) {
     Rig r;
     int pending = 0x30;
     r.cpu.set_interrupt_source([&] { return pending; }, [&] {

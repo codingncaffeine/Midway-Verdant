@@ -89,7 +89,7 @@ public:
     bool ready() const { return device_ != VK_NULL_HANDLE; }
     // Exact occlusion counts, enabled when the device has them.
     bool occlusion_precise() const { return enabled_.occlusion_precise; }
-    // Sampler border colours of our own (VK_EXT_custom_border_color): the NV2A's per-stage BORDER_COLOR. Without it a
+    // Sampler border colors of our own (VK_EXT_custom_border_color): the NV2A's per-stage BORDER_COLOR. Without it a
     // sampler takes the nearest of Vulkan's three built-in borders; `_unformatted` = no image format needed.
     bool custom_border() const { return enabled_.custom_border; }
     bool custom_border_unformatted() const { return enabled_.custom_border_unformatted; }

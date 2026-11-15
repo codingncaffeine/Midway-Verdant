@@ -224,7 +224,7 @@ void h_cache(JitCtx* c, u32 phys, u32 arg, const Block* b) {
 // on (the next block's native code, or null: back to the dispatcher).
 void* h_chain(JitCtx* c, Block::Link* slot) { return c->engine->chain(*c, slot); }
 
-void h_materialise(CpuState* s) { s->materialise(); }
+void h_materialize(CpuState* s) { s->materialize(); }
 u32 h_eflags(const CpuState* s) { return s->eflags(); }  // computed, the lazy record left as it is (LAHF)
 u32 h_cf(const CpuState* s) { return s->cf() ? 1u : 0u; }
 u32 h_cond(const Cpu* cpu, u32 cc) { return cpu->condition(static_cast<u8>(cc)) ? 1u : 0u; }
@@ -1305,10 +1305,10 @@ private:
         }
         x87_pointers(i, in);
         if (k == X87Form::CompareFlags) {
-            // The interpreter materialises the lazy flags (OF SF AF stay theirs) before it sets ZF PF CF. A call: the
+            // The interpreter materializes the lazy flags (OF SF AF stay theirs) before it sets ZF PF CF. A call: the
             // host x87 stack is empty here, as the ABI wants; the registers the checks left are computed again.
             a.mov(8, kArg0, kSt);
-            a.call_abs(reinterpret_cast<const void*>(&h_materialise));
+            a.call_abs(reinterpret_cast<const void*>(&h_materialize));
             x87_top();
             x87_phys(r9, ri);
             x87_addr(r10, r8);
@@ -1476,7 +1476,7 @@ private:
                 break;
             }
             case X87Form::CompareFlags: {
-                // F(U)COMI(P): ZF PF CF from the host's compare; the other flags as materialised; C1 cleared.
+                // F(U)COMI(P): ZF PF CF from the host's compare; the other flags as materialized; C1 cleared.
                 a.x87_mem(0xDB, 5, mem(r11));
                 a.x87_mem(0xDB, 5, mem(r10));
                 a.x87_raw(0xDF, 0xF1);  // fcomip st, st(1)
@@ -1797,7 +1797,7 @@ private:
         return true;
     }
 
-    // ROL/ROR by an immediate (register destination): the interpreter materialises the flags and sets CF and OF in
+    // ROL/ROR by an immediate (register destination): the interpreter materializes the flags and sets CF and OF in
     // them; a count of zero changes nothing.
     bool rotate(unsigned i, const Insn& in) {
         if (in.dst.kind != OpndKind::Reg || in.src.kind != OpndKind::Imm) return false;
@@ -1808,7 +1808,7 @@ private:
             return true;
         }
         a.mov(8, kArg0, kSt);
-        a.call_abs(reinterpret_cast<const void*>(&h_materialise));
+        a.call_abs(reinterpret_cast<const void*>(&h_materialize));
         load_greg(rax, in.dst.reg, size);
         a.shift_imm(size, in.op == Op::Rol ? 0 : 1, rax, static_cast<u8>(n));  // the host rotates modulo the size
         a.mov(size, greg(in.dst.reg, size), rax);
@@ -2030,7 +2030,7 @@ private:
             case K::Comi: {
                 // No NaN or denormal (checked above): the compare raises no MXCSR exception and its ZF, PF and CF are
                 // the architecture's; OF, SF and AF are cleared. It defines all six arithmetic flags, so the lazy record
-                // is simply replaced (no materialising).
+                // is simply replaced (no materializing).
                 a.sse_rr(0, op, 0, 1);
                 a.byte(0x9C);  // pushfq
                 a.pop(rax);
@@ -2762,7 +2762,7 @@ private:
         finish(i, true);
         return true;
     }
-    // LAHF: AH = the flags' low byte, computed as the interpreter computes it (no materialising).
+    // LAHF: AH = the flags' low byte, computed as the interpreter computes it (no materializing).
     bool lahf(unsigned i) {
         a.mov(8, kArg0, kSt);
         a.call_abs(reinterpret_cast<const void*>(&h_eflags));

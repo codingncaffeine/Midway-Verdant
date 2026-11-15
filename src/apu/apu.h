@@ -25,7 +25,7 @@
 // scratch and FIFO address spaces are concatenations of 4 KiB RAM pages named by scatter-gather tables the kernel
 // builds in RAM; a FIFO is a ring inside the FIFO space described by base/end/current registers.
 // Written from the xboxdevwiki APU and DSP pages, the DSP56300 family manual and traces of the kernel's register
-// programming; register offsets per the public register listing of the reference emulator (behaviour, no code).
+// programming; register offsets per the public register listing of the reference emulator (behavior, no code).
 namespace mv {
 
 class Apu : public PciDevice, public MmioHandler, public apu::SetupEngineHost {
@@ -64,7 +64,7 @@ public:
     // The EP works in 256-sample frames: its start-of-frame flag rises when the count is a multiple of eight frames,
     // and it then writes 256 stereo samples to FIFO 0 (the AC'97 rate); the GP's rings in scratch hold sixteen
     // frames, two of the EP's (xboxdevwiki APU). Like the GP it is resumed from halt every frame: a title's EP halts
-    // inside its initialisation and finishes it on the next frame, then polls the flag; resumed only every eighth
+    // inside its initialization and finishes it on the next frame, then polls the flag; resumed only every eighth
     // frame its first block would land after the AC'97, started with an 8 ms lead, had already passed it [inferred].
     static constexpr u32 kEpFrameDivider = 8;
 

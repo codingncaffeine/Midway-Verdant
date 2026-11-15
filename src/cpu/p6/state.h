@@ -151,14 +151,14 @@ struct CpuState {
         else set_reg8(r, static_cast<u8>(v));
     }
 
-    // The flags with the lazy bits materialised.
+    // The flags with the lazy bits materialized.
     u32 eflags() const;
     void set_eflags(u32 v) {
         lazy_op = LazyOp::None;
         flags = (v & ~fl::kAlways) | fl::kAlways;
     }
     bool flag(u32 bit) const { return (eflags() & bit) != 0; }
-    void materialise() {
+    void materialize() {
         if (lazy_op != LazyOp::None) set_eflags(eflags());
     }
     // Set the arithmetic flags from the last operation.

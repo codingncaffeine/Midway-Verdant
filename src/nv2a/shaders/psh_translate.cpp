@@ -19,7 +19,7 @@ bool depth_format(u32 color_format) {
     }
 }
 
-// The texture stage modes (SET_SHADER_STAGE_PROGRAM, five bits per stage). Their behaviour is the NV20 texture
+// The texture stage modes (SET_SHADER_STAGE_PROGRAM, five bits per stage). Their behavior is the NV20 texture
 // shader's, as the public NV_texture_shader specification describes it (each mode below names its operation there),
 // and the Direct3D 8 ps.1.x texture instruction it implements.
 enum : u32 {
@@ -72,13 +72,13 @@ u32 source_stage(const Key& key, u32 stage) {
     return 0;
 }
 
-// The source's colour as GLSL: a stage that is not earlier than this one has no result yet, so it reads zero.
+// The source's color as GLSL: a stage that is not earlier than this one has no result yet, so it reads zero.
 std::string source_name(const Key& key, u32 stage) {
     const u32 src = source_stage(key, stage);
     return src < stage ? std::format("t{}", src) : std::string("vec4(0.0)");
 }
 
-// This stage's dot product: its (s, t, r) with the source's colour as SET_DOT_RGBMAPPING maps it (bits 2-0 for
+// This stage's dot product: its (s, t, r) with the source's color as SET_DOT_RGBMAPPING maps it (bits 2-0 for
 // stage 1, 6-4 for stage 2, 10-8 for stage 3).
 std::string dot_expr(const Key& key, u32 stage) {
     const u32 mapping = stage == 0 ? 0 : (key.dot_mapping >> (4 * (stage - 1))) & 7u;
@@ -86,12 +86,12 @@ std::string dot_expr(const Key& key, u32 stage) {
 }
 
 // The dot mappings, written from the mapping names in the public register headers (zero to one; minus one to one in
-// the Microsoft, OpenGL and NVIDIA conventions; HILO; HILO hemisphere in the same three conventions). The colour
+// the Microsoft, OpenGL and NVIDIA conventions; HILO; HILO hemisphere in the same three conventions). The color
 // arrives as unsigned 0..1 channels in our R G B A order (the guest's ARGB names), so a signed byte is the channel's
 // byte read as two's complement. HILO takes the texel's 32 bits as two 16-bit halves, A R high and G B low; the
 // hemisphere forms add z = sqrt(1 - hi^2 - lo^2) as NV_texture_shader's signed HILO does. The reference emulator
 // passes mappings 5-7 through unchanged; ours follow the NV form, unconfirmed on hardware [verify]. The NVIDIA signed
-// 8-bit convention is byte / 127 here, as both behaviour references read it; NVIDIA's own table (NV_texture_shader,
+// 8-bit convention is byte / 127 here, as both behavior references read it; NVIDIA's own table (NV_texture_shader,
 // signed fixed point) has 127 -> 0.992, which would be byte / 128 [verify].
 constexpr const char* kDotMapFunctions =
     "float psh_s8(float x) {\n"
@@ -271,7 +271,7 @@ Key key_from_state(const KelvinState& s) {
     k.clip_plane_mode = s.reg(mthd::kShaderClipPlaneMode) & 0xFFFFu;
     k.dot_mapping = s.reg(mthd::kDotRgbMapping) & 0x777u;
     k.shadow_compare_func = s.reg(kShadowCompareFunc) & 7u;
-    // MV_RENDER_DEBUG=noshadow: every shadow-map comparison passes (the control for a shadow-map artefact).
+    // MV_RENDER_DEBUG=noshadow: every shadow-map comparison passes (the control for a shadow-map artifact).
     static const bool no_shadow = [] {
         const char* d = std::getenv("MV_RENDER_DEBUG");
         return d && std::string_view(d).find("noshadow") != std::string_view::npos;
@@ -439,7 +439,7 @@ Translation translate(const Key& key) {
                 else g += std::format("    t{0} = textureProj(tex{0}, vec3(vtx_t{0}.xy * tex_scale[{0}].xy, vtx_t{0}.w));\n", i);
                 break;
             case kModePassThrough:
-                // The texture coordinates become the colour, each clamped to [0, 1] (NV_texture_shader PASS_THROUGH;
+                // The texture coordinates become the color, each clamped to [0, 1] (NV_texture_shader PASS_THROUGH;
                 // D3D's texcoord clamps the same way).
                 g += std::format("    t{0} = clamp(vtx_t{0}, vec4(0.0), vec4(1.0));\n", i);
                 break;
@@ -485,7 +485,7 @@ Translation translate(const Key& key) {
                 // reference emulator leaves it: a documented placeholder [verify].
                 break;
             case kModeDotProduct:
-                // A dot product alone: its result feeds the stages after it and its colour is (0, 0, 0, 0)
+                // A dot product alone: its result feeds the stages after it and its color is (0, 0, 0, 0)
                 // (NV_texture_shader DOT_PRODUCT; D3D's texm3x2pad / texm3x3pad results are not readable).
                 break;
             case kModeDotST:
@@ -495,7 +495,7 @@ Translation translate(const Key& key) {
             case kModeDotZW:
                 // The fragment's depth becomes the previous stage's dot over this stage's one, in the [0, 1] window
                 // range; a depth outside it rejects the fragment (NV_texture_shader DOT_PRODUCT_DEPTH_REPLACE; D3D's
-                // texm3x2depth text instead clamps it and makes a zero divisor 1.0 [verify]). The colour is zero.
+                // texm3x2depth text instead clamps it and makes a zero divisor 1.0 [verify]). The color is zero.
                 g += std::format(
                     "    {{\n"
                     "        float depth = dot{0} / dot{1};\n"
@@ -537,7 +537,7 @@ Translation translate(const Key& key) {
                 break;
             case kModeDependentAR:
             case kModeDependentGB:
-                // The source's colour is the coordinate: (alpha, red) for texreg2ar, (green, blue) for texreg2gb, in
+                // The source's color is the coordinate: (alpha, red) for texreg2ar, (green, blue) for texreg2gb, in
                 // the guest's ARGB channel names, which our channels carry.
                 if (kind != SamplerKind::None) {
                     const std::string src = source_name(key, i);
@@ -550,8 +550,8 @@ Translation translate(const Key& key) {
                 break;
         }
     }
-    // MV_RENDER_DEBUG=white:N / grey:N (a bit per stage, 1-15): those stages' results replaced by white (mid grey),
-    // to find which stage carries an artefact.
+    // MV_RENDER_DEBUG=white:N / gray:N (a bit per stage, 1-15): those stages' results replaced by white (mid gray),
+    // to find which stage carries an artifact.
     {
         const auto mask = [](std::string_view name) {
             const char* d = std::getenv("MV_RENDER_DEBUG");
@@ -559,12 +559,12 @@ Translation translate(const Key& key) {
             const auto at = v.find(name);
             return at == std::string_view::npos ? 0u : static_cast<u32>(std::strtoul(v.data() + at + name.size(), nullptr, 10));
         };
-        static const u32 white = mask("white:"), grey = mask("grey:");
+        static const u32 white = mask("white:"), gray = mask("gray:") | mask("grey:");  // the older spelling still works
         for (u32 i = 0; i < 4; ++i) {
             if (white & (1u << i)) g += std::format("    t{} = vec4(1.0);\n", i);
-            else if (grey & (1u << i)) g += std::format("    t{} = vec4(0.5);\n", i);
+            else if (gray & (1u << i)) g += std::format("    t{} = vec4(0.5);\n", i);
         }
-        // showa:N / showc:N (a stage 0-3): the output is that stage's sampled alpha (colour), opaque.
+        // showa:N / showc:N (a stage 0-3): the output is that stage's sampled alpha (color), opaque.
         const auto stage = [](std::string_view name) {
             const char* d = std::getenv("MV_RENDER_DEBUG");
             const std::string_view v = d ? d : "";
@@ -656,7 +656,7 @@ Translation translate(const Key& key) {
         g += "    { vec4 s = round(frag_color * 255.0); frag_color = vec4(greaterThanEqual(s, vec4(128.0))) * (256.0 - s) / 255.0; }\n";
     if (key.swap_rb) g += "    frag_color = frag_color.bgra;\n";  // a B8 or G8B8 target: its first channel is blue
     // The exact path (key.exact_depth: depth writes, occlusion-counted draws, EQUAL tests): the depth the console
-    // writes, modelled on the reference emulator: the screen-space z plus the polygon offset (bias + factor x slope, in
+    // writes, modeled on the reference emulator: the screen-space z plus the polygon offset (bias + factor x slope, in
     // depth units), culled outside the clip range or clamped to it (SET_ZMIN_MAX_CONTROL), then put on the buffer's
     // integer step. The reference truncates; a racing title's shadow map then put a whole sunlit patch of road in
     // shadow (its compare one step off), and rounding to the nearest step keeps it lit and clean, so we round. A 24-bit

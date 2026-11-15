@@ -117,7 +117,7 @@ Nv2aStub::Nv2aStub(Bus& bus, Scheduler& sched, std::function<void(bool)> irq)
         schedule_alarm();
     };
     schedule_vblank();
-    for (u32 i = 0; i < 768; ++i) dac_[i] = static_cast<u8>(i / 3);  // the colour table powers up as the identity
+    for (u32 i = 0; i < 768; ++i) dac_[i] = static_cast<u8>(i / 3);  // the color table powers up as the identity
     kelvin_.set_vertex_memory(this, {bus_.ram(), static_cast<u32>(bus_.ram_size())});
     twod_ = std::make_unique<pgraph::TwoD>(bus_.ram(), bus_.ram_size(), *this);
     twod_->set_hooks([this](u32 phys, u32 len) { if (renderer_) renderer_->write_back_range(phys, len); },
@@ -627,7 +627,7 @@ void Nv2aStub::execute_method(const PushbufferMethod& m) {
                 pending_draws_.push_back({ticket, passes, bytes, marks_pushed_, (kelvin_.state().reg(kMethodZpassEnable) & 1u) != 0});
             if (debug_zpass() && (kelvin_.state().reg(kMethodZpassEnable) & 1u)) {
                 const auto& st = kelvin_.state();
-                std::fprintf(stderr, "zpass: counted draw ticket %llu (before %llu): primitive %u, %llu vertices, depth test %u func %04x write %u, stencil %u, colour mask %08x, cull %u face %04x, program mode %u, clip %08x %08x, zmin/max control %08x\n",
+                std::fprintf(stderr, "zpass: counted draw ticket %llu (before %llu): primitive %u, %llu vertices, depth test %u func %04x write %u, stencil %u, color mask %08x, cull %u face %04x, program mode %u, clip %08x %08x, zmin/max control %08x\n",
                              static_cast<unsigned long long>(ticket), static_cast<unsigned long long>(ticket_before), debug_primitive,
                              static_cast<unsigned long long>(debug_vertices), st.depth_test() ? 1u : 0u, st.reg(pgraph::mthd::kDepthFunc), st.depth_write() ? 1u : 0u,
                              st.stencil_test() ? 1u : 0u, st.color_mask(), st.cull_face() ? 1u : 0u, st.reg(pgraph::mthd::kCullFace), st.transform_mode(),
@@ -661,7 +661,7 @@ void Nv2aStub::execute_method(const PushbufferMethod& m) {
         const auto own = copies ? own_renderer() : std::unique_lock<std::mutex>{};
         twod_->method(bound_[m.subchannel], m.method, m.value);
     }
-    // The synchronisation methods every class shares, and Kelvin's semaphore: these are what the CPU waits on,
+    // The synchronization methods every class shares, and Kelvin's semaphore: these are what the CPU waits on,
     // so they are executed here while every drawing method is only logged (the real engine arrives in Phase 4).
     SyncState& s = sync_[m.subchannel];
     switch (m.method) {

@@ -19,9 +19,9 @@ struct Key {
     u32 shader_stage_program{0};
     u32 other_stage_input{0};
     u32 clip_plane_mode{0};  // SET_SHADER_CLIP_PLANE_MODE: four bits per stage, one per component
-    u32 dot_mapping{0};      // SET_DOT_RGBMAPPING: how stages 1-3 read their source's colour for a dot product
+    u32 dot_mapping{0};      // SET_DOT_RGBMAPPING: how stages 1-3 read their source's color for a dot product
     u32 shadow_compare_func{0};
-    std::array<u32, 4> texture_format{};  // only the fields that shape the shader (dimensionality, cube, colour)
+    std::array<u32, 4> texture_format{};  // only the fields that shape the shader (dimensionality, cube, color)
     u32 alpha_func{0x207};
     // 1: the shader writes the console's depth itself (exact steps, the clip range and the polygon offset): the renderer
     // asks it for depth writes, occlusion-counted draws and EQUAL tests; draws that only test keep the host's depth and

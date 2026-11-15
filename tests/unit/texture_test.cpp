@@ -173,7 +173,7 @@ TEST(Texture, DecodesLinearFormatsWithPitchAndPalettes) {
 }
 
 TEST(Texture, DecodesDxt1BlocksAndCubeFaces) {
-    // One DXT1 block: colour 0 = red (0xF800), colour 1 = blue (0x001F); indices 0,1,2,3 on the first row.
+    // One DXT1 block: color 0 = red (0xF800), color 1 = blue (0x001F); indices 0,1,2,3 on the first row.
     u8 block[8] = {0x00, 0xF8, 0x1F, 0x00, 0xE4, 0x00, 0x00, 0x00};  // 0xE4 = 11 10 01 00
     u8 out[4 * 4 * 4];
     decode_dxt1(block, 4, 4, out);
@@ -202,7 +202,7 @@ TEST(Texture, DecodesDxt1BlocksAndCubeFaces) {
 
 TEST(Texture, DecodesLinearYuvPairsWithTheirOwnChroma) {
     // 4x2 linear YUV, pitch 16: each pair of pixels shares one U and V. Pair 0 is BT.601 red (U 90, V 240) with lumas
-    // 82 and 235; pair 1 is grey (U = V = 128) with lumas 16 (black) and 235 (white).
+    // 82 and 235; pair 1 is gray (U = V = 128) with lumas 16 (black) and 235 (white).
     std::vector<u8> ram(4096, 0);
     const u8 yuy2[8] = {82, 90, 235, 240, 16, 128, 235, 128};    // Y0 U Y1 V
     const u8 uyvy[8] = {90, 82, 240, 235, 128, 16, 128, 235};    // U Y0 V Y1
@@ -262,10 +262,10 @@ TEST(Texture, A8IsWhiteWithAlpha) {
 
 TEST(Texture, DecodesCompressedVolumesWithTheSlicesBlocksTogether) {
     // An 8x4x2 DXT1 volume: two block positions, two slices. In memory each position's slices come together:
-    // (x0 z0) red, (x0 z1) green, (x1 z0) blue, (x1 z1) white, every texel index 0 (colour 0).
-    const u16 colours[4] = {0xF800, 0x07E0, 0x001F, 0xFFFF};
+    // (x0 z0) red, (x0 z1) green, (x1 z0) blue, (x1 z1) white, every texel index 0 (color 0).
+    const u16 colors[4] = {0xF800, 0x07E0, 0x001F, 0xFFFF};
     u8 blocks[4 * 8] = {};
-    for (u32 i = 0; i < 4; ++i) std::memcpy(&blocks[i * 8], &colours[i], 2);
+    for (u32 i = 0; i < 4; ++i) std::memcpy(&blocks[i * 8], &colors[i], 2);
     std::vector<u8> out(8 * 4 * 2 * 4);
     decode_dxt_volume(0x0C, blocks, 8, 4, 2, out.data());
     const auto texel = [&](u32 x, u32 y, u32 z) { return &out[((z * 4 + y) * 8 + x) * 4]; };

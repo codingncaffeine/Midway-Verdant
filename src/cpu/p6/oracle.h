@@ -23,7 +23,7 @@ public:
     bool init(Machine& machine, Cpu& cpu, std::string& error);
     void reset();
     // Run one instruction on the interpreter (with its writes buffered), replay it on the hypervisor, compare,
-    // apply the memory writes and resynchronise on a divergence. False when the oracle itself failed.
+    // apply the memory writes and resynchronize on a divergence. False when the oracle itself failed.
     bool step(Cpu& cpu);
     std::string last_error() const { return error_; }
     std::string summary() const;

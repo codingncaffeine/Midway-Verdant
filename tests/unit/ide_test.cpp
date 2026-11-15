@@ -234,7 +234,7 @@ TEST(Ide, AtapiErrorWhileDmaIsArmedSetsTheBusMasterInterruptBit) {
 }
 
 TEST(Ide, AtapiModeSense10ReturnsTheSecurityPageWithoutMedia) {
-    // The kernel's DVD initialisation reads mode page 0x3E (28 bytes: an 8-byte header and the 20-byte page) over
+    // The kernel's DVD initialization reads mode page 0x3E (28 bytes: an 8-byte header and the 20-byte page) over
     // DMA before any disc is involved, and rejects the drive unless the page's byte 3 reads 1.
     DvdRig r;
     r.packet({0x5A, 0x00, 0x3E, 0, 0, 0, 0, 0x00, 0x1C, 0, 0, 0}, true, 0);
@@ -284,7 +284,7 @@ std::filesystem::path make_disc(const char* name, u64 partition, u64 total, bool
 }
 }  // namespace
 
-TEST(DvdImage, RecognisesAnXisoAFullDumpAndRefusesOtherFiles) {
+TEST(DvdImage, RecognizesAnXisoAFullDumpAndRefusesOtherFiles) {
     std::filesystem::path xiso, full, plain;
     {  // the images close at the end of this block: Windows refuses to delete an open file
     std::string error;

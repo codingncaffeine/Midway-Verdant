@@ -32,8 +32,8 @@ u64 clear_clocks(const pgraph::KelvinState& state);
 inline constexpr u64 kTexturesPerPass = 2, kCombinerStagesPerPass = 2;
 u64 pixel_passes(const pgraph::KelvinState& state);
 // Stage C, memory: 6.4 GB/s (128-bit DDR at 200 MHz) at 233.33 MHz is 192/7 bytes a GPU clock, shared by everything.
-// A pixel's traffic: its colour written (and read to blend), its depth read to test and written, and a texel per
-// texture after the texture cache (one byte per texel [estimate]; Z compression not modelled yet). A pixel costs the
+// A pixel's traffic: its color written (and read to blend), its depth read to test and written, and a texel per
+// texture after the texture cache (one byte per texel [estimate]; Z compression not modeled yet). A pixel costs the
 // longer of its pipeline time and its memory time.
 inline constexpr u64 kBusBytesNum = 192, kBusBytesDen = 7;  // bytes per GPU clock
 inline constexpr u64 kTexelBytes = 1;                        // [estimate]

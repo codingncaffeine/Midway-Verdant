@@ -1,4 +1,4 @@
-// The video overlay: YUV 4:2:2 to RGB (BT.601 video range), placement, scaling and the colour key.
+// The video overlay: YUV 4:2:2 to RGB (BT.601 video range), placement, scaling and the color key.
 #include <gtest/gtest.h>
 
 #include <algorithm>
@@ -38,7 +38,7 @@ TEST(Overlay, ConvertsPlacesScalesAndKeys) {
     EXPECT_EQ(frame[2 * 16 + 6], 0x000000u);  // black
     EXPECT_EQ(frame[3 * 16 + 6], 0x123456u) << "below the rectangle: untouched";
 
-    // With the colour key only pixels of the key colour are replaced.
+    // With the color key only pixels of the key color are replaced.
     std::vector<u32> keyed(16 * 4, 0x123456u);
     keyed[1 * 16 + 3] = 0x00FF00u;
     ov.color_key = true;
@@ -48,7 +48,7 @@ TEST(Overlay, ConvertsPlacesScalesAndKeys) {
     EXPECT_EQ(keyed[1 * 16 + 3], 0xFFFFFFu);
 }
 
-TEST(Ramdac, TheColourTableIsWrittenThroughTheDacPortsAndAppliedPerChannel) {
+TEST(Ramdac, TheColorTableIsWrittenThroughTheDacPortsAndAppliedPerChannel) {
     Bus bus(4096);
     Scheduler sched;
     Nv2aStub gpu(bus, sched, nullptr);

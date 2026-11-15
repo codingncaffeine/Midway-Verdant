@@ -82,11 +82,11 @@ constexpr u32 kUniformBytes = (kConstantSlots + 2 + kFixedFunctionVectors) * 16;
 
 // The fixed-function vertex pipeline (execution mode 0) as GLSL with the same interface as a translated program:
 // skinning through the model-view matrices (XF slots 8+8i, inverses 12+8i), the normal into eye space, the lights
-// of SET_LIGHT_ENABLE_MASK (infinite, local, spot) with the colour sources of SET_COLOR_MATERIAL, specular per
+// of SET_LIGHT_ENABLE_MASK (infinite, local, spot) with the color sources of SET_COLOR_MATERIAL, specular per
 // SET_LIGHT_CONTROL and SET_SPECULAR_ENABLE, texgen per coordinate and the texture matrices (XF 0x44+8i), the fog
 // coordinate per SET_FOG_GEN_MODE, and the position through the composite matrix (XF 0-3, viewport scale
 // included) then the viewport offset (XF 0x3B), as the XDK's own program epilogue leaves it. The light data are
-// uniforms (fixed_function_uniforms). Behaviour per the method definitions and the reference emulator's
+// uniforms (fixed_function_uniforms). Behavior per the method definitions and the reference emulator's
 // generator (read, not copied); [verify] marks what neither settles.
 Translation fixed_function_translate(const KelvinState& state, const Options& options);
 // The state words the generated shader depends on (for caching): two states with equal keys get the same GLSL.

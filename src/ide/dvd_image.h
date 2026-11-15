@@ -15,7 +15,7 @@ namespace mv {
 
 // A game disc image on the host, read in 2048-byte sectors of the disc's Xbox (game) partition: an XISO holds that
 // partition alone; a full dump (the Redump layout) holds the video partition first and the game partition at byte
-// 0x18300000. Either is recognised by the XDVDFS volume descriptor ("MICROSOFT*XBOX*MEDIA") in sector 32 of the
+// 0x18300000. Either is recognized by the XDVDFS volume descriptor ("MICROSOFT*XBOX*MEDIA") in sector 32 of the
 // partition. Read-only.
 //
 // A split image (cut under 4 GiB for FAT32 drives: NAME.1.iso, NAME.2.iso, ...) is read as one: opening NAME.1.iso takes

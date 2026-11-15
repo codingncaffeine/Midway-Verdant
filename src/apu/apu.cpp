@@ -193,7 +193,7 @@ u32 Apu::read_word(u32 offset) {
     if (offset == kXgsCnt) return xgscnt_;
     if (offset < kVpBlock) return regs_[offset / 4];
     if (offset < kGpBlock) {
-        if (offset - kVpBlock == kVpFree) return 0x80;  // the queue is always drained at this level of modelling
+        if (offset - kVpBlock == kVpFree) return 0x80;  // the queue is always drained at this level of modeling
         return regs_[offset / 4];
     }
     if (offset >= kGpBlock && offset < kGpBlock + kBlockSize) {

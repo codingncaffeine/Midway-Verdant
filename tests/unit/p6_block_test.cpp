@@ -772,7 +772,7 @@ TEST(P6Block, ScheduleCountsDependencies) {
 
 // Directed x87 cases where each result is observable at once (C1 right after the instruction that sets or clears
 // it, a stack fault, NaN and denormal operands, compares): the step against the recompiler under several control
-// words. Singles at [EBX]: +0 1/3, +4 3.0, +8 1.0, +12 a denormal, +16 a quiet NaN, +20 a signalling NaN, +24 1e38.
+// words. Singles at [EBX]: +0 1/3, +4 3.0, +8 1.0, +12 a denormal, +16 a quiet NaN, +20 a signaling NaN, +24 1e38.
 TEST(P6Block, X87FormsMatchTheInterpreter) {
     // Without an 80-bit long double (MSVC) the interpreter's x87 is an approximation, and native x87 is off.
     if (!kHostX87) GTEST_SKIP() << "no 80-bit x87 type on this compiler";

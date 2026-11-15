@@ -13,7 +13,7 @@ class Machine;
 
 // A CPU backend runs the guest's instruction stream against the machine: the hardware-virtualized fast mode
 // (KVM, WHPX) or the cycle-counted interpreter. The machine owns the bus, the devices, the scheduler and the
-// lock that serialises device access; a backend calls back into it on every exit and takes interrupts from it.
+// lock that serializes device access; a backend calls back into it on every exit and takes interrupts from it.
 class CpuBackend {
 public:
     enum class Stop { None, Requested, TripleFault, InternalError };
@@ -47,7 +47,7 @@ public:
 
     // A backend that owns the timeline has the machine advance the scheduler to its clock instead of the host's:
     // the interpreter's cycle count, or the fast mode's guest clock (the work its virtual CPU did, D16). The fast
-    // mode with MV_GUEST_CLOCK=wall leaves the timeline to the host clock (the old behaviour, kept as a control).
+    // mode with MV_GUEST_CLOCK=wall leaves the timeline to the host clock (the old behavior, kept as a control).
     virtual bool owns_timeline() const { return false; }
     virtual Cycles timeline_cycles() const { return 0; }
     // For a timeline on the host's time (the fast mode's guest clock): the most guest seconds it can advance in a

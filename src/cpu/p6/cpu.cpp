@@ -631,7 +631,7 @@ void Cpu::exec_shift(const Insn& in) {
             cf = (r & 1) != 0;
             of = ((r & msb) != 0) != cf;
             if (count != 1) st_.undefined_flags |= fl::OF;
-            st_.materialise();
+            st_.materialize();
             st_.flags = (st_.flags & ~(fl::CF | fl::OF)) | (cf ? fl::CF : 0) | (of ? fl::OF : 0);
             store_dst(*this, d, size, r);
             return;
@@ -641,7 +641,7 @@ void Cpu::exec_shift(const Insn& in) {
             cf = (r & msb) != 0;
             of = ((r & msb) != 0) != ((r & (msb >> 1)) != 0);
             if (count != 1) st_.undefined_flags |= fl::OF;
-            st_.materialise();
+            st_.materialize();
             st_.flags = (st_.flags & ~(fl::CF | fl::OF)) | (cf ? fl::CF : 0) | (of ? fl::OF : 0);
             store_dst(*this, d, size, r);
             return;
@@ -659,7 +659,7 @@ void Cpu::exec_shift(const Insn& in) {
             }
             of = ((r & msb) != 0) != cf;
             if (count != 1) st_.undefined_flags |= fl::OF;
-            st_.materialise();
+            st_.materialize();
             st_.flags = (st_.flags & ~(fl::CF | fl::OF)) | (cf ? fl::CF : 0) | (of ? fl::OF : 0);
             store_dst(*this, d, size, r);
             return;
@@ -677,7 +677,7 @@ void Cpu::exec_shift(const Insn& in) {
             }
             of = ((a & msb) != 0) != cf_in;
             if (count != 1) st_.undefined_flags |= fl::OF;
-            st_.materialise();
+            st_.materialize();
             st_.flags = (st_.flags & ~(fl::CF | fl::OF)) | (cf ? fl::CF : 0) | (of ? fl::OF : 0);
             store_dst(*this, d, size, r);
             return;
@@ -1255,23 +1255,23 @@ void Cpu::execute(const Insn& in) {
 
         case Op::Cli:
             if (st_.protected_mode() && st_.cpl() > st_.iopl()) raise_gp(0);
-            st_.materialise();
+            st_.materialize();
             st_.flags &= ~fl::IF;
             return;
         case Op::Sti: {
             if (st_.protected_mode() && st_.cpl() > st_.iopl()) raise_gp(0);
-            st_.materialise();
+            st_.materialize();
             if (!(st_.flags & fl::IF)) st_.inhibit_interrupts = true;
             st_.flags |= fl::IF;
             return;
         }
-        case Op::Cld: st_.materialise(); st_.flags &= ~fl::DF; return;
-        case Op::Std: st_.materialise(); st_.flags |= fl::DF; return;
-        case Op::Clc: st_.materialise(); st_.flags &= ~fl::CF; return;
-        case Op::Stc: st_.materialise(); st_.flags |= fl::CF; return;
-        case Op::Cmc: st_.materialise(); st_.flags ^= fl::CF; return;
+        case Op::Cld: st_.materialize(); st_.flags &= ~fl::DF; return;
+        case Op::Std: st_.materialize(); st_.flags |= fl::DF; return;
+        case Op::Clc: st_.materialize(); st_.flags &= ~fl::CF; return;
+        case Op::Stc: st_.materialize(); st_.flags |= fl::CF; return;
+        case Op::Cmc: st_.materialize(); st_.flags ^= fl::CF; return;
         case Op::Sahf: {
-            st_.materialise();
+            st_.materialize();
             const u32 ah = st_.reg8(kEax + 4);
             st_.flags = (st_.flags & ~(fl::SF | fl::ZF | fl::AF | fl::PF | fl::CF)) | (ah & (fl::SF | fl::ZF | fl::AF | fl::PF | fl::CF));
             return;
@@ -1385,14 +1385,14 @@ void Cpu::execute(const Insn& in) {
                 const u32 r = in.op == Op::Bts ? a | (1u << bitno) : in.op == Op::Btr ? a & ~(1u << bitno) : a ^ (1u << bitno);
                 store_dst(*this, d, size, r);
             }
-            st_.materialise();
+            st_.materialize();
             st_.flags = (st_.flags & ~fl::CF) | (cf ? fl::CF : 0);
             st_.undefined_flags |= fl::OF | fl::SF | fl::ZF | fl::AF | fl::PF;
             return;
         }
         case Op::Bsf: case Op::Bsr: {
             const u32 v = read_op(in, in.src, size) & mask;
-            st_.materialise();
+            st_.materialize();
             st_.undefined_flags |= fl::OF | fl::SF | fl::AF | fl::PF | fl::CF;
             if (v == 0) {
                 st_.flags |= fl::ZF;
@@ -1430,7 +1430,7 @@ void Cpu::execute(const Insn& in) {
             const u32 lin = linear(in.mem_seg, effective_address(in), 8, Access::Write);
             mem_.probe_write(lin, 8);
             const u32 lo = mem_.read(lin, 4), hi = mem_.read(lin + 4, 4);
-            st_.materialise();
+            st_.materialize();
             if (lo == st_.gpr[kEax] && hi == st_.gpr[kEdx]) {
                 mem_.write(lin, 4, st_.gpr[kEbx]);
                 mem_.write(lin + 4, 4, st_.gpr[kEcx]);

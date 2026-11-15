@@ -34,7 +34,7 @@ VkFormat color_vk_format(u32 nv_format) {
     }
 }
 
-// SET_COLOR_CLEAR_VALUE as the target's colour format reads it. The 16-bit formats take their fields from the low
+// SET_COLOR_CLEAR_VALUE as the target's color format reads it. The 16-bit formats take their fields from the low
 // half: R5G6B5's 5-6-5, X1R5G5B5's 5-5-5. The 32-bit ones take R G B from bits 23-0. The alpha follows the format's
 // name: the Z variants of the X formats write their unused bits as zero, the O variants as one, X1A7 keeps seven
 // bits of the value's alpha below that bit, and only A8R8G8B8 takes all eight. B8 and G8B8 are read as 8888.
@@ -161,7 +161,7 @@ VulkanRenderer::VulkanRenderer(vk::Device& device, const HandleResolver& handles
         debug_show_v0_ = s.find("showv0") != std::string::npos;
         debug_skip_blend_ = s.find("skipblend") != std::string::npos;
         // drawid: every draw paints its number (the renderer's draw count, logged with the draw: red = bits 0-7,
-        // green = 8-15, blue = 16-23) wherever it writes colour: a flat white shader blended by the constant colour.
+        // green = 8-15, blue = 16-23) wherever it writes color: a flat white shader blended by the constant color.
         debug_draw_id_ = s.find("drawid") != std::string::npos;
         debug_flip_front_ = s.find("flipfront") != std::string::npos;
         // wball: every dirty target reaches RAM at each vblank (the control for write-back timing).
@@ -428,7 +428,7 @@ void VulkanRenderer::begin_frame(u32 slot) {
     fr.dead_images.clear();
     fr.dead_views.clear();
     fr.dead_framebuffers.clear();
-    if (fr.used) f.vkResetFences(dev_.device(), fr.used, fr.fences.data());  // all signalled: the last covers the rest
+    if (fr.used) f.vkResetFences(dev_.device(), fr.used, fr.fences.data());  // all signaled: the last covers the rest
     fr.used = 0;
     f.vkResetDescriptorPool(dev_.device(), fr.pool, 0);
     descriptor_sets_used_ = 0;
@@ -437,7 +437,7 @@ void VulkanRenderer::begin_frame(u32 slot) {
     last_set_ = VK_NULL_HANDLE;                             // the pool was reset
     slot_ = slot;
     begin_commands();
-    // The frame's queries: what its last use counted is read first (its fence has signalled), then the pools reset.
+    // The frame's queries: what its last use counted is read first (its fence has signaled), then the pools reset.
     harvest(fr);
     f.vkCmdResetQueryPool(cb_, fr.occlusion, 0, kQueriesPerFrame);  // always: counting may be switched on mid-frame
     fr.queries = 0;
@@ -785,7 +785,7 @@ VulkanRenderer::Surface* VulkanRenderer::target_for(const KelvinState& s) {
         erase_surface(it);
     }
     if (debug_tex_log_)
-        std::fprintf(stderr, "texlog: target %08x %ux%u %s colour %u zeta %u pitch %u\n", phys, width, height, d.swizzled() ? "swizzled" : "linear", d.color_format(), d.zeta_format(), d.color_pitch());
+        std::fprintf(stderr, "texlog: target %08x %ux%u %s color %u zeta %u pitch %u\n", phys, width, height, d.swizzled() ? "swizzled" : "linear", d.color_format(), d.zeta_format(), d.color_pitch());
     auto surf = std::make_unique<Surface>();
     Surface& t = *surf;
     t.phys = phys;
@@ -821,14 +821,14 @@ VulkanRenderer::Surface* VulkanRenderer::target_for(const KelvinState& s) {
         dev_.destroy_image(t.color);
         return nullptr;
     }
-    // Images start in GENERAL and stay there; the colour image starts with what RAM holds (the guest may draw over
+    // Images start in GENERAL and stay there; the color image starts with what RAM holds (the guest may draw over
     // an existing picture). Both are recorded into the frame, ahead of the draws that follow.
     end_pass();
     fresh_image(t.color);
     fresh_image(t.depth);
-    // A target that another target's colour or depth covers starts from what that one rendered: written back first (the
-    // memory is the truth; a target over another's depth buffer loaded stale RAM once depth read as colour stayed on
-    // the GPU). A target whose colour it covers is finished with, as the reference emulator evicts the surfaces a new
+    // A target that another target's color or depth covers starts from what that one rendered: written back first (the
+    // memory is the truth; a target over another's depth buffer loaded stale RAM once depth read as color stayed on
+    // the GPU). A target whose color it covers is finished with, as the reference emulator evicts the surfaces a new
     // one overlaps: the boot animation's targets lingered into the games that reused their memory.
     {
         const u64 b0 = t.phys, b1 = static_cast<u64>(t.phys) + t.bytes();
@@ -863,12 +863,12 @@ VulkanRenderer::Surface* VulkanRenderer::target_for(const KelvinState& s) {
     return raw;
 }
 
-// The colour image takes what RAM holds: at the target's creation, and again before it is drawn into once another
+// The color image takes what RAM holds: at the target's creation, and again before it is drawn into once another
 // engine has rewritten its memory (one title resets a glare buffer each frame with a 2D blit, then draws into it
 // additively; drawing on over the GPU's stale copy saturated it to white).
 void VulkanRenderer::upload_color_from_ram(Surface& t) {
     complete_write_backs_over(t.phys, static_cast<u64>(t.phys) + t.bytes());  // RAM must hold a copy still in flight
-    if (debug_tex_log_) std::fprintf(stderr, "texlog: reload colour %08x %ux%u frame %llu\n", t.phys, t.width, t.height, static_cast<unsigned long long>(frame_index_));
+    if (debug_tex_log_) std::fprintf(stderr, "texlog: reload color %08x %ux%u frame %llu\n", t.phys, t.width, t.height, static_cast<unsigned long long>(frame_index_));
     ++t.draw_serial;
     const u32 bpp = t.color_bytes();
     std::vector<u8> pixels(static_cast<std::size_t>(t.width) * t.height * bpp, 0), keep;
@@ -937,7 +937,7 @@ bool VulkanRenderer::ensure_pass(Surface& t, bool writes_color) {
     if (sampled_since_barrier_) surface_barrier();  // draws that sampled a target finish before it is drawn into again
     t.last_rendered_frame = frame_index_;
     t.last_used_vblank = vblank_index_;
-    if (!t.color_ram_newer) t.ram_newer = false;  // a colour image still to reload is not what RAM holds
+    if (!t.color_ram_newer) t.ram_newer = false;  // a color image still to reload is not what RAM holds
     attachments_written_ = true;
     VkRenderPassBeginInfo rbi{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
     rbi.renderPass = t.pass;
@@ -948,14 +948,14 @@ bool VulkanRenderer::ensure_pass(Surface& t, bool writes_color) {
     pass_target_ = &t;
     pass_fb_ = fb;
     if (t.borrow) t.borrow->last_used_vblank = vblank_index_;
-    // Whether the pass writes colour or depth is the draw's or the clear's to say (the colour mask, the depth and stencil
+    // Whether the pass writes color or depth is the draw's or the clear's to say (the color mask, the depth and stencil
     // state, the clear bits), so a pass that never touches one never lands it in guest RAM.
     t.rendered_this_frame = true;
     return true;
 }
 
 // The depth buffer at the target's zeta address, in its depth image before a pass: on the hardware the depth buffer is
-// memory, shared by every colour target that binds it; here each target has a depth image, so the contents follow the
+// memory, shared by every color target that binds it; here each target has a depth image, so the contents follow the
 // address. The target that last drew with it owns them; another target binding it takes them (a GPU copy when the
 // shapes match, else through RAM), and a target whose image held another address hands that back to RAM first. Two
 // targets sharing one depth buffer each kept their own copy, and whichever reached RAM last won.
@@ -1027,7 +1027,7 @@ void VulkanRenderer::bind_depth(Surface& t, bool cleared) {
         t.zeta_dirty = owner->zeta_dirty;
         owner->zeta_dirty = false;
         owner->depth_holds = 0;
-        ++t.draw_serial;  // a depth-as-colour conversion of it is stale
+        ++t.draw_serial;  // a depth-as-color conversion of it is stale
         ++stats_.depth_handovers;
     } else {
         if (owner && owner != &t) {
@@ -1115,7 +1115,7 @@ void VulkanRenderer::swap_depth(Surface& s, Surface::ParkedDepth& p) {
     std::swap(s.zeta_dirty, p.zeta_dirty);
     std::swap(s.depth_holds, p.depth_holds);
     std::swap(s.holds_pitch, p.holds_pitch);
-    ++s.draw_serial;  // a depth-as-colour conversion was of the other image
+    ++s.draw_serial;  // a depth-as-color conversion was of the other image
     stage_cache_.fill({});  // a stage may point at an entry that moved
 }
 
@@ -1173,7 +1173,7 @@ bool VulkanRenderer::park_for(Surface& t, u32 z) {
     return false;
 }
 
-// A depth image of the target's shape and format, with a framebuffer pairing it with the colour image.
+// A depth image of the target's shape and format, with a framebuffer pairing it with the color image.
 bool VulkanRenderer::spare_depth(Surface& t, Surface::ParkedDepth& p) {
     std::string error;
     const VkFormat df = t.zeta_format == 1 ? VK_FORMAT_D16_UNORM : depth24_;
@@ -1559,7 +1559,7 @@ void VulkanRenderer::store_write_backs(const std::vector<PendingWriteBack>& list
             store_color(s, base + w.offset);
             if (drawn_since) s.dirty = true;
         }
-        auto& cost = stats_.store_cost[std::format("{} of {:08x} {}x{} x{} {} fmt {:x}", w.zeta ? "depth" : "colour", w.zeta ? s.zeta_phys : s.phys, s.width, s.height, s.sc, s.swizzled ? "swizzled" : "linear", w.zeta ? s.zeta_format : s.color_format)];
+        auto& cost = stats_.store_cost[std::format("{} of {:08x} {}x{} x{} {} fmt {:x}", w.zeta ? "depth" : "color", w.zeta ? s.zeta_phys : s.phys, s.width, s.height, s.sc, s.swizzled ? "swizzled" : "linear", w.zeta ? s.zeta_format : s.color_format)];
         ++cost.first;
         cost.second += static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
     }
@@ -2339,7 +2339,7 @@ VkShaderModule VulkanRenderer::fragment_shader(const psh::Key& key, std::array<p
     }
     if (debug_flat_) t.glsl = "#version 450\nlayout(location = 0) out vec4 frag_color;\nvoid main() { frag_color = vec4(1.0); }\n";
     if (debug_show_v0_) {
-        // The interpolated diffuse colour in place of the combiners' result (the last statement of main).
+        // The interpolated diffuse color in place of the combiners' result (the last statement of main).
         if (const auto end = t.glsl.rfind('}'); end != std::string::npos) t.glsl.insert(end, "    frag_color = vec4(clamp(vtx_d0.rgb, 0.0, 1.0), 1.0);\n");
     }
     std::string log;
@@ -2570,7 +2570,7 @@ u64 VulkanRenderer::texture_content(u32 phys, u32 length, u32 palette_phys) cons
 
 // RAM is what the texture unit reads: an entry is stale once the CPU has rewritten its texels or its palette (a movie
 // frame decoded into the texture, glyphs drawn into a font page) since it was decoded. Write tracking is per page, and
-// a texture shares its pages with whatever the title keeps beside it (one title rewrote such neighbours several times
+// a texture shares its pages with whatever the title keeps beside it (one title rewrote such neighbors several times
 // a frame, and 70 % of its frame time went to decoding unchanged textures again), so a texture whose pages were
 // written is hashed before it is decoded again, and kept when its bytes are what they were.
 void VulkanRenderer::hash_pages(TextureEntry& e) const {
@@ -2624,7 +2624,7 @@ bool VulkanRenderer::overlaps_target(u32 phys, u32 length) {
         };
         for (const auto& [k, sp] : surfaces_) {
             const Surface& s = *sp;
-            target_ranges_.emplace_back(s.phys, static_cast<u64>(s.phys) + s.bytes());  // colour (a target at 0 too)
+            target_ranges_.emplace_back(s.phys, static_cast<u64>(s.phys) + s.bytes());  // color (a target at 0 too)
             add(s.zeta_phys, s.zeta_bytes());
             add(s.depth_holds, s.held_bytes());
             for (const Surface::ParkedDepth& p : s.parked) add(p.depth_holds, s.parked_bytes(p));
@@ -2664,7 +2664,7 @@ const VulkanRenderer::TextureEntry* VulkanRenderer::texture(const KelvinState& s
         }
         // Read through RAM from here: a copy in flight over it lands first (sampling in place above needs none).
         complete_write_backs_over(phys, static_cast<u64>(phys) + length);
-        // A render target the guest now samples: its pixels must be in RAM first — the colour image, or the depth
+        // A render target the guest now samples: its pixels must be in RAM first — the color image, or the depth
         // buffer when the texture is a shadow map.
         wb_why_ = Stats::kWbTexture;
         for (auto& [k, surf] : surfaces_) {
@@ -2678,7 +2678,7 @@ const VulkanRenderer::TextureEntry* VulkanRenderer::texture(const KelvinState& s
                                 " (" + sample_miss_ + ")"];
             };
             if (surf->dirty && a0 < static_cast<u64>(phys) + length && static_cast<u64>(phys) < a1) {
-                forced("colour");
+                forced("color");
                 queue_write_back(*surf);
             }
             const u64 z0 = surf->zeta_phys, z1 = static_cast<u64>(surf->zeta_phys) + surf->zeta_bytes();
@@ -2856,7 +2856,7 @@ VulkanRenderer::TextureEntry* VulkanRenderer::surface_texture(const TextureStage
     sample_miss_ = "texture format or shape not sampled in place";
     if (debug_roundtrip_ || ts.cubemap() || ts.dimensionality() != 2 || ts.mip_levels() > 1) return nullptr;
     const u32 fmt = ts.color_format();
-    // The colour formats whose texels are a target image's bytes: A8R8G8B8 and X8R8G8B8 (B8G8R8A8), R5G6B5, A1R5G5B5 and
+    // The color formats whose texels are a target image's bytes: A8R8G8B8 and X8R8G8B8 (B8G8R8A8), R5G6B5, A1R5G5B5 and
     // X1R5G5B5 (A1R5G5B5); the X formats read alpha as one. 16-bit targets went through RAM every time (Fable's 16-bit
     // picture, sampled each frame).
     VkFormat want = VK_FORMAT_UNDEFINED;
@@ -2880,7 +2880,7 @@ VulkanRenderer::TextureEntry* VulkanRenderer::surface_texture(const TextureStage
     for (auto& [k, sp] : surfaces_) {
         Surface& s = *sp;
         if (debug_tex_log_ && (s.phys == phys || s.zeta_phys == phys))
-            std::fprintf(stderr, "texlog: stage %08x fmt %02x %ux%u %s pitch %u vs target %08x/%08x %ux%u %s pitch %u/%u colour %u zeta %u dirty %d/%d aa %ux%u open %d\n", phys, fmt, w, h,
+            std::fprintf(stderr, "texlog: stage %08x fmt %02x %ux%u %s pitch %u vs target %08x/%08x %ux%u %s pitch %u/%u color %u zeta %u dirty %d/%d aa %ux%u open %d\n", phys, fmt, w, h,
                          linear ? "linear" : "swizzled", ts.pitch(), s.phys, s.zeta_phys, s.width, s.height, s.swizzled ? "swizzled" : "linear", s.pitch, s.zeta_pitch,
                          s.color_format, s.zeta_format, s.dirty ? 1 : 0, s.zeta_dirty ? 1 : 0, s.aa_x, s.aa_y, (pass_open_ && pass_target_ == &s) ? 1 : 0);
         // A rectangle of a pitch-linear region (a view drawn inside it, or a smaller shape at its base): a copy of that
@@ -2892,7 +2892,7 @@ VulkanRenderer::TextureEntry* VulkanRenderer::surface_texture(const TextureStage
             if (x0 + w <= s.width && y0 + h <= s.height) return subrect_texture(s, ts, phys, x0, y0, w, h, x8);
         }
         // The layout the target was last set up with does not matter: its image holds pixels, and the guest clears in
-        // pitch layout (one colour, the same either way) and draws in the layout it samples.
+        // pitch layout (one color, the same either way) and draws in the layout it samples.
         if (s.width != w || s.height != h) {
             if (color ? s.phys == phys : s.depth_holds == phys) sample_miss_ = "size differs";
             continue;
@@ -2900,18 +2900,18 @@ VulkanRenderer::TextureEntry* VulkanRenderer::surface_texture(const TextureStage
         if (!color && !s.parked.empty())
             if (TextureEntry* e = parked_texture(s, ts, phys, w, h, linear, depth16)) return e;
         const bool recent = !s.ram_newer && s.last_rendered_frame + 1 >= frame_index_;
-        // The depth buffer read as colour at its own address: converted on the GPU (Z24S8 on a device with D24S8).
+        // The depth buffer read as color at its own address: converted on the GPU (Z24S8 on a device with D24S8).
         if (want == VK_FORMAT_B8G8R8A8_UNORM && s.depth_holds == phys && s.phys != phys && s.zeta_format == 2 && depth24_ == VK_FORMAT_D24_UNORM_S8_UINT &&
             (s.zeta_dirty || recent) && linear == !s.swizzled && (!linear || ts.pitch() == (s.holds_pitch ? s.holds_pitch : s.zeta_pitch)))
             return zeta_color_texture(s, ts, phys, w, h, linear, x8, abgr);
         if (color) {
             if (s.phys != phys || !(s.dirty || recent)) continue;
             if (abgr) {
-                sample_miss_ = "a colour target read with red and blue swapped";
+                sample_miss_ = "a color target read with red and blue swapped";
                 continue;
             }
             if (color_vk_format(s.color_format) != want) {
-                sample_miss_ = "colour format differs";
+                sample_miss_ = "color format differs";
                 continue;
             }
             if (linear && ts.pitch() != s.pitch) {
@@ -3112,7 +3112,7 @@ VulkanRenderer::TextureEntry* VulkanRenderer::depth_snapshot_texture(Surface& s,
     return &e;
 }
 
-// The conversion's pieces, made the first time a draw reads a depth buffer as colour.
+// The conversion's pieces, made the first time a draw reads a depth buffer as color.
 bool VulkanRenderer::init_zeta_convert() {
     if (zc_pipeline_) return zc_in_.buffer || zc_buffers();  // the buffers go when the internal resolution changes
     if (zc_failed_) return false;
@@ -3216,7 +3216,7 @@ bool VulkanRenderer::zc_buffers(u32 texels) {
 
 // A draw reads a Z24S8 depth buffer as an A8R8G8B8 texture at the same address (a title masking its glare by
 // depth): the texels are the words RAM would hold, the depth in bits 31-8 above the stencil byte. They are made on
-// the GPU — depth and stencil copied into a buffer, packed by a compute pass, copied into a colour image — where
+// the GPU — depth and stencil copied into a buffer, packed by a compute pass, copied into a color image — where
 // before each read wrote the whole depth buffer back to RAM, waited for the GPU and decoded it again.
 VulkanRenderer::TextureEntry* VulkanRenderer::zeta_color_texture(Surface& s, const TextureStage& ts, u32 phys, u32 w, u32 h, bool linear, bool x8, bool abgr) {
     const u32 n = s.iw() * s.ih();  // the image's texels (the internal resolution's)
@@ -3233,7 +3233,7 @@ VulkanRenderer::TextureEntry* VulkanRenderer::zeta_color_texture(Surface& s, con
         std::string error;
         if (!dev_.create_image(VK_FORMAT_B8G8R8A8_UNORM, s.iw(), s.ih(), 1, 1, 1, VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
                                VK_IMAGE_ASPECT_COLOR_BIT, false, s.zcolor, error)) {
-            note("depth-as-colour image: " + error);
+            note("depth-as-color image: " + error);
             return nullptr;
         }
         end_pass();
@@ -3389,7 +3389,7 @@ VulkanRenderer::TextureEntry* VulkanRenderer::subrect_texture(Surface& s, const 
 VulkanRenderer::TextureEntry* VulkanRenderer::cube_texture(const TextureStage& ts, u32 phys) {
     if (debug_roundtrip_ || !ts.cubemap() || ts.mip_levels() > 1 || ts.log_width() != ts.log_height()) return nullptr;
     const u32 fmt = ts.color_format();
-    // The swizzled colour formats whose texels are a target image's bytes: A8R8G8B8 / X8R8G8B8 (B8G8R8A8), R5G6B5, A1R5G5B5 /
+    // The swizzled color formats whose texels are a target image's bytes: A8R8G8B8 / X8R8G8B8 (B8G8R8A8), R5G6B5, A1R5G5B5 /
     // X1R5G5B5; the X formats read alpha as one. PGR2's reflections are six R5G6B5 faces, each written back every frame
     // while only 32-bit faces were put together here.
     VkFormat want = VK_FORMAT_UNDEFINED;
@@ -3625,7 +3625,7 @@ void VulkanRenderer::destroy_surface_views(Surface& s) {
 }
 
 // The border a clamp-to-border stage shows is its BORDER_COLOR (0x1B24, A8R8G8B8), as the hardware captures show; a
-// device without custom border colours takes the nearest built-in one (transparent black, opaque black or opaque white).
+// device without custom border colors takes the nearest built-in one (transparent black, opaque black or opaque white).
 VkSampler VulkanRenderer::sampler(const TextureStage& ts, u32 levels) {
     // Anisotropy for a linearly filtered minification: the stage's own (TEXCTL0 bits 5:4), raised to the option's minimum,
     // within the device's limit; its log2 rides in key bits 27:25 (unused by ADDRESS).
@@ -3635,12 +3635,12 @@ VkSampler VulkanRenderer::sampler(const TextureStage& ts, u32 levels) {
     aniso = std::min(aniso, std::max(1u, static_cast<u32>(dev_.limits().maxSamplerAnisotropy)));
     const u32 aniso_log = static_cast<u32>(std::bit_width(aniso) - 1);
     const u64 key = (static_cast<u64>(ts.filter) << 32) | ts.address | (static_cast<u64>(levels) << 28) | (static_cast<u64>(aniso_log & 7u) << 25);
-    // Colour textures only: a depth or 16-bit luminance texture (one channel, read through the depth path) keeps the opaque
-    // black border it always had; the register colour on it flooded a title's intro movie white (not yet checked against
+    // Color textures only: a depth or 16-bit luminance texture (one channel, read through the depth path) keeps the opaque
+    // black border it always had; the register color on it flooded a title's intro movie white (not yet checked against
     // a hardware capture of a depth texture's border).
     const FormatInfo fi = format_info(ts.color_format());
-    const bool colour_texture = !fi.depth && ts.color_format() != 0x32 && ts.color_format() != 0x35;
-    const bool border = colour_texture && (ts.wrap_u() == 4 || ts.wrap_v() == 4 || ts.wrap_p() == 4);
+    const bool color_texture = !fi.depth && ts.color_format() != 0x32 && ts.color_format() != 0x35;
+    const bool border = color_texture && (ts.wrap_u() == 4 || ts.wrap_v() == 4 || ts.wrap_p() == 4);
     if (!border) {
         if (auto it = samplers_.find(key); it != samplers_.end()) return it->second;
     } else if (auto it = border_samplers_.find({key, ts.border_color}); it != border_samplers_.end()) {
@@ -3680,10 +3680,10 @@ VkSampler VulkanRenderer::sampler(const TextureStage& ts, u32 levels) {
     }
     VkSampler sm = VK_NULL_HANDLE;
     fn_->vkCreateSampler(dev_.device(), &sci, nullptr, &sm);
-    // Instrument: MV_DEBUG_SAMPLERS=1 names every sampler that reads a border colour or filters anisotropically as it is made.
+    // Instrument: MV_DEBUG_SAMPLERS=1 names every sampler that reads a border color or filters anisotropically as it is made.
     static const bool log_samplers = [] { const char* e = std::getenv("MV_DEBUG_SAMPLERS"); return e && *e == '1'; }();
     if ((border || aniso > 1) && log_samplers)
-        std::fprintf(stderr, "sampler: border %s colour %08x anisotropy %u address %08x format %08x filter %08x\n", border ? "yes" : "no", ts.border_color, aniso, ts.address, ts.format, ts.filter);
+        std::fprintf(stderr, "sampler: border %s color %08x anisotropy %u address %08x format %08x filter %08x\n", border ? "yes" : "no", ts.border_color, aniso, ts.address, ts.format, ts.filter);
     if (border) border_samplers_[{key, ts.border_color}] = sm;
     else samplers_[key] = sm;
     return sm;
@@ -3772,7 +3772,7 @@ void VulkanRenderer::clear(const KelvinState& s, u32 bits) {
     ensure_pass(*t, (bits & 0xF0u) != 0);
     if (bits & 3u) {
         t->depth_target().zeta_dirty = true;
-        if (t->borrow) ++t->borrow->draw_serial;  // the lender's depth-as-colour conversion is stale
+        if (t->borrow) ++t->borrow->draw_serial;  // the lender's depth-as-color conversion is stale
     }
     if (bits & 0xF0u) {
         t->dirty = true;
@@ -3783,7 +3783,7 @@ void VulkanRenderer::clear(const KelvinState& s, u32 bits) {
     VkClearAttachment att[2]{};
     u32 n = 0;
     if (drawid_on())
-        std::fprintf(stderr, "drawid clear: surface %08x bits %02x colour %08x zstencil %08x rect %u,%u..%u,%u of %ux%u (registers %08x %08x)\n", t->phys, bits, s.clear_color(),
+        std::fprintf(stderr, "drawid clear: surface %08x bits %02x color %08x zstencil %08x rect %u,%u..%u,%u of %ux%u (registers %08x %08x)\n", t->phys, bits, s.clear_color(),
                      s.clear_zstencil(), x0, y0, x1, y1, t->width, t->height, rect_h, rect_v);
     float color[4];
     clear_color_rgba(t->color_format, s.clear_color(), color);
@@ -3836,7 +3836,7 @@ VkPipeline VulkanRenderer::clear_pipeline(VkRenderPass pass, VkColorComponentFla
     const u64 key = (reinterpret_cast<u64>(pass) << 4) ^ mask;
     if (auto it = clear_pipelines_.find(key); it != clear_pipelines_.end()) return it->second;
     if (!clear_vs_) {
-        // A triangle over the whole viewport, and a fragment of 1.0 that the blend scales by the clear colour.
+        // A triangle over the whole viewport, and a fragment of 1.0 that the blend scales by the clear color.
         const CompiledShader vs = compile_glsl(ShaderStage::Vertex,
                                                "#version 450\n"
                                                "void main() {\n"
@@ -3876,7 +3876,7 @@ VkPipeline VulkanRenderer::clear_pipeline(VkRenderPass pass, VkColorComponentFla
     VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
     ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
     VkPipelineDepthStencilStateCreateInfo ds{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
-    // The colour is the blend constant times one: exact in every unsigned normalised format.
+    // The color is the blend constant times one: exact in every unsigned normalized format.
     VkPipelineColorBlendAttachmentState cb{};
     cb.blendEnable = VK_TRUE;
     cb.srcColorBlendFactor = VK_BLEND_FACTOR_CONSTANT_COLOR;
@@ -3931,22 +3931,22 @@ void VulkanRenderer::draw(const KelvinState& s, const DrawBatch& batch) {
     if (drawid_on())
         std::fprintf(stderr,
                      "drawid %u: surface %08x, stages %05x, blend %u, %zu indices, %zu ranges, %zu inline words, %u immediate; program %u, depth test %u func %x write %u, "
-                     "colour mask %08x, stencil %u, clip %g..%g, zeta %08x format %08x control0 %08x\n",
+                     "color mask %08x, stencil %u, clip %g..%g, zeta %08x format %08x control0 %08x\n",
                      draw_id, s.surface().color_offset, s.reg(mthd::kShaderStageProgram), s.blend() ? 1u : 0u, batch.indices.size(), batch.ranges.size(),
                      batch.inline_words.size(), batch.immediate_count, s.vertex_program_mode() ? 1u : 0u, s.depth_test() ? 1u : 0u, s.reg(mthd::kDepthFunc),
                      s.depth_write() ? 1u : 0u, s.reg(mthd::kColorMask), s.stencil_test() ? 1u : 0u, static_cast<double>(std::bit_cast<float>(s.reg(mthd::kClipMin))),
                      static_cast<double>(std::bit_cast<float>(s.reg(mthd::kClipMax))), s.reg(mthd::kSurfaceZetaOffset), s.reg(mthd::kSurfaceFormat), s.reg(mthd::kControl0));
     if (debug_draw_id_ && (s.blend() || s.surface().color_offset >= 0x03f00000u))
-        std::fprintf(stderr, "drawid %u: blend sfactor %x dfactor %x equation %x colour %08x; texture 0 at %08x format %08x, alpha test %u, combiner control %08x\n", draw_id,
+        std::fprintf(stderr, "drawid %u: blend sfactor %x dfactor %x equation %x color %08x; texture 0 at %08x format %08x, alpha test %u, combiner control %08x\n", draw_id,
                      s.reg(mthd::kBlendSfactor), s.reg(mthd::kBlendDfactor), s.reg(mthd::kBlendEquation), s.reg(mthd::kBlendColor), texture_phys(s, s.texture(0)), s.texture(0).format,
                      s.alpha_test() ? 1u : 0u, s.reg(mthd::kCombinerControl));
     if (debug_draw_id_ && (s.surface().color_offset >= 0x03f00000u || s.reg(mthd::kShaderStageProgram) == 0x08421u))
         for (u32 st = 1; st < (s.reg(mthd::kCombinerControl) & 0xFFu); ++st)
-            std::fprintf(stderr, "drawid %u: combiner stage %u colour in %08x out %08x alpha in %08x out %08x factors %08x %08x\n", draw_id, st, s.reg(mthd::kCombinerColorIcw + 4 * st),
+            std::fprintf(stderr, "drawid %u: combiner stage %u color in %08x out %08x alpha in %08x out %08x factors %08x %08x\n", draw_id, st, s.reg(mthd::kCombinerColorIcw + 4 * st),
                          s.reg(mthd::kCombinerColorOcw + 4 * st), s.reg(mthd::kCombinerAlphaIcw + 4 * st), s.reg(mthd::kCombinerAlphaOcw + 4 * st), s.reg(mthd::kCombinerFactor0 + 4 * st),
                          s.reg(mthd::kCombinerFactor1 + 4 * st));
     if (debug_draw_id_ && (s.surface().color_offset >= 0x03f00000u || s.reg(mthd::kShaderStageProgram) == 0x08421u))
-        std::fprintf(stderr, "drawid %u: combiner stage 0 colour in %08x out %08x alpha in %08x out %08x factors %08x %08x; final %08x %08x; texture 0 rect %08x control0 %08x control1 %08x filter %08x address %08x\n",
+        std::fprintf(stderr, "drawid %u: combiner stage 0 color in %08x out %08x alpha in %08x out %08x factors %08x %08x; final %08x %08x; texture 0 rect %08x control0 %08x control1 %08x filter %08x address %08x\n",
                      draw_id, s.reg(mthd::kCombinerColorIcw), s.reg(mthd::kCombinerColorOcw), s.reg(mthd::kCombinerAlphaIcw), s.reg(mthd::kCombinerAlphaOcw),
                      s.reg(mthd::kCombinerFactor0), s.reg(mthd::kCombinerFactor1), s.reg(mthd::kCombinerSpecFogCw0), s.reg(mthd::kCombinerSpecFogCw1),
                      s.reg(mthd::kTextureBase + 0x18), s.reg(mthd::kTextureBase + 0x0C), s.reg(mthd::kTextureBase + 0x10), s.reg(mthd::kTextureBase + 0x14), s.reg(mthd::kTextureBase + 0x08));
@@ -4187,7 +4187,7 @@ void VulkanRenderer::draw(const KelvinState& s, const DrawBatch& batch) {
         u[kConstants * 4 + 0] = static_cast<float>(view_.w / t->aa_x);  // the logical size the program maps to (the view's)
         u[kConstants * 4 + 1] = static_cast<float>(view_.h / t->aa_y);
         u[kConstants * 4 + 2] = static_cast<float>(t->sc);  // image pixels per stored pixel: point sizes, the vertex snap
-        u[kConstants * 4 + 3] = (t->sc > 1 && t->aa_x == 1 && t->aa_y == 1) ? 1.0f : 0.0f;  // 2D edges on a pixel centre cover whole blocks
+        u[kConstants * 4 + 3] = (t->sc > 1 && t->aa_x == 1 && t->aa_y == 1) ? 1.0f : 0.0f;  // 2D edges on a pixel center cover whole blocks
         u[kConstants * 4 + 4] = 0.0f;
         u[kConstants * 4 + 5] = t->zeta_format == 1 ? 65535.0f : 16777215.0f;
         u[kConstants * 4 + 6] = 0.0f;
@@ -4286,7 +4286,7 @@ void VulkanRenderer::draw(const KelvinState& s, const DrawBatch& batch) {
     ensure_pass(*t, s.color_mask() != 0);
     if ((s.depth_test() && s.depth_write()) || s.stencil_test()) {
         t->depth_target().zeta_dirty = true;
-        if (t->borrow) ++t->borrow->draw_serial;  // the lender's depth-as-colour conversion is stale
+        if (t->borrow) ++t->borrow->draw_serial;  // the lender's depth-as-color conversion is stale
     }
     if (s.color_mask() != 0) {
         t->dirty = true;
@@ -4444,7 +4444,7 @@ bool VulkanRenderer::write_back_at(u32 phys) {
 void VulkanRenderer::end_frame() {
     frame_draws_ = 0;
     ++frame_index_;
-    // Colour reaches RAM every frame (the scanout and the CPU read it); depth only when a texture samples it.
+    // Color reaches RAM every frame (the scanout and the CPU read it); depth only when a texture samples it.
     wb_why_ = Stats::kWbFrameEnd;
     for (auto& [k, s] : surfaces_) queue_write_back(*s);
     if (write_backs_.empty()) submit();  // nothing to copy: the frame runs on without a wait
@@ -4549,8 +4549,8 @@ bool VulkanRenderer::ensure_zeta_lo(Surface& s) {
 }
 
 // The depth image down to its stored size. NEAREST (the only filter a depth blit has) takes the texel under each stored
-// pixel's centre, (x + 0.5) * sc: the middle of its sc x sc block, as the row read-back does (at an even sc the centre is
-// a texel edge and the device may take either neighbour; a block drawn at one depth, or loaded from RAM, is the same).
+// pixel's center, (x + 0.5) * sc: the middle of its sc x sc block, as the row read-back does (at an even sc the center is
+// a texel edge and the device may take either neighbor; a block drawn at one depth, or loaded from RAM, is the same).
 void VulkanRenderer::blit_zeta_lo(Surface& s) {
     end_pass();
     VkMemoryBarrier before{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
@@ -4653,7 +4653,7 @@ void VulkanRenderer::write_back_zeta_banded(Surface& s) {
 // the next vblank writes the target's other buffer, never the one the frontend holds.
 void VulkanRenderer::capture_display(Surface& s) {
     if (s.sc <= 1 || s.swizzled || s.color_ram_newer) {
-        if (debug_tex_log_) std::fprintf(stderr, "texlog: no capture of %08x: sc %u swizzled %d colour from RAM pending %d\n", s.phys, s.sc, s.swizzled ? 1 : 0, s.color_ram_newer ? 1 : 0);
+        if (debug_tex_log_) std::fprintf(stderr, "texlog: no capture of %08x: sc %u swizzled %d color from RAM pending %d\n", s.phys, s.sc, s.swizzled ? 1 : 0, s.color_ram_newer ? 1 : 0);
         return;
     }
     const bool convert = init_display_convert();
@@ -4673,7 +4673,7 @@ void VulkanRenderer::capture_display(Surface& s) {
         Capture* newest = nullptr;
         for (auto& e : captures_)
             if (e->phys == s.phys && (!newest || e->taken > newest->taken)) newest = e.get();
-        // A colour table that changed since (a fade) needs the picture again even when the target did not, and so does
+        // A color table that changed since (a fade) needs the picture again even when the target did not, and so does
         // a video overlay (its next frame).
         if (newest && newest->valid && newest->serial == s.draw_serial && newest->sc == s.sc && newest->width == s.width && newest->height == s.height &&
             newest->pitch == s.pitch && !(convert && display_lut_on_) && !(convert && display_ov_)) {
@@ -4723,7 +4723,7 @@ void VulkanRenderer::capture_display(Surface& s) {
         c->phys = s.phys;
         c->xrgb = convert;
     }
-    // The conversion's descriptor set and colour table were last used by the previous capture, which may still be on
+    // The conversion's descriptor set and color table were last used by the previous capture, which may still be on
     // its way.
     if (last_capture_ && last_capture_->submitted) fn_->vkWaitForFences(dev_.device(), 1, &last_capture_->fence, VK_TRUE, ~0ull);
     fn_->vkResetFences(dev_.device(), 1, &c->fence);
@@ -4737,7 +4737,7 @@ void VulkanRenderer::capture_display(Surface& s) {
     after.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
     bool overlaid = false;
     if (convert) {
-        // The colour table as 768 words (the identity when the RAMDAC has none), then the pass over the image.
+        // The color table as 768 words (the identity when the RAMDAC has none), then the pass over the image.
         auto* lut = static_cast<u32*>(dc_lut_.mapped);
         for (u32 i = 0; i < 768; ++i) lut[i] = display_lut_on_ ? display_lut_[i] : i / 3;
         DisplayConvertPush push{};
@@ -4975,8 +4975,8 @@ bool VulkanRenderer::init_display_convert() {
         note("picture overlay source: " + error);
         return false;
     }
-    // Pixel (x, y) of the image as the scanout shows it: 8-bit channels through the colour table, the unused byte clear;
-    // then the video overlay over it where it covers (and the colour key, when on, matches the finished pixel), each
+    // Pixel (x, y) of the image as the scanout shows it: 8-bit channels through the color table, the unused byte clear;
+    // then the video overlay over it where it covers (and the color key, when on, matches the finished pixel), each
     // pixel worked out as draw_overlay does it on the CPU: the source texel in 12.20 fixed point from the 12.4 start
     // (the 32-bit sum split so nothing carries out), BT.601 with 8.8 coefficients (yuv601_to_xrgb).
     const CompiledShader cs = compile_glsl(ShaderStage::Compute,

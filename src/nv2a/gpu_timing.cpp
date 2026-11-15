@@ -74,7 +74,7 @@ u64 pixel_bytes(const pgraph::KelvinState& state) {
 u64 clear_clocks(const pgraph::KelvinState& state) {
     const auto s = state.surface();
     const u64 pixels = static_cast<u64>(s.clip_width()) * s.clip_height();
-    // Colour and depth written ([estimate]: the clear bits are not consulted; a fast Z clear is not modelled).
+    // Color and depth written ([estimate]: the clear bits are not consulted; a fast Z clear is not modeled).
     return pixel_clocks(pixels, 1, s.color_bytes() + s.zeta_bytes());
 }
 

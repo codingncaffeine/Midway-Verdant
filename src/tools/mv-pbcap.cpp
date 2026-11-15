@@ -226,7 +226,7 @@ int replay(const char* path, mv::u32 frames) {
         std::fprintf(stderr, "mv-pbcap: %s\n", error.c_str());
         return 1;
     }
-    std::printf("%u frames, %llu methods; scanout start %08x; final surface format %08x colour offset %08x pitch %08x clip %ux%u\n", r.frames(),
+    std::printf("%u frames, %llu methods; scanout start %08x; final surface format %08x color offset %08x pitch %08x clip %ux%u\n", r.frames(),
                 static_cast<unsigned long long>(r.methods()), r.scanout_start(), kelvin.state().surface().format,
                 kelvin.state().surface().color_offset, kelvin.state().surface().pitch, kelvin.state().surface().clip_width(),
                 kelvin.state().surface().clip_height());
@@ -251,7 +251,7 @@ struct ShaderDumpSink : mv::pgraph::RenderSink {
         for (mv::u32 t = 0; t < 4; ++t) {
             const TextureStage ts = s.texture(t);
             const DmaObject dma = replay->resolve(s.dma_handle(ts.dma_select() == 2 ? mthd::kDmaB : mthd::kDmaA));
-            std::printf("texture %u: mode %u enabled %d format %08x (colour %02x dim %u cube %d levels %u %ux%u rect %ux%u pitch %u) at %08x filter %08x address %08x\n", t,
+            std::printf("texture %u: mode %u enabled %d format %08x (color %02x dim %u cube %d levels %u %ux%u rect %ux%u pitch %u) at %08x filter %08x address %08x\n", t,
                         s.shader_stage_program(t), ts.enabled(), ts.format, ts.color_format(), ts.dimensionality(), ts.cubemap(), ts.mip_levels(), 1u << ts.log_width(),
                         1u << ts.log_height(), ts.rect_width(), ts.rect_height(), ts.pitch(), dma.base + ts.offset, ts.filter, ts.address);
             // Its first 48 bytes as the replay's RAM holds them (a small texture's whole mip chain).
@@ -266,7 +266,7 @@ struct ShaderDumpSink : mv::pgraph::RenderSink {
             if ((s.reg(mthd::kVertexDataArrayFormat + 4 * i) >> 4) & 0xFu)
                 std::printf(" v%u %08x@%08x", i, s.reg(mthd::kVertexDataArrayFormat + 4 * i), s.reg(mthd::kVertexDataArrayOffset + 4 * i));
         std::printf("\n");
-        // The first vertices' raw attribute bytes as the draw's arrays hold them (what a colour or alpha really is).
+        // The first vertices' raw attribute bytes as the draw's arrays hold them (what a color or alpha really is).
         std::printf("zeta %08x pitch %08x; cull face %x front face %x\n", d.zeta_offset, d.pitch, s.reg(mthd::kCullFace), s.reg(mthd::kFrontFace));
         std::printf("ranges:");
         for (const auto& [first, count] : batch.ranges) std::printf(" %u+%u", first, count);
@@ -296,7 +296,7 @@ struct ShaderDumpSink : mv::pgraph::RenderSink {
         }
         std::printf("combiner control %08x; stage programs %08x; other stage input %08x\n", s.reg(mthd::kCombinerControl), s.reg(mthd::kShaderStageProgram), s.reg(mthd::kShaderOtherStageInput));
         for (mv::u32 i = 0; i < 8; ++i)
-            std::printf("stage %u: colour icw %08x ocw %08x alpha icw %08x ocw %08x factor0 %08x factor1 %08x\n", i, s.reg(mthd::kCombinerColorIcw + 4 * i),
+            std::printf("stage %u: color icw %08x ocw %08x alpha icw %08x ocw %08x factor0 %08x factor1 %08x\n", i, s.reg(mthd::kCombinerColorIcw + 4 * i),
                         s.reg(mthd::kCombinerColorOcw + 4 * i), s.reg(mthd::kCombinerAlphaIcw + 4 * i), s.reg(mthd::kCombinerAlphaOcw + 4 * i),
                         s.reg(mthd::kCombinerFactor0 + 4 * i), s.reg(mthd::kCombinerFactor1 + 4 * i));
         std::printf("final: cw0 %08x cw1 %08x; specular fog factors %08x %08x\n", s.reg(mthd::kCombinerSpecFogCw0), s.reg(mthd::kCombinerSpecFogCw1), s.reg(0x1E20), s.reg(0x1E24));
@@ -318,7 +318,7 @@ struct DrawListSink : mv::pgraph::RenderSink {
     void clear(const mv::pgraph::KelvinState& s, mv::u32 what) override {
         if (frame != want_frame) return;
         const mv::pgraph::SurfaceState d = s.surface();
-        std::printf("clear  -> %08x %ux%u (%s) what %x colour %08x\n", d.color_offset, d.clip_width(), d.clip_height(), d.swizzled() ? "swizzled" : "pitch", what, s.clear_color());
+        std::printf("clear  -> %08x %ux%u (%s) what %x color %08x\n", d.color_offset, d.clip_width(), d.clip_height(), d.swizzled() ? "swizzled" : "pitch", what, s.clear_color());
     }
     void semaphore_release(const mv::pgraph::KelvinState&, mv::u32) override { ++frame; n = 0; }
     void draw(const mv::pgraph::KelvinState& s, const mv::pgraph::DrawBatch& b) override {
@@ -371,7 +371,7 @@ struct TextureDumpSink : mv::pgraph::RenderSink {
         for (mv::u32 t = 0; t < 4; ++t) {
             TextureStage ts = s.texture(t);
             if (!ts.enabled() || s.shader_stage_program(t) == 0) continue;
-            // MV_PBCAP_AS=FMT (hex): decode every stage's memory as that colour format instead (is it the format, or the bytes?).
+            // MV_PBCAP_AS=FMT (hex): decode every stage's memory as that color format instead (is it the format, or the bytes?).
             if (const char* as = std::getenv("MV_PBCAP_AS"); as && *as)
                 ts.format = (ts.format & ~0xFF00u) | ((static_cast<mv::u32>(std::strtoul(as, nullptr, 16)) & 0xFFu) << 8);
             const DmaObject dma = replay->resolve(s.dma_handle(ts.dma_select() == 2 ? mthd::kDmaB : mthd::kDmaA));
@@ -522,7 +522,7 @@ struct RenderObserver : mv::pgraph::Replay::Observer {
             if (!s.rendered_this_frame || index < first_png || (index - first_png) % stride != 0) continue;
             std::vector<mv::u8> rgba;
             if (!renderer->surface_rgba(s, rgba)) continue;
-            // MV_PBCAP_ALPHA=1: a 32-bit pitch surface's alpha byte as grey (what a later blend weighs by).
+            // MV_PBCAP_ALPHA=1: a 32-bit pitch surface's alpha byte as gray (what a later blend weighs by).
             if (std::getenv("MV_PBCAP_ALPHA") && s.bytes_per_pixel == 4 && !s.swizzled)
                 for (mv::u32 y = 0; y < s.height; ++y)
                     for (mv::u32 x = 0; x < s.width; ++x)

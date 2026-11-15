@@ -18,7 +18,7 @@ enum class Cat : u32 {
     Irq = 1u << 5,     // interrupt lines and injections
     Flash = 1u << 6,   // flash and MCPX ROM events
     Cpu = 1u << 7,     // CPU backend events (exits, resets, faults)
-    Boot = 1u << 8,    // boot-chain milestones recognised from behaviour
+    Boot = 1u << 8,    // boot-chain milestones recognized from behavior
     Timer = 1u << 9,   // PIT/RTC/PM timer programming
     Gpu = 1u << 10,    // NV2A register traffic
     Apu = 1u << 11,    // APU register traffic and processor events

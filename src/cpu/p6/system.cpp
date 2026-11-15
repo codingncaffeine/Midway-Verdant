@@ -559,7 +559,7 @@ void Cpu::exec_system(const Insn& in) {
             return;
         case Op::Sysenter: {
             if (!st_.protected_mode() || (st_.sysenter_cs & 0xFFFC) == 0) raise_gp(0);
-            st_.materialise();
+            st_.materialize();
             st_.flags &= ~(fl::VM | fl::IF | fl::RF);
             Segment& cs = st_.seg[kCs];
             cs.selector = static_cast<u16>(st_.sysenter_cs & 0xFFFC);
@@ -607,7 +607,7 @@ void Cpu::exec_system(const Insn& in) {
             if (!st_.protected_mode() || st_.v8086()) raise_ud();
             const u32 dst = read_op(in, in.dst, 2);
             const u32 src = read_op(in, in.src, 2);
-            st_.materialise();
+            st_.materialize();
             if ((dst & 3) < (src & 3)) {
                 write_op(in, in.dst, 2, (dst & 0xFFFCu) | (src & 3));
                 st_.flags |= fl::ZF;
@@ -619,7 +619,7 @@ void Cpu::exec_system(const Insn& in) {
         case Op::Lar: case Op::Lsl: {
             if (!st_.protected_mode() || st_.v8086()) raise_ud();
             const u16 sel = static_cast<u16>(read_op(in, in.src, 2));
-            st_.materialise();
+            st_.materialize();
             bool ok = (sel & 0xFFFC) != 0;
             Descriptor d{};
             if (ok) {
@@ -697,7 +697,7 @@ void Cpu::exec_system(const Insn& in) {
         case Op::Verr: case Op::Verw: {
             if (!st_.protected_mode()) raise_ud();
             const u16 sel = static_cast<u16>(read_op(in, in.dst, 2));
-            st_.materialise();
+            st_.materialize();
             bool ok = (sel & 0xFFFC) != 0;
             if (ok) {
                 const u32 index = sel & ~7u;

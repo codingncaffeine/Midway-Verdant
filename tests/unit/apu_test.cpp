@@ -833,7 +833,7 @@ TEST(ApuSynthesis, AMultipassVoiceReadsItsSubmixBinAndClearMixEmptiesIt) {
     }
 }
 
-TEST(ApuDirectMix, AVoiceOnlyInTheCentreBinReachesBothChannelsAtItsLoudestSendAndTheSinkGetsTheFrame) {
+TEST(ApuDirectMix, AVoiceOnlyInTheCenterBinReachesBothChannelsAtItsLoudestSendAndTheSinkGetsTheFrame) {
     using SE = apu::SetupEngine;
     SynthRig r;
     std::vector<i16> heard;
@@ -841,7 +841,7 @@ TEST(ApuDirectMix, AVoiceOnlyInTheCentreBinReachesBothChannelsAtItsLoudestSendAn
     r.fill_pcm(128);
     r.start(kPcm16Mono, 127, 0, 0, 384);  // V0 at 6 dB
     r.vp(SE::kMethodSetCurrentVoice, SynthRig::kVoice);
-    r.vp(0x300, 2u | (1u << 5));  // V0 to bin 2 (the centre); V1 (silent) to bin 1
+    r.vp(0x300, 2u | (1u << 5));  // V0 to bin 2 (the center); V1 (silent) to bin 1
     r.sched.advance_to(Rig::frame(1));
     EXPECT_TRUE(heard.empty()) << "the option is off: the sink hears nothing";
     for (u32 i = 0; i < 32; ++i) EXPECT_EQ(r.apu.setup_engine().direct()[i][0], 0.0f);

@@ -72,7 +72,7 @@ struct JitCtx {
     struct LogEntry {
         u64 where;  // the host address, the size in the top byte
         u64 old;
-    } log[256];  // not initialised: read only up to log_count (zeroing 4 KiB a run was a measurable cost)
+    } log[256];  // not initialized: read only up to log_count (zeroing 4 KiB a run was a measurable cost)
     u8 stop_why{};  // instrument: which test in BlockEngine::chain ended the run (0: none)
     // Where returns and indirect jumps chain inside the generated code: by target EIP (direct-mapped), each block the
     // engine chained such an exit into, with what its checks need (filled by BlockEngine::chain, cleared when the block

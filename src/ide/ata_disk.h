@@ -109,7 +109,7 @@ public:
     u16 read_data() override;
     void write_data(u16 value) override;
     u64 packets() const { return packets_; }
-    // Puts a disc in the tray (before power-on: the kernel finds it at initialisation).
+    // Puts a disc in the tray (before power-on: the kernel finds it at initialization).
     void insert(std::unique_ptr<DvdImage> disc) { disc_ = std::move(disc); }
     bool has_disc() const { return disc_ != nullptr; }
     const DvdImage* disc() const { return disc_.get(); }
@@ -152,7 +152,7 @@ private:
     u8 sense_key_{0}, asc_{0}, ascq_{0};
     bool dma_{false};  // the current PACKET command's data phase goes through the bus master (features bit 0)
     bool read_in_flight_{false};  // a READ's sectors are on the image's thread until its DMA data phase begins
-    Cycles read_due_{0};           // when that READ's modelled transfer ends (the host pacing is bounded past it)
+    Cycles read_due_{0};           // when that READ's modeled transfer ends (the host pacing is bounded past it)
     void drop_read();
     u64 packets_{0};
     Cycles ready_at_{cycles_from_ns(kSpinUpNs)};  // power-on is time 0
