@@ -438,7 +438,7 @@ u64 Cpu::read_msr(u32 index) {
         case 0x10: return cycles_ + st_.tsc;
         case 0x17: return 0;  // IA32_PLATFORM_ID
         case 0x1B: return st_.apic_base;
-        case 0x2A: return 0;  // EBL_CR_POWERON
+        case 0x2A: return 0xC5040000u;  // EBL_CR_POWERON: a 133 MHz bus and a ratio of 5.5 (see KvmBackend::kPowerOnConfiguration)
         case 0x79: return 0;  // BIOS_UPDT_TRIG
         case 0x8B: return st_.bios_sign_id;
         case 0xC1: case 0xC2: return 0;  // PERFCTR0/1

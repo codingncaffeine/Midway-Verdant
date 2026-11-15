@@ -142,6 +142,26 @@ bool KvmBackend::set_slot(u32 slot, u64 guest_phys, u64 size, void* host, bool r
     return true;
 }
 
+// The model-specific registers of the console's processor family (Intel's manual, the P6 family table) that the host
+// does not model for a guest: they read 0 and take any write here, as the cycle-counted core has them.
+bool KvmBackend::p6_msr(u32 index) {
+    switch (index) {
+        case 0x00: case 0x01:                          // the machine-check address and type of the older family
+        case 0x17:                                     // platform id
+        case kMsrPowerOn:
+        case 0x33:                                     // test control
+        case 0x79: case 0x8B:                          // microcode update trigger and signature
+        case 0x88: case 0x89: case 0x8A:               // the L2 cache data registers
+        case 0xC1: case 0xC2: case 0x186: case 0x187:  // the two performance counters and their event selects
+        case 0x116: case 0x118: case 0x119: case 0x11A: case 0x11B: case 0x11E:  // the L2 cache address, control and status
+        case 0x179: case 0x17A: case 0x17B:            // machine-check capability, status, control
+        case 0x1D9: case 0x1DB: case 0x1DC: case 0x1DD: case 0x1DE:  // debug control and the last branch and interrupt records
+        case 0x1E0:
+            return true;
+        default: return index >= 0x400 && index <= 0x413;  // the five machine-check banks
+    }
+}
+
 bool KvmBackend::setup_cpuid(std::string& error) {
     // A Coppermine Pentium III as the console's firmware and games see it: family 6, model 8, stepping 10;
     // FPU VME DE PSE TSC MSR PAE MCE CX8 SEP MTRR PGE MCA CMOV PAT PSE36 MMX FXSR SSE; no SSE2, no APIC in use.
@@ -295,19 +315,31 @@ bool KvmBackend::init(Machine& machine, std::string& error) {
         const char* ec = std::getenv("MV_EXIT_COST");
         clock_.set_exact_exits(guest_clock_on_ && tsc_offset_ctl_ && !(ec && std::strcmp(ec, "host") == 0));
     }
-    if (guest_clock_on_ && tsc_offset_ctl_) {
-        // The guest's own writes of the TSC come out here, so the clock keeps its account of where the TSC should be.
+    {
+        // Model-specific registers that leave the guest: its own writes of the TSC (the clock keeps its account of where
+        // the TSC should be), the power-on configuration register (the host answers 0: a 66 MHz bus), and every register
+        // the host does not know, which would otherwise fault inside the guest unseen.
         kvm_enable_cap cap{};
         cap.cap = KVM_CAP_X86_USER_SPACE_MSR;
-        cap.args[0] = KVM_MSR_EXIT_REASON_FILTER;
-        u8 deny = 0;  // the bitmap is copied: no bit set = the write leaves the guest
+        cap.args[0] = KVM_MSR_EXIT_REASON_FILTER | KVM_MSR_EXIT_REASON_UNKNOWN;
+        const bool exits = kvm_ioctl(vm_fd_, KVM_ENABLE_CAP, &cap) == 0;
+        u8 deny = 0;  // the bitmaps are copied: no bit set = the access leaves the guest
         kvm_msr_filter filter{};
         filter.flags = KVM_MSR_FILTER_DEFAULT_ALLOW;
-        filter.ranges[0].flags = KVM_MSR_FILTER_WRITE;
-        filter.ranges[0].base = 0x10;
-        filter.ranges[0].nmsrs = 1;
-        filter.ranges[0].bitmap = &deny;
-        tsc_writes_trapped_ = kvm_ioctl(vm_fd_, KVM_ENABLE_CAP, &cap) == 0 && kvm_ioctl(vm_fd_, KVM_X86_SET_MSR_FILTER, &filter) == 0;
+        u32 n = 0;
+        filter.ranges[n].flags = KVM_MSR_FILTER_READ;
+        filter.ranges[n].base = kMsrPowerOn;
+        filter.ranges[n].nmsrs = 1;
+        filter.ranges[n++].bitmap = &deny;
+        const bool trap_tsc = guest_clock_on_ && tsc_offset_ctl_;
+        if (trap_tsc) {
+            filter.ranges[n].flags = KVM_MSR_FILTER_WRITE;
+            filter.ranges[n].base = 0x10;
+            filter.ranges[n].nmsrs = 1;
+            filter.ranges[n++].bitmap = &deny;
+        }
+        const bool filtered = exits && kvm_ioctl(vm_fd_, KVM_X86_SET_MSR_FILTER, &filter) == 0;
+        tsc_writes_trapped_ = filtered && trap_tsc;
     }
 
     // The kick signal stays deliverable: its handler sets immediate_exit on the run area.
@@ -540,6 +572,12 @@ std::string KvmBackend::report() const {
     {
         std::vector<std::pair<u32, u64>> top(exit_sources_.begin(), exit_sources_.end());
         std::sort(top.begin(), top.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+        if (!odd_msrs_.empty()) {
+            r += "\nkvm: model-specific registers the host does not model (answered here):";
+            for (const auto& [index, m] : odd_msrs_)
+                r += std::format(" {:x} read x{} written x{}{}{}", index, m.reads, m.writes, m.writes ? std::format(" (last {:#x})", m.last_written) : "",
+                                 m.faults ? " FAULTED: the console's processor has no such register" : "");
+        }
         r += "\nkvm: busiest exits:";
         for (std::size_t i = 0; i < top.size() && i < 8; ++i)
             r += (top[i].first & 1u) ? std::format(" port {:04x} x{}", top[i].first >> 16, top[i].second)
@@ -1028,15 +1066,30 @@ void KvmBackend::thread_main() {
                 break;
             case KVM_EXIT_IRQ_WINDOW_OPEN: ++stats_.irq_window_exits; break;
             case KVM_EXIT_X86_WRMSR:
-                // The guest set its TSC (the only MSR filtered): do it, and count TSC time from here.
+                // The guest set its TSC: do it, and count TSC time from here. Any other write here is to a register the
+                // host does not model: taken and dropped if the console's processor has it, a fault if it has not.
                 if (run_->msr.index == 0x10) {
                     set_tsc(run_->msr.data);
                     tsc_epoch_ = clock_.now() - std::min<Cycles>(clock_.now(), run_->msr.data);
                     ++guest_tsc_writes_;
                     trace::log(trace::Cat::Cpu, "guest wrote the TSC: {:#x}", static_cast<u64>(run_->msr.data));
+                    run_->msr.error = 0;
+                } else {
+                    OddMsr& m = odd_msrs_[run_->msr.index];
+                    ++m.writes;
+                    m.last_written = run_->msr.data;
+                    m.faults = !p6_msr(run_->msr.index);
+                    run_->msr.error = m.faults ? 1 : 0;
                 }
-                run_->msr.error = 0;
                 break;
+            case KVM_EXIT_X86_RDMSR: {
+                OddMsr& m = odd_msrs_[run_->msr.index];
+                ++m.reads;
+                m.faults = !p6_msr(run_->msr.index);
+                run_->msr.data = run_->msr.index == kMsrPowerOn ? kPowerOnConfiguration : 0;
+                run_->msr.error = m.faults ? 1 : 0;
+                break;
+            }
             case KVM_EXIT_INTR: break;
             case KVM_EXIT_DEBUG: {
                 if (idle_eip_ && (run_->debug.arch.pc == idle_eips_[0] || run_->debug.arch.pc == idle_eips_[1]) && break_eips_.empty() && !watch_va_) {

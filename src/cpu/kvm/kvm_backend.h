@@ -204,6 +204,18 @@ private:
     u64 event_ns_{0}, handler_ns_{0}, pause_ns_{0};
     u64 tsc_rewinds_{0}, tsc_adjust_failures_{0}, guest_tsc_writes_{0}, tsc_rewound_{0};
     bool tsc_writes_trapped_{false};
+    // The power-on configuration register (EBL_CR_POWERON) and what the console's processor reports in it: a 133 MHz bus
+    // (bits 19:18 = 01) and a clock ratio of 5.5 (bits 25:22 = 0100, bit 27 clear), per the Pentium III datasheet's
+    // power-on configuration table: 733 MHz. The remaining set bits (26, 30, 31) are as xemu reports them [their value].
+    static constexpr u32 kMsrPowerOn = 0x2A;
+    static constexpr u64 kPowerOnConfiguration = 0xC5040000u;
+    static bool p6_msr(u32 index);
+    // Accesses to model-specific registers the host does not model, by register (the unload report lists them).
+    struct OddMsr {
+        u64 reads{0}, writes{0}, last_written{0};
+        bool faults{false};
+    };
+    std::map<u32, OddMsr> odd_msrs_;
     i64 tsc_lead_last_{0}, tsc_lead_max_{0}, tsc_lead_min_{0};
     double tsc_lead_sum_{0};
     u64 tsc_lead_samples_{0};
